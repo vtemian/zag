@@ -350,10 +350,10 @@ fn writeSkillFile(
     subdir: []const u8,
     frontmatter_body: []const u8,
 ) !void {
-    try dir.makePath(subdir);
-    var skill_dir = try dir.openDir(subdir, .{});
-    defer skill_dir.close();
-    try skill_dir.writeFile(.{ .sub_path = "SKILL.md", .data = frontmatter_body });
+    try dir.createDirPath(std.testing.io, subdir);
+    var skill_dir = try dir.openDir(std.testing.io, subdir, .{});
+    defer skill_dir.close(std.testing.io);
+    try skill_dir.writeFile(std.testing.io, .{ .sub_path = "SKILL.md", .data = frontmatter_body });
 }
 
 test "discover finds skills across project and user roots" {

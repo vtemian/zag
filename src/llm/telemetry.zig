@@ -365,7 +365,7 @@ fn setupTmpLog(tmp: *std.testing.TmpDir, path_buf: []u8, full_buf: []u8) ![]cons
 fn readArtifact(tmp_abs: []const u8, suffix: []const u8) ![]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const full = try std.fmt.bufPrint(&path_buf, "{s}/instance{s}", .{ tmp_abs, suffix });
-    return std.fs.cwd().readFileAlloc(testing.allocator, full, 4 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, full, testing.allocator, .limited(4 * 1024 * 1024));
 }
 
 test "Telemetry deinit emits timeline log line" {
@@ -587,13 +587,13 @@ test "Telemetry artifactPath sees Telemetry's writes" {
     const expected_req = (try file_log.artifactPath(testing.allocator, ".turn-2.req.json")) orelse
         return error.NoLogPath;
     defer testing.allocator.free(expected_req);
-    const stat_req = try std.fs.cwd().statFile(expected_req);
+    const stat_req = try std.Io.Dir.cwd().statFile(std.testing.io, expected_req, .{});
     try testing.expect(stat_req.size > 0);
 
     const expected_resp = (try file_log.artifactPath(testing.allocator, ".turn-2.resp.json")) orelse
         return error.NoLogPath;
     defer testing.allocator.free(expected_resp);
-    const stat_resp = try std.fs.cwd().statFile(expected_resp);
+    const stat_resp = try std.Io.Dir.cwd().statFile(std.testing.io, expected_resp, .{});
     try testing.expect(stat_resp.size > 0);
 }
 

@@ -548,8 +548,8 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
 
     // Write a temp file for read to target.
     const tmp = "zag-hook-e2e.txt";
-    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "hello" });
-    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = tmp, .data = "hello" });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
 
     const tool_calls = [_]types.ContentBlock.ToolUse{
         .{ .id = "call_1", .name = "bash", .input_raw = "{\"command\":\"ls\"}" },
@@ -637,8 +637,8 @@ test "jit context handler appends content to tool result" {
     try registry.register(read_tool.tool);
 
     const tmp = "zag-jit-attach-e2e.txt";
-    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "hello jit" });
-    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = tmp, .data = "hello jit" });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
 
     const tool_calls = [_]types.ContentBlock.ToolUse{
         .{ .id = "call_jit", .name = "read", .input_raw = "{\"path\":\"zag-jit-attach-e2e.txt\"}" },
@@ -699,8 +699,8 @@ test "no jit handler registered leaves tool result untouched" {
     try registry.register(read_tool.tool);
 
     const tmp = "zag-jit-noop-e2e.txt";
-    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "untouched" });
-    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = tmp, .data = "untouched" });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
 
     const tool_calls = [_]types.ContentBlock.ToolUse{
         .{ .id = "call_noop", .name = "read", .input_raw = "{\"path\":\"zag-jit-noop-e2e.txt\"}" },
@@ -763,8 +763,8 @@ test "jit handler returning nil leaves tool result untouched" {
     try registry.register(read_tool.tool);
 
     const tmp = "zag-jit-nil-e2e.txt";
-    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = "passthrough" });
-    defer std.fs.cwd().deleteFile(tmp) catch {};
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = tmp, .data = "passthrough" });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp) catch {};
 
     const tool_calls = [_]types.ContentBlock.ToolUse{
         .{ .id = "call_nil", .name = "read", .input_raw = "{\"path\":\"zag-jit-nil-e2e.txt\"}" },
@@ -841,9 +841,9 @@ test "agents_md JIT layer attaches AGENTS.md content via executeTools dispatch" 
     // single-directory probe matches.
     const agents_body = "# Local conventions\nUse TDD. Keep it terse.";
     const child_body = "package nested\n";
-    try tmp.dir.makePath("nested");
-    try tmp.dir.writeFile(.{ .sub_path = "nested/AGENTS.md", .data = agents_body });
-    try tmp.dir.writeFile(.{ .sub_path = "nested/file.txt", .data = child_body });
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = agents_body });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/file.txt", .data = child_body });
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &root_buf)];

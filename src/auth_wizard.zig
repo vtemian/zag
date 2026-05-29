@@ -1763,7 +1763,7 @@ test "scaffoldConfigLua writes expected contents for openai" {
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "openai", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     // Picked provider loads via an active `require(...)` line.
@@ -1792,7 +1792,7 @@ test "scaffoldConfigLua writes expected contents for anthropic" {
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     try testing.expect(std.mem.indexOf(u8, actual, "require(\"zag.providers.anthropic\")\n") != null);
@@ -1813,7 +1813,7 @@ test "scaffoldConfigLua does not duplicate the picked provider in the commented 
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     // The picked provider must appear exactly once as the active require; it
@@ -1845,7 +1845,7 @@ test "scaffoldConfigLua lists every other stdlib provider in the commented block
     // custom Lua-declared providers aren't required to match.
     try scaffoldConfigLua(testing.allocator, &registry, path, "ollama", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     for (embedded.entries) |entry| {
@@ -1873,11 +1873,11 @@ test "scaffoldConfigLua is a no-op when file exists" {
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
-    try tmp.dir.writeFile(.{ .sub_path = "config.lua", .data = "-- user content" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.lua", .data = "-- user content" });
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "openai", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("-- user content", actual);
 }
@@ -1895,7 +1895,7 @@ test "scaffoldConfigLua creates parent directories" {
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "groq", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
     try testing.expect(std.mem.indexOf(u8, actual, "require(\"zag.providers.groq\")") != null);
     try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"groq/llama-3.3-70b-versatile\")") != null);
@@ -1931,7 +1931,7 @@ test "scaffoldConfigLua writes chosen_model when provided" {
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "openai-oauth", "gpt-5.5");
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
     try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"openai-oauth/gpt-5.5\")") != null);
     // The endpoint's default_model must not leak through when the caller
@@ -1999,7 +1999,7 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
     try testing.expect(result.scaffolded_config);
 
     // auth.json: 0o600, openai key present.
-    const auth_stat = try std.fs.cwd().statFile(paths.auth_path);
+    const auth_stat = try std.Io.Dir.cwd().statFile(std.testing.io, paths.auth_path, .{});
     try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(auth_stat.mode & 0o777)));
 
     var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
@@ -2007,7 +2007,7 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
     try testing.expectEqualStrings("sk-abc-123", (try loaded.getApiKey("openai")).?);
 
     // config.lua: scaffolded with the openai template and the picked model.
-    const config_body = try std.fs.cwd().readFileAlloc(testing.allocator, paths.config_path, 1 << 16);
+    const config_body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, paths.config_path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(config_body);
     try testing.expect(std.mem.indexOf(u8, config_body, "require(\"zag.providers.openai\")") != null);
     try testing.expect(std.mem.indexOf(u8, config_body, "zag.set_default_model(\"openai/gpt-4o-mini\")") != null);
@@ -2055,7 +2055,7 @@ test "runWizard with forced_provider skips the choice prompt" {
     try testing.expectEqualStrings("sk-ant-key", (try loaded.getApiKey("anthropic")).?);
 
     // config.lua must NOT exist: forced mode is credential-only.
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.config_path));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, paths.config_path, .{}));
 }
 
 test "runWizard on forced_provider prints paste-me model hint, does not scaffold" {
@@ -2540,7 +2540,7 @@ test "dispatchProviderCredential skips credential capture for .none endpoints" {
     try dispatchProviderCredential(&deps, picked);
 
     // auth.json must not exist: `.none` writes nothing.
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.auth_path));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, paths.auth_path, .{}));
 
     const rendered = stdout_writer.written();
     try testing.expect(std.mem.indexOf(u8, rendered, "requires no credential") != null);
@@ -2699,7 +2699,7 @@ test "persistDefaultModel replaces existing line" {
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data =
         \\require("zag.providers.anthropic")
@@ -2710,7 +2710,7 @@ test "persistDefaultModel replaces existing line" {
 
     try persistDefaultModel(gpa, path, "openai-oauth/gpt-5.2");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"openai-oauth/gpt-5.2\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "anthropic/claude-sonnet-4-20250514") == null);
@@ -2725,14 +2725,14 @@ test "persistDefaultModel appends when no line exists" {
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data = "require(\"zag.providers.anthropic\")\n",
     });
 
     try persistDefaultModel(gpa, path, "anthropic/claude-opus-4-20250514");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"anthropic/claude-opus-4-20250514\")") != null);
 }
@@ -2746,7 +2746,7 @@ test "persistDefaultModel ignores commented-out lines" {
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data =
         \\-- zag.set_default_model("old/one")
@@ -2758,7 +2758,7 @@ test "persistDefaultModel ignores commented-out lines" {
 
     try persistDefaultModel(gpa, path, "openai/gpt-4o");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "-- zag.set_default_model(\"old/one\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"openai/gpt-4o\")") != null);
@@ -2774,7 +2774,7 @@ test "persistDefaultModel collapses multiple active lines to one" {
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data =
         \\zag.set_default_model("a/one")
@@ -2786,7 +2786,7 @@ test "persistDefaultModel collapses multiple active lines to one" {
 
     try persistDefaultModel(gpa, path, "a/final");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     const count = std.mem.count(u8, body, "zag.set_default_model(");
     try std.testing.expectEqual(@as(usize, 1), count);

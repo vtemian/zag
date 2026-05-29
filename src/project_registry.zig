@@ -281,7 +281,7 @@ test "malformed registry file recovers to empty list" {
     const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "projects.json",
         .data = "{ not valid json",
     });
@@ -340,8 +340,8 @@ test "saveAtomic uses a process-scoped tmp filename" {
     // must leave it alone (it would belong to another live zag, not us).
     // The legacy shared-tmp path "projects.json.tmp" must also be left
     // alone, since it is no longer in our cleanup namespace.
-    try tmp.dir.writeFile(.{ .sub_path = "projects.json.99999999.tmp", .data = "other-process" });
-    try tmp.dir.writeFile(.{ .sub_path = "projects.json.tmp", .data = "legacy-shared" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "projects.json.99999999.tmp", .data = "other-process" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "projects.json.tmp", .data = "legacy-shared" });
 
     var reg = try ProjectRegistry.init(std.testing.allocator, tmp_path);
     defer reg.deinit();
@@ -352,11 +352,11 @@ test "saveAtomic uses a process-scoped tmp filename" {
     const our_pid: i32 = @intCast(std.c.getpid());
     var our_tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const our_tmp_name = try std.fmt.bufPrint(&our_tmp_buf, "projects.json.{d}.tmp", .{our_pid});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(our_tmp_name, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.tmp.dir(std.testing.io, our_tmp_name, .{}));
 
     // The foreign-pid tmp and the legacy shared tmp must still be there.
-    try tmp.dir.access("projects.json.99999999.tmp", .{});
-    try tmp.dir.access("projects.json.tmp", .{});
+    try tmp.dir.tmp.dir(std.testing.io, "projects.json.99999999.tmp", .{});
+    try tmp.dir.tmp.dir(std.testing.io, "projects.json.tmp", .{});
 
     // And the real registry got written.
     const list = try reg.listProjects();

@@ -90,10 +90,12 @@ fn execTail(tail: []const [:0]const u8) noreturn {
     // Pass the parent's environ through unchanged. Env-resident secrets
     // are a separate threat from filesystem reads; tackle in a future plan
     // if real leak vectors surface.
-    const envp_z: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+    const envp_z: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
 
-    const err = std.posix.execveZ(tail[0].ptr, argv_z, envp_z);
-    std.debug.print("zag --__sandbox-helper: execve failed: {s}\n", .{@errorName(err)});
+    // 0.16 removed std.posix.execveZ; go straight to libc execve, which only
+    // returns on failure. Report the errno the same way the old error name did.
+    const rc = std.c.execve(tail[0].ptr, argv_z, envp_z);
+    std.debug.print("zag --__sandbox-helper: execve failed: {s}\n", .{@tagName(std.posix.errno(rc))});
     std.process.exit(127);
 }
 

@@ -202,8 +202,8 @@ test "systemPaths returns only existing paths" {
     }
 
     // Create only ~/.claude/CLAUDE.md.
-    try tmp.dir.makePath(".claude");
-    try writeFile(try tmp.dir.openDir(".claude", .{}), "CLAUDE.md", "global claude");
+    try tmp.dir.createDirPath(std.testing.io, ".claude");
+    try writeFile(try tmp.dir.tmp.dir(std.testing.io, ".claude", .{}), "CLAUDE.md", "global claude");
     {
         const paths = try systemPaths(home, testing.allocator);
         defer freeSystemPaths(paths, testing.allocator);
@@ -212,8 +212,8 @@ test "systemPaths returns only existing paths" {
     }
 
     // Add ~/.config/zag/AGENTS.md too; both should appear in declared order.
-    try tmp.dir.makePath(".config/zag");
-    try writeFile(try tmp.dir.openDir(".config/zag", .{}), "AGENTS.md", "global zag");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zag");
+    try writeFile(try tmp.dir.tmp.dir(std.testing.io, ".config/zag", .{}), "AGENTS.md", "global zag");
     {
         const paths = try systemPaths(home, testing.allocator);
         defer freeSystemPaths(paths, testing.allocator);
@@ -292,7 +292,7 @@ test "findUp walks up from nested cwd to ancestor with AGENTS.md" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "AGENTS.md", "ancestor wins");
-    try tmp.dir.makePath("a/b/c");
+    try tmp.dir.createDirPath(std.testing.io, "a/b/c");
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
     const cwd = try std.fs.path.join(testing.allocator, &.{ root, "a", "b", "c" });
@@ -308,8 +308,8 @@ test "findUp first-hit: nested AGENTS.md beats ancestor AGENTS.md" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "AGENTS.md", "ancestor");
-    try tmp.dir.makePath("nested");
-    try writeFile(try tmp.dir.openDir("nested", .{}), "AGENTS.md", "nested");
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    try writeFile(try tmp.dir.tmp.dir(std.testing.io, "nested", .{}), "AGENTS.md", "nested");
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
     const cwd = try std.fs.path.join(testing.allocator, &.{ root, "nested" });
@@ -325,7 +325,7 @@ test "findUp stops at worktree boundary" {
     defer tmp.cleanup();
     // AGENTS.md sits at tmp root, but worktree is "inner".
     try writeFile(tmp.dir, "AGENTS.md", "outside worktree");
-    try tmp.dir.makePath("inner/sub");
+    try tmp.dir.createDirPath(std.testing.io, "inner/sub");
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
     const worktree = try std.fs.path.join(testing.allocator, &.{ root, "inner" });
@@ -344,7 +344,7 @@ test "findUp skips files larger than MAX_BYTES" {
     // Write an oversized AGENTS.md plus a small CLAUDE.md fallback. The walk
     // should treat AGENTS.md as if absent and surface CLAUDE.md instead.
     {
-        var f = try tmp.dir.createFile("AGENTS.md", .{});
+        var f = try tmp.dir.tmp.dir(std.testing.io, "AGENTS.md", .{});
         defer f.close();
         const chunk = [_]u8{'x'} ** 4096;
         var written: usize = 0;

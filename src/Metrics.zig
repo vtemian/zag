@@ -513,7 +513,7 @@ pub fn getStats() Stats {
 pub fn dump(path: []const u8) !usize {
     if (!enabled) return 0;
 
-    const file = try std.fs.cwd().createFile(path, .{});
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
     defer file.close();
 
     var buf: std.ArrayList(u8) = .empty;
@@ -901,12 +901,12 @@ test "dump writes valid JSON" {
 
     const tmp_path = "zag-test-trace.json";
     const count = try dump(tmp_path);
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     try std.testing.expect(count > 0);
 
     // Read and verify basic structure
-    const file = try std.fs.cwd().openFile(tmp_path, .{});
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, tmp_path, .{});
     defer file.close();
     var trace_scratch: [8192]u8 = undefined;
     const len = try file.readAll(&trace_scratch);

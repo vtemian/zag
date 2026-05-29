@@ -6563,7 +6563,7 @@ test "zag.fs.read returns file bytes" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "r.txt", .data = "hello-from-disk" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "r.txt", .data = "hello-from-disk" });
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6669,7 +6669,7 @@ test "zag.fs.append extends an existing file" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "first" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "first" });
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6739,8 +6739,8 @@ test "zag.fs.mkdir creates directories, parents=true handles nesting" {
     eng.lua.pop(1);
 
     // Verify both directories actually exist on disk.
-    try tmp.dir.access("flat", .{});
-    try tmp.dir.access("nested/inner/leaf", .{});
+    try tmp.dir.tmp.dir(std.testing.io, "flat", .{});
+    try tmp.dir.tmp.dir(std.testing.io, "nested/inner/leaf", .{});
 }
 
 test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
@@ -6752,9 +6752,9 @@ test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "trash.txt", .data = "x" });
-    try tmp.dir.makePath("tree/inner");
-    try tmp.dir.writeFile(.{ .sub_path = "tree/inner/child.txt", .data = "y" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trash.txt", .data = "x" });
+    try tmp.dir.createDirPath(std.testing.io, "tree/inner");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tree/inner/child.txt", .data = "y" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
@@ -6788,8 +6788,8 @@ test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
     eng.lua.pop(1);
 
     // Nothing should remain at those paths.
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("trash.txt", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("tree", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.tmp.dir(std.testing.io, "trash.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.tmp.dir(std.testing.io, "tree", .{}));
 }
 
 test "zag.fs.list returns directory entries" {
@@ -6801,9 +6801,9 @@ test "zag.fs.list returns directory entries" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "one.txt", .data = "1" });
-    try tmp.dir.writeFile(.{ .sub_path = "two.txt", .data = "2" });
-    try tmp.dir.makeDir("sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "one.txt", .data = "1" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "two.txt", .data = "2" });
+    try tmp.dir.createDir(std.testing.io, tmp.dir, .default_dir);
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
@@ -6855,7 +6855,7 @@ test "zag.fs.stat returns kind, size, mtime_ms, mode" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "s.dat", .data = "0123456789ab" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "s.dat", .data = "0123456789ab" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
@@ -6909,7 +6909,7 @@ test "zag.fs.exists returns true for present file, false for missing" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "e.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "e.txt", .data = "" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
@@ -7257,8 +7257,8 @@ test "user dir file shadows embedded stdlib entry" {
     // Build a temp dir with zag/providers/anthropic.lua returning a sentinel.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("zag/providers");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "zag/providers");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "zag/providers/anthropic.lua",
         .data = "return 'from-user-dir'",
     });
@@ -8697,7 +8697,7 @@ test "zag.context.find_up surfaces AGENTS.md content from cwd" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "project guidance" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "project guidance" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
@@ -8730,8 +8730,8 @@ test "zag.context.find_up accepts a single string and walks up" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "ancestor body" });
-    try tmp.dir.makePath("nested/leaf");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "ancestor body" });
+    try tmp.dir.createDirPath(std.testing.io, "nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
@@ -8784,7 +8784,7 @@ test "zag.layers.agents_md emits AGENTS.md content wrapped in <instructions>" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
@@ -8840,8 +8840,8 @@ test "agents_md integration: eager-loaded layer pulls parent AGENTS.md into asse
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Prefer TDD." });
-    try tmp.dir.makePath("nested/leaf");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Prefer TDD." });
+    try tmp.dir.createDirPath(std.testing.io, "nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
@@ -8892,7 +8892,7 @@ test "agents_md integration: assembled prompt omits instructions block when no f
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("nested/leaf");
+    try tmp.dir.createDirPath(std.testing.io, "nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
@@ -8954,8 +8954,8 @@ test "zag.fs.read_file_sync and list_dir_sync" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "hello-sync" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.md", .data = "# header\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "hello-sync" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.md", .data = "# header\n" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
@@ -9012,8 +9012,8 @@ test "zag.subagents.filesystem loads agents from tmpdir" {
         \\---
         \\You are a reviewer. Read the diff and return findings.
     ;
-    try tmp.dir.makePath("agents");
-    try tmp.dir.writeFile(.{ .sub_path = "agents/reviewer.md", .data = reviewer_md });
+    try tmp.dir.createDirPath(std.testing.io, "agents");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/reviewer.md", .data = reviewer_md });
 
     const scout_md =
         \\---
@@ -9022,10 +9022,10 @@ test "zag.subagents.filesystem loads agents from tmpdir" {
         \\---
         \\You are a scout.
     ;
-    try tmp.dir.writeFile(.{ .sub_path = "agents/scout.md", .data = scout_md });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/scout.md", .data = scout_md });
 
     // A sibling file without the right extension must be ignored.
-    try tmp.dir.writeFile(.{ .sub_path = "agents/README", .data = "ignore me" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/README", .data = "ignore me" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
@@ -9068,14 +9068,14 @@ test "zag.subagents.filesystem skips malformed files with a warning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("agents");
+    try tmp.dir.createDirPath(std.testing.io, "agents");
     // Missing `name` field; must be skipped.
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agents/broken.md",
         .data = "---\ndescription: no name\n---\nbody\n",
     });
     // Valid; must be loaded even though a sibling was malformed.
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agents/good.md",
         .data = "---\nname: good\ndescription: ok\n---\nhi\n",
     });
@@ -10226,8 +10226,8 @@ test "zag.jit.agents_md attaches AGENTS.md from the read file's parent" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
-    try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "code.go", .data = "package main" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
@@ -10254,7 +10254,7 @@ test "zag.jit.agents_md returns nil when no instruction file exists" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "code.go", .data = "package main" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
@@ -10277,9 +10277,9 @@ test "zag.jit.agents_md dedups within a turn" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD." });
-    try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.go", .data = "package a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.go", .data = "package b" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
@@ -10315,9 +10315,9 @@ test "zag.jit.agents_md re-attaches across turn boundaries" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD." });
-    try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.go", .data = "package a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.go", .data = "package b" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
@@ -10360,7 +10360,7 @@ test "zag.jit.agents_md skips when ctx.is_error is true" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Should be skipped." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Should be skipped." });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 

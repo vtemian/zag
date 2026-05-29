@@ -97,11 +97,11 @@ test "read existing file" {
 
     // Write a temp file to read back
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll(test_content);
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\"}}", .{tmp_path});
     defer allocator.free(input);
@@ -148,11 +148,11 @@ test "read with max_lines truncation" {
     // 5 lines
     const test_content = "a\nb\nc\nd\ne\n";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll(test_content);
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"max_lines\": 2}}", .{tmp_path});
     defer allocator.free(input);

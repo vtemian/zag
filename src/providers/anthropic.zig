@@ -2103,7 +2103,7 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     const expected = (try file_log.artifactPath(allocator, ".turn-4.stream-error.json")) orelse
         return error.NoLogPath;
     defer allocator.free(expected);
-    const stat = try std.fs.cwd().statFile(expected);
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, expected, .{});
     try std.testing.expect(stat.size > 0);
 
     // error_detail got populated for the agent error formatter. The UI

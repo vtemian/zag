@@ -5220,7 +5220,7 @@ test "restorePane rebuilds both tree and messages" {
     // than via SessionHandle.appendEntry in a loop) sidesteps a known
     // quirk of std.Io.File positional writers: each freshly-created writer
     // starts at pos 0, so a single writer loop is the reliable pattern.
-    std.fs.cwd().makePath(".zag/sessions") catch {};
+    std.Io.Dir.cwd().createDirPath(std.testing.io, ".zag/sessions") catch {};
 
     const session_id = "restore_test_0123456789abcdef01";
 
@@ -5228,14 +5228,14 @@ test "restorePane rebuilds both tree and messages" {
     const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
 
     defer {
-        std.fs.cwd().deleteFile(jsonl_path) catch {};
+        std.Io.Dir.cwd().deleteFile(std.testing.io, jsonl_path) catch {};
     }
 
     // Write two entries using a single writer so positional offsets advance.
-    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, jsonl_path, .{ .truncate = true });
     {
         var write_scratch: [512]u8 = undefined;
-        var fw = file.writer(&write_scratch);
+        var fw = file.writer(std.testing.io, &write_scratch);
         try fw.interface.writeAll("{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":0}\n");
         try fw.interface.writeAll("{\"type\":\"assistant_text\",\"content\":\"hello\",\"ts\":1}\n");
         try fw.interface.flush();
@@ -5412,7 +5412,7 @@ test "swapProvider persists the pick to config.lua" {
 
     try f.wm.swapProvider("provB", "b2");
 
-    const body = try std.fs.cwd().readFileAlloc(allocator, config_path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, allocator, .limited(1 << 16));
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
 }
@@ -5946,12 +5946,12 @@ test "zag.pane.session_id returns the bound session id for a conversation pane" 
     // The PickerFixture's root_pane is conversation-backed but
     // session-less. Attach a real SessionHandle pointing at a temp
     // JSONL file so the binding has something to read.
-    std.fs.cwd().makePath(".zag/sessions") catch {};
+    std.Io.Dir.cwd().createDirPath(std.testing.io, ".zag/sessions") catch {};
     const session_id = "panebind_test_0123456789abcdef0";
     var jsonl_path_buf: [256]u8 = undefined;
     const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
-    defer std.fs.cwd().deleteFile(jsonl_path) catch {};
-    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, jsonl_path) catch {};
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, jsonl_path, .{ .truncate = true });
     var handle = Session.SessionHandle{
         .id_len = @intCast(session_id.len),
         .file = file,

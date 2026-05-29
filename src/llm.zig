@@ -952,7 +952,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{
@@ -980,7 +980,7 @@ test "createProviderFromLuaConfig surfaces NoDefaultModel when default_model uns
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{
@@ -1006,7 +1006,7 @@ test "createProviderFromLuaConfig returns MissingCredential when provider not in
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{
@@ -1076,7 +1076,7 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{

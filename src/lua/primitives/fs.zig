@@ -290,7 +290,7 @@ test "executeRead returns file bytes" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "hello.txt", .data = "hi there" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hello.txt", .data = "hi there" });
 
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try makeTmpAbs(&tmp, "hello.txt", &pbuf);
@@ -330,7 +330,7 @@ test "executeStat reports kind and size" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "s.dat", .data = "0123456789" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "s.dat", .data = "0123456789" });
 
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try makeTmpAbs(&tmp, "s.dat", &pbuf);

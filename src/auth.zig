@@ -646,7 +646,7 @@ test "saveAuthFile writes mode 0600" {
     try file.setApiKey("openai", "sk-test");
     try saveAuthFile(path, file);
 
-    const stat = try std.fs.cwd().statFile(path);
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
 }
 
@@ -661,7 +661,7 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     // Pre-create the file with a world-readable mode, as if the user chmod'd
     // it or restored from a tarball that stripped the original 0o600.
     {
-        const pre = try std.fs.cwd().createFile(path, .{ .mode = 0o644, .truncate = true });
+        const pre = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .mode = 0o644, .truncate = true });
         defer pre.close();
         try std.posix.fchmod(pre.handle, 0o644);
     }
@@ -671,7 +671,7 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     try file.setApiKey("openai", "sk-test");
     try saveAuthFile(path, file);
 
-    const stat = try std.fs.cwd().statFile(path);
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
 }
 
@@ -712,7 +712,7 @@ test "saveAuthFile is atomic under simulated crash" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json.tmp",
         .data = "garbage-from-a-prior-crash",
     });
@@ -729,7 +729,7 @@ test "saveAuthFile is atomic under simulated crash" {
 
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.statFile("auth.json.tmp"),
+        tmp.dir.statFile(std.testing.io, tmp.dir, .{}),
     );
 }
 
@@ -746,7 +746,7 @@ test "saveAuthFile preserves 0o600 after atomic rename" {
     try file.setApiKey("openai", "sk-mode");
     try saveAuthFile(path, file);
 
-    const stat = try std.fs.cwd().statFile(path);
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
 }
 

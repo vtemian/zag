@@ -118,7 +118,7 @@ test "write a new file" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "/tmp/zag-test-write-new.txt";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"hello world\\n\"}}", .{tmp_path});
     defer allocator.free(input);
@@ -130,7 +130,7 @@ test "write a new file" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote") != null);
 
     // Verify file was actually written
-    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tmp_path, allocator, .limited(1024));
     defer allocator.free(written);
     try std.testing.expectEqualStrings("hello world\n", written);
 }
@@ -139,7 +139,7 @@ test "write counts lines correctly" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "/tmp/zag-test-write-lines.txt";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     // 3 newlines => 4 lines (trailing partial line counts)
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"a\\nb\\nc\\n\"}}", .{tmp_path});
@@ -166,14 +166,14 @@ test "write returns detailed error result for invalid JSON input" {
 test "write leaves original file intact when destination is a directory" {
     const allocator = std.testing.allocator;
     const tmp_dir = "/tmp/zag-test-write-atomic-victim";
-    std.fs.cwd().makePath(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(std.testing.io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
 
     // Pre-populate the destination so we can verify it survives a failed write.
     const original_path = try std.fmt.allocPrint(allocator, "{s}/file.txt", .{tmp_dir});
     defer allocator.free(original_path);
     {
-        const f = try std.fs.cwd().createFile(original_path, .{});
+        const f = try std.Io.Dir.cwd().createFile(std.testing.io, original_path, .{});
         defer f.close();
         try f.writeAll("ORIGINAL");
     }
@@ -191,7 +191,7 @@ test "write leaves original file intact when destination is a directory" {
     try std.testing.expect(result.is_error);
 
     // The original sibling file must be unchanged.
-    const verify = try std.fs.cwd().readFileAlloc(allocator, original_path, 1024);
+    const verify = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, original_path, allocator, .limited(1024));
     defer allocator.free(verify);
     try std.testing.expectEqualStrings("ORIGINAL", verify);
 }

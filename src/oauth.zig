@@ -1430,5 +1430,5 @@ test "runLoginFlowWithCodes rejects mismatched state" {
     try std.testing.expectError(error.StateMismatch, result);
 
     // auth.json must not have been written.
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(auth_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, auth_path, .{}));
 }

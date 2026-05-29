@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const clock = @import("../clock.zig");
+const env_mod = @import("../env.zig");
 const testing = std.testing;
 const LuaEngine = @import("../LuaEngine.zig").LuaEngine;
 const Job = @import("Job.zig").Job;
@@ -21,7 +22,39 @@ const Hooks = @import("../Hooks.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
+// 0.16 made the process environment non-global: production code reads env
+// through `env_mod` over a captured `Environ.Map` rather than libc, and the
+// test runner never calls `env_mod.init`. These tests therefore drive a
+// module-owned map that `env_mod` points at, seeded from the real libc
+// environ once, so a test's `setEnvForTest("HOME", fake)` is visible to the
+// code under test. `setenv`/`unsetenv` are kept in sync for any residual
+// libc readers (e.g. child processes).
+var test_env_map: ?std.process.Environ.Map = null;
+
+fn ensureTestEnv() *std.process.Environ.Map {
+    if (test_env_map == null) {
+        var m: std.process.Environ.Map = .init(std.heap.page_allocator);
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry| : (i += 1) {
+            const pair = std.mem.span(entry);
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            m.put(pair[0..eq], pair[eq + 1 ..]) catch {};
+        }
+        test_env_map = m;
+        env_mod.init(&test_env_map.?);
+    }
+    return &test_env_map.?;
+}
+
+fn getEnvForTest(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    const m = ensureTestEnv();
+    const v = m.get(name) orelse return null;
+    return allocator.dupe(u8, v) catch null;
+}
+
 fn setEnvForTest(name: [:0]const u8, value: []const u8) void {
+    const m = ensureTestEnv();
+    m.put(name, value) catch {};
     var value_buf: [std.fs.max_path_bytes]u8 = undefined;
     std.debug.assert(value.len + 1 <= value_buf.len);
     @memcpy(value_buf[0..value.len], value);
@@ -30,17 +63,17 @@ fn setEnvForTest(name: [:0]const u8, value: []const u8) void {
 }
 
 fn restoreEnvForTest(name: [:0]const u8, prev: ?[]const u8) void {
+    const m = ensureTestEnv();
     if (prev) |p| {
         setEnvForTest(name, p);
     } else {
+        _ = m.swapRemove(name);
         _ = unsetenv(name.ptr);
     }
 }
 
 fn restoreCwd(abs_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
-    defer dir.close();
-    std.process.setCurrentDir(std.testing.io, dir) catch {};
+    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
 }
 
 /// Run a Lua string; on failure, print the top-of-stack message to
@@ -179,7 +212,7 @@ test "zag.sessions.list returns an array (headless, no projects registered)" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -207,7 +240,7 @@ test "zag.sessions.list surfaces a session created in cwd" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -244,7 +277,7 @@ test "zag.sessions.list returns status idle for a fresh session" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -277,7 +310,7 @@ test "zag.sessions.rename updates name, observable via list" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -312,7 +345,7 @@ test "zag.sessions.delete removes the session from list" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -377,7 +410,7 @@ test "zag.sessions.subagents returns task_start rows for a session" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -439,7 +472,7 @@ test "zag.sessions.rename rejects an unknown id with a clear error" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -476,7 +509,7 @@ test "zag.sessions.rename accepts a project_path hint and updates the meta" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -519,7 +552,7 @@ test "zag.sessions.rename rejects an unknown project_path hint" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -565,7 +598,7 @@ test "zag.sessions.rename fires SessionListChanged with change=renamed" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -608,7 +641,7 @@ test "zag.sessions.delete fires SessionListChanged with change=deleted" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -659,7 +692,7 @@ test "sessions sidebar renders one row per session and filters by name" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -760,7 +793,7 @@ test "sessions sidebar navigation handlers move and clamp the cursor" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -851,7 +884,7 @@ test "sessions sidebar expand/collapse toggle state.expanded for the cursor row"
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -918,7 +951,7 @@ test "sessions sidebar refreshes on SessionListChanged" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -990,7 +1023,7 @@ test "sessions sidebar refreshes on every PaneFocused while sidebar is open" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1071,7 +1104,7 @@ test "sessions sidebar re-pins to ~40 cells on LayoutResize" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1157,7 +1190,7 @@ test "sessions sidebar ignores LayoutResize when closed" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1211,7 +1244,7 @@ test "sessions sidebar marks the current-session row with a glyph" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1322,7 +1355,7 @@ test "sessions sidebar truncates long labels with ellipsis" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1415,7 +1448,7 @@ test "sessions sidebar renders subagent children under an expanded session" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1521,7 +1554,7 @@ test "sessions sidebar / enters filter mode and renders the prompt" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1586,7 +1619,7 @@ test "sessions sidebar filter input appends chars and narrows the list" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1655,7 +1688,7 @@ test "sessions sidebar filter backspace pops a char and re-broadens" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1728,7 +1761,7 @@ test "sessions sidebar filter escape clears filter and exits the mode" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1802,7 +1835,7 @@ test "sessions sidebar filter commit keeps filter applied and exits mode" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1877,7 +1910,7 @@ test "sessions sidebar r enters rename mode pre-filled with the current name" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1932,7 +1965,7 @@ test "sessions sidebar rename input extends the rename buffer" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -1989,7 +2022,7 @@ test "sessions sidebar rename backspace pops a char from rename buffer" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -2052,7 +2085,7 @@ test "sessions sidebar rename commit invokes zag.sessions.rename and exits" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -2127,7 +2160,7 @@ test "sessions sidebar rename escape discards the buffer and keeps the name" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -2190,7 +2223,7 @@ test "sessions sidebar r on a subagent row is a no-op" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -2256,7 +2289,7 @@ test "sessions sidebar d on a session row deletes the session" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);
@@ -2311,7 +2344,7 @@ test "sessions sidebar d on a subagent row is a no-op" {
 
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = getEnvForTest(allocator, "HOME");
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);

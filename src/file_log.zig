@@ -306,7 +306,7 @@ test "initWithPath opens the log file with mode 0o600" {
     try initWithPath(path);
     defer deinit();
 
-    const stat = try std.fs.cwd().statFile(path);
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
 }
 

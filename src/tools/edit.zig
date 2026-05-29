@@ -241,11 +241,11 @@ test "successful replacement" {
 
     const tmp_path = "/tmp/zag-test-edit-replace.txt";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll("hello world\n");
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"old_text\": \"hello\", \"new_text\": \"goodbye\"}}", .{tmp_path});
     defer allocator.free(input);
@@ -257,7 +257,7 @@ test "successful replacement" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "replaced") != null);
 
     // Verify file content changed
-    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tmp_path, allocator, .limited(1024));
     defer allocator.free(written);
     try std.testing.expectEqualStrings("goodbye world\n", written);
 }
@@ -267,11 +267,11 @@ test "old_text not found returns error" {
 
     const tmp_path = "/tmp/zag-test-edit-notfound.txt";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll("hello world\n");
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"old_text\": \"nonexistent\", \"new_text\": \"x\"}}", .{tmp_path});
     defer allocator.free(input);
@@ -286,11 +286,11 @@ test "multiple matches returns error" {
 
     const tmp_path = "/tmp/zag-test-edit-multi.txt";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll("aaa bbb aaa\n");
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"old_text\": \"aaa\", \"new_text\": \"ccc\"}}", .{tmp_path});
     defer allocator.free(input);
@@ -307,11 +307,11 @@ test "edit: CRLF file matches LF-supplied old_text" {
 
     const tmp_path = "/tmp/zag-test-edit-crlf.txt";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll("hello\r\nworld\r\n");
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     // old_text uses LF (the way the LLM naturally supplies text).
     const input = try std.fmt.allocPrint(
@@ -329,7 +329,7 @@ test "edit: CRLF file matches LF-supplied old_text" {
     // Verify the file was rewritten. Line endings of the untouched tail
     // must be preserved; the replacement's line ending matches the
     // new_text (LF).
-    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tmp_path, allocator, .limited(1024));
     defer allocator.free(written);
     try std.testing.expectEqualStrings("goodbye\nworld\r\n", written);
 }
@@ -338,11 +338,11 @@ test "edit rejects empty old_text" {
     const allocator = std.testing.allocator;
     const tmp_path = "/tmp/zag-test-edit-empty-old.txt";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll("hello world");
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const json = try std.fmt.allocPrint(
         allocator,
@@ -362,11 +362,11 @@ test "edit: LF file with LF old_text continues to work (no regression)" {
 
     const tmp_path = "/tmp/zag-test-edit-lf-nr.txt";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
         defer file.close();
         try file.writeAll("hello\nworld\n");
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(
         allocator,
@@ -380,7 +380,7 @@ test "edit: LF file with LF old_text continues to work (no regression)" {
 
     try std.testing.expect(!result.is_error);
 
-    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tmp_path, allocator, .limited(1024));
     defer allocator.free(written);
     try std.testing.expectEqualStrings("goodbye\nworld\n", written);
 }

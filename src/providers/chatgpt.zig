@@ -2415,7 +2415,7 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
         return error.NoLogPath;
     defer allocator.free(expected);
 
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, expected, 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, expected, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
@@ -2463,7 +2463,7 @@ test "chatgpt SSE: response.incomplete invokes telemetry.onStreamError with .cha
         return error.NoLogPath;
     defer allocator.free(expected);
 
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, expected, 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, expected, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});

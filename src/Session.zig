@@ -1825,7 +1825,7 @@ test "round-trip: append then load reflects generated id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("rt.jsonl", .{ .truncate = true });
+    const file = try tmp.dir.tmp.dir(std.testing.io, "rt.jsonl", .{ .truncate = true });
 
     var entries = [_]Entry{
         .{ .entry_type = .session_start, .timestamp = 100 },
@@ -1834,7 +1834,7 @@ test "round-trip: append then load reflects generated id" {
 
     var buf: [8192]u8 = undefined;
     var write_scratch: [256]u8 = undefined;
-    var fw = file.writer(&write_scratch);
+    var fw = file.writer(std.testing.io, &write_scratch);
     for (&entries) |*entry| {
         const json = try serializeEntryToBuf(entry, &buf);
         try fw.interface.writeAll(json);
@@ -1843,7 +1843,7 @@ test "round-trip: append then load reflects generated id" {
     try fw.interface.flush();
     file.close();
 
-    const content = try tmp.dir.readFileAlloc(allocator, "rt.jsonl", 1024 * 1024);
+    const content = try tmp.dir.readFileAlloc(std.testing.io, allocator, tmp.dir, .limited("rt.jsonl"));
     defer allocator.free(content);
 
     var count: usize = 0;
@@ -2009,7 +2009,7 @@ test "create, append, and load round-trip" {
 
     var buf: [8192]u8 = undefined;
     var write_scratch: [256]u8 = undefined;
-    var fw = file.writer(&write_scratch);
+    var fw = file.writer(std.testing.io, &write_scratch);
     for (&entries_to_write) |*entry| {
         const json = try serializeEntryToBuf(entry, &buf);
         try fw.interface.writeAll(json);
@@ -2136,7 +2136,7 @@ test "readMetaFile defaults to idle when status field is missing" {
     defer tmp.cleanup();
 
     const json = "{\"id\":\"abc\",\"created\":1,\"updated\":2,\"message_count\":3}";
-    try tmp.dir.writeFile(.{ .sub_path = "no-status.meta.json", .data = json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "no-status.meta.json", .data = json });
 
     const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
@@ -2157,7 +2157,7 @@ test "readMetaFile defaults to idle when status field is unrecognized" {
     defer tmp.cleanup();
 
     const json = "{\"id\":\"abc\",\"status\":\"bogus\",\"created\":1,\"updated\":2,\"message_count\":3}";
-    try tmp.dir.writeFile(.{ .sub_path = "bad-status.meta.json", .data = json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad-status.meta.json", .data = json });
 
     const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
@@ -2179,7 +2179,7 @@ test "File.sync runs without error on a fresh file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("sync-probe", .{ .truncate = true });
+    const file = try tmp.dir.tmp.dir(std.testing.io, "sync-probe", .{ .truncate = true });
     defer file.close();
     try file.writeAll("{\"type\":\"user_message\"}\n");
     try file.sync();
@@ -2205,7 +2205,7 @@ test "writeMetaFile replaces any stale .tmp via atomic rename" {
     const stale_path = try std.fmt.bufPrint(&stale_path_buf, "{s}/stale.meta.json.tmp", .{tmp_path});
 
     // Plant the stale tmp.
-    try std.fs.cwd().writeFile(.{ .sub_path = stale_path, .data = "stale bytes\n" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = stale_path, .data = "stale bytes\n" });
 
     var meta = Meta{ .created = 1, .updated = 2, .message_count = 1 };
     const id = "abcd";
@@ -2215,7 +2215,7 @@ test "writeMetaFile replaces any stale .tmp via atomic rename" {
     try writeMetaFile(meta_path, &meta);
 
     // After a rename-based write, the tmp should no longer exist.
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(stale_path));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, stale_path, .{}));
 
     // The final file must be the freshly written content.
     const loaded = try readMetaFile(meta_path, allocator);
@@ -2449,9 +2449,9 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
 
     // Two complete lines plus one partial (no trailing newline).
     const jsonl_body = "{\"a\":1}\n{\"b\":2}\n{\"c\":";
-    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = jsonl_body });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl", .data = jsonl_body });
 
-    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    var iter_dir = try tmp.dir.tmp.dir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close();
 
     const report = try recoverSessionFiles(iter_dir, "abc", allocator);
@@ -2459,7 +2459,7 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     try std.testing.expectEqual(@as(u32, 2), report.actual_line_count);
     try std.testing.expectEqual(@as(usize, "{\"c\":".len), report.truncated_bytes);
 
-    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    const after = try tmp.dir.readFileAlloc(std.testing.io, allocator, tmp.dir, .limited("abc.jsonl"));
     defer allocator.free(after);
     try std.testing.expectEqualStrings("{\"a\":1}\n{\"b\":2}\n", after);
 }
@@ -2470,21 +2470,21 @@ test "recoverSessionFiles deletes orphan .tmp files for the session" {
     defer tmp.cleanup();
 
     // One session, two orphans, plus an unrelated session's .tmp that must survive.
-    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = "{\"a\":1}\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "abc.meta.json.tmp", .data = "{}" });
-    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl.tmp", .data = "{}" });
-    try tmp.dir.writeFile(.{ .sub_path = "other.meta.json.tmp", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl", .data = "{\"a\":1}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.meta.json.tmp", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl.tmp", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.meta.json.tmp", .data = "{}" });
 
-    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    var iter_dir = try tmp.dir.tmp.dir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close();
 
     const report = try recoverSessionFiles(iter_dir, "abc", allocator);
     try std.testing.expectEqual(@as(usize, 2), report.orphaned_tmp_cleaned);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("abc.meta.json.tmp"));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("abc.jsonl.tmp"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, tmp.dir, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, tmp.dir, .{}));
     // Unrelated session's tmp must NOT be touched.
-    _ = try tmp.dir.statFile("other.meta.json.tmp");
+    _ = try tmp.dir.statFile(std.testing.io, tmp.dir, .{});
 }
 
 test "recoverSessionFiles reports line count for count reconciliation" {
@@ -2493,9 +2493,9 @@ test "recoverSessionFiles reports line count for count reconciliation" {
     defer tmp.cleanup();
 
     const jsonl_body = "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n{\"d\":4}\n";
-    try tmp.dir.writeFile(.{ .sub_path = "sess.jsonl", .data = jsonl_body });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sess.jsonl", .data = jsonl_body });
 
-    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    var iter_dir = try tmp.dir.tmp.dir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close();
 
     const report = try recoverSessionFiles(iter_dir, "sess", allocator);
@@ -2516,7 +2516,7 @@ test "loader synthesizes ids for pre-migration entries" {
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    try std.fs.cwd().makePath(sessions_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sessions_dir);
 
     const session_id = "oldfmt0000000000";
     var path_buf: [256]u8 = undefined;
@@ -2526,7 +2526,7 @@ test "loader synthesizes ids for pre-migration entries" {
         "{\"type\":\"session_start\",\"ts\":100}\n" ++
         "{\"type\":\"user_message\",\"content\":\"hello\",\"ts\":200}\n" ++
         "{\"type\":\"assistant_text\",\"content\":\"hi back\",\"ts\":300}\n";
-    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = old_format });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = jsonl_path, .data = old_format });
 
     const loaded = try loadEntries(session_id, allocator);
     defer {
@@ -2569,7 +2569,7 @@ test "loader preserves explicit ids from new-schema entries" {
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    try std.fs.cwd().makePath(sessions_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sessions_dir);
 
     var prng = std.Random.DefaultPrng.init(0xFEEDBABE);
     const id_a = ulid.generateAt(1000, prng.random());
@@ -2588,7 +2588,7 @@ test "loader preserves explicit ids from new-schema entries" {
     const session_id = "newfmt0000000000";
     var path_buf: [256]u8 = undefined;
     const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
-    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = body });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = jsonl_path, .data = body });
 
     const loaded = try loadEntries(session_id, allocator);
     defer {
@@ -2621,7 +2621,7 @@ test "loader handles mixed old+new entries" {
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    try std.fs.cwd().makePath(sessions_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sessions_dir);
 
     var prng = std.Random.DefaultPrng.init(0xC0FFEE42);
     const explicit_id = ulid.generateAt(5000, prng.random());
@@ -2638,7 +2638,7 @@ test "loader handles mixed old+new entries" {
     const session_id = "mixfmt0000000000";
     var path_buf: [256]u8 = undefined;
     const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
-    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = body });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = jsonl_path, .data = body });
 
     const loaded = try loadEntries(session_id, allocator);
     defer {
@@ -2853,7 +2853,7 @@ test "backfillEntry mixes line index into seed to avoid same-ms collisions" {
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    try std.fs.cwd().makePath(sessions_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sessions_dir);
 
     const session_id = "samems0000000000";
     var path_buf: [256]u8 = undefined;
@@ -2863,7 +2863,7 @@ test "backfillEntry mixes line index into seed to avoid same-ms collisions" {
     const same_ms_body =
         "{\"type\":\"user_message\",\"content\":\"a\",\"ts\":1000}\n" ++
         "{\"type\":\"user_message\",\"content\":\"b\",\"ts\":1000}\n";
-    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = same_ms_body });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = jsonl_path, .data = same_ms_body });
 
     const loaded = try loadEntries(session_id, allocator);
     defer {
@@ -2917,7 +2917,7 @@ test "loadEntries skips a corrupt mid-file entry without dropping later rows" {
         .{session_id},
     );
     {
-        var f = try std.fs.cwd().openFile(jsonl_path, .{ .mode = .read_write });
+        var f = try std.Io.Dir.cwd().openFile(std.testing.io, jsonl_path, .{ .mode = .read_write });
         defer f.close();
         try f.seekFromEnd(0);
         try f.writeAll("{\"type\":\"BOGUS\"}\n");
@@ -2983,11 +2983,11 @@ test "SessionManager.deleteSession removes both .jsonl and .meta.json and is ide
     // The underlying files must actually be gone.
     var jsonl_path_buf: [256]u8 = undefined;
     const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{id});
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(jsonl_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, jsonl_path, .{}));
 
     var meta_path_buf: [256]u8 = undefined;
     const meta_path = try std.fmt.bufPrint(&meta_path_buf, ".zag/sessions/{s}.meta.json", .{id});
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(meta_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, meta_path, .{}));
 }
 
 test "listSessionsAt enumerates sessions for a non-cwd project root" {
@@ -3232,7 +3232,7 @@ test "recordCwdInRegistry persists the canonicalized cwd" {
     const registry_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/projects.json", .{fake_home});
     defer allocator.free(registry_path);
 
-    const data = try std.fs.cwd().readFileAlloc(allocator, registry_path, 64 * 1024);
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, registry_path, allocator, .limited(64 * 1024));
     defer allocator.free(data);
 
     // The cwd recorded in the registry is the canonicalized one. macOS
@@ -3271,7 +3271,7 @@ test "SessionManager.init leaves the global registry alone" {
 
     // No `$HOME/.config/zag` should have been created. The tmp dir
     // doubles as fake_home, so we look for the `.config` subtree.
-    const probe = std.fs.cwd().openDir(".config", .{}) catch |err| switch (err) {
+    const probe = std.Io.Dir.cwd().openDir(std.testing.io, ".config", .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
