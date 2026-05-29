@@ -1124,6 +1124,29 @@ fn formatErrorJson(alloc: Allocator, err: anyerror) ![]u8 {
     );
 }
 
+/// Mint a registry-owned scratch buffer pre-filled with `text` (split on
+/// `\n`) and return a borrowed surface for it, exactly like the `.handle`
+/// attach path. On ANY failure the just-created buffer is removed from the
+/// registry via `errdefer`, so a failed scratch split leaves no orphan.
+fn mintScratchSurface(self: *WindowManager, text: []const u8) !AttachedSurface {
+    const bh = try self.buffer_registry.createScratch("scratch");
+    errdefer self.buffer_registry.remove(bh) catch {};
+    switch (try self.buffer_registry.resolve(bh)) {
+        .scratch => |sbuf| {
+            var split_lines: std.ArrayList([]const u8) = .empty;
+            defer split_lines.deinit(self.layout.allocator);
+            var line_it = std.mem.splitScalar(u8, text, '\n');
+            while (line_it.next()) |line| try split_lines.append(self.layout.allocator, line);
+            try sbuf.setLines(split_lines.items);
+        },
+        else => return error.NotAScratchBuffer,
+    }
+    return .{
+        .buffer = try self.buffer_registry.asBuffer(bh),
+        .view = try self.buffer_registry.asView(bh),
+    };
+}
+
 /// Service a layout round-trip request from an agent thread: dispatch on
 /// the op, allocate the JSON response on `self.layout.allocator`, and
 /// signal `req.done` so the waiter unblocks. The caller owns the request
@@ -1189,35 +1212,12 @@ pub fn handleLayoutRequest(self: *WindowManager, req: *agent_events.LayoutReques
                             };
                         },
                         .scratch => |text| {
-                            // Mint a registry-owned scratch buffer, fill it
-                            // with the inline text, and attach it just like
-                            // the `.handle` path. The registry owns the
-                            // buffer's lifetime; pane teardown frees only the
-                            // PaneEntry, so closing the pane is leak-safe.
-                            const bh = self.buffer_registry.createScratch("scratch") catch
+                            // The registry owns the scratch buffer's lifetime;
+                            // pane teardown frees only the PaneEntry, so
+                            // closing the pane is leak-safe. mintScratchSurface
+                            // cleans up the buffer if the fill/attach fails.
+                            break :blk_attached self.mintScratchSurface(text) catch
                                 break :blk errorOutcome(alloc, "scratch_create_failed");
-                            switch (self.buffer_registry.resolve(bh) catch
-                                break :blk errorOutcome(alloc, "scratch_create_failed")) {
-                                .scratch => |sbuf| {
-                                    var split_lines: std.ArrayList([]const u8) = .empty;
-                                    defer split_lines.deinit(alloc);
-                                    var line_it = std.mem.splitScalar(u8, text, '\n');
-                                    while (line_it.next()) |line|
-                                        split_lines.append(alloc, line) catch
-                                            break :blk errorOutcome(alloc, "oom");
-                                    sbuf.setLines(split_lines.items) catch
-                                        break :blk errorOutcome(alloc, "scratch_fill_failed");
-                                },
-                                else => break :blk errorOutcome(alloc, "scratch_create_failed"),
-                            }
-                            const resolved_buffer = self.buffer_registry.asBuffer(bh) catch
-                                break :blk errorOutcome(alloc, "scratch_create_failed");
-                            const resolved_view = self.buffer_registry.asView(bh) catch
-                                break :blk errorOutcome(alloc, "scratch_create_failed");
-                            break :blk_attached .{
-                                .buffer = resolved_buffer,
-                                .view = resolved_view,
-                            };
                         },
                     }
                 };

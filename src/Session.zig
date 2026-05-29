@@ -713,6 +713,10 @@ pub const SessionHandle = struct {
     pub fn setStatus(self: *SessionHandle, status: SessionStatus) !void {
         self.append_mutex.lock();
         defer self.append_mutex.unlock();
+        // Skip the fsync+rename when the status is unchanged: status is
+        // re-announced at every turn boundary, and a no-op transition does
+        // not need a durability barrier.
+        if (self.meta.status == status) return;
         self.meta.status = status;
         try self.updateMeta();
     }

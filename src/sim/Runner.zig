@@ -241,7 +241,13 @@ pub const Runner = struct {
         var tok = std.mem.tokenizeAny(u8, program, " \t");
         while (tok.next()) |word| {
             const z = try self.alloc.dupeZ(u8, word);
-            try argv_owned.append(self.alloc, z);
+            {
+                // errdefer only covers the gap before argv_owned takes
+                // ownership; once appended, the outer defer frees z, so this
+                // must not also free it (no double-free on a later error).
+                errdefer self.alloc.free(z);
+                try argv_owned.append(self.alloc, z);
+            }
             try argv.append(self.alloc, z.ptr);
         }
         if (argv.items.len == 0) return error.EmptySpawn;
