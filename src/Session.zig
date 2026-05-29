@@ -4,6 +4,7 @@
 //! with a companion meta.json for quick listing. Sessions live in .zag/sessions/.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const env_mod = @import("env.zig");
 const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
@@ -561,7 +562,7 @@ pub const SessionHandle = struct {
     /// stdlib has no recursive mutex, so the file-write body lives in
     /// `appendEntryLocked`, which both public entry points call after
     /// taking the lock once.
-    append_mutex: std.Thread.Mutex = .{},
+    append_mutex: sync.Mutex = .{},
 
     /// Append an entry to the JSONL file and update the meta file. The
     /// serializer fabricates a fresh ULID into the outgoing row when the

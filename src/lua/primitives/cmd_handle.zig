@@ -21,6 +21,7 @@
 //! consuming a fixed share of the worker pool.
 
 const std = @import("std");
+const sync = @import("../../sync.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -99,8 +100,8 @@ pub const CmdHandle = struct {
     helper: std.Thread,
 
     /// Internal command queue. Main enqueues; helper dequeues.
-    queue_mu: std.Thread.Mutex = .{},
-    queue_cv: std.Thread.Condition = .{},
+    queue_mu: sync.Mutex = .{},
+    queue_cv: sync.Condition = .{},
     queue: std.ArrayList(HelperCmd) = .empty,
     /// Set once `shutdownAndCleanup` has been called. Guards against
     /// double-free on a second __gc (Lua may, in pathological shutdown

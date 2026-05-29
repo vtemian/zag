@@ -2,37 +2,46 @@
 //!
 //! Zig 0.16 removed `std.Thread.Mutex`/`Condition`/`ResetEvent`; the
 //! replacements live under `std.Io` and take an `io` argument on every
-//! `lock`/`wait`/`signal`/`set` call. Zag locks from many call sites that
-//! do not have `io` in scope (and a process-wide `io` is shared across all
-//! threads anyway), so these wrappers capture the shared `io` once and keep
-//! the original io-free method shapes. They are drop-in replacements for the
-//! 0.15 `std.Thread.*` primitives with one change: each must be initialized
-//! with the process `io` via `.init(io)` rather than `.{}`.
+//! `lock`/`wait`/`signal`/`set` call. Zag locks from ~100 call sites that do
+//! not have `io` in scope, and the whole process shares exactly one
+//! `std.Io.Threaded` instance, so these wrappers read that single io from a
+//! module global (installed once by `main`/`Harness` via `setIo`) rather than
+//! threading it through every signature. The result is a drop-in for the 0.15
+//! `std.Thread.*` primitives: same `= .{}` field defaults, same io-free
+//! method shapes.
 //!
 //! The cancellation that `std.Io.Mutex.lock`/`Condition.wait` can surface is
 //! swallowed here (via the `*Uncancelable` variants) because Zag's locks are
 //! short internal critical sections, not cancellation points; turn/Lua
-//! cancellation flows through the explicit `Scope`/atomic-flag machinery, not
-//! through lock cancellation.
+//! cancellation flows through the explicit `Scope`/atomic-flag machinery.
 
 const std = @import("std");
 
-/// Drop-in for `std.Thread.Mutex`. Capture the process `io` with
-/// `Mutex.init(io)`; `lock`/`unlock`/`tryLock` keep their 0.15 signatures.
+/// The process-wide io, installed once at startup. All sync primitives read
+/// it here. Calling a lock/wait before `setIo` is a startup-ordering bug;
+/// `theIo()` traps on null rather than corrupting state silently.
+var process_io: ?std.Io = null;
+
+/// Install the process io. Call once from `main` (and `Harness`) before any
+/// thread that locks is spawned.
+pub fn setIo(io: std.Io) void {
+    process_io = io;
+}
+
+inline fn theIo() std.Io {
+    return process_io orelse @panic("sync: process io used before sync.setIo()");
+}
+
+/// Drop-in for `std.Thread.Mutex`. Default-initializes with `.{}`.
 pub const Mutex = struct {
     inner: std.Io.Mutex = .init,
-    io: std.Io,
-
-    pub fn init(io: std.Io) Mutex {
-        return .{ .io = io };
-    }
 
     pub fn lock(self: *Mutex) void {
-        self.inner.lockUncancelable(self.io);
+        self.inner.lockUncancelable(theIo());
     }
 
     pub fn unlock(self: *Mutex) void {
-        self.inner.unlock(self.io);
+        self.inner.unlock(theIo());
     }
 
     pub fn tryLock(self: *Mutex) bool {
@@ -40,35 +49,28 @@ pub const Mutex = struct {
     }
 };
 
-/// Drop-in for `std.Thread.Condition`. Capture the process `io` with
-/// `Condition.init(io)`. `wait` takes the paired `*Mutex` wrapper;
-/// `timedWait` returns `error.Timeout` when the deadline elapses.
+/// Drop-in for `std.Thread.Condition`. Default-initializes with `.{}`.
 pub const Condition = struct {
     inner: std.Io.Condition = .init,
-    io: std.Io,
-
-    pub fn init(io: std.Io) Condition {
-        return .{ .io = io };
-    }
 
     pub fn wait(self: *Condition, mutex: *Mutex) void {
-        self.inner.waitUncancelable(self.io, &mutex.inner);
+        self.inner.waitUncancelable(theIo(), &mutex.inner);
     }
 
     pub fn signal(self: *Condition) void {
-        self.inner.signal(self.io);
+        self.inner.signal(theIo());
     }
 
     pub fn broadcast(self: *Condition) void {
-        self.inner.broadcast(self.io);
+        self.inner.broadcast(theIo());
     }
 
     /// Wait until signalled or `timeout_ns` elapses. Returns `error.Timeout`
-    /// on deadline. Mirrors `std.Thread.Condition.timedWait`. The wait is
-    /// uncancelable: only the timeout or a signal wakes it.
+    /// on deadline. Mirrors `std.Thread.Condition.timedWait`. Uncancelable:
+    /// only the timeout or a signal wakes it.
     pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) error{Timeout}!void {
+        const io = theIo();
         const cond = &self.inner;
-        const io = self.io;
         const epoch = cond.epoch.load(.acquire);
         _ = cond.state.fetchAdd(.{ .waiters = 1, .signals = 0 }, .monotonic);
 
@@ -99,35 +101,29 @@ pub const Condition = struct {
 };
 
 /// Drop-in for `std.Thread.ResetEvent` (the "set once, wait" round-trip
-/// signal). Capture the process `io` with `Event.init(io)`. `set`/`wait`/
-/// `isSet`/`reset`/`timedWait` keep their 0.15 signatures.
-pub const Event = struct {
+/// signal). Default-initializes with `.{}`.
+pub const ResetEvent = struct {
     inner: std.Io.Event = .unset,
-    io: std.Io,
 
-    pub fn init(io: std.Io) Event {
-        return .{ .io = io };
+    pub fn set(self: *ResetEvent) void {
+        self.inner.set(theIo());
     }
 
-    pub fn set(self: *Event) void {
-        self.inner.set(self.io);
+    pub fn wait(self: *ResetEvent) void {
+        self.inner.waitUncancelable(theIo());
     }
 
-    pub fn wait(self: *Event) void {
-        self.inner.waitUncancelable(self.io);
-    }
-
-    pub fn isSet(self: *const Event) bool {
+    pub fn isSet(self: *const ResetEvent) bool {
         return self.inner.isSet();
     }
 
-    pub fn reset(self: *Event) void {
+    pub fn reset(self: *ResetEvent) void {
         self.inner.reset();
     }
 
     /// Wait up to `timeout_ns`. Returns `error.Timeout` if not set in time.
-    pub fn timedWait(self: *Event, timeout_ns: u64) error{Timeout}!void {
-        self.inner.waitTimeout(self.io, .{ .duration = durationFromNanos(timeout_ns) }) catch |err| switch (err) {
+    pub fn timedWait(self: *ResetEvent, timeout_ns: u64) error{Timeout}!void {
+        self.inner.waitTimeout(theIo(), .{ .duration = durationFromNanos(timeout_ns) }) catch |err| switch (err) {
             error.Timeout => return error.Timeout,
             error.Canceled => return error.Timeout,
         };

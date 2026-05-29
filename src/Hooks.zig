@@ -3,6 +3,7 @@
 //! HookRequest / LuaToolRequest to round-trip through the event queue.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const Allocator = std.mem.Allocator;
 
 const Hooks = @This();
@@ -166,7 +167,7 @@ pub const HookPayload = union(EventKind) {
 /// if any hook returned `{ cancel = true }`, and signals `done`.
 pub const HookRequest = struct {
     payload: *HookPayload,
-    done: std.Thread.ResetEvent,
+    done: sync.ResetEvent,
     cancelled: bool,
     /// If cancelled, the (optional) reason string. Written by the main
     /// thread before `done` is signalled; the thread that pushed the
@@ -191,7 +192,7 @@ pub const LuaToolRequest = struct {
     tool_name: []const u8,
     input_raw: []const u8,
     allocator: Allocator,
-    done: std.Thread.ResetEvent,
+    done: sync.ResetEvent,
     // outputs (main thread writes before signalling done)
     result_content: ?[]const u8,
     result_is_error: bool,

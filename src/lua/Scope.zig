@@ -9,6 +9,7 @@
 //! flight.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const Job = @import("Job.zig").Job;
@@ -23,7 +24,7 @@ pub const Scope = struct {
     state: std.atomic.Value(State) = .init(.active),
     reason: ?[]const u8 = null, // owned by alloc when set via cancel
     shielded: bool = false,
-    mu: std.Thread.Mutex = .{},
+    mu: sync.Mutex = .{},
 
     pub fn init(alloc: Allocator, parent: ?*Scope) !*Scope {
         const s = try alloc.create(Scope);

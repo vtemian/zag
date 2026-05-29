@@ -10,13 +10,14 @@
 //! would stall the whole pool.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
 const Scope = @import("Scope.zig").Scope;
 
 pub const Queue = struct {
     alloc: Allocator,
-    mu: std.Thread.Mutex = .{},
+    mu: sync.Mutex = .{},
     ring: []*Job,
     head: usize = 0,
     tail: usize = 0,

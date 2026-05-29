@@ -18,6 +18,7 @@
 //!     Tracked at https://github.com/vtemian/zag/issues/5.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
 const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.task_tool);
@@ -268,7 +269,7 @@ fn runChild(
     // forced to null above in that case, so the fallback drain is Zig-only and
     // never touches the VM off the main thread.
     if (ctx.child_registry) |registry| {
-        var child_done: std.Thread.ResetEvent = .{};
+        var child_done: sync.ResetEvent = .{};
         try registry.register(.{ .runner = &child_runner, .done = &child_done });
         // No errdefer-remove needed: registration cannot fail after this
         // point, and the main thread always removes the entry on the child's

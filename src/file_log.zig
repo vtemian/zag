@@ -24,10 +24,8 @@ var log_path: ?[]u8 = null;
 /// we only allocate at most one path string per process and free it in
 /// `deinit`. Kept as a module-level for symmetry with `log_file`.
 const path_allocator: Allocator = std.heap.page_allocator;
-/// Serialises `handler` writes across threads. Initialized with the process
-/// io on `init`; default-init carries an undefined io that is never touched
-/// because `handler` bails before locking when `log_file` is null.
-var log_mutex: ?sync.Mutex = null;
+/// Serialises `handler` writes across threads.
+var log_mutex: sync.Mutex = .{};
 /// Per-thread re-entry guard. A bug in the handler (or in std.fs) could
 /// fire a log inside the handler; drop the nested call instead of looping.
 threadlocal var in_handler: bool = false;
@@ -86,11 +84,10 @@ pub fn initWithPath(path: []const u8) !void {
 pub fn init(alloc: Allocator, io: std.Io, env: *std.process.Environ.Map) !void {
     const path = try resolvePath(alloc, io, env);
     defer alloc.free(path);
-    // `initWithPath` clears module state via `deinit`, so install the io and
-    // write mutex (used by `handler`) only after it returns.
+    // `initWithPath` clears module state via `deinit`, so install the io
+    // (used by `handler`) only after it returns.
     try initWithPath(path);
     log_io = io;
-    log_mutex = sync.Mutex.init(io);
 }
 
 /// Close the log file if open. Idempotent.
@@ -100,7 +97,6 @@ pub fn deinit() void {
     }
     log_file = null;
     log_io = null;
-    log_mutex = null;
     if (log_path) |p| path_allocator.free(p);
     log_path = null;
 }
@@ -156,8 +152,8 @@ pub fn handler(
     const body = std.fmt.bufPrint(scratch[prefix.len..], format ++ "\n", args) catch return;
     const total = scratch[0 .. prefix.len + body.len];
 
-    if (log_mutex) |*m| m.lock();
-    defer if (log_mutex) |*m| m.unlock();
+    log_mutex.lock();
+    defer log_mutex.unlock();
     f.writeStreamingAll(io, total) catch {};
     if (mirror_stderr.load(.monotonic)) {
         const stderr = std.Io.File.stderr();

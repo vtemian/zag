@@ -6,6 +6,7 @@
 //! off to EventOrchestrator. Anything event-loop-shaped lives there.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const llm = @import("llm.zig");
@@ -146,6 +147,9 @@ pub fn main(start: std.process.Init) !void {
     var io_threaded = std.Io.Threaded.init(allocator, .{});
     defer io_threaded.deinit();
     const io = io_threaded.io();
+    // Install the process io for the sync primitives (sync.Mutex/Condition/
+    // ResetEvent) before any locking thread is spawned.
+    sync.setIo(io);
 
     // Borrowed process environment (non-global in 0.16). Captured once in the
     // env module so deep, io-free call sites can read it via `env.get` /

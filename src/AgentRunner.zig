@@ -13,6 +13,7 @@
 //! session persistence stays inline, independent of the sink.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.agent_runner);
@@ -2136,13 +2137,13 @@ test "ChildRunnerRegistry.drainAll finishes a child, signals done, removes entry
     var registry = ChildRunnerRegistry.init(allocator);
     defer registry.deinit();
 
-    var child_done: std.Thread.ResetEvent = .{};
+    var child_done: sync.ResetEvent = .{};
     try registry.register(.{ .runner = &runner, .done = &child_done });
 
     // Worker thread parks on `done`, exactly as runChild would. It must wake
     // only after the test thread's drainAll() finishes the child.
     const Waiter = struct {
-        fn run(done: *std.Thread.ResetEvent, woke: *std.atomic.Value(bool)) void {
+        fn run(done: *sync.ResetEvent, woke: *std.atomic.Value(bool)) void {
             done.wait();
             woke.store(true, .release);
         }

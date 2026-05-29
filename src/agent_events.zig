@@ -8,6 +8,7 @@
 //! thread-spawning code.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const Hooks = @import("Hooks.zig");
@@ -292,11 +293,11 @@ pub const AgentEvent = union(enum) {
 /// there is no caller left to react to `error.EventDropped`.
 pub const EventQueue = struct {
     /// Guards concurrent access to buffer / head / tail / len.
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
     /// Signalled after `drain` frees slots so a producer waiting in
     /// `pushWithBackpressure` wakes as soon as capacity reopens rather than
     /// after a fixed polling interval. Waited on under `mutex`.
-    drained: std.Thread.Condition = .{},
+    drained: sync.Condition = .{},
     /// Ring storage for queued events. Length equals the queue's capacity.
     buffer: []AgentEvent,
     /// Index of the next event to be drained.
@@ -497,7 +498,7 @@ pub const LayoutRequest = struct {
     /// this to false and leave `result_json` null.
     result_owned: bool = true,
     /// Signalled by the main thread when the response fields are set.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
 
     /// Construct a request with the given op. All response fields start
     /// empty; the main thread fills them before `done.set()`.
@@ -528,7 +529,7 @@ pub const PromptAssemblyRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when either `result` or
     /// `error_name` has been filled in.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Populated on success. Null when `error_name` is set.
     result: ?prompt.AssembledPrompt = null,
     /// Populated on failure with `@errorName` of whatever went wrong
@@ -578,7 +579,7 @@ pub const JitContextRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil) has been finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
     /// the call errored. Owned by the waiter.
@@ -644,7 +645,7 @@ pub const ToolTransformRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil) has been finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
     /// the call errored. Owned by the waiter.
@@ -704,7 +705,7 @@ pub const ToolGateRequest = struct {
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil / no handler) has been
     /// finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
     /// the call errored. Owned by the waiter; release via
@@ -787,7 +788,7 @@ pub const LoopDetectRequest = struct {
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil / no handler) has been
     /// finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, decoded into a `LoopAction`. The
     /// `reminder` arm's text is duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
@@ -884,7 +885,7 @@ pub const CompactRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when `outcome` (or `error_name`)
     /// has been finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Default to "use default" so a missing handler / nil return /
     /// dispatch-side error all flow into the Zig fallback chain.
     outcome: CompactStrategyOutcome = .use_default,
@@ -1100,7 +1101,7 @@ test "freeOwned signals hook_request done" {
 const BackpressureDrainer = struct {
     queue: *EventQueue,
     allocator: Allocator,
-    go: std.Thread.ResetEvent,
+    go: sync.ResetEvent,
     drained_n: std.atomic.Value(usize),
 
     fn run(self: *BackpressureDrainer) void {

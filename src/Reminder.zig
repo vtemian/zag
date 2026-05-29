@@ -17,6 +17,7 @@
 //! mutex.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const log = std.log.scoped(.reminder);
@@ -57,7 +58,7 @@ pub const Entry = struct {
 /// after `push` returns.
 pub const Queue = struct {
     entries: std.ArrayList(Entry) = .empty,
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
 
     /// Free all queued entries and the backing array. Safe to call on a
     /// queue that has already been drained.

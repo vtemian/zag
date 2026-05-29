@@ -15,6 +15,7 @@
 //! without leaving a dangling pointer in the registry.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const Allocator = std.mem.Allocator;
 const AgentRunner = @import("AgentRunner.zig");
 
@@ -24,10 +25,10 @@ const ChildRunnerRegistry = @This();
 /// stays alive until `done` is signalled.
 pub const Handle = struct {
     runner: *AgentRunner,
-    done: *std.Thread.ResetEvent,
+    done: *sync.ResetEvent,
 };
 
-mutex: std.Thread.Mutex = .{},
+mutex: sync.Mutex = .{},
 entries: std.ArrayList(Handle) = .empty,
 allocator: Allocator,
 
@@ -118,8 +119,8 @@ test "register then remove by pointer empties the registry" {
     // them, so undefined AgentRunner storage is fine here.
     var runner_a: AgentRunner = undefined;
     var runner_b: AgentRunner = undefined;
-    var done_a: std.Thread.ResetEvent = .{};
-    var done_b: std.Thread.ResetEvent = .{};
+    var done_a: sync.ResetEvent = .{};
+    var done_b: sync.ResetEvent = .{};
 
     try testing.expect(reg.isEmpty());
     try reg.register(.{ .runner = &runner_a, .done = &done_a });

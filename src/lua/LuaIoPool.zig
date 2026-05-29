@@ -10,6 +10,7 @@
 //! the agent loop.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
 const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
@@ -19,8 +20,8 @@ const CompletionQueue = @import("LuaCompletionQueue.zig").Queue;
 pub const Pool = struct {
     alloc: Allocator,
     workers: []std.Thread,
-    queue_mu: std.Thread.Mutex = .{},
-    queue_cv: std.Thread.Condition = .{},
+    queue_mu: sync.Mutex = .{},
+    queue_cv: sync.Condition = .{},
     // Simple FIFO linked list of pending jobs; workers pop from head.
     pending_head: ?*JobNode = null,
     pending_tail: ?*JobNode = null,
