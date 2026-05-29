@@ -44,6 +44,7 @@ const stdin_buffer_len: usize = 8256;
 const RegistryView = LuaEngine.RegistryView;
 
 const file_log = @import("file_log.zig");
+const env_mod = @import("env.zig");
 /// Floor log_level at .debug so the runtime gate in `file_log.handler`
 /// (driven by `ZAG_DEBUG` / `ZAG_LOG_LEVEL`) decides what actually gets
 /// written. Without this, `.debug` calls are stripped at compile time and
@@ -146,9 +147,11 @@ pub fn main(start: std.process.Init) !void {
     defer io_threaded.deinit();
     const io = io_threaded.io();
 
-    // Borrowed process environment (non-global in 0.16). Threaded into env
-    // reads instead of the removed `std.process.getEnvVarOwned`.
+    // Borrowed process environment (non-global in 0.16). Captured once in the
+    // env module so deep, io-free call sites can read it via `env.get` /
+    // `env.getOwned` instead of the removed `std.process.getEnvVarOwned`.
     const env = start.environ_map;
+    env_mod.init(env);
 
     file_log.init(allocator, io, env) catch |err| {
         // Best-effort: if the log file can't be opened, continue without
@@ -161,20 +164,25 @@ pub fn main(start: std.process.Init) !void {
     // Parse args first so `zag auth ...` subcommands bypass Lua + provider
     // init entirely. The TUI path picks up `.new_session` / `.resume_*`
     // below exactly as before. `--login=<provider>` is an older CLI shortcut
-    // that also exits before any TUI wiring.
-    const startup_mode = parseStartupArgs(allocator) catch .new_session;
+    // that also exits before any TUI wiring. Args are non-global in 0.16; the
+    // process arena owns the resolved slice.
+    const arena = start.arena.allocator();
+    const argv_z = start.minimal.args.toSlice(arena) catch &[_][:0]const u8{};
+    const argv = try arena.alloc([]const u8, argv_z.len);
+    for (argv_z, 0..) |a, i| argv[i] = a;
+    const startup_mode = parseStartupArgs(allocator, io, argv) catch .new_session;
     defer freeStartupMode(startup_mode, allocator);
 
     // Real stdin/stdout for the wizard. Sized >= auth_wizard.max_secret_len so
     // legitimate 8192-byte keys trigger the wizard's explicit length check
     // instead of surfacing as `error.StreamTooLong` from the reader.
-    const stdin_file = std.fs.File{ .handle = posix.STDIN_FILENO };
+    const stdin_file = std.Io.File.stdin();
     var stdin_buf: [stdin_buffer_len]u8 = undefined;
-    var stdin_reader = stdin_file.reader(&stdin_buf);
+    var stdin_reader = stdin_file.reader(io, &stdin_buf);
 
-    const stdout_file_wiz = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    const stdout_file_wiz = std.Io.File.stdout();
     var stdout_wiz_buf: [1024]u8 = undefined;
-    var stdout_wiz_writer = stdout_file_wiz.writer(&stdout_wiz_buf);
+    var stdout_wiz_writer = stdout_file_wiz.writer(io, &stdout_wiz_buf);
 
     // Dispatch auth subcommands *before* any subsystem comes up. These paths
     // exit the process; the TUI wiring below never runs.
@@ -196,7 +204,7 @@ pub fn main(start: std.process.Init) !void {
             // OAuth signin flow. Exit with the process code the helper
             // returns so shell scripts can branch on success/failure.
             var stderr_buf: [1024]u8 = undefined;
-            var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+            var stderr_w = std.Io.File.stderr().writer(io, &stderr_buf);
             const code = cli_auth.runLoginCommand(allocator, prov, &stderr_w.interface) catch |err| {
                 stderr_w.interface.flush() catch {};
                 return err;
@@ -301,7 +309,7 @@ pub fn main(start: std.process.Init) !void {
     else
         llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| {
             if (err == error.MissingCredential) {
-                const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+                const stderr_file = std.Io.File.stderr();
                 var scratch: [512]u8 = undefined;
                 const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
                 _ = stderr_file.write(message) catch {};
@@ -380,7 +388,7 @@ pub fn main(start: std.process.Init) !void {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
-    const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    const stdout_file = std.Io.File.stdout();
 
     setNonBlocking(posix.STDIN_FILENO) catch |err| {
         log.warn("failed to set stdin non-blocking: {}", .{err});

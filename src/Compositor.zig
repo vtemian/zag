@@ -1383,8 +1383,8 @@ test "multi-line bash command emits no raw control bytes" {
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
     try screen.render(write_end);
     write_end.close();

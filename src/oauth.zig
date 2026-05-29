@@ -1030,7 +1030,7 @@ pub fn runLoginFlowWithCodes(
     // 3) Launch the browser unless tests opted out.
     if (!opts.skip_browser) {
         var stdout_buf: [1024]u8 = undefined;
-        var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_w = std.Io.File.stdout().writer(&stdout_buf);
         stdout_w.interface.print(
             "Opening your browser to sign in. If it doesn't open, paste:\n  {s}\n\n",
             .{auth_url},

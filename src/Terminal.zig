@@ -228,7 +228,7 @@ pub fn checkResize(self: *Terminal) ?Size {
 // -- Private helpers ---------------------------------------------------------
 
 fn writeEscapeSequence(seq: []const u8) !void {
-    const stdout = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    const stdout = std.Io.File.stdout();
     // 256 bytes: longest escape sequence we emit is ~30 bytes (mouse tracking
     // enable/disable pair). 256 gives generous headroom without touching the heap.
     var buf: [256]u8 = undefined;

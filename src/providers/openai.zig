@@ -6,6 +6,7 @@
 //! (Anthropic-style) and OpenAI's message format.
 
 const std = @import("std");
+const env_mod = @import("../env.zig");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
 const Provider = llm.Provider;
@@ -483,7 +484,7 @@ fn parseSseStream(
     var sse_data: std.ArrayList(u8) = .empty;
     defer sse_data.deinit(allocator);
 
-    const debug_sse = std.posix.getenv("ZAG_DEBUG_SSE_DUMP") != null;
+    const debug_sse = env_mod.get("ZAG_DEBUG_SSE_DUMP") != null;
 
     while (try stream.nextSseEvent(cancel, &scratch, &sse_data)) |sse| {
         if (debug_sse) log.warn("[sse-raw] {s}", .{sse.data});

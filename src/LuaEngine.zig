@@ -4,6 +4,7 @@
 //! so that plugins can define tools in Lua that appear alongside the built-in Zig tools.
 
 const std = @import("std");
+const env_mod = @import("env.zig");
 const clock = @import("clock.zig");
 const zlua = @import("zlua");
 const build_options = @import("build_options");
@@ -460,7 +461,7 @@ pub const LuaEngine = struct {
     /// searcher that covers `~/.config/zag/lua/*.lua` is installed once in
     /// `init`, so `require()` works here without any additional setup.
     pub fn loadUserConfig(self: *LuaEngine) void {
-        const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
+        const home = env_mod.getOwned(self.allocator, "HOME") catch return;
         defer self.allocator.free(home);
 
         // Load config.lua (collects zag.tool() calls)
@@ -2548,7 +2549,7 @@ pub const LuaEngine = struct {
         // user_searcher closure treats an empty dir as "no user overrides".
         var user_dir_owned: ?[]u8 = null;
         defer if (user_dir_owned) |d| allocator.free(d);
-        if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+        if (env_mod.getOwned(allocator, "HOME")) |home| {
             defer allocator.free(home);
             user_dir_owned = try std.fmt.allocPrint(allocator, "{s}/.config/zag/lua", .{home});
         } else |_| {

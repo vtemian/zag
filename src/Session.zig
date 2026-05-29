@@ -4,6 +4,7 @@
 //! with a companion meta.json for quick listing. Sessions live in .zag/sessions/.
 
 const std = @import("std");
+const env_mod = @import("env.zig");
 const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
@@ -263,7 +264,7 @@ pub const Meta = struct {
 /// removed between getCwdAlloc and realpathAlloc, rare but possible) the
 /// raw cwd string is used as a fallback rather than abandoning the call.
 pub fn recordCwdInRegistry(allocator: Allocator) !void {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try env_mod.getOwned(allocator, "HOME");
     defer allocator.free(home);
 
     const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zag" });
@@ -535,7 +536,7 @@ pub const SessionHandle = struct {
     /// Valid length of the id field.
     id_len: u8 = 0,
     /// Open JSONL file handle for appending.
-    file: std.fs.File,
+    file: std.Io.File,
     /// Current session metadata (kept in sync on writes).
     meta: Meta,
     /// Allocator for temporary buffers.
@@ -591,7 +592,7 @@ pub const SessionHandle = struct {
         const json = json_buf.items;
 
         var write_scratch: [256]u8 = undefined;
-        // std.fs.File.writer defaults to positional mode starting at pos=0,
+        // std.Io.File.writer defaults to positional mode starting at pos=0,
         // so every appendEntry would pwrite from byte 0 and clobber prior
         // rows. writerStreaming uses the file's own cursor, which createFile
         // leaves at 0 and loadSession advances via seekFromEnd(0), so writes
@@ -633,7 +634,7 @@ pub const SessionHandle = struct {
             else => false,
         };
         if (!is_streaming_delta) {
-            // On macOS APFS, std.fs.File.sync() routes to F_FULLFSYNC, which is
+            // On macOS APFS, std.Io.File.sync() routes to F_FULLFSYNC, which is
             // the strict barrier covering all dirty pages for the fd. A stdlib
             // regression to plain fsync(2) would weaken power-loss semantics.
             try self.file.sync();
@@ -869,7 +870,7 @@ pub fn listSessionsAt(allocator: Allocator, project_path: []const u8) ![]Meta {
 /// Read a `Meta` from `<dir>/<name>` without going through `std.fs.cwd()`.
 /// Used by `listSessionsAt` so cross-project enumeration does not require
 /// chdir'ing into the project root.
-fn readMetaFromDir(dir: std.fs.Dir, name: []const u8, allocator: Allocator) !Meta {
+fn readMetaFromDir(dir: std.Io.Dir, name: []const u8, allocator: Allocator) !Meta {
     const content = try dir.readFileAlloc(allocator, name, 4096);
     defer allocator.free(content);
 
@@ -1048,7 +1049,7 @@ pub const RecoveryReport = struct {
 ///   2. Delete orphan `.tmp` files from a failed atomic meta rename.
 ///   3. Report the real line count so the caller can fix `meta.message_count`.
 /// `dir` must be opened with `.iterate = true`.
-pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8, allocator: Allocator) !RecoveryReport {
+pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8, allocator: Allocator) !RecoveryReport {
     var report: RecoveryReport = .{};
 
     // Step 1: truncate incomplete final JSONL line, count complete lines.
@@ -2369,7 +2370,7 @@ test "appendEntry persists tool_result content larger than 8 KiB" {
 }
 
 test "appendEntry appends without clobbering previous rows" {
-    // Regression test for a positional-writer bug: std.fs.File.writer
+    // Regression test for a positional-writer bug: std.Io.File.writer
     // defaults to positional mode starting at pos=0, so each appendEntry
     // was pwrite'ing from byte 0 and overwriting prior rows. Exercise
     // three appends through the real public API and confirm all three
@@ -3189,7 +3190,7 @@ test "recordCwdInRegistry persists the canonicalized cwd" {
     const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(fake_home);
 
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
     defer if (prev_home) |p| allocator.free(p);
 
     setEnvForTest("HOME", fake_home);
@@ -3230,7 +3231,7 @@ test "SessionManager.init leaves the global registry alone" {
     const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(fake_home);
 
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
     defer if (prev_home) |p| allocator.free(p);
 
     setEnvForTest("HOME", fake_home);
@@ -3267,7 +3268,7 @@ test "SessionManager.init succeeds when HOME is unset" {
     try tmp.dir.setAsCwd();
     defer restoreCwd(orig_cwd);
 
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
     defer if (prev_home) |p| allocator.free(p);
 
     _ = unsetenv("HOME");

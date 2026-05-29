@@ -42,6 +42,7 @@
 //!     both are deferred to v2.
 
 const std = @import("std");
+const env_mod = @import("../../env.zig");
 const zlua = @import("zlua");
 const Lua = zlua.Lua;
 
@@ -79,7 +80,7 @@ fn fireSessionListChanged(
 /// Resolve `$HOME/.config/zag` the same way `Session.recordCwdInRegistry`
 /// does. Returns an owned slice; caller frees with `allocator.free`.
 fn resolveConfigDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try env_mod.getOwned(allocator, "HOME");
     defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, ".config", "zag" });
 }

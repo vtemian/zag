@@ -406,7 +406,7 @@ fn colorsEqual(a: Color, b: Color) bool {
 /// that share the same style/fg/bg into a single cursor-move + SGR + run
 /// of UTF-8 bytes. Implicit terminal cursor advancement after each
 /// codepoint keeps the per-cell overhead near zero.
-pub fn render(self: *Screen, file: std.fs.File) !void {
+pub fn render(self: *Screen, file: std.Io.File) !void {
     // Recovery path: a prior render returned WriteTimeout with a partial
     // frame written to the terminal. `previous` no longer reflects what
     // the terminal actually has, so force every cell to diff as dirty.
@@ -729,7 +729,7 @@ fn rgbTo256(r: u8, g: u8, b: u8) u8 {
 // -- Tests -------------------------------------------------------------------
 
 /// Read all bytes from a pipe's read end into a caller-provided buffer. Only for tests.
-fn readPipe(read_end: std.fs.File, buf: []u8) ![]const u8 {
+fn readPipe(read_end: std.Io.File, buf: []u8) ![]const u8 {
     var total: usize = 0;
     while (total < buf.len) {
         const n = std.posix.read(read_end.handle, buf[total..]) catch break;
@@ -819,8 +819,8 @@ test "render with no changes produces only sync markers" {
 
     // Both grids are identical (all empty cells), so no cell output needed
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -846,8 +846,8 @@ test "render emits output for changed cells" {
     cell.style = .{ .bold = true };
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -876,8 +876,8 @@ test "render copies current to previous" {
     screen.getCell(0, 0).codepoint = 'A';
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -904,8 +904,8 @@ test "second render with no new changes produces only sync markers" {
     // First render: flushes the change
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
 
         try screen.render(write_end);
         write_end.close();
@@ -915,8 +915,8 @@ test "second render with no new changes produces only sync markers" {
     // Second render: no changes since first render
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
 
         try screen.render(write_end);
@@ -987,8 +987,8 @@ test "render encodes non-ASCII multi-byte UTF-8 codepoints" {
     screen.getCell(0, 2).codepoint = 0x1F600;
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -1017,8 +1017,8 @@ test "render emits RGB background color SGR sequences" {
     screen.getCell(0, 0).bg = .{ .rgb = .{ .r = 255, .g = 128, .b = 0 } };
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -1066,8 +1066,8 @@ test "writeSgr downgrades RGB to 256 when true_color is unavailable" {
     screen.getCell(0, 0).fg = .{ .rgb = .{ .r = 255, .g = 0, .b = 0 } };
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -1091,8 +1091,8 @@ test "render reuses output buffer across frames" {
     screen.getCell(0, 0).codepoint = 'A';
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
         try screen.render(write_end);
         write_end.close();
@@ -1105,8 +1105,8 @@ test "render reuses output buffer across frames" {
     screen.getCell(1, 0).codepoint = 'B';
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
         try screen.render(write_end);
         write_end.close();
@@ -1126,8 +1126,8 @@ test "render emits palette background color SGR sequences" {
     screen.getCell(0, 0).bg = .{ .palette = 42 };
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -1259,8 +1259,8 @@ test "diff emits at most one SGR per contiguous same-style run" {
     }
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -1300,8 +1300,8 @@ test "diff merges run containing wide-char continuation cell" {
     _ = screen.writeStr(0, 0, "ab中cd", .{}, .{ .palette = 1 });
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -1331,8 +1331,8 @@ test "render returns WriteTimeout when tty backpressure exceeds deadline" {
     // Non-blocking pipe whose read end we never drain, so the write buffer
     // fills up and never drains.
     const pipe = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
     defer write_end.close();
 
@@ -1378,8 +1378,8 @@ test "render after write_timed_out forces full redraw" {
     screen.write_timed_out = true;
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
 
     try screen.render(write_end);
@@ -1405,8 +1405,8 @@ test "forced full redraw erases the display so vacated cells cannot ghost" {
     for (screen.current) |*cell| cell.codepoint = 'W';
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
         try screen.render(write_end);
         write_end.close();
@@ -1427,8 +1427,8 @@ test "forced full redraw erases the display so vacated cells cannot ghost" {
     screen.getCell(0, 1).codepoint = 'i';
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
     try screen.render(write_end);
     write_end.close();
@@ -1452,8 +1452,8 @@ test "normal changed-cell frame does not erase the whole display" {
     screen.getCell(0, 0).codepoint = 'h';
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
     try screen.render(write_end);
     write_end.close();
@@ -1539,8 +1539,8 @@ test "render clears cluster side table so ZWJ repaint does not grow it" {
     try testing.expect(screen.cluster_index.items.len == 1);
 
     const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    const write_end: std.Io.File = .{ .handle = pipe[1] };
+    const read_end: std.Io.File = .{ .handle = pipe[0] };
     defer read_end.close();
     try screen.render(write_end);
     write_end.close();
@@ -1564,8 +1564,8 @@ test "render clears cluster side table so ZWJ repaint does not grow it" {
 
     // Second render drains again.
     const pipe2 = try std.posix.pipe();
-    const write_end2: std.fs.File = .{ .handle = pipe2[1] };
-    const read_end2: std.fs.File = .{ .handle = pipe2[0] };
+    const write_end2: std.Io.File = .{ .handle = pipe2[1] };
+    const read_end2: std.Io.File = .{ .handle = pipe2[0] };
     defer read_end2.close();
     try screen.render(write_end2);
     write_end2.close();
@@ -1584,8 +1584,8 @@ test "render keeps cluster side table bounded across many frames" {
     _ = screen.writeStr(0, 0, family, .{}, .default);
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
         try screen.render(write_end);
         write_end.close();
@@ -1600,8 +1600,8 @@ test "render keeps cluster side table bounded across many frames" {
         try testing.expectEqual(@as(usize, 1), screen.cluster_index.items.len);
 
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
         try screen.render(write_end);
         write_end.close();
@@ -1626,8 +1626,8 @@ test "render emits full ZWJ cluster bytes across consecutive frames" {
     _ = screen.writeStr(0, 0, family, .{}, .default);
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
         try screen.render(write_end);
         write_end.close();
@@ -1643,8 +1643,8 @@ test "render emits full ZWJ cluster bytes across consecutive frames" {
     _ = screen.writeStr(0, 0, family, .{}, .default);
     {
         const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const write_end: std.Io.File = .{ .handle = pipe[1] };
+        const read_end: std.Io.File = .{ .handle = pipe[0] };
         defer read_end.close();
         try screen.render(write_end);
         write_end.close();

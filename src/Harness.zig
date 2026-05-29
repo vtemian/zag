@@ -379,7 +379,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     var provider = llm.createProviderFromLuaConfig(registry_ptr, default_model, auth_path, gpa) catch |err| {
         // Headless can't run the interactive wizard, so a missing default
         // or credential just exits with a hint pointing at config.lua / auth.
-        const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+        const stderr_file = std.Io.File.stderr();
         switch (err) {
             error.NoDefaultModel => {
                 const msg = "zag: no default model configured. Set one in ~/.config/zag/config.lua via `zag.set_default_model(\"provider/model\")`.\n";

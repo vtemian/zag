@@ -299,7 +299,7 @@ pub const CmdHandle = struct {
         }
 
         // Pull bytes until a newline lands in the buffer or the pipe
-        // drains. `std.fs.File.read` blocks; that's fine because the
+        // drains. `std.Io.File.read` blocks; that's fine because the
         // helper thread exists precisely to absorb that block.
         while (true) {
             var chunk: [4096]u8 = undefined;

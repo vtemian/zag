@@ -52,7 +52,7 @@ pub const HeadlessMode = struct {
 /// One-liner describing the `zag auth ...` grammar, sent to stderr on bad
 /// input. Kept in a single place so the usage text doesn't drift from the
 /// parser.
-pub fn printAuthHelp() void {
+pub fn printAuthHelp(io: std.Io) void {
     const msg =
         \\zag: usage:
         \\  zag auth login <provider>   Add or replace credential for <provider>
@@ -60,8 +60,8 @@ pub fn printAuthHelp() void {
         \\  zag auth remove <provider>  Delete credential for <provider>
         \\
     ;
-    const stderr = std.fs.File{ .handle = posix.STDERR_FILENO };
-    _ = stderr.write(msg) catch {};
+    const stderr = std.Io.File.stderr();
+    stderr.writeStreamingAll(io, msg) catch {};
 }
 
 /// Parse CLI args. Recognizes `zag auth login|list|remove`, `--session=<id>`,
@@ -71,19 +71,16 @@ pub fn printAuthHelp() void {
 /// everything else goes through the slice-based flag parser. Strings that
 /// need an owning copy are duped into `allocator` and must be released with
 /// `freeStartupMode`.
-pub fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
-
+pub fn parseStartupArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !StartupMode {
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "auth")) {
         if (argv.len < 3) {
-            printAuthHelp();
+            printAuthHelp(io);
             std.process.exit(2);
         }
         const sub = argv[2];
         if (std.mem.eql(u8, sub, "login")) {
             if (argv.len < 4) {
-                printAuthHelp();
+                printAuthHelp(io);
                 std.process.exit(2);
             }
             return .{ .auth_login = try allocator.dupe(u8, argv[3]) };
@@ -93,12 +90,12 @@ pub fn parseStartupArgs(allocator: std.mem.Allocator) !StartupMode {
         }
         if (std.mem.eql(u8, sub, "remove")) {
             if (argv.len < 4) {
-                printAuthHelp();
+                printAuthHelp(io);
                 std.process.exit(2);
             }
             return .{ .auth_remove = try allocator.dupe(u8, argv[3]) };
         }
-        printAuthHelp();
+        printAuthHelp(io);
         std.process.exit(2);
     }
 

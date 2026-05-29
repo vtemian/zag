@@ -78,7 +78,7 @@ screen: *Screen,
 /// and forwarded to each runner on submit for worker-side hook dispatch.
 lua_engine: ?*LuaEngine,
 /// Where to write the rendered screen.
-stdout_file: std.fs.File,
+stdout_file: std.Io.File,
 /// Read end of the wake pipe. The orchestrator polls this alongside stdin so
 /// agent-thread event pushes and SIGWINCH can interrupt its wait without a
 /// busy-wait sleep.
@@ -143,7 +143,7 @@ pub const Config = struct {
     /// hand in a fallback registry seeded with the same built-ins.
     command_registry: *CommandRegistry,
     /// Where to write the rendered screen.
-    stdout_file: std.fs.File,
+    stdout_file: std.Io.File,
     /// Read end of the wake pipe; polled alongside stdin so agent events
     /// and SIGWINCH can interrupt poll() without a busy-wait.
     wake_read_fd: posix.fd_t,

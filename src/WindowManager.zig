@@ -5218,7 +5218,7 @@ test "restorePane rebuilds both tree and messages" {
     // deterministic id, write a small JSONL file ourselves, and build a
     // SessionHandle struct pointing at it. Writing the file directly (rather
     // than via SessionHandle.appendEntry in a loop) sidesteps a known
-    // quirk of std.fs.File positional writers: each freshly-created writer
+    // quirk of std.Io.File positional writers: each freshly-created writer
     // starts at pos 0, so a single writer loop is the reliable pattern.
     std.fs.cwd().makePath(".zag/sessions") catch {};
 

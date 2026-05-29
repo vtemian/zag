@@ -28,6 +28,7 @@
 //! backing array.
 
 const std = @import("std");
+const env_mod = @import("env.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const frontmatter = @import("frontmatter.zig");
@@ -115,7 +116,7 @@ pub const SkillRegistry = struct {
     /// simply emit an empty `<available_skills>` block in that case.
     /// Caller owns the returned registry and must call `deinit(alloc)`.
     pub fn discoverFromDefaults(alloc: Allocator) SkillRegistry {
-        const home = std.process.getEnvVarOwned(alloc, "HOME") catch |err| switch (err) {
+        const home = env_mod.getOwned(alloc, "HOME") catch |err| switch (err) {
             error.EnvironmentVariableNotFound => alloc.dupe(u8, ".") catch return .{},
             else => {
                 log.warn("HOME unreadable, skills discovery skipped: {}", .{err});
@@ -343,7 +344,7 @@ fn writeXmlEscaped(writer: anytype, raw: []const u8) !void {
 // --- Tests ---
 
 fn writeSkillFile(
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     subdir: []const u8,
     frontmatter_body: []const u8,
 ) !void {

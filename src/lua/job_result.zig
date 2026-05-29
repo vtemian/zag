@@ -227,7 +227,7 @@ pub fn pushJobResultOntoStack(allocator: Allocator, co: *Lua, job: *async_job.Jo
             // Array-style Lua table: numeric keys 1..N, each value
             // `{name=string, kind=string}`. Kind is a stable string
             // tag (file/dir/symlink/other) rather than the
-            // std.fs.File.Kind identifier so Lua callers aren't
+            // std.Io.File.Kind identifier so Lua callers aren't
             // coupled to the Zig enum layout.
             co.newTable();
             for (r.entries, 0..) |entry, i| {

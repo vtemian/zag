@@ -38,7 +38,7 @@ fn setFsErr(alloc: Allocator, job: *Job, err: anyerror) void {
     job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
 }
 
-fn kindFromStd(k: std.fs.File.Kind) job_mod.FsKind {
+fn kindFromStd(k: std.Io.File.Kind) job_mod.FsKind {
     return switch (k) {
         .file => .file,
         .directory => .dir,

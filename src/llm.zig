@@ -4,6 +4,7 @@
 //! implement, plus the model string parser and provider factory.
 
 const std = @import("std");
+const env_mod = @import("env.zig");
 const types = @import("types.zig");
 const auth = @import("auth.zig");
 const Allocator = std.mem.Allocator;
@@ -445,7 +446,7 @@ pub const ProviderResult = struct {
 /// `$HOME/.config/zag/auth.json`, falling back to `./.config/zag/auth.json`
 /// when `$HOME` is unset. Returns a slice of `buf`; no heap allocation.
 fn defaultAuthPath(buf: []u8) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse ".";
+    const home = env_mod.get("HOME") orelse ".";
     return std.fmt.bufPrint(buf, "{s}/.config/zag/auth.json", .{home});
 }
 

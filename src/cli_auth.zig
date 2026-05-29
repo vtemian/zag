@@ -152,7 +152,7 @@ pub fn runLoginCommand(
         return 1;
     };
 
-    const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    const stdout_file = std.Io.File.stdout();
     var scratch: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(
         &scratch,

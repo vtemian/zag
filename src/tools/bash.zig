@@ -39,6 +39,7 @@
 //! agent can interrupt long-running commands.
 
 const std = @import("std");
+const env_mod = @import("../env.zig");
 const clock = @import("../clock.zig");
 const builtin = @import("builtin");
 const types = @import("../types.zig");
@@ -103,7 +104,7 @@ pub fn execute(
     const sandbox: ?SandboxArgv = sandbox_blk: {
         if (permissive) break :sandbox_blk null;
 
-        const home = std.posix.getenv("HOME") orelse home_blk: {
+        const home = env_mod.get("HOME") orelse home_blk: {
             log.warn("HOME unset; sandbox secret-deny rules will be rooted at '/' (no per-user secrets denied)", .{});
             break :home_blk "/";
         };
@@ -606,7 +607,7 @@ test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" 
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    const home = std.posix.getenv("HOME") orelse "/";
+    const home = env_mod.get("HOME") orelse "/";
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/";
     const profile = try buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home });

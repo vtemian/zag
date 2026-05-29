@@ -11,6 +11,7 @@
 //! endpoints (e.g. local Ollama) skip credential capture entirely.
 
 const std = @import("std");
+const env_mod = @import("env.zig");
 
 const log = std.log.scoped(.auth_wizard);
 
@@ -45,7 +46,7 @@ pub const Paths = struct {
 /// `$HOME`. Mirrors `LuaEngine.loadUserConfig`'s lookup so the wizard agrees
 /// with the engine on file locations. Propagates any HOME read error.
 pub fn buildPaths(allocator: std.mem.Allocator) !Paths {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try env_mod.getOwned(allocator, "HOME");
     defer allocator.free(home);
 
     const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home});
@@ -59,7 +60,7 @@ pub fn buildPaths(allocator: std.mem.Allocator) !Paths {
 /// so we don't crash under `env -i`; the login flow surfaces a clearer
 /// error downstream when it tries to persist.
 pub fn buildAuthPath(allocator: std.mem.Allocator) ![]u8 {
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+    const home_dir = env_mod.getOwned(allocator, "HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => blk: {
             log.warn("HOME unset; falling back to \".\" for auth.json path", .{});
             break :blk try allocator.dupe(u8, ".");
@@ -1136,7 +1137,7 @@ pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
 /// Print an actionable "no credentials, switch to a TTY" hint for `provider_name`
 /// to `stderr` and exit with status 1. Used by `runFirstRunWizard` from both
 /// the up-front non-TTY guard and the `error.NonInteractiveFirstRun` retry path.
-fn exitNoCredentialsForProvider(stderr: std.fs.File, provider_name: []const u8) noreturn {
+fn exitNoCredentialsForProvider(stderr: std.Io.File, provider_name: []const u8) noreturn {
     var scratch: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(
         &scratch,
@@ -1161,7 +1162,7 @@ pub fn runFirstRunWizard(
 ) !llm.ProviderResult {
     const default_model: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
 
-    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    const stderr = std.Io.File.stderr();
     const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
 
     if (!is_tty) {
@@ -1917,7 +1918,7 @@ test "scaffoldConfigLua writes chosen_model when provided" {
 /// `tmpDir`. Returned slices are owned by `testing.allocator` and must be
 /// freed by the caller.
 fn wizardPaths(
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
 ) !struct { auth_path: []u8, config_path: []u8 } {
     const dir_path = try dir.realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(dir_path);

@@ -194,7 +194,7 @@ pub const HttpStreamLineDoneSpec = struct {
 };
 
 /// Entry kind surfaced to Lua for fs.list and fs.stat. Maps
-/// `std.fs.File.Kind` onto the four buckets we expose: file, dir,
+/// `std.Io.File.Kind` onto the four buckets we expose: file, dir,
 /// symlink, other. Everything that isn't a regular file, directory,
 /// or symlink collapses into `.other`.
 pub const FsKind = enum {
@@ -274,7 +274,7 @@ pub const FsStatSpec = struct {
 };
 
 /// Success payload for an `fs_stat` job. `mtime_ms` is milliseconds
-/// since UTC 1970-01-01 (truncated from std.fs.File.Stat.mtime which
+/// since UTC 1970-01-01 (truncated from std.Io.File.Stat.mtime which
 /// is nanoseconds). `mode` is the POSIX mode bits widened to u32 so
 /// the Lua binding can push it as an integer without worrying about
 /// platform-specific `mode_t` width.

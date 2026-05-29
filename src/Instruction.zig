@@ -178,7 +178,7 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
 
 // --- tests ---
 
-fn writeFile(dir: std.fs.Dir, name: []const u8, body: []const u8) !void {
+fn writeFile(dir: std.Io.Dir, name: []const u8, body: []const u8) !void {
     var f = try dir.createFile(name, .{});
     defer f.close();
     try f.writeAll(body);
