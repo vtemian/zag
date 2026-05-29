@@ -36,12 +36,12 @@ pub fn connectLoopback(port: u16) !Io.net.Stream {
     return addr.connect(std.testing.io, .{ .mode = .stream });
 }
 
-/// Read up to `dest.len` bytes from `stream`. 0.16 reads through a buffered
-/// `Stream.Reader`; this wrapper keeps the old one-shot `stream.read(dest)`
-/// shape for test servers. Returns 0 at EOF.
+/// Read up to `dest.len` bytes from `stream`. 0.16 reads through a
+/// `Stream.Reader`; give it a zero-length internal buffer so it issues a
+/// single direct `recv` into `dest` rather than buffering surplus bytes into
+/// a scratch that this short-lived reader would then drop. Returns 0 at EOF.
 pub fn streamRead(stream: Io.net.Stream, dest: []u8) !usize {
-    var scratch: [256]u8 = undefined;
-    var r = stream.reader(std.testing.io, &scratch);
+    var r = stream.reader(std.testing.io, &.{});
     return r.interface.readSliceShort(dest);
 }
 
