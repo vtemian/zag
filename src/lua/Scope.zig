@@ -82,42 +82,44 @@ pub const Scope = struct {
     }
 
     pub fn cancel(self: *Scope, reason: []const u8) Allocator.Error!void {
-        // Pre-allocate everything BEFORE the CAS so the only fallible operations
-        // happen while state is still .active. If any alloc fails, caller sees
-        // OOM with the scope untouched and can retry. Only once all resources
-        // are in hand do we flip state; on CAS loss (another thread cancelled
-        // first) we free our resources and return idempotently.
+        // Only the reason dupe is fallible before we commit; if it fails the
+        // caller sees OOM with the scope untouched and can retry.
         const reason_dupe = try self.alloc.dupe(u8, reason);
         errdefer self.alloc.free(reason_dupe);
 
-        self.mu.lock();
-        const jobs_snap = self.alloc.alloc(*Job, self.jobs.items.len) catch |err| {
-            self.mu.unlock();
-            return err;
-        };
-        errdefer self.alloc.free(jobs_snap);
-        const children_snap = self.alloc.alloc(*Scope, self.children.items.len) catch |err| {
-            self.mu.unlock();
-            return err;
-        };
-        errdefer self.alloc.free(children_snap);
-        @memcpy(jobs_snap, self.jobs.items);
-        @memcpy(children_snap, self.children.items);
-        self.mu.unlock();
-
-        // CAS active -> cancelling; lost CAS means someone else already cancelled.
+        // Publish .cancelling FIRST so any job that registers after this point
+        // observes the cancel on its next isCancelled() poll. Without this
+        // ordering a job that runs isCancelled()/arm-aborter/registerJob in the
+        // window between an empty snapshot and the CAS would slip past both the
+        // snapshot and its own pre-register cancel check, leaving its aborter
+        // unfired. Lost CAS means someone else already cancelled: free our dupe
+        // and return idempotently (no snapshots allocated yet).
         if (self.state.cmpxchgStrong(.active, .cancelling, .acq_rel, .acquire) != null) {
             self.alloc.free(reason_dupe);
-            self.alloc.free(jobs_snap);
-            self.alloc.free(children_snap);
             return;
         }
-
-        // We own the cancel. Publish reason and act outside the lock. No more
-        // fallible ops past this point: aborter fires and cascade swallows errors.
         self.reason = reason_dupe;
-        defer self.alloc.free(jobs_snap);
-        defer self.alloc.free(children_snap);
+
+        // Snapshot under the lock AFTER publishing .cancelling so every job
+        // registered before we take the lock is captured. Past the CAS the
+        // cancel is committed and cannot be un-cancelled, so a snapshot alloc
+        // failure is best-effort (log + skip) rather than fatal.
+        self.mu.lock();
+        const jobs_snap: []*Job = self.alloc.alloc(*Job, self.jobs.items.len) catch |err| blk: {
+            std.log.scoped(.scope).warn("job snapshot alloc failed, aborters skipped: {}", .{err});
+            break :blk &.{};
+        };
+        const children_snap: []*Scope = self.alloc.alloc(*Scope, self.children.items.len) catch |err| blk: {
+            std.log.scoped(.scope).warn("child snapshot alloc failed, cascade skipped: {}", .{err});
+            break :blk &.{};
+        };
+        @memcpy(jobs_snap, self.jobs.items[0..jobs_snap.len]);
+        @memcpy(children_snap, self.children.items[0..children_snap.len]);
+        self.mu.unlock();
+        // The zero-len fallbacks above have no heap backing, so only free a
+        // snapshot that was actually allocated.
+        defer if (jobs_snap.len > 0) self.alloc.free(jobs_snap);
+        defer if (children_snap.len > 0) self.alloc.free(children_snap);
 
         // Fire aborters on all registered jobs.
         for (jobs_snap) |j| j.abort();
@@ -257,20 +259,25 @@ test "Scope.cancel leaves state active when dupe fails" {
     try testing.expect(root.reason == null);
 }
 
-test "Scope.cancel leaves state active when snapshot alloc fails" {
-    // Root init = 1 alloc. Child init = 1 alloc + 1 alloc for parent's
-    // children backing array growth = 3 total. Cancel's dupe = alloc 4.
-    // Snapshot alloc = alloc 5 -> fail there.
+test "Scope.cancel stays committed when snapshot alloc fails after CAS" {
+    // Allocation order: root struct (0), child struct (1), parent's children
+    // backing-array growth (2), cancel's reason dupe (3, must succeed so the
+    // CAS commits), then the jobs snapshot (4) which we fail. Past the CAS the
+    // cancel is irreversible: the failed jobs snapshot is logged and skipped,
+    // the children snapshot (5) still succeeds, and the cascade reaches child.
     var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
     const root = try Scope.init(fa.allocator(), null);
     defer root.deinit();
     const child = try Scope.init(fa.allocator(), root);
     defer child.deinit();
 
-    try testing.expectError(error.OutOfMemory, root.cancel("boom"));
-    try testing.expect(!root.isCancelled());
-    try testing.expect(!child.isCancelled()); // cascade never happened
-    try testing.expect(root.reason == null);
+    try root.cancel("boom");
+    try testing.expectEqual(State.cancelling, root.state.load(.acquire));
+    try testing.expect(root.isCancelled());
+    try testing.expectEqualStrings("boom", root.reason.?);
+    // Cascade still ran: the child snapshot alloc succeeded after the failed
+    // jobs snapshot, so the committed cancel propagated.
+    try testing.expect(child.isCancelled());
 }
 
 test {
