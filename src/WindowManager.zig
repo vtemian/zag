@@ -1188,6 +1188,37 @@ pub fn handleLayoutRequest(self: *WindowManager, req: *agent_events.LayoutReques
                                 .view = resolved_view,
                             };
                         },
+                        .scratch => |text| {
+                            // Mint a registry-owned scratch buffer, fill it
+                            // with the inline text, and attach it just like
+                            // the `.handle` path. The registry owns the
+                            // buffer's lifetime; pane teardown frees only the
+                            // PaneEntry, so closing the pane is leak-safe.
+                            const bh = self.buffer_registry.createScratch("scratch") catch
+                                break :blk errorOutcome(alloc, "scratch_create_failed");
+                            switch (self.buffer_registry.resolve(bh) catch
+                                break :blk errorOutcome(alloc, "scratch_create_failed")) {
+                                .scratch => |sbuf| {
+                                    var split_lines: std.ArrayList([]const u8) = .empty;
+                                    defer split_lines.deinit(alloc);
+                                    var line_it = std.mem.splitScalar(u8, text, '\n');
+                                    while (line_it.next()) |line|
+                                        split_lines.append(alloc, line) catch
+                                            break :blk errorOutcome(alloc, "oom");
+                                    sbuf.setLines(split_lines.items) catch
+                                        break :blk errorOutcome(alloc, "scratch_fill_failed");
+                                },
+                                else => break :blk errorOutcome(alloc, "scratch_create_failed"),
+                            }
+                            const resolved_buffer = self.buffer_registry.asBuffer(bh) catch
+                                break :blk errorOutcome(alloc, "scratch_create_failed");
+                            const resolved_view = self.buffer_registry.asView(bh) catch
+                                break :blk errorOutcome(alloc, "scratch_create_failed");
+                            break :blk_attached .{
+                                .buffer = resolved_buffer,
+                                .view = resolved_view,
+                            };
+                        },
                     }
                 };
                 const new_handle = self.splitById(handle, dir, attached) catch |err|
@@ -3725,6 +3756,81 @@ test "handleLayoutRequest describe round-trips parseable JSON" {
     defer parsed.deinit();
     const nodes = parsed.value.object.get("nodes") orelse return error.TestUnexpectedResult;
     try std.testing.expect(nodes == .object);
+}
+
+test "handleLayoutRequest split with scratch buffer creates a text pane" {
+    const allocator = std.testing.allocator;
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    var session_mgr: ?Session.SessionManager = null;
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = pane,
+        .provider = undefined,
+        .session_mgr = &session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+    var test_viewport: Viewport = .{};
+
+    try wm.attachLayoutRegistry();
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    // Address the lone root leaf by its registry id, then split it into a
+    // scratch pane carrying two lines of inline text.
+    const root_handle = try wm.handleForNode(layout.root.?);
+    const root_id = try NodeRegistry.formatId(allocator, root_handle);
+    defer allocator.free(root_id);
+
+    var req = agent_events.LayoutRequest.init(.{ .split = .{
+        .id = root_id,
+        .direction = "vertical",
+        .buffer = .{ .scratch = "line one\nline two" },
+    } });
+    wm.handleLayoutRequest(&req);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(!req.is_error);
+    const bytes = req.result_json orelse return error.TestUnexpectedResult;
+    defer if (req.result_owned) allocator.free(bytes);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("ok").?.bool);
+
+    // The new pane must be a leaf whose view renders both text lines.
+    const new_id = parsed.value.object.get("new_id").?.string;
+    const new_handle = try NodeRegistry.parseId(new_id);
+    const new_node = try wm.node_registry.resolve(new_handle);
+    try std.testing.expect(new_node.* == .leaf);
+    try std.testing.expectEqual(@as(usize, 2), try new_node.leaf.view.lineCount());
 }
 
 test "handleLayoutRequest rejects invalid id with error outcome" {
