@@ -390,6 +390,13 @@ pub const SessionManager = struct {
 
         // Recover from any crash that left the session half-written: truncate
         // an incomplete trailing JSONL line and remove orphaned .tmp files.
+        //
+        // meta.message_count is intentionally NOT reconciled against the real
+        // line count here (recovery is tail-only and never scans the body). It
+        // is append-maintained best-effort and may undercount after a crash or
+        // a session that ended on un-persisted streaming deltas; treat it as a
+        // display hint, not an authoritative count. Entry loading reads actual
+        // JSONL lines and never consults it.
         var sessions = cwd.openDir(sessions_dir, .{ .iterate = true }) catch |e| {
             log.err("failed to open sessions dir for recovery: {}", .{e});
             return e;
@@ -733,14 +740,15 @@ pub const SessionHandle = struct {
 
 /// Load all entries from a session's JSONL file.
 /// Caller must free the returned slice and each entry's allocated strings.
-/// Upper bound on the JSONL we will read into memory in one shot. Set far
-/// above any real session (the largest observed is ~9 MiB); the bound only
-/// guards against a corrupt or pathological file rather than capping normal
-/// growth. A session approaching this size would need lazy/windowed loading,
-/// which is out of scope here. Replaces a former 10 MiB cap that the largest
-/// real session was already at 90% of, so the next big one would have failed
-/// to open with `error.FileTooBig`.
-const max_session_bytes: usize = 1 << 30; // 1 GiB
+/// Upper bound on the JSONL we will read into memory in one shot. Clears the
+/// largest observed session (~9 MiB) by ~14x while bounding the worst-case
+/// synchronous main-thread read of a corrupt or pathological file: the whole
+/// file is slurped before line-splitting, so an unbounded cap would let a
+/// runaway file freeze the UI loop. Replaces a former 10 MiB cap the largest
+/// real session was already at 90% of (the next big one would have failed
+/// with `error.FileTooBig`). A session legitimately approaching this size
+/// would need lazy/windowed loading, which is out of scope here.
+const max_session_bytes: usize = 128 * 1024 * 1024; // 128 MiB
 
 /// Read `path` (cwd-relative) and parse every JSONL line into an owned Entry
 /// slice. Shared body of `loadEntries` (cwd session) and `loadEntriesAt`
@@ -769,7 +777,7 @@ fn loadEntriesFromPath(allocator: Allocator, path: []const u8) ![]Entry {
             // torn trailing line before we get here, so a parse failure
             // mid-file is real corruption and we want it greppable.
             log.warn(
-                "loadEntries: skipping corrupt entry at byte {d} of {s}: {s}",
+                "session: skipping corrupt entry at byte {d} of {s}: {s}",
                 .{ line_start_offset, path, @errorName(err) },
             );
             continue;
@@ -1685,6 +1693,22 @@ test "parseEntry frees the prior value on a duplicate key (no leak, last wins)" 
     try std.testing.expectEqualStrings("second", parsed.content);
     try std.testing.expect(parsed.signature != null);
     try std.testing.expectEqualStrings("sig2", parsed.signature.?);
+}
+
+test "parseEntry rejects an invalid subagent_path element" {
+    const allocator = std.testing.allocator;
+
+    // Negative, u32-overflowing, and non-integer array elements each fail the
+    // line (matching the old DOM reader's InvalidSubagentPath). The partial
+    // path list built before the bad element must not leak.
+    const neg = "{\"type\":\"info\",\"subagent_path\":[0,-1],\"ts\":1}";
+    try std.testing.expectError(error.InvalidSubagentPath, parseEntry(neg, allocator));
+
+    const over = "{\"type\":\"info\",\"subagent_path\":[4294967296],\"ts\":1}";
+    try std.testing.expectError(error.InvalidSubagentPath, parseEntry(over, allocator));
+
+    const str = "{\"type\":\"info\",\"subagent_path\":[\"x\"],\"ts\":1}";
+    try std.testing.expectError(error.InvalidSubagentPath, parseEntry(str, allocator));
 }
 
 test "serializeEntry with tool fields" {
@@ -2692,6 +2716,39 @@ test "recoverSessionFiles leaves a clean newline-terminated file untouched" {
     const after = try tmp.dir.readFileAlloc(allocator, "sess.jsonl", 1024);
     defer allocator.free(after);
     try std.testing.expectEqualStrings(jsonl_body, after);
+}
+
+test "recoverSessionFiles is a no-op on an empty session file" {
+    // end_pos == 0 short-circuits before any tail read or backward scan.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = "" });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc");
+    try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
+}
+
+test "recoverSessionFiles truncates a lone unterminated line with no newline" {
+    // A file with zero '\n' is one torn line: lastNewlinePos exhausts its
+    // backward scan to offset 0, so the whole file is truncated away.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "{\"a\":1}"; // no trailing newline
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = body });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc");
+    try std.testing.expectEqual(@as(usize, body.len), report.truncated_bytes);
+
+    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
 test "loader synthesizes ids for pre-migration entries" {
