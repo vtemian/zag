@@ -262,9 +262,10 @@ pub const Meta = struct {
 ///
 /// The cwd is canonicalized with `realpath` before insertion so the same
 /// project reached via a symlink alias or with a trailing slash collapses
-/// to a single registry entry; if realpath fails (e.g. the cwd was
-/// removed between getCwdAlloc and realpathAlloc, rare but possible) the
-/// raw cwd string is used as a fallback rather than abandoning the call.
+/// to a single registry entry. 0.16 routes the cwd through realpath under
+/// the process io, which canonicalizes symlinks in one step (the old
+/// getCwdAlloc + realpathAlloc pair); on failure the error propagates rather
+/// than registering a non-canonical path.
 pub fn recordCwdInRegistry(allocator: Allocator) !void {
     const home = try env_mod.getOwned(allocator, "HOME");
     defer allocator.free(home);
@@ -272,11 +273,8 @@ pub fn recordCwdInRegistry(allocator: Allocator) !void {
     const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zag" });
     defer allocator.free(config_dir);
 
-    const raw_cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(raw_cwd);
-
-    const canonical_cwd = std.fs.realpathAlloc(allocator, raw_cwd) catch raw_cwd;
-    defer if (canonical_cwd.ptr != raw_cwd.ptr) allocator.free(canonical_cwd);
+    const canonical_cwd = try std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", allocator);
+    defer allocator.free(canonical_cwd);
 
     var registry = try ProjectRegistry.init(allocator, config_dir);
     defer registry.deinit();

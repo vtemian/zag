@@ -1188,8 +1188,8 @@ fn applyRefinedName(self: *Conversation, name: []const u8, prompt: []const u8) !
             if (link_node.node_type != .subagent_link) continue;
             if (link_node.subagent_index != self.parent_subagent_id) continue;
 
-            const should_set_prompt = (prompt.len > 0) and
-                ((link_node.subagent_prompt orelse "").len == 0);
+            const existing_prompt: []const u8 = link_node.subagent_prompt orelse "";
+            const should_set_prompt = (prompt.len > 0) and (existing_prompt.len == 0);
 
             // Dupe both first so a prompt-allocation failure leaves
             // the link node untouched (no half-applied refinement).

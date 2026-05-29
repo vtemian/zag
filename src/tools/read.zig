@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 
 const ReadInput = struct {
@@ -33,7 +34,7 @@ pub fn execute(
     const max_lines = input.max_lines orelse 2000;
 
     // Read the whole file into memory (up to 10MB)
-    const content = std.fs.cwd().readFileAlloc(allocator, input.path, types.max_file_bytes) catch |err| {
+    const content = std.Io.Dir.cwd().readFileAlloc(process_io.get(), input.path, allocator, .limited(types.max_file_bytes)) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };

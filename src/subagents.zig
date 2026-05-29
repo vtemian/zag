@@ -142,7 +142,12 @@ pub const SubagentRegistry = struct {
     pub fn taskInputSchemaJson(self: *const SubagentRegistry, alloc: Allocator) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(alloc);
-        try self.writeTaskInputSchema(list.writer(alloc));
+        // 0.16 dropped the ArrayList writer adapter. Drive the list through an
+        // Allocating writer, then sync the grown buffer back into `list` so
+        // `toOwnedSlice` returns the bytes the writer produced.
+        var aw = std.Io.Writer.Allocating.fromArrayList(alloc, &list);
+        try self.writeTaskInputSchema(&aw.writer);
+        list = aw.toArrayList();
         return list.toOwnedSlice(alloc);
     }
 };

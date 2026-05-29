@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 
 const EditInput = struct {
@@ -36,7 +37,8 @@ pub fn execute(
         return .{ .content = msg, .is_error = true };
     }
 
-    const content = std.fs.cwd().readFileAlloc(allocator, input.path, types.max_file_bytes) catch |err| {
+    const io = process_io.get();
+    const content = std.Io.Dir.cwd().readFileAlloc(io, input.path, allocator, .limited(types.max_file_bytes)) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
@@ -130,13 +132,13 @@ pub fn execute(
     }) catch return types.oomResult();
     defer allocator.free(new_content);
 
-    const file = std.fs.cwd().createFile(input.path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().createFile(io, input.path, .{}) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: cannot write '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(new_content) catch |err| {
+    file.writeStreamingAll(io, new_content) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: writing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };

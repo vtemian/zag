@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 
 const WriteInput = struct {
@@ -30,9 +31,11 @@ pub fn execute(
     defer parsed.deinit();
     const input = parsed.value;
 
+    const io = process_io.get();
+
     // Create parent directories if needed
     if (std.fs.path.dirname(input.path)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "error: cannot create directory '{s}': {s}", .{ dir, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
@@ -45,27 +48,27 @@ pub fn execute(
     defer allocator.free(tmp_path);
 
     {
-        const file = std.fs.cwd().createFile(tmp_path, .{ .truncate = true }) catch |err| {
+        const file = std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true }) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
-        defer file.close();
+        defer file.close(io);
 
-        file.writeAll(input.content) catch |err| {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+        file.writeStreamingAll(io, input.content) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             const msg = std.fmt.allocPrint(allocator, "error: writing to '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
 
-        file.sync() catch |err| {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+        file.sync(io) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             const msg = std.fmt.allocPrint(allocator, "error: syncing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
     }
 
-    std.fs.cwd().rename(tmp_path, input.path) catch |err| {
-        std.fs.cwd().deleteFile(tmp_path) catch {};
+    std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), input.path, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         const msg = std.fmt.allocPrint(allocator, "error: finalizing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };

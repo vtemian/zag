@@ -43,6 +43,7 @@ const env_mod = @import("../env.zig");
 const clock = @import("../clock.zig");
 const builtin = @import("builtin");
 const types = @import("../types.zig");
+const process_io = @import("../process_io.zig");
 const landlock = @import("../sandbox/landlock_linux.zig");
 const Allocator = std.mem.Allocator;
 
@@ -109,9 +110,12 @@ pub fn execute(
             break :home_blk "/";
         };
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch |err| cwd_blk: {
-            log.warn("realpath('.') failed ({s}); sandbox cwd write-scope will be rooted at '/', expect EPERM on writes", .{@errorName(err)});
-            break :cwd_blk "/";
+        const cwd: []const u8 = cwd_blk: {
+            const n = std.Io.Dir.cwd().realPath(process_io.get(), &cwd_buf) catch |err| {
+                log.warn("realpath('.') failed ({s}); sandbox cwd write-scope will be rooted at '/', expect EPERM on writes", .{@errorName(err)});
+                break :cwd_blk "/";
+            };
+            break :cwd_blk cwd_buf[0..n];
         };
 
         const built: ?SandboxArgv = switch (builtin.os.tag) {

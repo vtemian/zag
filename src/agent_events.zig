@@ -342,12 +342,16 @@ pub const EventQueue = struct {
         self.buffer[self.tail] = event;
         self.tail = (self.tail + 1) % self.buffer.len;
         self.len += 1;
-        // Signal the wake pipe if one is configured. WouldBlock (pipe full,
-        // wake already pending) and BrokenPipe (reader closed during
-        // shutdown) are expected; other errors are swallowed because the
+        // Signal the wake pipe if one is configured. 0.16 removed
+        // std.posix.write; the self-pipe wake is a single byte to a
+        // non-blocking fd whose errors (EAGAIN when a wake is already pending,
+        // EPIPE when the reader closed during shutdown) are all benign here,
+        // so write via the raw libc syscall and ignore the result, matching
+        // the wake writes in Terminal.zig and LuaCompletionQueue.zig. The
         // authoritative event delivery has already succeeded.
         if (self.wake_fd) |fd| {
-            _ = std.posix.write(fd, &[_]u8{1}) catch {};
+            const byte: [1]u8 = .{1};
+            _ = std.c.write(fd, &byte, 1);
         }
     }
 
