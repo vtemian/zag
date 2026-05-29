@@ -738,12 +738,20 @@ pub const SessionHandle = struct {
 
 /// Load all entries from a session's JSONL file.
 /// Caller must free the returned slice and each entry's allocated strings.
-pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
-    var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
-        return error.PathTooLong;
+/// Upper bound on the JSONL we will read into memory in one shot. Set far
+/// above any real session (the largest observed is ~9 MiB); the bound only
+/// guards against a corrupt or pathological file rather than capping normal
+/// growth. A session approaching this size would need lazy/windowed loading,
+/// which is out of scope here. Replaces a former 10 MiB cap that the largest
+/// real session was already at 90% of, so the next big one would have failed
+/// to open with `error.FileTooBig`.
+const max_session_bytes: usize = 1 << 30; // 1 GiB
 
-    const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |e| {
+/// Read `path` (cwd-relative) and parse every JSONL line into an owned Entry
+/// slice. Shared body of `loadEntries` (cwd session) and `loadEntriesAt`
+/// (arbitrary project root); both differ only in how they spell the path.
+fn loadEntriesFromPath(allocator: Allocator, path: []const u8) ![]Entry {
+    const content = std.fs.cwd().readFileAlloc(allocator, path, max_session_bytes) catch |e| {
         log.err("failed to read session file: {}", .{e});
         return e;
     };
@@ -781,6 +789,13 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
     }
 
     return entries.toOwnedSlice(allocator);
+}
+
+pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
+        return error.PathTooLong;
+    return loadEntriesFromPath(allocator, path);
 }
 
 /// Fill in a synthetic ULID for any entry loaded from a pre-migration JSONL
@@ -994,42 +1009,7 @@ pub fn loadEntriesAt(allocator: Allocator, project_path: []const u8, id: []const
         "{s}/{s}/{s}.jsonl",
         .{ project_path, sessions_dir, id },
     ) catch return error.PathTooLong;
-
-    const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |e| {
-        log.err("failed to read session file: {}", .{e});
-        return e;
-    };
-    defer allocator.free(content);
-
-    var entries: std.ArrayList(Entry) = .empty;
-    errdefer {
-        for (entries.items) |entry| freeEntry(entry, allocator);
-        entries.deinit(allocator);
-    }
-
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
-    var line_index: usize = 0;
-    var line_start_offset: usize = 0;
-    while (line_iter.next()) |line| {
-        defer line_start_offset += line.len + 1;
-        if (line.len == 0) continue;
-        var entry = parseEntry(line, allocator) catch |err| {
-            log.warn(
-                "loadEntriesAt: skipping corrupt entry at byte {d} of {s}: {s}",
-                .{ line_start_offset, path, @errorName(err) },
-            );
-            continue;
-        };
-        const previous_id: ?ulid.Ulid = if (entries.items.len > 0)
-            entries.items[entries.items.len - 1].id
-        else
-            null;
-        backfillEntry(&entry, previous_id, line_index);
-        try entries.append(allocator, entry);
-        line_index += 1;
-    }
-
-    return entries.toOwnedSlice(allocator);
+    return loadEntriesFromPath(allocator, path);
 }
 
 /// Outcome of a session's crash-recovery pass. `actual_line_count` is the
@@ -2965,6 +2945,50 @@ test "tool_call and tool_result round-trip tool_use_id and tool_input via loadEn
 
     // The cross-reference is the whole point: tool_result -> tool_call.
     try std.testing.expectEqualStrings(call_entry.tool_use_id.?, result_entry.tool_use_id.?);
+}
+
+test "loadEntries loads a session JSONL larger than the former 10 MiB cap" {
+    // A single entry whose content exceeds 10 MiB used to fail the entire
+    // load with error.FileTooBig (readFileAlloc's hard cap). The largest real
+    // session was already ~9 MiB, so the next big one would not have opened.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try std.fs.cwd().makePath(sessions_dir);
+
+    const big_len = 11 * 1024 * 1024;
+    const huge = try allocator.alloc(u8, big_len);
+    defer allocator.free(huge);
+    @memset(huge, 'x');
+
+    const session_id = "bigsession000000";
+    var path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
+
+    // One JSONL line by hand; 'x' bytes need no escaping.
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    try line.appendSlice(allocator, "{\"type\":\"info\",\"content\":\"");
+    try line.appendSlice(allocator, huge);
+    try line.appendSlice(allocator, "\",\"ts\":1}\n");
+    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = line.items });
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqual(EntryType.info, loaded[0].entry_type);
+    try std.testing.expectEqual(@as(usize, big_len), loaded[0].content.len);
 }
 
 test "backfillEntry mixes line index into seed to avoid same-ms collisions" {
