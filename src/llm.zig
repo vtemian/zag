@@ -62,6 +62,12 @@ pub const ProviderError = std.mem.Allocator.Error || CancelError || error{
     /// Refresh token was rejected by the IdP (invalid_grant family).
     /// The user needs to re-run `zag --login=<provider>`.
     LoginExpired,
+    /// A socket-level inter-byte read timeout fired (SO_RCVTIMEO/EAGAIN
+    /// recovered by `streaming.readChunk` / `http.zig`). Surfaced
+    /// verbatim rather than collapsed into `ApiError` so the agent
+    /// fallback can treat a stalled connection as retryable, distinct
+    /// from an opaque transport failure.
+    ReadTimeout,
 };
 
 /// Cooperative-cancellation error, composed into ProviderError via `||`.
@@ -92,6 +98,7 @@ pub fn mapProviderError(err: anyerror) ProviderError {
         error.ProviderResponseFailed => error.ProviderResponseFailed,
         error.NotLoggedIn => error.NotLoggedIn,
         error.LoginExpired => error.LoginExpired,
+        error.ReadTimeout => error.ReadTimeout,
         else => blk: {
             log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
             break :blk error.ApiError;
@@ -1107,6 +1114,13 @@ test "mapProviderError passes LoginExpired through" {
     try std.testing.expectEqual(
         @as(ProviderError, error.LoginExpired),
         mapProviderError(error.LoginExpired),
+    );
+}
+
+test "mapProviderError passes ReadTimeout through" {
+    try std.testing.expectEqual(
+        @as(ProviderError, error.ReadTimeout),
+        mapProviderError(error.ReadTimeout),
     );
 }
 
