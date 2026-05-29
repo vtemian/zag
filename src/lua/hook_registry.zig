@@ -546,7 +546,7 @@ pub const HookDispatcher = struct {
             return;
         };
         defer parsed.deinit();
-        lua_json.pushJsonValue(lua, parsed.value);
+        try lua_json.pushJsonValue(lua, parsed.value);
         lua.setField(-2, key);
     }
 };
