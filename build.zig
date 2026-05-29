@@ -36,9 +36,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("build_options", build_options.createModule());
-    exe_mod.addImport("zlua", zlua_dep.module("zlua"));
-    exe_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+    addCommonImports(exe_mod, build_options, zlua_dep, zigimg_dep);
 
     const exe = b.addExecutable(.{
         .name = "zag",
@@ -151,9 +149,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addImport("build_options", build_options.createModule());
-    test_mod.addImport("zlua", zlua_dep.module("zlua"));
-    test_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+    addCommonImports(test_mod, build_options, zlua_dep, zigimg_dep);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
@@ -171,13 +167,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    agent_test_mod.addImport("build_options", build_options.createModule());
-    agent_test_mod.addImport("zlua", zlua_dep.module("zlua"));
-    agent_test_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+    addCommonImports(agent_test_mod, build_options, zlua_dep, zigimg_dep);
 
     const agent_tests = b.addTest(.{
         .root_module = agent_test_mod,
     });
     const run_agent_tests = b.addRunArtifact(agent_tests);
     test_step.dependOn(&run_agent_tests.step);
+}
+
+/// Wire the imports every zag-graph module shares: a fresh `build_options`
+/// module (one per graph, never shared across modules), plus the zlua and
+/// zigimg dependency modules. sim_mod is intentionally excluded; it omits
+/// zlua/zigimg to keep Lua out of the sim binary's libc/ghostty-only link.
+fn addCommonImports(
+    m: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+    zlua_dep: *std.Build.Dependency,
+    zigimg_dep: *std.Build.Dependency,
+) void {
+    m.addImport("build_options", build_options.createModule());
+    m.addImport("zlua", zlua_dep.module("zlua"));
+    m.addImport("zigimg", zigimg_dep.module("zigimg"));
 }
