@@ -80,11 +80,10 @@ fn onStreamEvent(opaque_ctx: *anyopaque, event: llm.StreamEvent) void {
                 ctx.cancel.store(true, .release);
                 return;
             };
-            const duped = ctx.allocator.dupe(u8, t) catch return;
-            // pushWithBackpressure frees `duped` via the supplied allocator
-            // on drop, so don't free again.
+            const duped = agent_events.OwnedPayload.dupe(ctx.allocator, t) catch return;
+            // pushWithBackpressure frees `duped` via its own allocator on
+            // drop, so don't free again.
             ctx.queue.pushWithBackpressure(
-                ctx.allocator,
                 .{ .compaction_summary_delta = duped },
                 agent_events.default_backpressure_ms,
             ) catch {};

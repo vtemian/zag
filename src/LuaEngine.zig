@@ -11448,7 +11448,7 @@ test "runDefaultSummarization detects prior summary and switches to UPDATE promp
     while (true) {
         const n = queue.drain(&buf);
         if (n == 0) break;
-        for (buf[0..n]) |ev| ev.freeOwned(alloc);
+        for (buf[0..n]) |ev| ev.freeOwned();
     }
 }
 
@@ -11516,10 +11516,10 @@ test "zag.llm.complete with stream=true emits compaction_summary_delta to attach
         for (buf[0..n]) |ev| {
             switch (ev) {
                 .compaction_summary_delta => |t| {
-                    if (std.mem.indexOf(u8, t, "STREAM ME") != null) found_delta = true;
-                    alloc.free(t);
+                    if (std.mem.indexOf(u8, t.bytes, "STREAM ME") != null) found_delta = true;
+                    t.free();
                 },
-                else => ev.freeOwned(alloc),
+                else => ev.freeOwned(),
             }
         }
     }
