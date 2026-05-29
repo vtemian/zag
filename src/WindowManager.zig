@@ -1938,6 +1938,22 @@ pub fn attachSession(self: *WindowManager, pane: Pane) ?*Session.SessionHandle {
         return null;
     };
     conversation.attachSession(h);
+
+    // Announce the new session so an open sessions sidebar drops its cached
+    // list and shows the row. The `.created` change otherwise has no producer
+    // (rename/delete fire from the Lua bindings, status from AgentRunner); a
+    // missing or flaky engine just means the sidebar refreshes on its next
+    // event. Mirrors AgentRunner.announceSessionStatus's fire shape.
+    if (self.lua_engine) |engine| {
+        var payload: Hooks.HookPayload = .{ .session_list_changed = .{
+            .change = .created,
+            .session_id = h.meta.idSlice(),
+        } };
+        _ = engine.fireHook(&payload) catch |err| {
+            log.warn("SessionListChanged(.created) hook fire failed: {}", .{err});
+        };
+    }
+
     return h;
 }
 
@@ -5279,6 +5295,16 @@ test "restorePane rebuilds both tree and messages" {
 
     // Session handle was attached.
     try std.testing.expect(cb.session_handle != null);
+
+    // Content survives the scratch arena that backed the load. restorePane
+    // bump-allocates the Entry slice and frees it (arena deinit) before
+    // returning, so reading the text now would dangle if any node borrowed
+    // Entry bytes instead of copying them into the conversation's buffers.
+    var content_theme = @import("Theme.zig").defaultTheme();
+    const rr = try cb.readText(allocator, 100, &content_theme);
+    defer allocator.free(rr.text);
+    try std.testing.expect(std.mem.indexOf(u8, rr.text, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rr.text, "hello") != null);
 }
 
 // -- Provider swap test scaffolding ------------------------------------------
@@ -8428,6 +8454,13 @@ test "splitFocusedWithSession attaches loaded session to a new pane" {
 
     const sh = session_conv.session_handle orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(session_id, sh.id[0..sh.id_len]);
+
+    // openSessionPane arena-loads the Entry slice and frees it before
+    // returning; the replayed content must have been copied into the pane's
+    // buffers, not left borrowing the freed arena. Reading it back proves so.
+    const rr = try session_conv.readText(allocator, 100, &theme);
+    defer allocator.free(rr.text);
+    try std.testing.expect(std.mem.indexOf(u8, rr.text, "hi from disk") != null);
 }
 
 test "splitFocusedWithSession rejects sessions when persistence is disabled" {
