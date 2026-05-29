@@ -11,6 +11,7 @@
 //! endpoints (e.g. local Ollama) skip credential capture entirely.
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
 const process_io = @import("process_io.zig");
 const env_mod = @import("env.zig");
 
@@ -682,7 +683,7 @@ pub fn promptPicker(
 
     var buf: [1]u8 = undefined;
     while (true) {
-        const n = std.posix.read(fd, &buf) catch |err| {
+        const n = wake_pipe.read(fd, &buf) catch |err| {
             try deps.stdout.writeByte('\n');
             try deps.stdout.flush();
             return err;

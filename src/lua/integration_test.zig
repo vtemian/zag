@@ -9,6 +9,7 @@
 //! fixtures in one place.
 
 const std = @import("std");
+const wake_pipe = @import("../wake_pipe.zig");
 const clock = @import("../clock.zig");
 const env_mod = @import("../env.zig");
 const testing = std.testing;
@@ -103,9 +104,9 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
     eng.async_runtime.?.completions.wake_fd = fds[1];
 
     // Build a minimal Job the worker can run. Sleep(0) is fine.
@@ -124,7 +125,7 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
     var buf: [1]u8 = undefined;
     const deadline = clock.milliTimestamp() + 1000;
     while (clock.milliTimestamp() < deadline) {
-        const n = std.posix.read(fds[0], &buf) catch |err| switch (err) {
+        const n = wake_pipe.read(fds[0], &buf) catch |err| switch (err) {
             error.WouldBlock => {
                 clock.sleep(1 * std.time.ns_per_ms);
                 continue;

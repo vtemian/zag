@@ -38,9 +38,58 @@ pub fn open() Error![2]posix.fd_t {
     return fds;
 }
 
+/// Create a plain blocking pipe (no NONBLOCK/CLOEXEC). Returns
+/// `.{ read_fd, write_fd }`. Drop-in for the removed `std.posix.pipe()`,
+/// used by tests that write a payload and read it back synchronously.
+pub fn openBlocking() Error![2]posix.fd_t {
+    var fds: [2]c.fd_t = undefined;
+    while (true) switch (posix.errno(c.pipe(&fds))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        else => return error.Unexpected,
+    };
+    return fds;
+}
+
 /// Close a wake fd. Drop-in for the removed `std.posix.close` on these fds.
 pub fn close(fd: posix.fd_t) void {
     std.Io.Threaded.closeFd(fd);
+}
+
+pub const RwError = error{ WouldBlock, BrokenPipe, EndOfStream, Unexpected };
+
+/// Read from a raw pipe fd. Drop-in for the removed `std.posix.read` on the
+/// wake/test pipes: returns the byte count, `error.EndOfStream` on a 0-length
+/// read (writer closed), and `error.WouldBlock` on EAGAIN so drain loops keep
+/// their "read until empty" shape.
+pub fn read(fd: posix.fd_t, buf: []u8) RwError!usize {
+    while (true) {
+        const rc = c.read(fd, buf.ptr, buf.len);
+        if (rc > 0) return @intCast(rc);
+        if (rc == 0) return error.EndOfStream;
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+/// Write to a raw pipe fd. Drop-in for the removed `std.posix.write` on the
+/// wake/test pipes.
+pub fn write(fd: posix.fd_t, bytes: []const u8) RwError!usize {
+    while (true) {
+        const rc = c.write(fd, bytes.ptr, bytes.len);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .PIPE => return error.BrokenPipe,
+            else => return error.Unexpected,
+        }
+    }
 }
 
 fn setFlag(fd: posix.fd_t, cmd: i32, flag: u32) Error!void {

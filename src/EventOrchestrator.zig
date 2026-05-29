@@ -12,6 +12,7 @@
 //! (see Conversation.draft).
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
 const clock = @import("clock.zig");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
@@ -248,7 +249,7 @@ pub fn run(self: *EventOrchestrator) !void {
 fn drainWakePipe(fd: posix.fd_t) void {
     var buf: [64]u8 = undefined;
     while (true) {
-        _ = posix.read(fd, &buf) catch return;
+        _ = wake_pipe.read(fd, &buf) catch return;
     }
 }
 
@@ -1291,27 +1292,27 @@ test {
 }
 
 test "drainWakePipe consumes all pending bytes" {
-    const fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     // Write more than the 64-byte internal scratch so drainWakePipe must loop.
     const payload = [_]u8{1} ** 128;
-    try std.testing.expectEqual(@as(usize, 128), try posix.write(fds[1], &payload));
+    try std.testing.expectEqual(@as(usize, 128), try wake_pipe.write(fds[1], &payload));
 
     drainWakePipe(fds[0]);
 
     // A subsequent non-blocking read must now return WouldBlock, proving the
     // pipe is empty. EAGAIN maps to error.WouldBlock on Zig 0.15.
     var scratch: [8]u8 = undefined;
-    const residual = posix.read(fds[0], &scratch);
+    const residual = wake_pipe.read(fds[0], &scratch);
     try std.testing.expectError(error.WouldBlock, residual);
 }
 
 test "drainWakePipe on empty pipe returns without blocking" {
-    const fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     // Pipe is empty; the function must bail on the first WouldBlock rather
     // than hang. If this test ever times out, drainWakePipe is blocking.

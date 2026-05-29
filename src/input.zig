@@ -12,6 +12,7 @@
 //! - `parser`: stateful `Parser` with fragmentation + ESC timeout.
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
 const core = @import("input/core.zig");
 const parser_mod = @import("input/parser.zig");
 
@@ -1084,20 +1085,20 @@ test "Parser.pollOnce: fragmented CSI via a real pipe resolves to Ctrl+Up" {
     // `pipe2` with the flag struct is the codebase idiom (see
     // agent_events.zig, main.zig, Screen.zig). Prefer it over
     // pipe + fcntl for portability across Zig 0.15's posix module.
-    const pipe = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const pipe = try wake_pipe.open();
     const read_fd = pipe[0];
     const write_fd = pipe[1];
-    defer std.posix.close(read_fd);
-    defer std.posix.close(write_fd);
+    defer wake_pipe.close(read_fd);
+    defer wake_pipe.close(write_fd);
 
     var p: Parser = .{};
 
     // Write the first fragment.
-    _ = try std.posix.write(write_fd, &.{ 0x1b, '[' });
+    _ = try wake_pipe.write(write_fd, &.{ 0x1b, '[' });
     try std.testing.expect(p.pollOnce(read_fd, 0) == null);
 
     // Write the rest.
-    _ = try std.posix.write(write_fd, &.{ '1', ';', '5', 'A' });
+    _ = try wake_pipe.write(write_fd, &.{ '1', ';', '5', 'A' });
     const ev = p.pollOnce(read_fd, 1).?;
     switch (ev) {
         .key => |k| {

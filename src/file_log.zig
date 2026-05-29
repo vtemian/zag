@@ -283,10 +283,7 @@ test "initWithPath opens an existing directory and appends" {
         const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
         defer file.close(std.testing.io);
         var fr = file.reader(std.testing.io, &read_scratch);
-        const n = fr.interface.readSliceShort(&contents_buf) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
+        const n = try fr.interface.readSliceShort(&contents_buf);
         break :blk contents_buf[0..n];
     };
 
@@ -395,10 +392,7 @@ test "handler drops messages below min level" {
         const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
         defer file.close(std.testing.io);
         var fr = file.reader(std.testing.io, &read_scratch);
-        const n = fr.interface.readSliceShort(&contents_buf) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
+        const n = try fr.interface.readSliceShort(&contents_buf);
         break :blk contents_buf[0..n];
     };
 
@@ -430,10 +424,7 @@ test "raising min level to debug lets debug through" {
         const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
         defer file.close(std.testing.io);
         var fr = file.reader(std.testing.io, &read_scratch);
-        const n = fr.interface.readSliceShort(&contents_buf) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => return err,
-        };
+        const n = try fr.interface.readSliceShort(&contents_buf);
         break :blk contents_buf[0..n];
     };
     try std.testing.expect(std.mem.indexOf(u8, contents, "verbose: 42") != null);

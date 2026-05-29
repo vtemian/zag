@@ -10,6 +10,7 @@
 //! would stall the whole pool.
 
 const std = @import("std");
+const wake_pipe = @import("../wake_pipe.zig");
 const sync = @import("../sync.zig");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
@@ -120,16 +121,16 @@ test "Queue.push writes one byte to wake_fd" {
     var q = try Queue.init(alloc, 4);
     defer q.deinit();
 
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     q.wake_fd = fds[1];
     var j = stubJob(root);
     try q.push(&j);
 
     var buf: [4]u8 = undefined;
-    const n = try std.posix.read(fds[0], &buf);
+    const n = try wake_pipe.read(fds[0], &buf);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(@as(u8, 1), buf[0]);
 }

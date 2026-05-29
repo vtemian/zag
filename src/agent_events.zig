@@ -8,6 +8,7 @@
 //! thread-spawning code.
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
 const sync = @import("sync.zig");
 const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
@@ -1051,15 +1052,15 @@ test "push writes to wake_fd when set" {
     var queue = try EventQueue.initBounded(std.testing.allocator, 16);
     defer queue.deinit();
 
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     queue.wake_fd = fds[1];
     try queue.push(.{ .text_delta = "hi" });
 
     var buf: [16]u8 = undefined;
-    const n = try std.posix.read(fds[0], &buf);
+    const n = try wake_pipe.read(fds[0], &buf);
     try std.testing.expectEqual(@as(usize, 1), n);
 
     var drain_buf: [4]AgentEvent = undefined;

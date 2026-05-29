@@ -7,6 +7,7 @@
 //! without a follow-up byte.
 
 const std = @import("std");
+const wake_pipe = @import("../wake_pipe.zig");
 const core = @import("core.zig");
 const Event = core.Event;
 const KeyEvent = core.KeyEvent;
@@ -223,7 +224,7 @@ pub const Parser = struct {
     /// available; the caller should poll the fd again later.
     pub fn pollOnce(self: *Parser, fd: std.posix.fd_t, now_ms: i64) ?Event {
         var buf: [READ_BUF_SIZE]u8 = undefined;
-        const n = std.posix.read(fd, &buf) catch |err| switch (err) {
+        const n = wake_pipe.read(fd, &buf) catch |err| switch (err) {
             error.WouldBlock => 0,
             else => blk: {
                 log.warn("unexpected read error: {}", .{err});

@@ -562,7 +562,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
 
         if (count == 0) {
             var wake_buf: [64]u8 = undefined;
-            _ = posix.read(deps.wake_read_fd, &wake_buf) catch {};
+            _ = wake_pipe.read(deps.wake_read_fd, &wake_buf) catch {};
             continue;
         }
 
