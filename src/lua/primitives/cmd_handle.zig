@@ -22,6 +22,8 @@
 
 const std = @import("std");
 const sync = @import("../../sync.zig");
+const clock = @import("../../clock.zig");
+const process_io = @import("../../process_io.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -173,6 +175,7 @@ pub const CmdHandle = struct {
         argv: []const []const u8,
         opts: SpawnOpts,
     ) !*CmdHandle {
+        const io = process_io.get();
         const self = try alloc.create(CmdHandle);
         errdefer alloc.destroy(self);
 
@@ -181,50 +184,50 @@ pub const CmdHandle = struct {
             .completions = completions,
             .root_scope = root_scope,
             .arena = arena,
-            .child = std.process.Child.init(argv, alloc),
+            .child = undefined,
             .helper = undefined,
             .max_line_bytes = opts.max_line_bytes,
         };
-        // Route stdio to /dev/null by default. `.Close` would hand
-        // EBADF to any child that writes a startup banner (see
-        // /bin/echo, which exits non-zero when stdout is closed);
-        // `.Inherit` would spam the host process's terminal during
-        // tests. `capture_stdout` in `opts` opts into `.Pipe` for
-        // `:lines()`; `:write` in 6.4c will add `capture_stdin`.
-        // stderr is always `.Ignore` until `:stderr_lines()` exists;
-        // the Lua binding rejects `capture_stderr = true` at spawn
-        // rather than silently letting a chatty child stall on a full
-        // stderr pipe the helper never drains.
-        self.child.stdin_behavior = if (opts.capture_stdin) .Pipe else .Ignore;
-        self.child.stdout_behavior = if (opts.capture_stdout) .Pipe else .Ignore;
-        self.child.stderr_behavior = .Ignore;
-        if (opts.cwd) |c| self.child.cwd = c;
 
+        // 0.16 moved stdio routing, cwd, and env onto the spawn options;
+        // `std.process.Child` no longer has post-init `*_behavior` fields or
+        // a `spawn` method. Move the EnvMap into stable handle storage first
+        // so `environ_map` can borrow it for the spawn syscall and beyond.
         switch (opts.env_mode) {
             .inherit => {},
             .replace, .extend => if (opts.env_map) |m| {
-                // Move the EnvMap into stable handle storage; child.env_map
-                // is a borrow that must survive past Child.spawn(), so it
-                // cannot point into the caller's stack frame. Caller has
-                // already merged parent env for .extend.
+                // Caller has already merged parent env for .extend.
                 self.env_map_storage = m;
-                self.child.env_map = &self.env_map_storage.?;
             },
         }
 
-        try self.child.spawn();
+        // Route stdio to /dev/null by default. `.close` would hand EBADF to
+        // any child that writes a startup banner (see /bin/echo, which exits
+        // non-zero when stdout is closed); `.inherit` would spam the host
+        // process's terminal during tests. `capture_stdout` opts into a pipe
+        // for `:lines()`; `capture_stdin` into one for `:write()`. stderr is
+        // always `.ignore` until `:stderr_lines()` exists; the Lua binding
+        // rejects `capture_stderr = true` at spawn rather than silently
+        // letting a chatty child stall on a full stderr pipe.
+        self.child = std.process.spawn(io, .{
+            .argv = argv,
+            .cwd = if (opts.cwd) |c| .{ .path = c } else .inherit,
+            .environ_map = if (self.env_map_storage) |*m| m else null,
+            .stdin = if (opts.capture_stdin) .pipe else .ignore,
+            .stdout = if (opts.capture_stdout) .pipe else .ignore,
+            .stderr = .ignore,
+        }) catch |err| return err;
         errdefer {
             // Spawn succeeded but we failed below; kill-and-reap so we
             // don't strand a child.
-            std.posix.kill(self.child.id, std.posix.SIG.KILL) catch {};
-            _ = self.child.wait() catch {};
+            self.child.kill(io);
         }
 
         self.helper = try std.Thread.spawn(.{}, helperLoop, .{self});
         // Name the helper for nicer debugger/`ps -M` output. setName
         // can fail on some OSes (permissions, unsupported); ignore
         // and log at debug; the helper still works unnamed.
-        self.helper.setName("zag.cmd_handle") catch |err| {
+        self.helper.setName(io, "zag.cmd_handle") catch |err| {
             log.debug("cmd_handle helper setName failed: {s}", .{@errorName(err)});
         };
         return self;
@@ -267,7 +270,9 @@ pub const CmdHandle = struct {
     /// and we skip the kill entirely.
     fn runKill(self: *CmdHandle, signo: u8) void {
         if (self.state.load(.acquire) == .exited) return;
-        std.posix.kill(self.child.id, signalNumToSig(signo)) catch |err| {
+        // `child.id` becomes null once `wait`/`kill` has reaped the process.
+        const pid = self.child.id orelse return;
+        std.posix.kill(pid, signalNumToSig(signo)) catch |err| {
             log.debug("cmd:kill helper kill failed: {s}", .{@errorName(err)});
         };
     }
@@ -300,15 +305,21 @@ pub const CmdHandle = struct {
         }
 
         // Pull bytes until a newline lands in the buffer or the pipe
-        // drains. `std.Io.File.read` blocks; that's fine because the
-        // helper thread exists precisely to absorb that block.
+        // drains. `readStreaming` blocks; that's fine because the helper
+        // thread exists precisely to absorb that block. 0.16 signals EOF
+        // with `error.EndOfStream` rather than a 0-length read, so fold
+        // that back into the existing n==0 drain path.
+        const io = process_io.get();
         while (true) {
             var chunk: [4096]u8 = undefined;
-            const n = stdout.read(&chunk) catch |err| {
-                log.warn("read_line: stdout read failed: {s}", .{@errorName(err)});
-                self.stdout_eof = true;
-                self.postReadLineDone(thread_ref, null);
-                return;
+            const n = stdout.readStreaming(io, &.{&chunk}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => {
+                    log.warn("read_line: stdout read failed: {s}", .{@errorName(err)});
+                    self.stdout_eof = true;
+                    self.postReadLineDone(thread_ref, null);
+                    return;
+                },
             };
             if (n == 0) {
                 self.stdout_eof = true;
@@ -393,7 +404,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -421,7 +432,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -445,7 +456,7 @@ pub const CmdHandle = struct {
             return;
         };
 
-        stdin.writeAll(data) catch |err| {
+        stdin.writeStreamingAll(process_io.get(), data) catch |err| {
             self.postWriteDoneErr(thread_ref, @errorName(err));
             return;
         };
@@ -460,7 +471,7 @@ pub const CmdHandle = struct {
     /// so the coroutine resumes rather than hanging.
     fn runCloseStdin(self: *CmdHandle, thread_ref: i32) void {
         if (self.child.stdin) |stdin| {
-            stdin.close();
+            stdin.close(process_io.get());
             self.child.stdin = null;
         }
         self.postCloseStdinDone(thread_ref);
@@ -484,7 +495,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -511,7 +522,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -536,7 +547,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -552,7 +563,7 @@ pub const CmdHandle = struct {
     /// time __gc runs the completion queue itself may be torn down).
     fn runWait(self: *CmdHandle, thread_ref: i32) void {
         if (self.state.load(.acquire) != .exited) {
-            const term = self.child.wait() catch |err| {
+            const term = self.child.wait(process_io.get()) catch |err| {
                 log.warn("child.wait failed: {s}", .{@errorName(err)});
                 self.exit_code = -1;
                 self.state.store(.exited, .release);
@@ -561,9 +572,9 @@ pub const CmdHandle = struct {
             };
 
             self.exit_code = switch (term) {
-                .Exited => |c| @as(i32, @intCast(c)),
-                .Signal => |s| -@as(i32, @intCast(s)),
-                .Stopped, .Unknown => -1,
+                .exited => |c| @as(i32, @intCast(c)),
+                .signal => |s| -@as(i32, @intCast(@intFromEnum(s))),
+                .stopped, .unknown => -1,
             };
             self.state.store(.exited, .release);
         }
@@ -604,7 +615,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -628,7 +639,7 @@ pub const CmdHandle = struct {
         // deliver the kill; otherwise we also enqueue the wait.
         const s = self.state.load(.acquire);
         if (s != .exited) {
-            self.submit(.{ .kill = .{ .signo = std.posix.SIG.KILL } }) catch {};
+            self.submit(.{ .kill = .{ .signo = @intFromEnum(std.posix.SIG.KILL) } }) catch {};
             if (s == .running) {
                 self.submit(.{ .wait = .{ .thread_ref = 0 } }) catch {};
             }
@@ -636,7 +647,7 @@ pub const CmdHandle = struct {
             // been SIGKILLed. If this ever hangs, the process is
             // uninterruptible (D state) and we have a bigger problem.
             while (self.state.load(.acquire) != .exited) {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
         }
 

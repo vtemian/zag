@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const zlua = @import("zlua");
+const clock = @import("../clock.zig");
 const Hooks = @import("../Hooks.zig");
 const lua_json = @import("lua_json.zig");
 const Allocator = std.mem.Allocator;
@@ -216,7 +217,7 @@ pub const HookDispatcher = struct {
                 // other threads; 1ms is short enough to keep latency low
                 // on short hook bodies and long enough to avoid burning
                 // a core on slow primitives.
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
         }
 

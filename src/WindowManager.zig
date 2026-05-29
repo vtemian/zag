@@ -2365,7 +2365,7 @@ fn swapProviderOnPanePtr(
             while (runner.isAgentRunning()) : (waited_ms += 1) {
                 if (waited_ms >= timeout_ms) return error.SwapTimeout;
                 _ = runner.drainEvents();
-                std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
         }
         runner.shutdown();

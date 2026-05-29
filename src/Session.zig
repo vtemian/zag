@@ -593,13 +593,14 @@ pub const SessionHandle = struct {
         };
         const json = json_buf.items;
 
+        const io = process_io.get();
         var write_scratch: [256]u8 = undefined;
         // std.Io.File.writer defaults to positional mode starting at pos=0,
         // so every appendEntry would pwrite from byte 0 and clobber prior
         // rows. writerStreaming uses the file's own cursor, which createFile
         // leaves at 0 and loadSession advances via seekFromEnd(0), so writes
         // always land at the current tail.
-        var w = self.file.writerStreaming(&write_scratch);
+        var w = self.file.writerStreaming(io, &write_scratch);
         w.interface.writeAll(json) catch |e| {
             log.err("failed to write entry: {}", .{e});
             return e;
@@ -639,7 +640,7 @@ pub const SessionHandle = struct {
             // On macOS APFS, std.Io.File.sync() routes to F_FULLFSYNC, which is
             // the strict barrier covering all dirty pages for the fd. A stdlib
             // regression to plain fsync(2) would weaken power-loss semantics.
-            try self.file.sync();
+            try self.file.sync(io);
             self.fsync_count += 1;
             self.updateMeta() catch |e| {
                 log.warn("failed to update meta after append: {}", .{e});

@@ -78,6 +78,26 @@ pub const Timer = struct {
     }
 };
 
+/// Block the calling thread for `ns` nanoseconds. Drop-in for the removed
+/// `std.Thread.sleep`/`std.time.sleep`: 0.16 routes sleeps through `io.sleep`,
+/// but the few sleep sites in Zag are short poll-loop pauses with no io in
+/// scope and no cancellation semantics, so they go straight to libc
+/// `nanosleep` like the other clock shims here.
+pub fn sleep(ns: u64) void {
+    var req: posix.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    // nanosleep writes the unslept remainder into `req` on EINTR, so the
+    // loop resumes from where it was interrupted. Any other failure (only
+    // EINVAL is possible with a well-formed timespec) just ends the wait.
+    while (true) {
+        const rc = std.c.nanosleep(&req, &req);
+        if (rc == 0) return;
+        if (posix.errno(rc) != .INTR) return;
+    }
+}
+
 // -- Secure random --------------------------------------------------------
 //
 // 0.16 removed `std.crypto.random`; the secure source now lives behind

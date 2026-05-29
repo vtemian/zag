@@ -219,7 +219,7 @@ pub fn formatKeySpec(buf: []u8, ev: input.KeyEvent) []const u8 {
             } else if (ch >= 0x20 and ch < 0x7f) {
                 w.writeByte(@intCast(ch)) catch {};
             } else {
-                std.fmt.format(w, "u{d}", .{@as(u32, ch)}) catch {};
+                w.print("u{d}", .{@as(u32, ch)}) catch {};
             }
         },
         .escape => w.writeAll("Esc") catch {},
@@ -236,7 +236,7 @@ pub fn formatKeySpec(buf: []u8, ev: input.KeyEvent) []const u8 {
         .page_down => w.writeAll("PageDown") catch {},
         .delete => w.writeAll("Del") catch {},
         .insert => w.writeAll("Ins") catch {},
-        .function => |n| std.fmt.format(w, "F{d}", .{n}) catch {},
+        .function => |n| w.print("F{d}", .{n}) catch {},
     }
     w.writeAll(">") catch {};
     return stream.buffered();

@@ -208,7 +208,7 @@ pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
     // Windows has no POSIX mode bits, so skip the check there.
     if (@import("builtin").os.tag != .windows) {
         if (cwd.statFile(io, path, .{})) |stat| {
-            const mode: std.posix.mode_t = @intCast(stat.mode & 0o7777);
+            const mode: std.posix.mode_t = @intCast(stat.permissions.toMode() & 0o7777);
             if (!checkFileMode(mode)) {
                 log.warn("auth file at '{s}' has mode 0o{o} (expected 0o600); credentials may be readable by other users", .{ path, mode });
             }
