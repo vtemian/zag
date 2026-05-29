@@ -4,7 +4,7 @@
 //! sidebar plugin. The full surface is:
 //!
 //!   * `zag.sessions.list()`: array of `{id, name, model, created_ms,
-//!     updated_ms, message_count, project}` rows aggregated across every
+//!     updated_ms, message_count, status, project}` rows aggregated across every
 //!     project recorded in `ProjectRegistry`, sorted by `updated_ms`
 //!     descending.
 //!   * `zag.sessions.rename(id, new_name, project_path?)`:update the
@@ -223,6 +223,9 @@ fn pushRow(lua: *Lua, row: Row) void {
 
     lua.pushInteger(@intCast(row.meta.message_count));
     lua.setField(-2, "message_count");
+
+    _ = lua.pushString(row.meta.status.toSlice());
+    lua.setField(-2, "status");
 
     _ = lua.pushString(row.project_path);
     lua.setField(-2, "project");

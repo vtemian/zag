@@ -99,6 +99,33 @@ pub const EntryType = enum {
     }
 };
 
+/// Session lifecycle status surfaced in the sidebar.
+pub const SessionStatus = enum {
+    idle,
+    working,
+    failed,
+
+    pub fn toSlice(self: SessionStatus) []const u8 {
+        return switch (self) {
+            .idle => "idle",
+            .working => "working",
+            .failed => "failed",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?SessionStatus {
+        const map = .{
+            .{ "idle", SessionStatus.idle },
+            .{ "working", SessionStatus.working },
+            .{ "failed", SessionStatus.failed },
+        };
+        inline for (map) |pair| {
+            if (std.mem.eql(u8, s, pair[0])) return pair[1];
+        }
+        return null;
+    }
+};
+
 /// A single JSONL entry representing one event in a session.
 pub const Entry = struct {
     /// Semantic type of this entry.
@@ -194,6 +221,8 @@ pub const Meta = struct {
     updated: i64 = 0,
     /// Number of entries appended so far.
     message_count: u32 = 0,
+    /// Session lifecycle status.
+    status: SessionStatus = .idle,
 
     /// Return the id as a slice.
     pub fn idSlice(self: *const Meta) []const u8 {
@@ -689,6 +718,14 @@ pub const SessionHandle = struct {
         self.file.close();
     }
 
+    /// Update the session status and persist the companion .meta.json file.
+    pub fn setStatus(self: *SessionHandle, status: SessionStatus) !void {
+        self.append_mutex.lock();
+        defer self.append_mutex.unlock();
+        self.meta.status = status;
+        try self.updateMeta();
+    }
+
     /// Write the current meta to the companion .meta.json file.
     fn updateMeta(self: *SessionHandle) !void {
         var path_buf: [256]u8 = undefined;
@@ -873,6 +910,11 @@ fn readMetaFromDir(dir: std.fs.Dir, name: []const u8, allocator: Allocator) !Met
     }
     if (obj.get("message_count")) |v| {
         if (v == .integer) meta.message_count = @intCast(v.integer);
+    }
+    if (obj.get("status")) |v| {
+        if (v == .string) {
+            meta.status = SessionStatus.fromSlice(v.string) orelse .idle;
+        }
     }
 
     return meta;
@@ -1304,6 +1346,7 @@ fn writeMetaFile(path: []const u8, meta: *const Meta) !void {
     try w.print(",\"created\":{d}", .{meta.created});
     try w.print(",\"updated\":{d}", .{meta.updated});
     try w.print(",\"message_count\":{d}", .{meta.message_count});
+    try w.print(",\"status\":\"{s}\"", .{meta.status.toSlice()});
     try w.writeAll("}");
 
     const json = stream.getWritten();
@@ -1375,6 +1418,11 @@ fn readMetaFile(path: []const u8, allocator: Allocator) !Meta {
     }
     if (obj.get("message_count")) |v| {
         if (v == .integer) meta.message_count = @intCast(v.integer);
+    }
+    if (obj.get("status")) |v| {
+        if (v == .string) {
+            meta.status = SessionStatus.fromSlice(v.string) orelse .idle;
+        }
     }
 
     return meta;
@@ -2016,6 +2064,77 @@ test "writeMetaFile and readMetaFile round-trip" {
     try std.testing.expectEqual(@as(i64, 1000), loaded.created);
     try std.testing.expectEqual(@as(i64, 2000), loaded.updated);
     try std.testing.expectEqual(@as(u32, 5), loaded.message_count);
+    try std.testing.expectEqual(SessionStatus.idle, loaded.status);
+}
+
+test "writeMetaFile and readMetaFile round-trip with working status" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var meta = Meta{
+        .created = 1000,
+        .updated = 2000,
+        .message_count = 5,
+        .status = .working,
+    };
+    const id = "deadbeef12345678";
+    @memcpy(meta.id[0..id.len], id);
+    meta.id_len = @intCast(id.len);
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/test-working.meta.json", .{tmp_path});
+
+    try writeMetaFile(path, &meta);
+
+    const loaded = try readMetaFile(path, allocator);
+
+    try std.testing.expectEqual(SessionStatus.working, loaded.status);
+}
+
+test "readMetaFile defaults to idle when status field is missing" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json = "{\"id\":\"abc\",\"created\":1,\"updated\":2,\"message_count\":3}";
+    try tmp.dir.writeFile(.{ .sub_path = "no-status.meta.json", .data = json });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/no-status.meta.json", .{tmp_path});
+
+    const loaded = try readMetaFile(path, allocator);
+
+    try std.testing.expectEqualStrings("abc", loaded.idSlice());
+    try std.testing.expectEqual(SessionStatus.idle, loaded.status);
+}
+
+test "readMetaFile defaults to idle when status field is unrecognized" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json = "{\"id\":\"abc\",\"status\":\"bogus\",\"created\":1,\"updated\":2,\"message_count\":3}";
+    try tmp.dir.writeFile(.{ .sub_path = "bad-status.meta.json", .data = json });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/bad-status.meta.json", .{tmp_path});
+
+    const loaded = try readMetaFile(path, allocator);
+
+    try std.testing.expectEqual(SessionStatus.idle, loaded.status);
 }
 
 test "File.sync runs without error on a fresh file" {

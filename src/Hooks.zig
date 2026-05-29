@@ -131,7 +131,7 @@ pub const HookPayload = union(EventKind) {
         /// for a future Lua-callable session-create path; production code
         /// never constructs it today, so Lua handlers branching on
         /// `evt.change == "created"` are dead until that lands.
-        change: enum { created, renamed, deleted },
+        change: enum { created, renamed, deleted, status_changed },
         /// Identifier of the affected session (ULID string). Borrowed
         /// from the caller; valid for the duration of the hook fire only.
         session_id: []const u8,

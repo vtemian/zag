@@ -231,6 +231,39 @@ test "zag.sessions.list surfaces a session created in cwd" {
     );
 }
 
+test "zag.sessions.list returns status idle for a fresh session" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    handle.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local sessions = zag.sessions.list()
+        \\assert(#sessions == 1, "expected one session")
+        \\assert(sessions[1].status == "idle",
+        \\       "expected status 'idle', got " .. tostring(sessions[1].status))
+    );
+}
+
 test "zag.sessions.rename updates name, observable via list" {
     const allocator = testing.allocator;
 
@@ -1225,7 +1258,8 @@ test "sessions sidebar marks the current-session row with a glyph" {
         \\    -- were removed when the green row-bg became the active
         \\    -- marker. Every row now starts at the `▸ ` glyph.
         \\    -- `▸` / `▾` are each 3 UTF-8 bytes (U+25B8 / U+25BE).
-        \\    local head = r.label:sub(1, 3)
+        \\    -- A leading status space prefixes the glyph for idle sessions.
+        \\    local head = r.label:sub(2, 4)
         \\    assert(head == "▸" or head == "▾",
         \\           "row label should start with the expand glyph: " .. tostring(r.label))
         \\end
@@ -1336,19 +1370,19 @@ test "sessions sidebar truncates long labels with ellipsis" {
         \\assert(short_row ~= nil, "short row missing")
         \\assert(long_row ~= nil, "long row missing")
         \\
-        \\-- Short label fits intact: glyph+space (2) + date col padded
+        \\-- Short label fits intact: status(1) + glyph+space (2) + date col padded
         \\-- to 3 ('now') + 1 space + name. No leading cursor pad
         \\-- since the green row-bg is the active marker.
-        \\assert(short_row.label == "▸ now alpha",
+        \\assert(short_row.label == " ▸ now alpha",
         \\       "short label unexpected: " .. tostring(short_row.label))
         \\
-        \\-- Long label truncates the name to the first 33 bytes plus
+        \\-- Long label truncates the name to the first 32 bytes plus
         \\-- a single '…' codepoint; the prefix layout matches the
-        \\-- short-label row. 33 + 1 ellipsis cell + 6-cell prefix
-        \\-- (glyph + date + gap) lands at exactly 40 cells, the
+        \\-- short-label row. 32 + 1 ellipsis cell + 7-cell prefix
+        \\-- (status + glyph + date + gap) lands at exactly 40 cells, the
         \\-- sidebar's target panel width.
-        \\local want = "▸ now "
-        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 33)
+        \\local want = " ▸ now "
+        \\    .. string.sub("a-very-long-user-supplied-session-label!", 1, 32)
         \\    .. "…"
         \\assert(long_row.label == want,
         \\       "long label unexpected:\n  got " .. tostring(long_row.label)

@@ -515,6 +515,7 @@ pub const HookDispatcher = struct {
                     .created => "created",
                     .renamed => "renamed",
                     .deleted => "deleted",
+                    .status_changed => "status_changed",
                 };
                 setTableString(lua, "change", change_str);
                 setTableString(lua, "session_id", p.session_id);

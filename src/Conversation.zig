@@ -1329,6 +1329,13 @@ pub fn attachSession(self: *Conversation, handle: *Session.SessionHandle) void {
     self.session_handle = handle;
 }
 
+/// Update the session status via the attached handle, if any.
+pub fn setSessionStatus(self: *Conversation, status: Session.SessionStatus) !void {
+    if (self.session_handle) |sh| {
+        try sh.setStatus(status);
+    }
+}
+
 /// Persist an event to the session JSONL file, if a session is attached.
 /// Swallows errors after logging them and flipping `persist_failed`;
 /// production callers all want the same swallow-and-flag behaviour, so
