@@ -22,10 +22,35 @@ const log = std.log.scoped(.agent_events);
 /// order of magnitude more headroom than the typical 8-16ms main-loop tick.
 pub const default_backpressure_ms: u32 = 100;
 
+/// A heap-allocated string bundled with the allocator that produced it.
+///
+/// Agent-thread producers do not share one allocator: streaming deltas
+/// are duped from the per-turn wire arena, while queued tool events are
+/// duped from the runner's persistent GPA (the per-worker arena that runs
+/// the tool is torn down at join, and `ArenaAllocator` is not
+/// thread-safe). Carrying the producing allocator alongside the bytes
+/// makes `freeOwned` free each payload through the heap that actually
+/// owns it, turning the cross-allocator free into a compile-time
+/// impossibility instead of a runtime "Invalid free" abort.
+pub const OwnedPayload = struct {
+    bytes: []const u8,
+    allocator: Allocator,
+
+    /// Dupe `src` onto `allocator` and bind the two together.
+    pub fn dupe(allocator: Allocator, src: []const u8) !OwnedPayload {
+        return .{ .bytes = try allocator.dupe(u8, src), .allocator = allocator };
+    }
+
+    /// Release the bytes through their producing allocator.
+    pub fn free(self: OwnedPayload) void {
+        self.allocator.free(self.bytes);
+    }
+};
+
 /// An event produced by the agent loop for the main thread to consume.
 pub const AgentEvent = union(enum) {
     /// Partial text from the LLM response.
-    text_delta: []const u8,
+    text_delta: OwnedPayload,
     /// Partial text from an in-flight compaction summary. Distinct
     /// from `.text_delta` because the UI should NOT render this as
     /// the model's reply — it's transient work the agent is doing
@@ -36,14 +61,14 @@ pub const AgentEvent = union(enum) {
     /// `provider.callStreaming`; the Lua-side default summarizer
     /// (which goes through `zag.llm.complete` and the worker pool)
     /// is synchronous today and does not emit these deltas.
-    compaction_summary_delta: []const u8,
+    compaction_summary_delta: OwnedPayload,
     /// Partial extended-thinking text. Duped by the agent-side stream
     /// adapter so the payload outlives the provider's SSE buffer. The
     /// `provider` tag travels alongside the text so JSONL persistence
     /// records the wire format that produced the delta instead of
     /// hardcoding `"anthropic"` for every provider.
     thinking_delta: struct {
-        text: []const u8,
+        text: OwnedPayload,
         provider: types.ContentBlock.ThinkingProvider,
     },
     /// End of a thinking block. Lets the UI collapse the in-progress
@@ -54,7 +79,7 @@ pub const AgentEvent = union(enum) {
     /// Tool execution completed with output.
     tool_result: ToolResultEvent,
     /// Informational message (token counts, timing, etc.).
-    info: []const u8,
+    info: OwnedPayload,
     /// Running output-token count for the in-flight turn. Mirrors
     /// `llm.StreamEvent.usage`: a UI-only counter the working line reads,
     /// not a conversation node, not persisted, not wire-projected. Carries
@@ -63,7 +88,7 @@ pub const AgentEvent = union(enum) {
     /// Agent loop completed successfully.
     done,
     /// An error occurred during agent execution.
-    err: []const u8,
+    err: OwnedPayload,
     /// Discard the in-progress assistant text node so a subsequent
     /// text_delta starts a fresh render. Used when a partial stream
     /// is replaced by a non-streaming fallback response.
@@ -158,47 +183,49 @@ pub const AgentEvent = union(enum) {
     /// Payload for a tool call start event.
     pub const ToolStartEvent = struct {
         /// The registered tool name.
-        name: []const u8,
+        name: OwnedPayload,
         /// Correlation ID matching this start to its result.
         /// Null for streaming preview events (before execution).
-        call_id: ?[]const u8 = null,
+        call_id: ?OwnedPayload = null,
         /// Raw JSON arguments passed to the tool. Null for streaming
         /// previews that see the call before arguments are fully assembled.
         /// Trajectory writers consume this as ATIF `tool_calls[].arguments`.
-        input_raw: ?[]const u8 = null,
+        input_raw: ?OwnedPayload = null,
     };
 
     /// Payload for a completed tool execution.
     pub const ToolResultEvent = struct {
         /// The tool's output text.
-        content: []const u8,
+        content: OwnedPayload,
         /// Whether the tool reported an error.
         is_error: bool,
         /// Correlation ID matching this result to its tool_start.
         /// Null when correlation is not needed (single tool).
-        call_id: ?[]const u8 = null,
+        call_id: ?OwnedPayload = null,
     };
 
     /// Free any heap-allocated bytes owned by this event.
     /// Call on drop paths (queue full, error recovery) so an event that
-    /// never reaches a consumer does not leak. `.done` and
-    /// `.reset_assistant_text` own nothing.
-    pub fn freeOwned(self: AgentEvent, allocator: Allocator) void {
+    /// never reaches a consumer does not leak. Each owned arm carries its
+    /// own producing allocator via `OwnedPayload`, so this takes no
+    /// allocator argument: the payload frees itself through the heap that
+    /// produced it. `.done` and `.reset_assistant_text` own nothing.
+    pub fn freeOwned(self: AgentEvent) void {
         switch (self) {
-            .text_delta => |s| allocator.free(s),
-            .compaction_summary_delta => |s| allocator.free(s),
-            .thinking_delta => |td| allocator.free(td.text),
+            .text_delta => |p| p.free(),
+            .compaction_summary_delta => |p| p.free(),
+            .thinking_delta => |td| td.text.free(),
             .tool_start => |t| {
-                allocator.free(t.name);
-                if (t.call_id) |id| allocator.free(id);
-                if (t.input_raw) |raw| allocator.free(raw);
+                t.name.free();
+                if (t.call_id) |id| id.free();
+                if (t.input_raw) |raw| raw.free();
             },
             .tool_result => |r| {
-                allocator.free(r.content);
-                if (r.call_id) |id| allocator.free(id);
+                r.content.free();
+                if (r.call_id) |id| id.free();
             },
-            .info => |s| allocator.free(s),
-            .err => |s| allocator.free(s),
+            .info => |p| p.free(),
+            .err => |p| p.free(),
             // Hook/Lua round-trips hold borrowed pointers; caller owns
             // the request struct and its payload. No bytes to free here.
             // compaction_event borrows its outcome string from rodata
@@ -272,39 +299,6 @@ pub const AgentEvent = union(enum) {
             },
         }
     }
-
-    /// Free a CONSUMER-drained event whose payload ownership is mixed.
-    /// Queued events come from two producers: streaming deltas
-    /// (`streamEventToQueue`) are duped on the wire `arena`, while the full
-    /// `tool_start` (with `call_id`) and every `tool_result` are duped on
-    /// `gpa` (== queue.allocator) by `runToolStep` so they survive
-    /// parallel-worker arena teardown. A drain that frees everything with a
-    /// single allocator either crashes (gpa-freeing arena memory) or leaks
-    /// (arena-freeing gpa memory); this frees each arm at its true source.
-    /// The streaming-preview `tool_start` (null `call_id`) is arena-owned.
-    /// Round-trip request and no-byte arms defer to `freeOwned`.
-    pub fn freeOwnedMixed(self: AgentEvent, arena: Allocator, gpa: Allocator) void {
-        switch (self) {
-            .text_delta => |s| arena.free(s),
-            .compaction_summary_delta => |s| arena.free(s),
-            .thinking_delta => |td| arena.free(td.text),
-            .info => |s| arena.free(s),
-            .err => |s| arena.free(s),
-            .tool_start => |t| {
-                const owner = if (t.call_id == null) arena else gpa;
-                owner.free(t.name);
-                if (t.call_id) |id| owner.free(id);
-                if (t.input_raw) |raw| owner.free(raw);
-            },
-            .tool_result => |r| {
-                gpa.free(r.content);
-                if (r.call_id) |id| gpa.free(id);
-            },
-            // No-byte arms and round-trip requests: identical to freeOwned
-            // (no allocations to free; parked workers are signalled).
-            else => self.freeOwned(arena),
-        }
-    }
 };
 
 /// Thread-safe, fixed-capacity event queue backed by a ring buffer.
@@ -368,28 +362,35 @@ pub const EventQueue = struct {
     /// owns. Thread-safe.
     pub fn push(self: *EventQueue, event: AgentEvent) error{QueueFull}!void {
         self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.len == self.buffer.len) return error.QueueFull;
+        if (self.len == self.buffer.len) {
+            self.mutex.unlock();
+            return error.QueueFull;
+        }
         self.buffer[self.tail] = event;
         self.tail = (self.tail + 1) % self.buffer.len;
         self.len += 1;
+        // Snapshot the wake fd under the lock, then perform the syscall
+        // after unlocking so a slow pipe write doesn't serialize other
+        // producers behind the ring mutex.
+        const wake = self.wake_fd;
+        self.mutex.unlock();
         // Signal the wake pipe if one is configured. WouldBlock (pipe full,
         // wake already pending) and BrokenPipe (reader closed during
         // shutdown) are expected; other errors are swallowed because the
         // authoritative event delivery has already succeeded.
-        if (self.wake_fd) |fd| {
+        if (wake) |fd| {
             _ = std.posix.write(fd, &[_]u8{1}) catch {};
         }
     }
 
     /// Best-effort push: on `QueueFull`, bump `dropped` and free the
-    /// event's owned bytes using `allocator`. The allocator must be the
-    /// one that produced those bytes; pass the same one every call site
-    /// used to dupe the payload.
-    pub fn tryPush(self: *EventQueue, allocator: Allocator, event: AgentEvent) void {
+    /// event's owned bytes. Each owned arm carries its producing allocator
+    /// via `OwnedPayload`, so the freed bytes always go back to the heap
+    /// that allocated them.
+    pub fn tryPush(self: *EventQueue, event: AgentEvent) void {
         self.push(event) catch {
             _ = self.dropped.fetchAdd(1, .monotonic);
-            event.freeOwned(allocator);
+            event.freeOwned();
         };
     }
 
@@ -397,26 +398,21 @@ pub const EventQueue = struct {
     /// the ring is full, wait up to `max_wait_ms` for the consumer to drain
     /// a slot before giving up. Returns `error.EventDropped` if the budget
     /// expires; in that case `dropped` is incremented, the event's owned
-    /// bytes are freed via `allocator`, and a warn-level log records the
-    /// drop so it isn't silent. Thread-safe.
-    ///
-    /// Like `tryPush`, `allocator` must be the one that produced the event's
-    /// owned bytes, which is NOT necessarily the queue's own allocator: the
-    /// agent thread allocates payloads from the per-turn wire arena while the
-    /// queue storage lives on the persistent heap allocator. Freeing through
-    /// the wrong one is cross-allocator UB.
+    /// bytes are freed (each `OwnedPayload` arm frees through its own
+    /// producing allocator), and a warn-level log records the drop so it
+    /// isn't silent. Thread-safe.
     ///
     /// Uses the `drained` condition variable so a consumer freeing capacity
     /// wakes the producer within microseconds rather than after a fixed
-    /// polling interval.
+    /// polling interval. The `timedWait` loop holds the mutex per the
+    /// condvar contract; the wake-pipe write happens after the unlock so a
+    /// slow syscall doesn't serialize other producers behind the ring lock.
     pub fn pushWithBackpressure(
         self: *EventQueue,
-        allocator: Allocator,
         event: AgentEvent,
         max_wait_ms: u32,
     ) error{EventDropped}!void {
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         const deadline_ns: u64 = @as(u64, max_wait_ms) * std.time.ns_per_ms;
         var elapsed_ns: u64 = 0;
@@ -427,7 +423,8 @@ pub const EventQueue = struct {
                     "event queue drop after {d}ms backpressure: kind={s}",
                     .{ max_wait_ms, @tagName(event) },
                 );
-                event.freeOwned(allocator);
+                self.mutex.unlock();
+                event.freeOwned();
                 return error.EventDropped;
             }
             const remaining_ns = deadline_ns - elapsed_ns;
@@ -443,7 +440,9 @@ pub const EventQueue = struct {
         self.buffer[self.tail] = event;
         self.tail = (self.tail + 1) % self.buffer.len;
         self.len += 1;
-        if (self.wake_fd) |fd| {
+        const wake = self.wake_fd;
+        self.mutex.unlock();
+        if (wake) |fd| {
             _ = std.posix.write(fd, &[_]u8{1}) catch {};
         }
     }
@@ -968,17 +967,19 @@ test {
 }
 
 test "push and drain events" {
-    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 256);
     defer queue.deinit();
 
-    try queue.push(.{ .text_delta = "hello" });
-    try queue.push(.{ .text_delta = " world" });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "hello") });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, " world") });
 
     var buf: [16]AgentEvent = undefined;
     const count = queue.drain(&buf);
+    defer for (buf[0..count]) |ev| ev.freeOwned();
     try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqualStrings("hello", buf[0].text_delta);
-    try std.testing.expectEqualStrings(" world", buf[1].text_delta);
+    try std.testing.expectEqualStrings("hello", buf[0].text_delta.bytes);
+    try std.testing.expectEqualStrings(" world", buf[1].text_delta.bytes);
 }
 
 test "drain empty queue returns zero" {
@@ -991,59 +992,66 @@ test "drain empty queue returns zero" {
 }
 
 test "push multiple drain all" {
-    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 256);
     defer queue.deinit();
 
-    try queue.push(.{ .text_delta = "a" });
-    try queue.push(.{ .tool_start = .{ .name = "bash" } });
-    try queue.push(.{ .tool_result = .{ .content = "output", .is_error = false } });
-    try queue.push(.{ .info = "tokens: 42" });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "a") });
+    try queue.push(.{ .tool_start = .{ .name = try OwnedPayload.dupe(alloc, "bash") } });
+    try queue.push(.{ .tool_result = .{ .content = try OwnedPayload.dupe(alloc, "output"), .is_error = false } });
+    try queue.push(.{ .info = try OwnedPayload.dupe(alloc, "tokens: 42") });
     try queue.push(.done);
-    try queue.push(.{ .err = "oops" });
+    try queue.push(.{ .err = try OwnedPayload.dupe(alloc, "oops") });
 
     var buf: [16]AgentEvent = undefined;
     const count = queue.drain(&buf);
+    defer for (buf[0..count]) |ev| ev.freeOwned();
     try std.testing.expectEqual(@as(usize, 6), count);
 
-    try std.testing.expectEqualStrings("a", buf[0].text_delta);
-    try std.testing.expectEqualStrings("bash", buf[1].tool_start.name);
-    try std.testing.expectEqualStrings("output", buf[2].tool_result.content);
+    try std.testing.expectEqualStrings("a", buf[0].text_delta.bytes);
+    try std.testing.expectEqualStrings("bash", buf[1].tool_start.name.bytes);
+    try std.testing.expectEqualStrings("output", buf[2].tool_result.content.bytes);
     try std.testing.expect(!buf[2].tool_result.is_error);
-    try std.testing.expectEqualStrings("tokens: 42", buf[3].info);
+    try std.testing.expectEqualStrings("tokens: 42", buf[3].info.bytes);
     try std.testing.expectEqual(AgentEvent.done, buf[4]);
-    try std.testing.expectEqualStrings("oops", buf[5].err);
+    try std.testing.expectEqualStrings("oops", buf[5].err.bytes);
 }
 
 test "drain clears queue" {
-    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 256);
     defer queue.deinit();
 
-    try queue.push(.{ .text_delta = "first" });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "first") });
 
     var buf: [8]AgentEvent = undefined;
-    _ = queue.drain(&buf);
+    const first = queue.drain(&buf);
+    for (buf[0..first]) |ev| ev.freeOwned();
 
     const count = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 0), count);
 }
 
 test "drain with small buffer returns partial" {
-    var queue = try EventQueue.initBounded(std.testing.allocator, 256);
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 256);
     defer queue.deinit();
 
-    try queue.push(.{ .text_delta = "a" });
-    try queue.push(.{ .text_delta = "b" });
-    try queue.push(.{ .text_delta = "c" });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "a") });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "b") });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "c") });
 
     var buf: [2]AgentEvent = undefined;
     const count = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqualStrings("a", buf[0].text_delta);
-    try std.testing.expectEqualStrings("b", buf[1].text_delta);
+    try std.testing.expectEqualStrings("a", buf[0].text_delta.bytes);
+    try std.testing.expectEqualStrings("b", buf[1].text_delta.bytes);
+    for (buf[0..count]) |ev| ev.freeOwned();
 
     const count2 = queue.drain(&buf);
     try std.testing.expectEqual(@as(usize, 1), count2);
-    try std.testing.expectEqualStrings("c", buf[0].text_delta);
+    try std.testing.expectEqualStrings("c", buf[0].text_delta.bytes);
+    for (buf[0..count2]) |ev| ev.freeOwned();
 }
 
 test "EventQueue bounded: pushes beyond capacity go to dropped" {
@@ -1057,22 +1065,20 @@ test "EventQueue bounded: pushes beyond capacity go to dropped" {
         while (true) {
             const n = queue.drain(&buf);
             if (n == 0) break;
-            for (buf[0..n]) |ev| ev.freeOwned(alloc);
+            for (buf[0..n]) |ev| ev.freeOwned();
         }
     }
 
     for (0..4) |_| {
-        const owned = try alloc.dupe(u8, "x");
-        errdefer alloc.free(owned);
-        try queue.push(.{ .info = owned });
+        try queue.push(.{ .info = try OwnedPayload.dupe(alloc, "x") });
     }
-    const overflow = try alloc.dupe(u8, "x");
-    queue.tryPush(alloc, .{ .info = overflow });
+    queue.tryPush(.{ .info = try OwnedPayload.dupe(alloc, "x") });
     try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
 }
 
 test "push writes to wake_fd when set" {
-    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 16);
     defer queue.deinit();
 
     const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
@@ -1080,7 +1086,7 @@ test "push writes to wake_fd when set" {
     defer std.posix.close(fds[1]);
 
     queue.wake_fd = fds[1];
-    try queue.push(.{ .text_delta = "hi" });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "hi") });
 
     var buf: [16]u8 = undefined;
     const n = try std.posix.read(fds[0], &buf);
@@ -1088,17 +1094,20 @@ test "push writes to wake_fd when set" {
 
     var drain_buf: [4]AgentEvent = undefined;
     const count = queue.drain(&drain_buf);
+    for (drain_buf[0..count]) |ev| ev.freeOwned();
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test "push with null wake_fd skips the write" {
-    var queue = try EventQueue.initBounded(std.testing.allocator, 16);
+    const alloc = std.testing.allocator;
+    var queue = try EventQueue.initBounded(alloc, 16);
     defer queue.deinit();
 
-    try queue.push(.{ .text_delta = "hi" });
+    try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "hi") });
 
     var buf: [4]AgentEvent = undefined;
     const count = queue.drain(&buf);
+    for (buf[0..count]) |ev| ev.freeOwned();
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
@@ -1124,14 +1133,13 @@ test "freeOwned signals hook_request done" {
     var req = Hooks.HookRequest.init(&payload);
     const ev: AgentEvent = .{ .hook_request = &req };
     try std.testing.expect(!req.done.isSet());
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(!req.cancelled);
 }
 
 const BackpressureDrainer = struct {
     queue: *EventQueue,
-    allocator: Allocator,
     go: std.Thread.ResetEvent,
     drained_n: std.atomic.Value(usize),
 
@@ -1139,7 +1147,7 @@ const BackpressureDrainer = struct {
         self.go.wait();
         var buf: [8]AgentEvent = undefined;
         const n = self.queue.drain(&buf);
-        for (buf[0..n]) |ev| ev.freeOwned(self.allocator);
+        for (buf[0..n]) |ev| ev.freeOwned();
         self.drained_n.store(n, .release);
     }
 };
@@ -1151,13 +1159,11 @@ test "pushWithBackpressure waits for drain and succeeds" {
 
     // Fill the queue
     for (0..2) |_| {
-        const owned = try alloc.dupe(u8, "x");
-        try queue.push(.{ .info = owned });
+        try queue.push(.{ .info = try OwnedPayload.dupe(alloc, "x") });
     }
 
     var drainer: BackpressureDrainer = .{
         .queue = &queue,
-        .allocator = alloc,
         .go = .{},
         .drained_n = .{ .raw = 0 },
     };
@@ -1167,8 +1173,7 @@ test "pushWithBackpressure waits for drain and succeeds" {
     // Release drainer so it drains concurrently while we wait.
     drainer.go.set();
 
-    const payload = try alloc.dupe(u8, "after-drain");
-    try queue.pushWithBackpressure(alloc, .{ .info = payload }, 5_000);
+    try queue.pushWithBackpressure(.{ .info = try OwnedPayload.dupe(alloc, "after-drain") }, 5_000);
 
     // Poll for the drainer to finish; bounded by the join() in defer so a
     // busted wake-up would hang the test rather than silently passing.
@@ -1179,7 +1184,7 @@ test "pushWithBackpressure waits for drain and succeeds" {
     // Drain the pushed event to keep the deferred deinit clean.
     var buf: [4]AgentEvent = undefined;
     const n = queue.drain(&buf);
-    for (buf[0..n]) |ev| ev.freeOwned(alloc);
+    for (buf[0..n]) |ev| ev.freeOwned();
 }
 
 test "pushWithBackpressure drops after budget, no leak" {
@@ -1189,16 +1194,14 @@ test "pushWithBackpressure drops after budget, no leak" {
     defer {
         var buf: [4]AgentEvent = undefined;
         const n = queue.drain(&buf);
-        for (buf[0..n]) |ev| ev.freeOwned(alloc);
+        for (buf[0..n]) |ev| ev.freeOwned();
     }
 
     for (0..2) |_| {
-        const owned = try alloc.dupe(u8, "x");
-        try queue.push(.{ .info = owned });
+        try queue.push(.{ .info = try OwnedPayload.dupe(alloc, "x") });
     }
 
-    const payload = try alloc.dupe(u8, "doomed");
-    const err = queue.pushWithBackpressure(alloc, .{ .info = payload }, 10);
+    const err = queue.pushWithBackpressure(.{ .info = try OwnedPayload.dupe(alloc, "doomed") }, 10);
     try std.testing.expectError(error.EventDropped, err);
     try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
 }
@@ -1206,19 +1209,23 @@ test "pushWithBackpressure drops after budget, no leak" {
 test "pushWithBackpressure drop frees through the producer allocator, not the queue allocator" {
     // Regression: agent-thread producers allocate event payloads from the
     // per-turn wire arena, while the queue's own storage is owned by the
-    // persistent heap allocator. The drop path used to free the payload
-    // through the queue allocator, so dropping an arena-owned payload freed
-    // an arena pointer through the heap allocator and the DebugAllocator
-    // aborted with "Invalid free". Mirrors the streaming crash chain
-    // streamEventToQueue -> pushWithBackpressure when a thinking_delta burst
-    // saturates the queue.
+    // persistent heap allocator. The old API took the free allocator as a
+    // separate argument, so a caller could pass the queue allocator by
+    // mistake and free an arena pointer through the heap allocator, which
+    // the DebugAllocator aborts on as "Invalid free". `OwnedPayload` now
+    // binds the bytes to their producing allocator, so the drop path frees
+    // through the producer (here: a no-op arena free) by construction. The
+    // queue allocator and the producer allocator are deliberately distinct
+    // to prove the bytes are not routed through the wrong heap. Mirrors the
+    // streaming crash chain streamEventToQueue -> pushWithBackpressure when
+    // a thinking_delta burst saturates the queue.
     const queue_alloc = std.testing.allocator;
     var queue = try EventQueue.initBounded(queue_alloc, 2);
     defer queue.deinit();
     defer {
         var buf: [4]AgentEvent = undefined;
         const n = queue.drain(&buf);
-        for (buf[0..n]) |ev| ev.freeOwned(queue_alloc);
+        for (buf[0..n]) |ev| ev.freeOwned();
     }
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1226,12 +1233,14 @@ test "pushWithBackpressure drop frees through the producer allocator, not the qu
     const producer = arena.allocator();
 
     for (0..2) |_| {
-        const owned = try queue_alloc.dupe(u8, "x");
-        try queue.push(.{ .info = owned });
+        try queue.push(.{ .info = try OwnedPayload.dupe(queue_alloc, "x") });
     }
 
-    const payload = try producer.dupe(u8, "doomed");
-    const err = queue.pushWithBackpressure(producer, .{ .info = payload }, 10);
+    const payload = try OwnedPayload.dupe(producer, "doomed");
+    // The dropped payload carries the arena allocator, so freeOwned routes
+    // the free back to the arena even though the queue lives on the GPA.
+    try std.testing.expectEqual(producer.ptr, payload.allocator.ptr);
+    const err = queue.pushWithBackpressure(.{ .info = payload }, 10);
     try std.testing.expectError(error.EventDropped, err);
     try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.acquire));
 }
@@ -1249,7 +1258,7 @@ test "freeOwned signals layout_request done with is_error" {
     const ev: AgentEvent = .{ .layout_request = &req };
     try std.testing.expect(!req.done.isSet());
     try std.testing.expect(!req.is_error);
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(req.is_error);
 }
@@ -1269,7 +1278,7 @@ test "freeOwned signals prompt_assembly_request done with error_name" {
     const ev: AgentEvent = .{ .prompt_assembly_request = &req };
     try std.testing.expect(!req.done.isSet());
     try std.testing.expect(req.error_name == null);
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
     try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
 }
@@ -1314,7 +1323,7 @@ test "freeOwned signals lua_tool_request done with error_name" {
     const ev: AgentEvent = .{ .lua_tool_request = &req };
     try std.testing.expect(!req.done.isSet());
     try std.testing.expect(req.error_name == null);
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
     try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
 }
@@ -1367,7 +1376,7 @@ test "freeOwned signals jit_context_request done with error_name" {
     const ev: AgentEvent = .{ .jit_context_request = &req };
     try std.testing.expect(!req.done.isSet());
     try std.testing.expect(req.error_name == null);
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(req.error_name != null);
     try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
@@ -1398,7 +1407,7 @@ test "freeOwned signals tool_transform_request done" {
     var req = ToolTransformRequest.init("bash", "in", "out", false, std.testing.allocator);
     const ev: AgentEvent = .{ .tool_transform_request = &req };
     try std.testing.expect(!req.done.isSet());
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
 }
 
@@ -1427,7 +1436,7 @@ test "freeOwned signals tool_gate_request done" {
     var req = ToolGateRequest.init("m", &tools_seen, std.testing.allocator);
     const ev: AgentEvent = .{ .tool_gate_request = &req };
     try std.testing.expect(!req.done.isSet());
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
 }
 
@@ -1471,7 +1480,7 @@ test "freeOwned signals loop_detect_request done" {
     var req = LoopDetectRequest.init("bash", "{}", false, 1, std.testing.allocator);
     const ev: AgentEvent = .{ .loop_detect_request = &req };
     try std.testing.expect(!req.done.isSet());
-    ev.freeOwned(std.testing.allocator);
+    ev.freeOwned();
     try std.testing.expect(req.done.isSet());
 }
 
@@ -1518,7 +1527,7 @@ test "compaction_event round-trips through the queue with no allocations" {
     }
     // freeOwned is a no-op for this variant — strings live on rodata.
     // Hitting it shouldn't allocate or crash.
-    buf[0].freeOwned(std.testing.allocator);
+    buf[0].freeOwned();
 }
 
 test "compaction_event with error_name surfaces the refused stage cleanly" {

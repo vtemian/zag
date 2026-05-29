@@ -321,7 +321,7 @@ pub fn runLoopStreaming(
                 Metrics.recordCompactionRefused();
                 // Emit a final compaction_event with .refused before
                 // returning the error so telemetry sees the failure.
-                queue.pushWithBackpressure(allocator, .{ .compaction_event = .{
+                queue.pushWithBackpressure(.{ .compaction_event = .{
                     .outcome = "refused",
                     .messages_before = messages_before,
                     .messages_after = @intCast(messages.items.len),
@@ -347,7 +347,7 @@ pub fn runLoopStreaming(
         // the no-op case to avoid flooding consumers with per-turn
         // noise.
         if (!std.mem.eql(u8, compact_outcome_tag, "skipped")) {
-            queue.pushWithBackpressure(allocator, .{ .compaction_event = .{
+            queue.pushWithBackpressure(.{ .compaction_event = .{
                 .outcome = compact_outcome_tag,
                 .messages_before = messages_before,
                 .messages_after = @intCast(messages.items.len),
@@ -735,6 +735,40 @@ pub const StreamContext = struct {
     text_count: u32 = 0,
 };
 
+/// Whether a streaming failure is worth retrying as a single non-streamed
+/// request. Streaming-framing errors (oversized SSE lines/events) and
+/// generic transport/response failures can assemble differently when the
+/// whole body arrives in one shot, so a non-streamed retry is a cheap second
+/// chance. Fatal errors re-fire into the same wall: auth problems
+/// (NotLoggedIn, LoginExpired), config typos (InvalidUri, MissingApiKey),
+/// and OOM all fail identically non-streamed, so re-firing only doubles the
+/// user's wait before surfacing the same error. Cancellation is the user's
+/// intent, not a failure. A read timeout means the connection already
+/// stalled mid-stream; re-firing a full non-streamed request blindly would
+/// likely stall again, so we propagate it rather than retry.
+///
+/// Exhaustive over `llm.ProviderError` so adding a provider error variant
+/// forces a deliberate retryable/fatal classification here.
+fn isStreamingRetryable(err: llm.ProviderError) bool {
+    return switch (err) {
+        error.SseLineTooLong,
+        error.SseEventDataTooLarge,
+        error.SseEventTypeTooLong,
+        error.ApiError,
+        error.MalformedResponse,
+        error.ProviderResponseFailed,
+        => true,
+        error.Cancelled,
+        error.NotLoggedIn,
+        error.LoginExpired,
+        error.InvalidUri,
+        error.MissingApiKey,
+        error.ReadTimeout,
+        error.OutOfMemory,
+        => false,
+    };
+}
+
 /// Call the LLM with streaming, falling back to non-streaming on error.
 pub fn callLlm(
     provider: llm.Provider,
@@ -787,11 +821,19 @@ pub fn callLlm(
     };
 
     return provider.callStreaming(&stream_req) catch |streaming_err| {
-        // Cancellation is cooperative, not a streaming failure: re-firing
-        // the same request non-streamed would waste work and ignore the
-        // user's intent. Propagate straight to the turn loop.
-        if (streaming_err == error.Cancelled) return error.Cancelled;
-        log.warn("streaming failed ({s}), falling back", .{@errorName(streaming_err)});
+        // A fatal streaming error re-fires into the same wall non-streamed,
+        // so skip the fallback and propagate. If partial text was already
+        // rendered, discard it first so the turn doesn't strand an
+        // orphaned partial assistant node when the error surfaces (RESIL-6:
+        // the reset must fire on the fatal-propagate path too, not only
+        // when the fallback runs).
+        if (!isStreamingRetryable(streaming_err)) {
+            if (stream_ctx.text_count > 0) {
+                queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
+            }
+            return streaming_err;
+        }
+        log.warn("streaming failed ({s}), falling back to non-streaming", .{@errorName(streaming_err)});
         const req = llm.Request{
             .system_stable = system_stable,
             .system_volatile = system_volatile,
@@ -805,17 +847,17 @@ pub fn callLlm(
         // If streaming already rendered partial text, discard it so the
         // full fallback response doesn't appear concatenated to the partial.
         if (stream_ctx.text_count > 0) {
-            queue.pushWithBackpressure(allocator, .reset_assistant_text, agent_events.default_backpressure_ms) catch {};
+            queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
         }
         // Push text to queue since streaming callback didn't fire (or was reset)
         for (fallback.content) |block| {
             switch (block) {
                 .text => |t| {
-                    const duped = allocator.dupe(u8, t.text) catch |err| {
+                    const duped = agent_events.OwnedPayload.dupe(allocator, t.text) catch |err| {
                         log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
                         continue;
                     };
-                    queue.pushWithBackpressure(allocator, .{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
+                    queue.pushWithBackpressure(.{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
                 },
                 else => {},
             }
@@ -2202,12 +2244,13 @@ pub fn runDefaultSummarization(
                             ctx.buf.appendSlice(ctx.allocator, t) catch return;
                             // Side-channel the delta to the UI. Dupe
                             // because the callback's slice is owned by
-                            // the SSE parser's scratch buffer.
-                            const duped = ctx.allocator.dupe(u8, t) catch return;
-                            // pushWithBackpressure frees `duped` via the
-                            // supplied allocator on drop, so don't free again.
+                            // the SSE parser's scratch buffer. The
+                            // OwnedPayload binds the bytes to ctx.allocator
+                            // so the queue frees them through the right heap.
+                            const duped = agent_events.OwnedPayload.dupe(ctx.allocator, t) catch return;
+                            // pushWithBackpressure frees `duped` via its
+                            // own allocator on drop, so don't free again.
                             ctx.queue.pushWithBackpressure(
-                                ctx.allocator,
                                 .{ .compaction_summary_delta = duped },
                                 agent_events.default_backpressure_ms,
                             ) catch {};
@@ -2395,24 +2438,24 @@ fn runToolStep(
             errdefer payload_alloc.free(synth);
 
             {
-                const start_name = try payload_alloc.dupe(u8, tc.name);
-                errdefer payload_alloc.free(start_name);
-                const start_id = try payload_alloc.dupe(u8, tc.id);
-                errdefer payload_alloc.free(start_id);
-                const start_input = try payload_alloc.dupe(u8, tc.input_raw);
-                errdefer payload_alloc.free(start_input);
-                queue.pushWithBackpressure(payload_alloc, .{ .tool_start = .{
+                const start_name = try agent_events.OwnedPayload.dupe(payload_alloc, tc.name);
+                errdefer start_name.free();
+                const start_id = try agent_events.OwnedPayload.dupe(payload_alloc, tc.id);
+                errdefer start_id.free();
+                const start_input = try agent_events.OwnedPayload.dupe(payload_alloc, tc.input_raw);
+                errdefer start_input.free();
+                queue.pushWithBackpressure(.{ .tool_start = .{
                     .name = start_name,
                     .call_id = start_id,
                     .input_raw = start_input,
                 } }, agent_events.default_backpressure_ms) catch {};
             }
 
-            const result_content = try payload_alloc.dupe(u8, synth);
-            errdefer payload_alloc.free(result_content);
-            const result_id = try payload_alloc.dupe(u8, tc.id);
-            errdefer payload_alloc.free(result_id);
-            queue.pushWithBackpressure(payload_alloc, .{ .tool_result = .{
+            const result_content = try agent_events.OwnedPayload.dupe(payload_alloc, synth);
+            errdefer result_content.free();
+            const result_id = try agent_events.OwnedPayload.dupe(payload_alloc, tc.id);
+            errdefer result_id.free();
+            queue.pushWithBackpressure(.{ .tool_result = .{
                 .content = result_content,
                 .is_error = true,
                 .call_id = result_id,
@@ -2425,13 +2468,13 @@ fn runToolStep(
             const effective_input = maybe_rewrite orelse tc.input_raw;
 
             {
-                const start_name = try payload_alloc.dupe(u8, tc.name);
-                errdefer payload_alloc.free(start_name);
-                const start_id = try payload_alloc.dupe(u8, tc.id);
-                errdefer payload_alloc.free(start_id);
-                const start_input = try payload_alloc.dupe(u8, effective_input);
-                errdefer payload_alloc.free(start_input);
-                queue.pushWithBackpressure(payload_alloc, .{ .tool_start = .{
+                const start_name = try agent_events.OwnedPayload.dupe(payload_alloc, tc.name);
+                errdefer start_name.free();
+                const start_id = try agent_events.OwnedPayload.dupe(payload_alloc, tc.id);
+                errdefer start_id.free();
+                const start_input = try agent_events.OwnedPayload.dupe(payload_alloc, effective_input);
+                errdefer start_input.free();
+                queue.pushWithBackpressure(.{ .tool_start = .{
                     .name = start_name,
                     .call_id = start_id,
                     .input_raw = start_input,
@@ -2496,11 +2539,11 @@ fn runToolStep(
                 final = .{ .content = replacement, .is_error = final.is_error, .owned = true };
             }
 
-            const result_content = try payload_alloc.dupe(u8, final.content);
-            errdefer payload_alloc.free(result_content);
-            const result_id = try payload_alloc.dupe(u8, tc.id);
-            errdefer payload_alloc.free(result_id);
-            queue.pushWithBackpressure(payload_alloc, .{ .tool_result = .{
+            const result_content = try agent_events.OwnedPayload.dupe(payload_alloc, final.content);
+            errdefer result_content.free();
+            const result_id = try agent_events.OwnedPayload.dupe(payload_alloc, tc.id);
+            errdefer result_id.free();
+            queue.pushWithBackpressure(.{ .tool_result = .{
                 .content = result_content,
                 .is_error = final.is_error,
                 .call_id = result_id,
@@ -2711,19 +2754,19 @@ pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
     const alloc = stream_ctx.allocator;
     const agent_event: agent_events.AgentEvent = switch (event) {
         .text_delta => |t| blk: {
-            const duped = alloc.dupe(u8, t) catch return;
+            const duped = agent_events.OwnedPayload.dupe(alloc, t) catch return;
             stream_ctx.text_count += 1;
             break :blk .{ .text_delta = duped };
         },
-        .tool_start => |t| .{ .tool_start = .{ .name = alloc.dupe(u8, t) catch return } },
+        .tool_start => |t| .{ .tool_start = .{ .name = agent_events.OwnedPayload.dupe(alloc, t) catch return } },
         .usage => |u| .{ .usage = .{ .output_tokens = u.output_tokens } },
-        .info => |t| .{ .info = alloc.dupe(u8, t) catch return },
+        .info => |t| .{ .info = agent_events.OwnedPayload.dupe(alloc, t) catch return },
         .done => return,
-        .err => |t| .{ .err = alloc.dupe(u8, t) catch return },
+        .err => |t| .{ .err = agent_events.OwnedPayload.dupe(alloc, t) catch return },
         // Thinking is surfaced as its own AgentRunner/Conversation
         // node. Task 1.11 will also fan this into the trajectory capture.
         .thinking_delta => |td| blk: {
-            const duped = alloc.dupe(u8, td.text) catch return;
+            const duped = agent_events.OwnedPayload.dupe(alloc, td.text) catch return;
             break :blk .{ .thinking_delta = .{ .text = duped, .provider = td.provider } };
         },
         .thinking_stop => .thinking_stop,
@@ -2733,7 +2776,7 @@ pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
     // highest-volume producer in the agent loop; a bounded wait keeps the
     // user-visible transcript intact across a slow render frame instead of
     // silently losing tokens.
-    stream_ctx.queue.pushWithBackpressure(alloc, agent_event, agent_events.default_backpressure_ms) catch {};
+    stream_ctx.queue.pushWithBackpressure(agent_event, agent_events.default_backpressure_ms) catch {};
 }
 
 test {
