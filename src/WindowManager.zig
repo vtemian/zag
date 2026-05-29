@@ -12,6 +12,7 @@
 //! new tree/geometry logic there and any new lifecycle logic here.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -8295,7 +8296,7 @@ test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-k
     defer allocator.free(open_script);
     try f.engine.lua.doString(open_script);
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         // Cycle through printable ASCII so each keystroke produces a

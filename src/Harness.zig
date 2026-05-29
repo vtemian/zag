@@ -20,6 +20,7 @@
 //!    stable/volatile prompt.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const posix = std.posix;
 const prompt = @import("prompt.zig");
 const types = @import("types.zig");
@@ -437,7 +438,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     const session_id: []const u8 = if (session_handle) |*sh|
         sh.id[0..sh.id_len]
     else
-        std.fmt.bufPrint(&synth_id_buf, "headless-{d}", .{std.time.milliTimestamp()}) catch "headless";
+        std.fmt.bufPrint(&synth_id_buf, "headless-{d}", .{clock.milliTimestamp()}) catch "headless";
 
     lua_engine.initAsync(4, 256) catch |err| {
         log.warn("lua async runtime init failed: {}", .{err});
@@ -506,7 +507,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     var capture = Trajectory.Capture.init(gpa);
     defer capture.deinit();
 
-    const started_at = std.time.milliTimestamp();
+    const started_at = clock.milliTimestamp();
     try capture.beginTurn(started_at);
 
     const spec = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id);

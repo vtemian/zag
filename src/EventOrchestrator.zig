@@ -12,6 +12,7 @@
 //! (see Conversation.draft).
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -353,7 +354,7 @@ fn tick(
     // ticks at 4 Hz even when events are silent or filtered. When
     // nothing is running, fall back to the parser's escape-timeout (or
     // -1 = block forever) so idle CPU stays at zero.
-    const parser_timeout = parser.pollTimeoutMs(std.time.milliTimestamp());
+    const parser_timeout = parser.pollTimeoutMs(clock.milliTimestamp());
     const heartbeat_ms: ?i32 = if (self.anyAgentRunning()) 250 else null;
     const poll_timeout = pollTimeoutWithHeartbeat(parser_timeout, heartbeat_ms);
     _ = posix.poll(&fds, poll_timeout) catch {};
@@ -374,7 +375,7 @@ fn tick(
     }
 
     // Poll for input (outside frame span, so wait doesn't count)
-    const maybe_event = parser.pollOnce(posix.STDIN_FILENO, std.time.milliTimestamp());
+    const maybe_event = parser.pollOnce(posix.STDIN_FILENO, clock.milliTimestamp());
 
     // Resize: merge SIGWINCH and in-band CSI sources so handleResize
     // is called at most once per tick.
@@ -477,7 +478,7 @@ fn tick(
     // Read focused-runner state once, before the dirty check, so the
     // same elapsed_ms feeds both the heartbeat decision and the
     // composite call below. These calls are cheap (one optional deref
-    // + one std.time.milliTimestamp at most) so paying for them on the
+    // + one clock.milliTimestamp at most) so paying for them on the
     // skipped-frame path is negligible.
     const focused = self.window_manager.getFocusedPane();
     const agent_running = if (focused.runner) |r| r.isAgentRunning() else false;
@@ -613,7 +614,7 @@ fn sweepFloatsForAutoClose(self: *EventOrchestrator) void {
     const layout = self.window_manager.layout;
     if (layout.floats.items.len == 0) return;
 
-    const now = std.time.milliTimestamp();
+    const now = clock.milliTimestamp();
 
     // Real layouts hold ≤ 10 floats; a fixed-size stack scratch is
     // plenty. The cap matches the orchestrator's other per-frame
@@ -1803,7 +1804,7 @@ test "sweepFloatsForAutoClose closes a float whose time has elapsed" {
 
     // Backdate created_at_ms to well outside the timeout so the next
     // sweep observes the float as expired without sleeping the test.
-    f.layout.findFloat(handle).?.created_at_ms = std.time.milliTimestamp() - 1000;
+    f.layout.findFloat(handle).?.created_at_ms = clock.milliTimestamp() - 1000;
 
     var orch: EventOrchestrator = undefined;
     orch.window_manager = f.wm.*;

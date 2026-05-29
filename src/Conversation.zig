@@ -5,6 +5,7 @@
 //! Nodes are rendered to display lines via an internal NodeRenderer.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
@@ -1414,7 +1415,7 @@ pub fn persistUserMessage(self: *Conversation, text: []const u8) void {
     self.persistEvent(.{
         .entry_type = .user_message,
         .content = text,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = clock.milliTimestamp(),
     });
 }
 

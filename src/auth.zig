@@ -23,6 +23,7 @@
 //! silently dropping the entry.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 
 const oauth = @import("oauth.zig");
@@ -476,7 +477,7 @@ pub const ResolveOptions = struct {
 };
 
 fn defaultNow() i64 {
-    return std.time.timestamp();
+    return clock.timestamp();
 }
 
 /// Unified credential entry point. Loads `auth.json`, looks up

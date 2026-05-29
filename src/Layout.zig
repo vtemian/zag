@@ -9,6 +9,7 @@
 //! a pane-lifecycle context.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
@@ -368,7 +369,7 @@ pub fn addFloat(
         .rect = rect,
         .config = stored_config,
         .title_storage = owned_title,
-        .created_at_ms = std.time.milliTimestamp(),
+        .created_at_ms = clock.milliTimestamp(),
         .cursor_draft_len_at_open = 0,
         .origin_buffer = null,
     };

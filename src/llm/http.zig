@@ -6,6 +6,7 @@
 //! counterpart lives in `streaming.zig`.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const Endpoint = @import("../llm.zig").Endpoint;
 const anthropic_provider = @import("../providers/anthropic.zig");
@@ -735,7 +736,7 @@ test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id f
     // sourced from `zag.provider{}` reaches buildHeaders correctly.
     const allocator = std.testing.allocator;
 
-    const access = try buildFreshAccessToken(allocator, std.time.timestamp() + 3600);
+    const access = try buildFreshAccessToken(allocator, clock.timestamp() + 3600);
     defer allocator.free(access);
 
     var tmp = std.testing.tmpDir(.{});
@@ -879,7 +880,7 @@ test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const result = httpPostJsonRaw(
         url,
         "{}",
@@ -887,7 +888,7 @@ test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body
         allocator,
         .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 },
     );
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
     try std.testing.expectError(error.ReadTimeout, result);
     // 500 ms timeout plus generous slack for connect/handshake. The
     // OS-default behaviour would push this well past 60 s.

@@ -39,6 +39,7 @@
 //! agent can interrupt long-running commands.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const builtin = @import("builtin");
 const types = @import("../types.zig");
 const landlock = @import("../sandbox/landlock_linux.zig");
@@ -497,7 +498,7 @@ test "bash kills child on cancel" {
     std.Thread.sleep(200 * std.time.ns_per_ms);
     cancel.store(true, .release);
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     thread.join();
     const elapsed_ns = timer.read();
 

@@ -4,6 +4,7 @@
 //! with a companion meta.json for quick listing. Sessions live in .zag/sessions/.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const ulid = @import("ulid.zig");
@@ -277,7 +278,7 @@ pub fn recordCwdInRegistry(allocator: Allocator) !void {
     var registry = try ProjectRegistry.init(allocator, config_dir);
     defer registry.deinit();
 
-    try registry.register(canonical_cwd, std.time.milliTimestamp());
+    try registry.register(canonical_cwd, clock.milliTimestamp());
 }
 
 /// Manages session creation, loading, and listing.
@@ -311,7 +312,7 @@ pub const SessionManager = struct {
         const id_len = generateId(&id_buf);
         const id = id_buf[0..id_len];
 
-        const now = std.time.milliTimestamp();
+        const now = clock.milliTimestamp();
 
         // Build file paths
         var jsonl_path_buf: [256]u8 = undefined;
@@ -654,7 +655,7 @@ pub const SessionHandle = struct {
         const name_len: u8 = @intCast(@min(new_name.len, self.meta.name.len));
         @memcpy(self.meta.name[0..name_len], new_name[0..name_len]);
         self.meta.name_len = name_len;
-        self.meta.updated = std.time.milliTimestamp();
+        self.meta.updated = clock.milliTimestamp();
 
         try self.updateMeta();
 
@@ -690,7 +691,7 @@ pub const SessionHandle = struct {
         const name_len: u8 = @intCast(@min(new_name.len, self.meta.name.len));
         @memcpy(self.meta.name[0..name_len], new_name[0..name_len]);
         self.meta.name_len = name_len;
-        self.meta.updated = std.time.milliTimestamp();
+        self.meta.updated = clock.milliTimestamp();
 
         try self.updateMeta();
 
@@ -977,7 +978,7 @@ pub fn renameSessionAt(
     const name_len: u8 = @intCast(@min(new_name.len, meta.name.len));
     @memcpy(meta.name[0..name_len], new_name[0..name_len]);
     meta.name_len = name_len;
-    meta.updated = std.time.milliTimestamp();
+    meta.updated = clock.milliTimestamp();
 
     try writeMetaFile(meta_path, &meta);
 }
@@ -1107,7 +1108,7 @@ pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8, allocator: Allocator
 /// Generate a random hex ID (16 random bytes = 32 hex chars).
 fn generateId(buf: *[32]u8) u8 {
     var uuid_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&uuid_bytes);
+    clock.randomBytes(&uuid_bytes);
     const hex = std.fmt.bytesToHex(uuid_bytes, .lower);
     @memcpy(buf[0..32], &hex);
     return 32;
@@ -1120,7 +1121,7 @@ fn generateId(buf: *[32]u8) u8 {
 /// returns.
 fn serializeEntry(entry: *Entry, out: *std.ArrayList(u8), allocator: Allocator) !void {
     if (isZeroUlid(entry.id)) {
-        entry.id = ulid.generate(std.crypto.random);
+        entry.id = ulid.generate(clock.random());
     }
 
     const w = out.writer(allocator);
@@ -2672,7 +2673,7 @@ test "appendEntry serializes concurrent writes from multiple threads" {
                 _ = args.h.appendEntry(.{
                     .entry_type = .user_message,
                     .content = content,
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = clock.milliTimestamp(),
                 }) catch return;
             }
         }

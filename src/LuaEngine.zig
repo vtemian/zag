@@ -4,6 +4,7 @@
 //! so that plugins can define tools in Lua that appear alongside the built-in Zig tools.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const zlua = @import("zlua");
 const build_options = @import("build_options");
 const types = @import("types.zig");
@@ -2389,7 +2390,7 @@ pub const LuaEngine = struct {
     fn sinkEnforceBudget(ctx: *anyopaque, budget_ms: i64) void {
         const self: *LuaEngine = @ptrCast(@alignCast(ctx));
         if (budget_ms <= 0) return;
-        const now = std.time.milliTimestamp();
+        const now = clock.milliTimestamp();
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
             const task = entry.value_ptr.*;
@@ -2779,7 +2780,7 @@ pub const LuaEngine = struct {
             .scope = scope,
             .hook_payload = hook_payload,
             .compact_request = compact_request,
-            .started_at_ms = if (hook_payload != null) std.time.milliTimestamp() else 0,
+            .started_at_ms = if (hook_payload != null) clock.milliTimestamp() else 0,
             .budget_ms = if (hook_payload != null) self.hook_dispatcher.hook_budget_ms else null,
         };
 
@@ -3118,8 +3119,8 @@ test "zag.sleep yields, worker sleeps, coroutine resumes with (true, nil)" {
     // Drive the drain-and-resume loop by hand: no orchestrator running in
     // tests, so we poll the completion queue and feed each job through
     // resumeFromJob until the coroutine retires (or the deadline trips).
-    const deadline = std.time.milliTimestamp() + 500;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 500;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -3163,8 +3164,8 @@ test "zag.sleep returns (nil, 'cancelled') when scope cancelled mid-sleep" {
     try task.scope.cancel("test");
 
     // Drive drain loop until task retires.
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5206,8 +5207,8 @@ test "zag.spawn returns handle and :done() flips after sleep completes" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5246,8 +5247,8 @@ test "zag.detach spawns a fire-and-forget coroutine" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5284,8 +5285,8 @@ test "task:join yields until target completes, returns (true, nil)" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5322,8 +5323,8 @@ test "task:join returns (nil, 'cancelled') when target is cancelled" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5371,8 +5372,8 @@ test "zag.all collects results in input order" {
     _ = try eng.lua.getGlobal("test_all");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5423,8 +5424,8 @@ test "zag.race returns fastest value and reports winning index" {
     _ = try eng.lua.getGlobal("test_race");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5466,8 +5467,8 @@ test "zag.timeout returns err='timeout' when fn overshoots deadline" {
     _ = try eng.lua.getGlobal("test_timeout");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5506,8 +5507,8 @@ test "zag.timeout passes through value when fn beats deadline" {
     _ = try eng.lua.getGlobal("test_timeout_win");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5545,8 +5546,8 @@ test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
     _ = try eng.lua.getGlobal("test_cmd");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5587,8 +5588,8 @@ test "zag.cmd stdin piped to /bin/cat echoes back" {
     _ = try eng.lua.getGlobal("test_cat");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5625,8 +5626,8 @@ test "zag.cmd env_extra sets env var visible to child" {
     _ = try eng.lua.getGlobal("test_env");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5661,16 +5662,16 @@ test "zag.cmd timeout_ms kills long-running process" {
     _ = try eng.lua.getGlobal("test_timeout");
     _ = try eng.spawnCoroutine(0, null);
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const deadline = start + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
             std.Thread.sleep(1 * std.time.ns_per_ms);
         }
     }
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
 
     _ = try eng.lua.getGlobal("_to_r_is_nil");
@@ -5703,8 +5704,8 @@ test "zag.cmd.spawn + kill + wait returns signal-coded exit" {
     _ = try eng.lua.getGlobal("test_spawn_kill");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5744,8 +5745,8 @@ test "zag.cmd.spawn of short-lived process: wait returns code 0" {
     _ = try eng.lua.getGlobal("test_spawn_quick");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5782,8 +5783,8 @@ test "zag.cmd.spawn :wait after child exited returns code" {
     );
     _ = try eng.lua.getGlobal("test_post_exit");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5818,8 +5819,8 @@ test "zag.cmd.spawn GC without :wait reaps child cleanly" {
     );
     _ = try eng.lua.getGlobal("test_gc_no_wait");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5855,8 +5856,8 @@ test "zag.cmd.spawn :lines yields lines then nil at EOF" {
     );
     _ = try eng.lua.getGlobal("test_lines");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5901,8 +5902,8 @@ test "zag.cmd.spawn :lines errors when stdout not captured" {
     _ = try eng.lua.getGlobal("test_no_capture");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -5951,8 +5952,8 @@ test "zag.cmd.spawn :write feeds stdin, :close_stdin causes cat to exit" {
     _ = try eng.lua.getGlobal("test_write");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -6009,8 +6010,8 @@ test "zag.cmd.kill on a spawned child exits it with the signal" {
     _ = try eng.lua.getGlobal("test_kill");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -6097,8 +6098,8 @@ test "zag.http.get fetches from a local test server" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -6191,8 +6192,8 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -6286,8 +6287,8 @@ test "zag.http.post sends body and parses response" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -6374,8 +6375,8 @@ test "zag.http.stream yields response lines then nil at EOF" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else std.Thread.sleep(1 * std.time.ns_per_ms);
     }
 
@@ -6460,8 +6461,8 @@ test "zag.http.stream flushes trailing partial line on EOS" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else std.Thread.sleep(1 * std.time.ns_per_ms);
     }
 
@@ -6508,8 +6509,8 @@ test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
     );
     _ = try eng.lua.getGlobal("test_partial_cmd");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -6541,8 +6542,8 @@ test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
 /// pattern, so pull it out to keep the test bodies focused on their
 /// assertions.
 fn driveDrainLoop(eng: *LuaEngine, timeout_ms: i64) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + timeout_ms;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
@@ -7021,9 +7022,9 @@ test "hook budget cancels a runaway coroutine" {
         .args_rewrite = null,
     } };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     _ = try eng.fireHook(&payload);
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     // Budget is 30ms; enforcement + worker abort round-trip should
     // finish well under 5 seconds (and nowhere near 10s).

@@ -5,6 +5,7 @@
 //! synchronized output (CSI ?2026h/l) to eliminate flicker.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -534,7 +535,7 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
         while (written < self.render_buf.items.len) {
             written += file.write(self.render_buf.items[written..]) catch |err| switch (err) {
                 error.WouldBlock => {
-                    const now_ms = std.time.milliTimestamp();
+                    const now_ms = clock.milliTimestamp();
                     if (block_started_ms == null) block_started_ms = now_ms;
                     const elapsed_ms: i64 = now_ms - block_started_ms.?;
                     if (elapsed_ms >= write_deadline_ms) {
@@ -1351,9 +1352,9 @@ test "render returns WriteTimeout when tty backpressure exceeds deadline" {
     defer screen.deinit();
     for (screen.current) |*cell| cell.codepoint = 'Z';
 
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = clock.milliTimestamp();
     const result = screen.render(write_end);
-    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+    const elapsed_ms = clock.milliTimestamp() - start_ms;
 
     try std.testing.expectError(error.WriteTimeout, result);
     try std.testing.expect(screen.write_timed_out);

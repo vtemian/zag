@@ -19,6 +19,7 @@
 //! allocated and freed on `deinit`.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 
 const Allocator = std.mem.Allocator;
 const error_class = @import("error_class.zig");
@@ -103,7 +104,7 @@ pub const Telemetry = struct {
             .session_id = opts.session_id,
             .turn = opts.turn,
             .model = opts.model,
-            .started_ns = std.time.nanoTimestamp(),
+            .started_ns = clock.nanoTimestamp(),
         };
         return self;
     }
@@ -124,7 +125,7 @@ pub const Telemetry = struct {
     /// for tests and for callers that want the structured form without
     /// going through std.log. Caller frees with `self.allocator`.
     pub fn formatTimeline(self: *Telemetry) ![]u8 {
-        const elapsed_ns = std.time.nanoTimestamp() - self.started_ns;
+        const elapsed_ns = clock.nanoTimestamp() - self.started_ns;
         const elapsed_ms: i64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
         const error_kind = self.error_kind orelse "-";
         return std.fmt.allocPrint(

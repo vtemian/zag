@@ -8,6 +8,7 @@
 //! `job.err_tag` and returns.
 
 const std = @import("std");
+const clock = @import("../../clock.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -133,7 +134,7 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
         }
     }
 
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = clock.milliTimestamp();
     const deadline_ms: i64 = if (spec.timeout_ms > 0)
         start_ms +| @as(i64, @intCast(spec.timeout_ms))
     else
@@ -153,7 +154,7 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
             job.err_tag = .cancelled;
             return;
         }
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = clock.milliTimestamp();
         if (now_ms >= deadline_ms) {
             std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
             _ = child.wait() catch {};
@@ -301,9 +302,9 @@ test "executeExec honors scope cancel" {
         .thread_ref = 0,
         .scope = root,
     };
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     executeExec(alloc, &job);
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     try testing.expect(job.err_tag != null);
     try testing.expect(job.err_tag.? == .cancelled);
@@ -360,7 +361,7 @@ test "executeExec cancels in-flight child via aborter" {
         }
     };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const thread = try std.Thread.spawn(.{}, worker.run, .{ alloc, &job });
 
     // Give the worker enough time to actually spawn /bin/sleep
@@ -370,7 +371,7 @@ test "executeExec cancels in-flight child via aborter" {
     try root.cancel("test");
 
     thread.join();
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     try testing.expect(job.err_tag != null);
     try testing.expect(job.err_tag.? == .cancelled);

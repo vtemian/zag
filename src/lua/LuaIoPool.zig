@@ -10,6 +10,7 @@
 //! the agent loop.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
 const Scope = @import("Scope.zig").Scope;
@@ -126,8 +127,8 @@ pub const Pool = struct {
 fn executeJob(alloc: Allocator, job: *Job) void {
     switch (job.kind) {
         .sleep => |s| {
-            const deadline = std.time.milliTimestamp() + @as(i64, @intCast(s.ms));
-            while (std.time.milliTimestamp() < deadline) {
+            const deadline = clock.milliTimestamp() + @as(i64, @intCast(s.ms));
+            while (clock.milliTimestamp() < deadline) {
                 if (job.scope.isCancelled()) {
                     job.err_tag = .cancelled;
                     return;
@@ -260,8 +261,8 @@ test "Pool submit routes job to worker and posts to completion queue" {
     try pool.submit(&job);
 
     // Poll the completion queue for up to 1s
-    const deadline = std.time.milliTimestamp() + 1000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 1000;
+    while (clock.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expectEqual(&job, got);
             try testing.expect(got.err_tag == null);
@@ -291,17 +292,17 @@ test "Pool executes sleep job" {
         .scope = root,
     };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     try pool.submit(&job);
 
     const deadline = start + 500;
-    while (std.time.milliTimestamp() < deadline) {
+    while (clock.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expectEqual(&job, got);
             try testing.expect(got.err_tag == null);
             try testing.expect(got.result != null);
             try testing.expect(got.result.? == .empty);
-            const elapsed = std.time.milliTimestamp() - start;
+            const elapsed = clock.milliTimestamp() - start;
             try testing.expect(elapsed >= 20);
             return;
         }
@@ -331,16 +332,16 @@ test "Pool sleep honors cancellation before dispatch" {
         .scope = root,
     };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     try pool.submit(&job);
 
     const deadline = start + 500;
-    while (std.time.milliTimestamp() < deadline) {
+    while (clock.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expect(got.err_tag != null);
             try testing.expect(got.err_tag.? == .cancelled);
             try testing.expect(got.result == null);
-            const elapsed = std.time.milliTimestamp() - start;
+            const elapsed = clock.milliTimestamp() - start;
             try testing.expect(elapsed < 100);
             return;
         }

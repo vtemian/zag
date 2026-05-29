@@ -109,7 +109,7 @@ fn postStartupBanner(view: *Conversation, resume_id: ?[]const u8, session_handle
 }
 
 /// Top-level entry: wires subsystems and hands control to EventOrchestrator.
-pub fn main() !void {
+pub fn main(start: std.process.Init) !void {
     // Sandbox helper short-circuit: when invoked as
     // `zag --__sandbox-helper <cwd> <home> -- /bin/sh -c <cmd>` by
     // tools/bash.zig, we install landlock and execve into the tail. This
@@ -138,13 +138,25 @@ pub fn main() !void {
 
     const allocator = trace.wrapAllocator(gpa.allocator());
 
-    file_log.init(allocator) catch |err| {
+    // One process-wide io shared across every thread Zag spawns (agent
+    // thread, Lua worker pool, cmd/http helpers). A multithread-safe
+    // `Threaded` instance is required because that sharing is concurrent;
+    // `init.io` (single-threaded) would disable concurrency.
+    var io_threaded = std.Io.Threaded.init(allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+
+    // Borrowed process environment (non-global in 0.16). Threaded into env
+    // reads instead of the removed `std.process.getEnvVarOwned`.
+    const env = start.environ_map;
+
+    file_log.init(allocator, io, env) catch |err| {
         // Best-effort: if the log file can't be opened, continue without
         // logging. Print once to stderr so the user knows.
         std.debug.print("zag: file logger disabled ({s})\n", .{@errorName(err)});
     };
     defer file_log.deinit();
-    file_log.configureFromEnv(allocator);
+    file_log.configureFromEnv(env);
 
     // Parse args first so `zag auth ...` subcommands bypass Lua + provider
     // init entirely. The TUI path picks up `.new_session` / `.resume_*`

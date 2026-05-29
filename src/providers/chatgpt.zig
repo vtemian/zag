@@ -13,6 +13,7 @@
 //! Reference: codex-rs/codex-api/src/common.rs:159-180 (ResponsesApiRequest).
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
 const Harness = @import("../Harness.zig");
@@ -2040,7 +2041,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     // Use wall-clock time rather than a frozen constant: buildHeaders uses
     // ResolveOptions{} defaults (std.time.timestamp), so a hardcoded past
     // exp would trigger a refresh against the mock URL and fail.
-    const access = try testAccessTokenWithExp(allocator, std.time.timestamp() + 3600);
+    const access = try testAccessTokenWithExp(allocator, clock.timestamp() + 3600);
     defer allocator.free(access);
 
     var tmp = std.testing.tmpDir(.{});
@@ -2154,7 +2155,7 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
     // Use wall-clock time rather than a frozen constant: buildHeaders uses
     // ResolveOptions{} defaults (std.time.timestamp), so a hardcoded past
     // exp would trigger a refresh against the mock URL and fail.
-    const access = try testAccessTokenWithExp(allocator, std.time.timestamp() + 3600);
+    const access = try testAccessTokenWithExp(allocator, clock.timestamp() + 3600);
     defer allocator.free(access);
 
     var tmp = std.testing.tmpDir(.{});

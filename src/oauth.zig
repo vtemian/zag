@@ -5,6 +5,7 @@
 //! --login=<provider> or from src/auth.zig during credential refresh.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
@@ -27,7 +28,7 @@ pub const PkceCodes = struct {
 
 pub fn generatePkce(alloc: Allocator) !PkceCodes {
     var raw: [64]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    clock.randomBytes(&raw);
 
     const enc = std.base64.url_safe_no_pad.Encoder;
 
@@ -86,7 +87,7 @@ test "generatePkce produces distinct verifiers across calls" {
 
 pub fn generateState(alloc: Allocator) ![]const u8 {
     var raw: [32]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    clock.randomBytes(&raw);
 
     const enc = std.base64.url_safe_no_pad.Encoder;
     const buf = try alloc.alloc(u8, enc.calcSize(raw.len));
@@ -1108,7 +1109,7 @@ pub fn runLoginFlowWithCodes(
     defer alloc.free(account_id);
 
     // 9) Persist into auth.json.
-    const last_refresh = try formatIsoUtc(alloc, std.time.timestamp());
+    const last_refresh = try formatIsoUtc(alloc, clock.timestamp());
     defer alloc.free(last_refresh);
     auth.upsertOAuth(alloc, opts.auth_path, opts.provider_name, .{
         .id_token = tokens.id_token,

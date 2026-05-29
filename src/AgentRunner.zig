@@ -13,6 +13,7 @@
 //! session persistence stays inline, independent of the sink.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.agent_runner);
 const Conversation = @import("Conversation.zig");
@@ -297,7 +298,7 @@ pub fn submit(
     self.queue_active = true;
     self.lua_engine = deps.lua_engine;
     self.cancel_flag.store(false, .release);
-    self.turn_started_ms = std.time.milliTimestamp();
+    self.turn_started_ms = clock.milliTimestamp();
     self.output_tokens.store(0, .release);
 
     // Populate the TaskContext the agent thread publishes into the
@@ -533,7 +534,7 @@ pub fn shutdownAll(runners: []const *AgentRunner) void {
 /// Milliseconds since the current turn's agent thread spawned, or 0 when idle.
 pub fn elapsedMs(self: *const AgentRunner) u64 {
     const start = self.turn_started_ms orelse return 0;
-    const now = std.time.milliTimestamp();
+    const now = clock.milliTimestamp();
     return if (now > start) @intCast(now - start) else 0;
 }
 
@@ -924,7 +925,7 @@ pub fn drainEvents(self: *AgentRunner) DrainResult {
 /// per-arm `defer allocator.free(...)` lifetime; the headless loop
 /// owns the bytes for the duration of its switch arm.
 pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) void {
-    const ts = std.time.milliTimestamp();
+    const ts = clock.milliTimestamp();
     switch (event) {
         .text_delta => |text| {
             self.conversation.persistEvent(.{
@@ -1254,7 +1255,7 @@ test "elapsedMs and outputTokens reflect per-turn state" {
     try std.testing.expectEqual(@as(u32, 0), runner.outputTokens());
 
     // A turn that started in the past reports a positive elapsed time.
-    runner.turn_started_ms = std.time.milliTimestamp() - 50;
+    runner.turn_started_ms = clock.milliTimestamp() - 50;
     try std.testing.expect(runner.elapsedMs() >= 50);
 
     // Output-token counter reads back what the streaming path stored.

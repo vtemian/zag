@@ -8,6 +8,7 @@
 //! thread-spawning code.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const Hooks = @import("Hooks.zig");
 const prompt = @import("prompt.zig");
@@ -398,9 +399,9 @@ pub const EventQueue = struct {
                 return error.EventDropped;
             }
             const remaining_ns = deadline_ns - elapsed_ns;
-            const wait_start = std.time.nanoTimestamp();
+            const wait_start = clock.nanoTimestamp();
             self.drained.timedWait(&self.mutex, remaining_ns) catch {};
-            const wait_end = std.time.nanoTimestamp();
+            const wait_end = clock.nanoTimestamp();
             const delta: u64 = @intCast(@max(0, wait_end - wait_start));
             elapsed_ns += delta;
         }

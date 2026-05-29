@@ -43,7 +43,7 @@ const paste_end = "\x1b[201~";
 ///
 ///     var parser: input.Parser = .{};
 ///     while (running) {
-///         const now = std.time.milliTimestamp();
+///         const now = clock.milliTimestamp();
 ///         if (parser.pollOnce(stdin_fd, now)) |event| {
 ///             // dispatch event
 ///         }

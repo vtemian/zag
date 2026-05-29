@@ -20,6 +20,7 @@
 //! with an EOS/IO-error and the handle shuts down promptly.
 
 const std = @import("std");
+const clock = @import("../../clock.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -617,14 +618,14 @@ test "HttpStreamHandle close interrupts blocked helper read" {
     // Wait for that first completion before racing :close(). Poll
     // rather than sleep blindly so the test isn't timing-fragile on
     // slow CI.
-    const poll_start = std.time.milliTimestamp();
+    const poll_start = clock.milliTimestamp();
     while (true) {
         if (completions.pop()) |j| {
             if (j.kind.http_stream_line_done.line) |l| alloc.free(l);
             alloc.destroy(j);
             break;
         }
-        if (std.time.milliTimestamp() - poll_start > 2000) return error.TestTimedOutBeforeFirstLine;
+        if (clock.milliTimestamp() - poll_start > 2000) return error.TestTimedOutBeforeFirstLine;
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
 
@@ -638,10 +639,10 @@ test "HttpStreamHandle close interrupts blocked helper read" {
     // return in well under 1s. Without the socket shutdown the
     // helper.join() call inside shutdownAndCleanup would wait for
     // the 10s server sleep to elapse.
-    const close_start = std.time.milliTimestamp();
+    const close_start = clock.milliTimestamp();
     handle.close();
     handle.shutdownAndCleanup();
-    const elapsed_ms = std.time.milliTimestamp() - close_start;
+    const elapsed_ms = clock.milliTimestamp() - close_start;
 
     try testing.expect(elapsed_ms < 1000);
 }

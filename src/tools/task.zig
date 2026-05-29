@@ -18,6 +18,7 @@
 //!     Tracked at https://github.com/vtemian/zag/issues/5.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.task_tool);
 const types = @import("../types.zig");
@@ -155,7 +156,7 @@ fn runChild(
             task_start_id = sh.appendEntry(.{
                 .entry_type = .task_start,
                 .content = payload,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = clock.milliTimestamp(),
             }) catch |err| outer: {
                 log.warn("task_start persist failed: {}", .{err});
                 break :outer null;
@@ -307,7 +308,7 @@ fn runChild(
         _ = sh.appendEntry(.{
             .entry_type = .task_end,
             .content = owned,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = clock.milliTimestamp(),
             .parent_id = task_start_id,
         }) catch |err| log.warn("task_end persist failed: {}", .{err});
     }

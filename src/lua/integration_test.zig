@@ -9,6 +9,7 @@
 //! fixtures in one place.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const testing = std.testing;
 const LuaEngine = @import("../LuaEngine.zig").LuaEngine;
 const Job = @import("Job.zig").Job;
@@ -88,8 +89,8 @@ test "initAsync pool wake_fd pipeline delivers a job completion" {
 
     // Wait for wake byte
     var buf: [1]u8 = undefined;
-    const deadline = std.time.milliTimestamp() + 1000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 1000;
+    while (clock.milliTimestamp() < deadline) {
         const n = std.posix.read(fds[0], &buf) catch |err| switch (err) {
             error.WouldBlock => {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -125,8 +126,8 @@ test "resumeFromJob drains completion queue and frees the job" {
     try eng.async_runtime.?.pool.submit(job);
 
     // Wait for the worker's pass-through push to land in completions.
-    const deadline = std.time.milliTimestamp() + 1000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 1000;
+    while (clock.milliTimestamp() < deadline) {
         eng.async_runtime.?.completions.mu.lock();
         const has_entry = eng.async_runtime.?.completions.len > 0;
         eng.async_runtime.?.completions.mu.unlock();

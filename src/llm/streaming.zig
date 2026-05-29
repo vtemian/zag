@@ -12,6 +12,7 @@
 //! against hostile or broken endpoints.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const error_detail = @import("error_detail.zig");
 const error_class = @import("error_class.zig");
@@ -1080,7 +1081,7 @@ test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-bo
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const stream = try StreamingResponse.createWithOptions(.{
         .url = url,
         .body = "",
@@ -1092,7 +1093,7 @@ test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-bo
     defer stream.destroy();
 
     const result = stream.readLine(null);
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
     try std.testing.expectError(error.ReadTimeout, result);
     // 500 ms timeout plus generous slack for connect/handshake. The
     // OS-default behaviour would push this well past 60 s.

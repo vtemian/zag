@@ -23,6 +23,7 @@
 //! the socket and frees the connection struct).
 
 const std = @import("std");
+const clock = @import("../../clock.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
@@ -548,9 +549,9 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
     const cancel_thread = try std.Thread.spawn(.{}, CancelCtx.run, .{root});
     defer cancel_thread.join();
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     executeHttpGet(alloc, &job);
-    const elapsed_ms = std.time.milliTimestamp() - start;
+    const elapsed_ms = clock.milliTimestamp() - start;
 
     try testing.expect(job.err_tag != null);
     try testing.expectEqual(job_mod.ErrTag.cancelled, job.err_tag.?);

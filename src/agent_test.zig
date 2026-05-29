@@ -7,6 +7,7 @@
 //! create a tail-of-graph cycle).
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const types = @import("types.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
@@ -470,7 +471,7 @@ test "parallel execution is faster than sequential" {
         .{ .id = "call_3", .name = "echo_slow", .input_raw = "{}" },
     };
 
-    var timer = std.time.Timer.start() catch |err| {
+    var timer = clock.Timer.start() catch |err| {
         std.debug.print("skipping benchmark: no monotonic clock ({s})\n", .{@errorName(err)});
         return;
     };

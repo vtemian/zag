@@ -3,6 +3,7 @@
 //! appends results, and loops until the model returns a text-only response.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const types = @import("types.zig");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
@@ -2438,7 +2439,7 @@ fn runToolStep(
                 } }, agent_events.default_backpressure_ms) catch {};
             }
 
-            const t0 = std.time.milliTimestamp();
+            const t0 = clock.milliTimestamp();
             // The tool itself allocates from `allocator` (the per-worker
             // arena on the parallel path). Whatever it returns gets duped
             // into `payload_alloc` immediately so the arena can be torn
@@ -2457,7 +2458,7 @@ fn runToolStep(
             errdefer payload_alloc.free(final.content);
             // milliTimestamp() is monotonic in practice but the type is i64.
             // Clamp to 0 to avoid negative-delta wraparound when casting to u64.
-            const elapsed_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - t0));
+            const elapsed_ms: u64 = @intCast(@max(0, clock.milliTimestamp() - t0));
 
             const post = try firePostHook(lua_engine, tc, elapsed_ms, final, queue, cancel);
             // If a hook rewrote the content, the rewrite is owned by us.

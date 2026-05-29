@@ -11,6 +11,7 @@
 //! wrapper arrive in later tasks.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const llm = @import("llm.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
@@ -263,7 +264,7 @@ pub const EnvSnapshot = struct {
             }
         }
 
-        const date_iso = try formatIsoDate(alloc, std.time.timestamp());
+        const date_iso = try formatIsoDate(alloc, clock.timestamp());
         errdefer alloc.free(date_iso);
 
         return .{
