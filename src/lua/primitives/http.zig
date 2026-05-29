@@ -23,6 +23,7 @@
 //! the socket and frees the connection struct).
 
 const std = @import("std");
+const test_net = @import("../../test_net.zig");
 const clock = @import("../../clock.zig");
 const builtin = @import("builtin");
 const process_io = @import("../../process_io.zig");
@@ -383,19 +384,19 @@ test "executeHttpGet fetches from a local test server" {
     defer root.deinit();
 
     // Listen on 127.0.0.1:0; kernel picks a free port.
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Minimal HTTP/1.1 server: accept one connection, read the
     // request (drain until we've seen \r\n\r\n or buffer fills), send
     // a canned 200 OK with "hello world" body, close. Thread exits
     // after serving one request.
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             // Read enough to unblock the client. We only look for
             // \r\n\r\n (end of headers); body would come next but GET
@@ -403,7 +404,7 @@ test "executeHttpGet fetches from a local test server" {
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -416,7 +417,7 @@ test "executeHttpGet fetches from a local test server" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "hello world";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -489,22 +490,22 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
     const root = try Scope.init(alloc, null);
     defer root.deinit();
 
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Slow server: accept, read the request, then sleep 10s before
     // responding. The test cancels long before the sleep ends.
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -521,7 +522,7 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "ok";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});

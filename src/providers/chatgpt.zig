@@ -13,6 +13,7 @@
 //! Reference: codex-rs/codex-api/src/common.rs:159-180 (ResponsesApiRequest).
 
 const std = @import("std");
+const test_net = @import("../test_net.zig");
 const clock = @import("../clock.zig");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
@@ -1932,9 +1933,9 @@ const canned_text_sse =
 /// that are already in flight but the connection is still mid-write.
 /// Draining until `\r\n\r\n` (end of request headers) plus any
 /// `Content-Length` body bytes is the robust shape.
-fn mockServeOnce(srv: *std.net.Server, response: []const u8) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockServeOnce(srv: *std.Io.net.Server, response: []const u8) void {
+    var conn = srv.accept(std.testing.io) catch return;
+    defer conn.close(std.testing.io);
 
     const alloc = std.heap.page_allocator;
     var req: std.ArrayList(u8) = .empty;
@@ -1944,7 +1945,7 @@ fn mockServeOnce(srv: *std.net.Server, response: []const u8) void {
     // 1. Read until we see the end-of-headers sentinel.
     var headers_end: usize = 0;
     while (true) {
-        const n = conn.stream.read(&tmp) catch return;
+        const n = test_net.streamRead(conn, &tmp) catch return;
         if (n == 0) return; // client hung up before finishing request
         req.appendSlice(alloc, tmp[0..n]) catch return;
         if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
@@ -1969,13 +1970,13 @@ fn mockServeOnce(srv: *std.net.Server, response: []const u8) void {
     var body_remaining = if (content_length > body_have) content_length - body_have else 0;
     while (body_remaining > 0) {
         const want = @min(body_remaining, tmp.len);
-        const n = conn.stream.read(tmp[0..want]) catch return;
+        const n = test_net.streamRead(conn, tmp[0..want]) catch return;
         if (n == 0) break;
         body_remaining -= n;
     }
 
     // 3. Now it's safe to write the canned response.
-    _ = conn.stream.writeAll(response) catch {};
+    _ = test_net.streamWriteAll(conn, response) catch {};
 }
 
 // Chunked transfer encoding: Zig 0.15's http.Client has a bug in
@@ -2020,9 +2021,8 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     const allocator = std.testing.allocator;
 
     // 1. Spin up a localhost SSE server with a canned response.
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     const http_response = try buildMockResponse(allocator, canned_text_sse);
     defer allocator.free(http_response);
@@ -2032,7 +2032,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     // even if the client never connected (e.g. callStreaming errored early).
     // Otherwise the test deadlocks on a failing happy path.
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 

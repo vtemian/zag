@@ -23,6 +23,7 @@
 //! silently dropping the entry.
 
 const std = @import("std");
+const test_net = @import("test_net.zig");
 const clock = @import("clock.zig");
 const process_io = @import("process_io.zig");
 const Allocator = std.mem.Allocator;
@@ -1050,10 +1051,10 @@ test "resolveCredential returns current oauth tokens when well before expiry" {
 }
 
 test "resolveCredential refreshes when within 5 minutes of expiry" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Mock IdP returns a fresh id_token whose account claim is acc-new, a
     // new access_token whose exp is well in the future, and a rotated
@@ -1080,12 +1081,12 @@ test "resolveCredential refreshes when within 5 minutes of expiry" {
     defer std.testing.allocator.free(response);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, resp: []const u8) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server, resp: []const u8) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamRead(conn, &buf) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, response });
@@ -1149,10 +1150,10 @@ test "resolveCredential refreshes when within 5 minutes of expiry" {
 }
 
 test "resolveCredential refreshes when access token already expired" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const frozen_now: i64 = 1_700_000_000;
     const new_access = try accessTokenWithExp(std.testing.allocator, frozen_now + 3600);
@@ -1174,12 +1175,12 @@ test "resolveCredential refreshes when access token already expired" {
     defer std.testing.allocator.free(response);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, resp: []const u8) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server, resp: []const u8) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamRead(conn, &buf) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, response });
@@ -1236,22 +1237,22 @@ test "resolveCredential refreshes when access token already expired" {
 }
 
 test "resolveCredential maps LoginExpired from refresh endpoint" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
+            _ = test_net.streamRead(conn, &buf) catch {};
             const resp =
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: 69\r\nConnection: close\r\n\r\n" ++
                 "{\"error\":\"invalid_grant\",\"error_description\":\"refresh token expired\"}";
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});

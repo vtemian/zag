@@ -6,6 +6,7 @@
 //! counterpart lives in `streaming.zig`.
 
 const std = @import("std");
+const test_net = @import("../test_net.zig");
 const clock = @import("../clock.zig");
 const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
@@ -809,18 +810,21 @@ test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id f
 /// headers (chunked transfer, no chunk yet) and sleeps long enough that
 /// any read on the body side hits `SO_RCVTIMEO`. Mirrors
 /// `mockTimeoutServer` in `streaming.zig`.
-fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockTimeoutServer(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    const io = std.testing.io;
+    var stream = srv.accept(io) catch return;
+    defer stream.close(io);
 
     const alloc = std.heap.page_allocator;
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(alloc);
 
+    var read_scratch: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_scratch);
     var tmp: [4096]u8 = undefined;
     var headers_end: usize = 0;
     while (true) {
-        const n = conn.stream.read(&tmp) catch return;
+        const n = sr.interface.readSliceShort(&tmp) catch return;
         if (n == 0) return;
         req.appendSlice(alloc, tmp[0..n]) catch return;
         if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
@@ -843,7 +847,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
     var body_remaining = if (content_length > body_have) content_length - body_have else 0;
     while (body_remaining > 0) {
         const want = @min(body_remaining, tmp.len);
-        const n = conn.stream.read(tmp[0..want]) catch return;
+        const n = sr.interface.readSliceShort(tmp[0..want]) catch return;
         if (n == 0) break;
         body_remaining -= n;
     }
@@ -855,7 +859,10 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
         "Content-Type: application/json\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
-    _ = conn.stream.writeAll(head_only) catch {};
+    var write_scratch: [256]u8 = undefined;
+    var sw = stream.writer(io, &write_scratch);
+    sw.interface.writeAll(head_only) catch {};
+    sw.interface.flush() catch {};
     clock.sleep(sleep_ns);
 }
 
@@ -868,13 +875,12 @@ test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body
     // `error.ReadTimeout`.
     const allocator = std.testing.allocator;
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     const thr = try std.Thread.spawn(.{}, mockTimeoutServer, .{ &server, 3 * std.time.ns_per_s });
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 

@@ -20,6 +20,7 @@
 //! with an EOS/IO-error and the handle shuts down promptly.
 
 const std = @import("std");
+const test_net = @import("../../test_net.zig");
 const sync = @import("../../sync.zig");
 const clock = @import("../../clock.zig");
 const process_io = @import("../../process_io.zig");
@@ -566,20 +567,20 @@ test "HttpStreamHandle close interrupts blocked helper read" {
     // and then holds the connection open without sending more bytes
     // for 10 seconds. The helper thread will read the first line
     // successfully, then block waiting for the next one.
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -592,7 +593,7 @@ test "HttpStreamHandle close interrupts blocked helper read" {
                 "Transfer-Encoding: chunked\r\n" ++
                 "\r\n" ++
                 "6\r\nline1\n\r\n";
-            conn.stream.writeAll(resp) catch return;
+            test_net.streamWriteAll(conn, resp) catch return;
 
             // Hold the connection open; the test's `:close()` will
             // cause shutdown on the client side, which shows up here

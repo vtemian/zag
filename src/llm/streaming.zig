@@ -12,6 +12,7 @@
 //! against hostile or broken endpoints.
 
 const std = @import("std");
+const test_net = @import("../test_net.zig");
 const clock = @import("../clock.zig");
 const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
@@ -1013,9 +1014,9 @@ test "freeHeaders is leak-clean on captured slice" {
 /// long enough that any read on the body side will hit `SO_RCVTIMEO`.
 /// Mirrors the `mockServeOnce` shape from `providers/chatgpt.zig` but
 /// stops short of writing a chunk so the client's body reader stalls.
-fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockTimeoutServer(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    var conn = srv.accept(std.testing.io) catch return;
+    defer conn.close(std.testing.io);
 
     const alloc = std.heap.page_allocator;
     var req: std.ArrayList(u8) = .empty;
@@ -1024,7 +1025,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
     var tmp: [4096]u8 = undefined;
     var headers_end: usize = 0;
     while (true) {
-        const n = conn.stream.read(&tmp) catch return;
+        const n = test_net.streamRead(conn, &tmp) catch return;
         if (n == 0) return;
         req.appendSlice(alloc, tmp[0..n]) catch return;
         if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
@@ -1047,7 +1048,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
     var body_remaining = if (content_length > body_have) content_length - body_have else 0;
     while (body_remaining > 0) {
         const want = @min(body_remaining, tmp.len);
-        const n = conn.stream.read(tmp[0..want]) catch return;
+        const n = test_net.streamRead(conn, tmp[0..want]) catch return;
         if (n == 0) break;
         body_remaining -= n;
     }
@@ -1058,7 +1059,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
         "Content-Type: text/event-stream\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
-    _ = conn.stream.writeAll(head_only) catch {};
+    _ = test_net.streamWriteAll(conn, head_only) catch {};
     clock.sleep(sleep_ns);
 }
 
@@ -1071,15 +1072,14 @@ test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-bo
     // surfaces it as `error.ReadTimeout`.
     const allocator = std.testing.allocator;
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     // Sleep well past the 500 ms read timeout so the test fails clearly
     // when the timeout machinery is missing or wired wrong.
     const thr = try std.Thread.spawn(.{}, mockTimeoutServer, .{ &server, 3 * std.time.ns_per_s });
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 

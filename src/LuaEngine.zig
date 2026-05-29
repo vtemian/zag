@@ -4,6 +4,7 @@
 //! so that plugins can define tools in Lua that appear alongside the built-in Zig tools.
 
 const std = @import("std");
+const test_net = @import("test_net.zig");
 const env_mod = @import("env.zig");
 const clock = @import("clock.zig");
 const zlua = @import("zlua");
@@ -6050,19 +6051,19 @@ test "zag.http.get fetches from a local test server" {
 
     // Canned HTTP/1.1 server: kernel picks the port, thread serves one
     // request then exits. Same pattern as primitives/http.zig's test.
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6074,7 +6075,7 @@ test "zag.http.get fetches from a local test server" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "hello from lua";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -6139,10 +6140,10 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Capture the received request bytes so the test can assert which
     // headers the client sent. Shared by-pointer with the server
@@ -6154,13 +6155,13 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
     var captured = Captured{};
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, cap: *Captured) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server, cap: *Captured) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var total: usize = 0;
             while (total < cap.request_bytes.len) {
-                const n = conn.stream.read(cap.request_bytes[total..]) catch break;
+                const n = test_net.streamRead(conn, cap.request_bytes[total..]) catch break;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, cap.request_bytes[0..total], "\r\n\r\n") != null) break;
@@ -6174,7 +6175,7 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "ok";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, &captured });
@@ -6218,24 +6219,24 @@ test "zag.http.post sends body and parses response" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Echo server: read the request (crude but OK for small bodies
     // under a single MSS), grab everything after `\r\n\r\n`, send it
     // back as the response body. No Content-Length on the request
     // side means we also accept chunked-less small payloads.
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [8192]u8 = undefined;
             var total: usize = 0;
             // Headers first
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6253,7 +6254,7 @@ test "zag.http.post sends body and parses response" {
 
             // Keep reading until we have the full body.
             while ((total - header_end) < content_length and total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
             }
@@ -6261,7 +6262,7 @@ test "zag.http.post sends body and parses response" {
             const body = buf[header_end..total];
             var resp_buf: [8192]u8 = undefined;
             const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -6324,19 +6325,19 @@ test "zag.http.stream yields response lines then nil at EOF" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    var server_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try server_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6348,7 +6349,7 @@ test "zag.http.stream yields response lines then nil at EOF" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "line1\nline2\nline3\n";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -6409,19 +6410,19 @@ test "zag.http.stream flushes trailing partial line on EOS" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    var server_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try server_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6434,7 +6435,7 @@ test "zag.http.stream flushes trailing partial line on EOS" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "a\nb\nc";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
