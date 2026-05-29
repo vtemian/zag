@@ -853,10 +853,10 @@ test "render with no changes produces only sync markers" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     // Read what was written using raw posix read
     var scratch: [8192]u8 = undefined;
@@ -880,10 +880,10 @@ test "render emits output for changed cells" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [8192]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
@@ -910,10 +910,10 @@ test "render copies current to previous" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     // After render, previous should match current
     try std.testing.expectEqual(@as(u21, 'A'), screen.previous[0].codepoint);
@@ -940,8 +940,8 @@ test "second render with no new changes produces only sync markers" {
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
 
         try screen.render(write_end);
-        write_end.close();
-        read_end.close();
+        write_end.close(std.testing.io);
+        read_end.close(std.testing.io);
     }
 
     // Second render: no changes since first render
@@ -949,10 +949,10 @@ test "second render with no new changes produces only sync markers" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
 
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
 
         var scratch: [8192]u8 = undefined;
         const output = try readPipe(read_end, &scratch);
@@ -1021,10 +1021,10 @@ test "render encodes non-ASCII multi-byte UTF-8 codepoints" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [8192]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
@@ -1051,10 +1051,10 @@ test "render emits RGB background color SGR sequences" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [8192]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
@@ -1100,10 +1100,10 @@ test "writeSgr downgrades RGB to 256 when true_color is unavailable" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [8192]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
@@ -1125,9 +1125,9 @@ test "render reuses output buffer across frames" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
         var scratch: [8192]u8 = undefined;
         const output = try readPipe(read_end, &scratch);
         try std.testing.expect(std.mem.indexOf(u8, output, "A") != null);
@@ -1139,9 +1139,9 @@ test "render reuses output buffer across frames" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
         var scratch: [8192]u8 = undefined;
         const output = try readPipe(read_end, &scratch);
         // Frame 2 should only contain 'B', not 'A' (A is now in previous)
@@ -1160,10 +1160,10 @@ test "render emits palette background color SGR sequences" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [8192]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
@@ -1293,10 +1293,10 @@ test "diff emits at most one SGR per contiguous same-style run" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [2048]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
@@ -1334,10 +1334,10 @@ test "diff merges run containing wide-char continuation cell" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [2048]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
@@ -1365,8 +1365,8 @@ test "render returns WriteTimeout when tty backpressure exceeds deadline" {
     const pipe = try wake_pipe.open();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
-    defer write_end.close();
+    defer read_end.close(std.testing.io);
+    defer write_end.close(std.testing.io);
 
     // Preload the pipe buffer until the next write would block. Ensures the
     // render's first `file.write` hits WouldBlock rather than succeeding by
@@ -1412,10 +1412,10 @@ test "render after write_timed_out forces full redraw" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
 
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     try std.testing.expect(!screen.write_timed_out);
 
@@ -1439,9 +1439,9 @@ test "forced full redraw erases the display so vacated cells cannot ghost" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
         var scratch: [1024]u8 = undefined;
         _ = try readPipe(read_end, &scratch);
     }
@@ -1461,9 +1461,9 @@ test "forced full redraw erases the display so vacated cells cannot ghost" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
     var scratch: [1024]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
 
@@ -1486,9 +1486,9 @@ test "normal changed-cell frame does not erase the whole display" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
     var scratch: [1024]u8 = undefined;
     const output = try readPipe(read_end, &scratch);
 
@@ -1573,9 +1573,9 @@ test "render clears cluster side table so ZWJ repaint does not grow it" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
     var scratch: [1024]u8 = undefined;
     _ = try readPipe(read_end, &scratch);
 
@@ -1598,9 +1598,9 @@ test "render clears cluster side table so ZWJ repaint does not grow it" {
     const pipe2 = try wake_pipe.openBlocking();
     const write_end2: std.Io.File = .{ .handle = pipe2[1], .flags = .{ .nonblocking = false } };
     const read_end2: std.Io.File = .{ .handle = pipe2[0], .flags = .{ .nonblocking = false } };
-    defer read_end2.close();
+    defer read_end2.close(std.testing.io);
     try screen.render(write_end2);
-    write_end2.close();
+    write_end2.close(std.testing.io);
     _ = try readPipe(read_end2, &scratch);
     try testing.expectEqual(@as(usize, 0), screen.cluster_bytes.items.len);
     try testing.expectEqual(@as(usize, 0), screen.cluster_index.items.len);
@@ -1618,9 +1618,9 @@ test "render keeps cluster side table bounded across many frames" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
         var scratch: [1024]u8 = undefined;
         _ = try readPipe(read_end, &scratch);
     }
@@ -1634,9 +1634,9 @@ test "render keeps cluster side table bounded across many frames" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
         var scratch: [1024]u8 = undefined;
         _ = try readPipe(read_end, &scratch);
 
@@ -1660,9 +1660,9 @@ test "render emits full ZWJ cluster bytes across consecutive frames" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
         var scratch: [1024]u8 = undefined;
         const output = try readPipe(read_end, &scratch);
         try testing.expect(std.mem.indexOf(u8, output, family) != null);
@@ -1677,9 +1677,9 @@ test "render emits full ZWJ cluster bytes across consecutive frames" {
         const pipe = try wake_pipe.openBlocking();
         const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
         const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-        defer read_end.close();
+        defer read_end.close(std.testing.io);
         try screen.render(write_end);
-        write_end.close();
+        write_end.close(std.testing.io);
         var scratch: [1024]u8 = undefined;
         const output = try readPipe(read_end, &scratch);
         try testing.expect(std.mem.indexOf(u8, output, family) != null);

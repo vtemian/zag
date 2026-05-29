@@ -2019,7 +2019,7 @@ test "create, append, and load round-trip" {
     file.close(std.testing.io);
 
     // Read back
-    const content = try tmp_dir.readFileAlloc(allocator, "test.jsonl", 1024 * 1024);
+    const content = try tmp_dir.readFileAlloc(std.testing.io, "test.jsonl", allocator, .limited(1024 * 1024));
     defer allocator.free(content);
 
     var loaded: std.ArrayList(Entry) = .empty;

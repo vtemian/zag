@@ -1386,9 +1386,9 @@ test "multi-line bash command emits no raw control bytes" {
     const pipe = try wake_pipe.openBlocking();
     const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
     const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
-    defer read_end.close();
+    defer read_end.close(std.testing.io);
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [16384]u8 = undefined;
     var total: usize = 0;

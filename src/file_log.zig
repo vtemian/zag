@@ -454,7 +454,18 @@ test "parseLevel maps spellings to log.Level" {
 }
 
 test "resolvePath returns $HOME/.zag/logs/<uuid>.log" {
-    const path = resolvePath(std.testing.allocator) catch |err| switch (err) {
+    // 0.16 routes env through an explicit map; seed one from the real
+    // environ so resolvePath can read HOME.
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const pair = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        try env.put(pair[0..eq], pair[eq + 1 ..]);
+    }
+
+    const path = resolvePath(std.testing.allocator, std.testing.io, &env) catch |err| switch (err) {
         error.NoLogPath => return error.SkipZigTest,
         else => return err,
     };
