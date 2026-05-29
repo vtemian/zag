@@ -2052,7 +2052,7 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buf)];
     const log_full = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     defer file_log.deinit();

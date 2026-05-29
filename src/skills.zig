@@ -375,9 +375,9 @@ test "discover finds skills across project and user roots" {
         "---\nname: skill-b\ndescription: Second skill.\n---\nBody.\n",
     );
 
-    const project_root = try project_tmp.dir.realpathAlloc(alloc, ".");
+    const project_root = try project_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(project_root);
-    const home_root = try home_tmp.dir.realpathAlloc(alloc, ".");
+    const home_root = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(home_root);
 
     var registry = try SkillRegistry.discover(alloc, home_root, project_root);
@@ -419,9 +419,9 @@ test "project shadows user on name collision" {
         "---\nname: same\ndescription: User version.\n---\n",
     );
 
-    const project_root = try project_tmp.dir.realpathAlloc(alloc, ".");
+    const project_root = try project_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(project_root);
-    const home_root = try home_tmp.dir.realpathAlloc(alloc, ".");
+    const home_root = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(home_root);
 
     var registry = try SkillRegistry.discover(alloc, home_root, project_root);
@@ -449,7 +449,7 @@ test "invalid names are rejected" {
         "---\nname: Bad_Name\ndescription: Should be rejected.\n---\n",
     );
 
-    const home_root = try home_tmp.dir.realpathAlloc(alloc, ".");
+    const home_root = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(home_root);
 
     var registry = try SkillRegistry.discover(alloc, home_root, null);

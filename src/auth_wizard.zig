@@ -1756,7 +1756,7 @@ test "scaffoldConfigLua writes expected contents for openai" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1785,7 +1785,7 @@ test "scaffoldConfigLua writes expected contents for anthropic" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1806,7 +1806,7 @@ test "scaffoldConfigLua does not duplicate the picked provider in the commented 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1835,7 +1835,7 @@ test "scaffoldConfigLua lists every other stdlib provider in the commented block
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1868,7 +1868,7 @@ test "scaffoldConfigLua is a no-op when file exists" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1888,7 +1888,7 @@ test "scaffoldConfigLua creates parent directories" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "nested", "config.lua" });
     defer testing.allocator.free(path);
@@ -1907,7 +1907,7 @@ test "scaffoldConfigLua rejects unknown provider" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1924,7 +1924,7 @@ test "scaffoldConfigLua writes chosen_model when provided" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1945,7 +1945,7 @@ test "scaffoldConfigLua writes chosen_model when provided" {
 fn wizardPaths(
     dir: std.Io.Dir,
 ) !struct { auth_path: []u8, config_path: []u8 } {
-    const dir_path = try dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const auth_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "auth.json" });
     errdefer testing.allocator.free(auth_path);
@@ -2694,7 +2694,7 @@ test "persistDefaultModel replaces existing line" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
@@ -2720,7 +2720,7 @@ test "persistDefaultModel appends when no line exists" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
@@ -2741,7 +2741,7 @@ test "persistDefaultModel ignores commented-out lines" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
@@ -2769,7 +2769,7 @@ test "persistDefaultModel collapses multiple active lines to one" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);

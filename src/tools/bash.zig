@@ -519,7 +519,7 @@ test "bash kills child on cancel" {
 
     // Give the child time to start before signalling cancel, so the test
     // exercises the cancellation path rather than a pre-poll early-out.
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    clock.sleep(200 * std.time.ns_per_ms);
     cancel.store(true, .release);
 
     var timer = try clock.Timer.start();
@@ -632,19 +632,19 @@ test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" 
     const allocator = std.testing.allocator;
     const home = env_mod.get("HOME") orelse "/";
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/";
+    const io = std.testing.io;
+    const cwd: []const u8 = if (std.Io.Dir.cwd().realPath(io, &cwd_buf)) |n| cwd_buf[0..n] else |_| "/";
     const profile = try buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home });
     defer allocator.free(profile);
 
-    var child = std.process.Child.init(
-        &.{ "/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", "exit 0" },
-        allocator,
-    );
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    const term = try child.wait();
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", "exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const term = try child.wait(io);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
 test "execute denies reading ~/.ssh on macOS in strict mode" {

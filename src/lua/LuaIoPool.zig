@@ -217,7 +217,7 @@ test "worker bumps completions.dropped when ring is full" {
     try pool.submit(&j3);
 
     // Wait long enough for workers to process all three.
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    clock.sleep(100 * std.time.ns_per_ms);
 
     try testing.expect(completions.dropped.load(.monotonic) >= 2);
 
@@ -271,7 +271,7 @@ test "Pool submit routes job to worker and posts to completion queue" {
             try testing.expect(got.result.? == .empty);
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
     return error.JobNeverCompleted;
 }
@@ -307,7 +307,7 @@ test "Pool executes sleep job" {
             try testing.expect(elapsed >= 20);
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
     return error.SleepJobNeverCompleted;
 }
@@ -346,7 +346,7 @@ test "Pool sleep honors cancellation before dispatch" {
             try testing.expect(elapsed < 100);
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
     return error.CancelledJobNeverCompleted;
 }

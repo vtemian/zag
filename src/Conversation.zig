@@ -2469,7 +2469,7 @@ test "loadFromEntries reloads tool_call nodes collapsed" {
 fn restoreTestCwd(abs_path: []const u8) void {
     var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
     defer dir.close();
-    dir.setAsCwd() catch {};
+    std.process.setCurrentDir(std.testing.io, dir) catch {};
 }
 
 test "child Conversation persistEvent stamps subagent_path and routes through parent" {
@@ -2478,9 +2478,9 @@ test "child Conversation persistEvent stamps subagent_path and routes through pa
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);
@@ -2520,9 +2520,9 @@ test "loadFromEntries reconstructs subagents from tagged entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);
@@ -2594,9 +2594,9 @@ test "depth-2 subagent_path round-trips through persist + load" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);
@@ -3478,9 +3478,9 @@ test "loadFromEntries refines (unknown) when task_start arrives after child even
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);

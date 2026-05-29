@@ -5094,7 +5094,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
             while (true) {
                 const n = self.queue.drain(&slot);
                 if (n == 0) {
-                    std.Thread.sleep(std.time.ns_per_ms);
+                    clock.sleep(std.time.ns_per_ms);
                     continue;
                 }
                 switch (slot[0]) {
@@ -5393,7 +5393,7 @@ test "swapProvider persists the pick to config.lua" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -8339,13 +8339,13 @@ test "splitFocusedWithSession attaches loaded session to a new pane" {
     // here cannot collide with the host project's `.zag/sessions`.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer {
         if (std.fs.openDirAbsolute(orig_cwd, .{})) |d_const| {
             var d = d_const;
-            d.setAsCwd() catch {};
+            std.process.setCurrentDir(std.testing.io, d) catch {};
             d.close();
         } else |_| {}
     }

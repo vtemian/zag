@@ -406,7 +406,7 @@ test "buildHeaders creates correct auth for bearer endpoint" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(path);
@@ -443,7 +443,7 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
     // resolve succeeds against a real on-disk file.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(path);
@@ -742,7 +742,7 @@ test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id f
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(path);
@@ -856,7 +856,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
     _ = conn.stream.writeAll(head_only) catch {};
-    std.Thread.sleep(sleep_ns);
+    clock.sleep(sleep_ns);
 }
 
 test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body" {

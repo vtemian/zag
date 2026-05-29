@@ -2081,7 +2081,7 @@ test "writeMetaFile and readMetaFile round-trip" {
 
     // Write meta to a temp file. We need a path relative to cwd for writeMetaFile,
     // so we use the tmpDir's real path.
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
     var path_buf: [512]u8 = undefined;
@@ -2116,7 +2116,7 @@ test "writeMetaFile and readMetaFile round-trip with working status" {
     @memcpy(meta.id[0..id.len], id);
     meta.id_len = @intCast(id.len);
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
     var path_buf: [512]u8 = undefined;
@@ -2138,7 +2138,7 @@ test "readMetaFile defaults to idle when status field is missing" {
     const json = "{\"id\":\"abc\",\"created\":1,\"updated\":2,\"message_count\":3}";
     try tmp.dir.writeFile(.{ .sub_path = "no-status.meta.json", .data = json });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
     var path_buf: [512]u8 = undefined;
@@ -2159,7 +2159,7 @@ test "readMetaFile defaults to idle when status field is unrecognized" {
     const json = "{\"id\":\"abc\",\"status\":\"bogus\",\"created\":1,\"updated\":2,\"message_count\":3}";
     try tmp.dir.writeFile(.{ .sub_path = "bad-status.meta.json", .data = json });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
     var path_buf: [512]u8 = undefined;
@@ -2196,7 +2196,7 @@ test "writeMetaFile replaces any stale .tmp via atomic rename" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
     var meta_path_buf: [512]u8 = undefined;
@@ -2224,9 +2224,7 @@ test "writeMetaFile replaces any stale .tmp via atomic rename" {
 }
 
 fn restoreCwd(abs_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
-    defer dir.close();
-    dir.setAsCwd() catch {};
+    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
 }
 
 test "appendEntry does not fsync per streaming-delta entry; non-delta entries do" {
@@ -2246,9 +2244,9 @@ test "appendEntry does not fsync per streaming-delta entry; non-delta entries do
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2303,9 +2301,9 @@ test "renameIfUnnamed only renames when meta has no name yet" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2332,9 +2330,9 @@ test "renameIfUnnamed treats empty string as no-op" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2364,9 +2362,9 @@ test "appendEntry persists tool_result content larger than 8 KiB" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2414,9 +2412,9 @@ test "appendEntry appends without clobbering previous rows" {
     // SessionManager and loadEntries both use std.fs.cwd(); chdir into
     // the tmp dir so .zag/sessions resolves under it, then restore cwd
     // on exit.
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2513,9 +2511,9 @@ test "loader synthesizes ids for pre-migration entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     try std.fs.cwd().makePath(sessions_dir);
@@ -2566,9 +2564,9 @@ test "loader preserves explicit ids from new-schema entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     try std.fs.cwd().makePath(sessions_dir);
@@ -2618,9 +2616,9 @@ test "loader handles mixed old+new entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     try std.fs.cwd().makePath(sessions_dir);
@@ -2674,9 +2672,9 @@ test "appendEntry serializes concurrent writes from multiple threads" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2784,9 +2782,9 @@ test "tool_call and tool_result round-trip tool_use_id and tool_input via loadEn
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2850,9 +2848,9 @@ test "backfillEntry mixes line index into seed to avoid same-ms collisions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     try std.fs.cwd().makePath(sessions_dir);
@@ -2890,9 +2888,9 @@ test "loadEntries skips a corrupt mid-file entry without dropping later rows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -2955,9 +2953,9 @@ test "SessionManager.deleteSession removes both .jsonl and .meta.json and is ide
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -3003,13 +3001,13 @@ test "listSessionsAt enumerates sessions for a non-cwd project root" {
     var project_b = std.testing.tmpDir(.{});
     defer project_b.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
 
-    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    const path_a = try project_a.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(path_a);
 
-    try project_a.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_a.dir);
     {
         var mgr = try SessionManager.init(allocator);
         var handle = try mgr.createSession("test-model");
@@ -3018,7 +3016,7 @@ test "listSessionsAt enumerates sessions for a non-cwd project root" {
 
     // Move cwd into project_b: from b's perspective, project_a is a
     // foreign project root and listSessionsAt is the only way to see it.
-    try project_b.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_b.dir);
     defer restoreCwd(orig_cwd);
 
     const sessions = try listSessionsAt(allocator, path_a);
@@ -3043,13 +3041,13 @@ test "deleteSessionAt removes session files under a non-cwd project root" {
     var project_b = std.testing.tmpDir(.{});
     defer project_b.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
 
-    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    const path_a = try project_a.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(path_a);
 
-    try project_a.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_a.dir);
     var id_owned: []u8 = undefined;
     {
         var mgr = try SessionManager.init(allocator);
@@ -3059,7 +3057,7 @@ test "deleteSessionAt removes session files under a non-cwd project root" {
     }
     defer allocator.free(id_owned);
 
-    try project_b.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_b.dir);
     defer restoreCwd(orig_cwd);
 
     try deleteSessionAt(path_a, id_owned);
@@ -3083,13 +3081,13 @@ test "renameSessionAt updates meta name under a non-cwd project root" {
     var project_b = std.testing.tmpDir(.{});
     defer project_b.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
 
-    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    const path_a = try project_a.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(path_a);
 
-    try project_a.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_a.dir);
     var id_owned: []u8 = undefined;
     {
         var mgr = try SessionManager.init(allocator);
@@ -3099,7 +3097,7 @@ test "renameSessionAt updates meta name under a non-cwd project root" {
     }
     defer allocator.free(id_owned);
 
-    try project_b.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_b.dir);
     defer restoreCwd(orig_cwd);
 
     try renameSessionAt(allocator, path_a, id_owned, "renamed-cross-project");
@@ -3125,13 +3123,13 @@ test "renameSessionAt does not append a session_rename audit entry" {
     var project_b = std.testing.tmpDir(.{});
     defer project_b.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
 
-    const path_a = try project_a.dir.realpathAlloc(allocator, ".");
+    const path_a = try project_a.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(path_a);
 
-    try project_a.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_a.dir);
     var id_owned: []u8 = undefined;
     {
         var mgr = try SessionManager.init(allocator);
@@ -3141,7 +3139,7 @@ test "renameSessionAt does not append a session_rename audit entry" {
     }
     defer allocator.free(id_owned);
 
-    try project_b.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, project_b.dir);
     defer restoreCwd(orig_cwd);
 
     const before = try loadEntriesAt(allocator, path_a, id_owned);
@@ -3170,9 +3168,9 @@ test "SessionManager.loadSession rejects ids that try to escape the sessions dir
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -3188,9 +3186,9 @@ test "SessionManager.deleteSession rejects ids that try to escape the sessions d
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     var mgr = try SessionManager.init(allocator);
@@ -3213,12 +3211,12 @@ test "recordCwdInRegistry persists the canonicalized cwd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
 
     const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
@@ -3238,7 +3236,7 @@ test "recordCwdInRegistry persists the canonicalized cwd" {
     defer allocator.free(data);
 
     // The cwd recorded in the registry is the canonicalized one. macOS
-    // tmpDir paths land under /private/var/..., and `tmp.dir.setAsCwd()`
+    // tmpDir paths land under /private/var/..., and `std.process.setCurrentDir(std.testing.io, tmp.dir)`
     // followed by `realpathAlloc(".")` returns that canonical form, so
     // the registry entry must match `fake_home` byte-for-byte.
     try std.testing.expect(std.mem.indexOf(u8, data, fake_home) != null);
@@ -3254,12 +3252,12 @@ test "SessionManager.init leaves the global registry alone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
 
     const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
@@ -3294,9 +3292,9 @@ test "SessionManager.init succeeds when HOME is unset" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
     const prev_home = env_mod.getOwned(allocator, "HOME") catch null;

@@ -623,7 +623,7 @@ test "checkFileMode flags world- or group-accessible bits" {
 test "loadAuthFile returns empty map when file missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(path);
     const missing = try std.fs.path.join(std.testing.allocator, &.{ path, "auth.json" });
     defer std.testing.allocator.free(missing);
@@ -636,7 +636,7 @@ test "loadAuthFile returns empty map when file missing" {
 test "saveAuthFile writes mode 0600" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -653,7 +653,7 @@ test "saveAuthFile writes mode 0600" {
 test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -678,7 +678,7 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
 test "round-trip preserves api_key entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -707,7 +707,7 @@ test "saveAuthFile is atomic under simulated crash" {
     // auth.json with the new contents only.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -736,7 +736,7 @@ test "saveAuthFile is atomic under simulated crash" {
 test "saveAuthFile preserves 0o600 after atomic rename" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -753,7 +753,7 @@ test "saveAuthFile preserves 0o600 after atomic rename" {
 test "removeEntry deletes existing and is a no-op for missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -782,7 +782,7 @@ test "removeEntry deletes existing and is a no-op for missing" {
 test "loadAuthFile round-trips an oauth entry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -813,7 +813,7 @@ test "loadAuthFile round-trips an oauth entry" {
 test "loadAuthFile preserves api_key entries alongside oauth entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -844,7 +844,7 @@ test "loadAuthFile preserves api_key entries alongside oauth entries" {
 test "upsertOAuth replaces an existing oauth entry without clobbering api_key entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -882,7 +882,7 @@ test "upsertOAuth replaces an existing oauth entry without clobbering api_key en
 test "upsertOAuth serializes concurrent callers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -970,7 +970,7 @@ fn idTokenWithAccount(alloc: Allocator, account_id: []const u8) ![]const u8 {
 test "resolveCredential returns api_key verbatim" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -991,7 +991,7 @@ test "resolveCredential returns api_key verbatim" {
 test "resolveCredential returns error.NotLoggedIn when entry missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1006,7 +1006,7 @@ test "resolveCredential returns error.NotLoggedIn when entry missing" {
 test "resolveCredential returns current oauth tokens when well before expiry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1096,7 +1096,7 @@ test "resolveCredential refreshes when within 5 minutes of expiry" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1190,7 +1190,7 @@ test "resolveCredential refreshes when access token already expired" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1262,7 +1262,7 @@ test "resolveCredential maps LoginExpired from refresh endpoint" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);

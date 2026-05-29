@@ -3125,7 +3125,7 @@ test "zag.sleep yields, worker sleeps, coroutine resumes with (true, nil)" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -3170,7 +3170,7 @@ test "zag.sleep returns (nil, 'cancelled') when scope cancelled mid-sleep" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -3642,7 +3642,7 @@ test "end-to-end: config file to registry execution" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes by the test thread are serviced.
             AgentRunner.dispatchHookRequests(q, eng, null);
@@ -5213,7 +5213,7 @@ test "zag.spawn returns handle and :done() flips after sleep completes" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5253,7 +5253,7 @@ test "zag.detach spawns a fire-and-forget coroutine" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5291,7 +5291,7 @@ test "task:join yields until target completes, returns (true, nil)" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5329,7 +5329,7 @@ test "task:join returns (nil, 'cancelled') when target is cancelled" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5378,7 +5378,7 @@ test "zag.all collects results in input order" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5430,7 +5430,7 @@ test "zag.race returns fastest value and reports winning index" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5473,7 +5473,7 @@ test "zag.timeout returns err='timeout' when fn overshoots deadline" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5513,7 +5513,7 @@ test "zag.timeout passes through value when fn beats deadline" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5552,7 +5552,7 @@ test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5594,7 +5594,7 @@ test "zag.cmd stdin piped to /bin/cat echoes back" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5632,7 +5632,7 @@ test "zag.cmd env_extra sets env var visible to child" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5669,7 +5669,7 @@ test "zag.cmd timeout_ms kills long-running process" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     const elapsed = clock.milliTimestamp() - start;
@@ -5710,7 +5710,7 @@ test "zag.cmd.spawn + kill + wait returns signal-coded exit" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5751,7 +5751,7 @@ test "zag.cmd.spawn of short-lived process: wait returns code 0" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5789,7 +5789,7 @@ test "zag.cmd.spawn :wait after child exited returns code" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5825,7 +5825,7 @@ test "zag.cmd.spawn GC without :wait reaps child cleanly" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5862,7 +5862,7 @@ test "zag.cmd.spawn :lines yields lines then nil at EOF" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5908,7 +5908,7 @@ test "zag.cmd.spawn :lines errors when stdout not captured" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
 
@@ -5958,7 +5958,7 @@ test "zag.cmd.spawn :write feeds stdin, :close_stdin causes cat to exit" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6016,7 +6016,7 @@ test "zag.cmd.kill on a spawned child exits it with the signal" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6104,7 +6104,7 @@ test "zag.http.get fetches from a local test server" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6198,7 +6198,7 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6293,7 +6293,7 @@ test "zag.http.post sends body and parses response" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6378,7 +6378,7 @@ test "zag.http.stream yields response lines then nil at EOF" {
 
     const deadline = clock.milliTimestamp() + 3000;
     while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
-        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else std.Thread.sleep(1 * std.time.ns_per_ms);
+        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else clock.sleep(1 * std.time.ns_per_ms);
     }
 
     _ = try eng.lua.getGlobal("_stream_count");
@@ -6464,7 +6464,7 @@ test "zag.http.stream flushes trailing partial line on EOS" {
 
     const deadline = clock.milliTimestamp() + 3000;
     while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
-        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else std.Thread.sleep(1 * std.time.ns_per_ms);
+        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else clock.sleep(1 * std.time.ns_per_ms);
     }
 
     _ = try eng.lua.getGlobal("_partial_count");
@@ -6515,7 +6515,7 @@ test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6548,7 +6548,7 @@ fn driveDrainLoop(eng: *LuaEngine, timeout_ms: i64) !void {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6565,7 +6565,7 @@ test "zag.fs.read returns file bytes" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "r.txt", .data = "hello-from-disk" });
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/r.txt", .{base});
 
@@ -6628,7 +6628,7 @@ test "zag.fs.write + read roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/w.txt", .{base});
 
@@ -6671,7 +6671,7 @@ test "zag.fs.append extends an existing file" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "first" });
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/a.txt", .{base});
 
@@ -6708,7 +6708,7 @@ test "zag.fs.mkdir creates directories, parents=true handles nesting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var flat_buf: [std.fs.max_path_bytes]u8 = undefined;
     const flat_path = try std.fmt.bufPrint(&flat_buf, "{s}/flat", .{base});
     var deep_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6757,7 +6757,7 @@ test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
     try tmp.dir.writeFile(.{ .sub_path = "tree/inner/child.txt", .data = "y" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var f_buf: [std.fs.max_path_bytes]u8 = undefined;
     const file_path = try std.fmt.bufPrint(&f_buf, "{s}/trash.txt", .{base});
     var t_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6806,7 +6806,7 @@ test "zag.fs.list returns directory entries" {
     try tmp.dir.makeDir("sub");
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     _ = eng.lua.pushString(base);
     eng.lua.setGlobal("_ls_path");
 
@@ -6858,7 +6858,7 @@ test "zag.fs.stat returns kind, size, mtime_ms, mode" {
     try tmp.dir.writeFile(.{ .sub_path = "s.dat", .data = "0123456789ab" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/s.dat", .{base});
 
@@ -6912,7 +6912,7 @@ test "zag.fs.exists returns true for present file, false for missing" {
     try tmp.dir.writeFile(.{ .sub_path = "e.txt", .data = "" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var yes_buf: [std.fs.max_path_bytes]u8 = undefined;
     const yes_path = try std.fmt.bufPrint(&yes_buf, "{s}/e.txt", .{base});
     var no_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -7264,7 +7264,7 @@ test "user dir file shadows embedded stdlib entry" {
     });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
 
     // Redirect _ZAG_LOADER.user_dir to the temp dir. The searcher closure
     // reads ctx.user_dir on every call, so this takes effect immediately.
@@ -7291,7 +7291,7 @@ test "require falls through to embedded when user dir file missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_tmp_user_dir");
     try engine.lua.doString("_ZAG_LOADER.user_dir = _tmp_user_dir");
@@ -8673,7 +8673,7 @@ test "zag.context.find_up returns nil when no instruction file is present" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     _ = engine.lua.pushString(root);
     engine.lua.setGlobal("_root");
@@ -8699,7 +8699,7 @@ test "zag.context.find_up surfaces AGENTS.md content from cwd" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "project guidance" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     _ = engine.lua.pushString(root);
     engine.lua.setGlobal("_root");
@@ -8733,7 +8733,7 @@ test "zag.context.find_up accepts a single string and walks up" {
     try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "ancestor body" });
     try tmp.dir.makePath("nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
     defer std.testing.allocator.free(leaf);
 
@@ -8760,7 +8760,7 @@ test "zag.layers.agents_md renders nothing when no instruction file exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.layers.agents_md')");
 
@@ -8786,7 +8786,7 @@ test "zag.layers.agents_md emits AGENTS.md content wrapped in <instructions>" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.layers.agents_md')");
 
@@ -8843,7 +8843,7 @@ test "agents_md integration: eager-loaded layer pulls parent AGENTS.md into asse
     try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Prefer TDD." });
     try tmp.dir.makePath("nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
     defer std.testing.allocator.free(leaf);
 
@@ -8894,7 +8894,7 @@ test "agents_md integration: assembled prompt omits instructions block when no f
     defer tmp.cleanup();
     try tmp.dir.makePath("nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
     defer std.testing.allocator.free(leaf);
 
@@ -8958,7 +8958,7 @@ test "zag.fs.read_file_sync and list_dir_sync" {
     try tmp.dir.writeFile(.{ .sub_path = "b.md", .data = "# header\n" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
 
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_base");
@@ -9028,7 +9028,7 @@ test "zag.subagents.filesystem loads agents from tmpdir" {
     try tmp.dir.writeFile(.{ .sub_path = "agents/README", .data = "ignore me" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath("agents", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
 
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_agents_dir");
@@ -9081,7 +9081,7 @@ test "zag.subagents.filesystem skips malformed files with a warning" {
     });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath("agents", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
 
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_agents_dir");
@@ -10229,7 +10229,7 @@ test "zag.jit.agents_md attaches AGENTS.md from the read file's parent" {
     try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
     try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10256,7 +10256,7 @@ test "zag.jit.agents_md returns nil when no instruction file exists" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10281,7 +10281,7 @@ test "zag.jit.agents_md dedups within a turn" {
     try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
     try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10319,7 +10319,7 @@ test "zag.jit.agents_md re-attaches across turn boundaries" {
     try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
     try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10362,7 +10362,7 @@ test "zag.jit.agents_md skips when ctx.is_error is true" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Should be skipped." });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 

@@ -1283,7 +1283,7 @@ const MockIssuer = struct {
 test "runLoginFlowWithCodes exchanges code, persists auth.json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(auth_path);
@@ -1313,7 +1313,7 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
             while (attempts < 50) : (attempts += 1) {
                 const addr = std.net.Address.parseIp("127.0.0.1", port) catch return;
                 const stream = std.net.tcpConnectToAddress(addr) catch {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    clock.sleep(10 * std.time.ns_per_ms);
                     continue;
                 };
                 defer stream.close();
@@ -1375,7 +1375,7 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
 test "runLoginFlowWithCodes rejects mismatched state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(auth_path);
@@ -1391,7 +1391,7 @@ test "runLoginFlowWithCodes rejects mismatched state" {
             while (attempts < 50) : (attempts += 1) {
                 const addr = std.net.Address.parseIp("127.0.0.1", port) catch return;
                 const stream = std.net.tcpConnectToAddress(addr) catch {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    clock.sleep(10 * std.time.ns_per_ms);
                     continue;
                 };
                 defer stream.close();

@@ -275,7 +275,7 @@ fn echoSlowExecute(
     allocator: Allocator,
     _: ?*std.atomic.Value(bool),
 ) types.ToolError!types.ToolResult {
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    clock.sleep(50 * std.time.ns_per_ms);
     return .{ .content = try allocator.dupe(u8, "echo_result"), .is_error = false };
 }
 
@@ -568,7 +568,7 @@ test "executeTools: ToolPre veto + ToolPost redact across real hook pipeline" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes (e.g. ToolPost after the last
             // registry.execute returns) are serviced before we join.
@@ -652,7 +652,7 @@ test "jit context handler appends content to tool result" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -714,7 +714,7 @@ test "no jit handler registered leaves tool result untouched" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -778,7 +778,7 @@ test "jit handler returning nil leaves tool result untouched" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -846,7 +846,7 @@ test "agents_md JIT layer attaches AGENTS.md content via executeTools dispatch" 
     try tmp.dir.writeFile(.{ .sub_path = "nested/file.txt", .data = child_body });
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &root_buf);
+    const root = root_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &root_buf)];
 
     var child_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
     const child_path = try std.fmt.bufPrint(&child_buf, "{s}/nested/file.txt", .{root});
@@ -870,7 +870,7 @@ test "agents_md JIT layer attaches AGENTS.md content via executeTools dispatch" 
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -941,7 +941,7 @@ test "tool_transform replaces bash output via executeTools dispatch" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -999,7 +999,7 @@ test "tool_transform returning nil leaves output untouched" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -1057,7 +1057,7 @@ test "tool_transform handler error preserves original output" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -1127,7 +1127,7 @@ test "tool_transform sees post-JIT content (JIT runs first, transform replaces)"
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -1620,7 +1620,7 @@ const GateTestHarness = struct {
         const AgentRunnerLocal = @import("AgentRunner.zig");
         while (!stop_flag.load(.acquire)) {
             AgentRunnerLocal.dispatchHookRequests(q, eng, null);
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
         AgentRunnerLocal.dispatchHookRequests(q, eng, null);
     }
@@ -2304,7 +2304,7 @@ test "HE10.5 integration: eager-loaded zag.loop.default fires reminder via fireL
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -2388,7 +2388,7 @@ test "HE10.5 integration: eager-loaded zag.compact.default yields to the Zig fal
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -2462,7 +2462,7 @@ test "HE10.6 regression: predictive estimator catches mid-turn tool_result blowu
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine.LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             AgentRunner.dispatchHookRequests(q, eng, null);
         }
@@ -2655,10 +2655,10 @@ const CancelPathHarness = struct {
         start_delay_ns: u64,
     ) void {
         const AgentRunnerLocal = @import("AgentRunner.zig");
-        std.Thread.sleep(start_delay_ns);
+        clock.sleep(start_delay_ns);
         while (!stop_flag.load(.acquire)) {
             AgentRunnerLocal.dispatchHookRequests(q, eng, null);
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
         AgentRunnerLocal.dispatchHookRequests(q, eng, null);
     }

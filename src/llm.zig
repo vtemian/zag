@@ -960,7 +960,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -988,7 +988,7 @@ test "createProviderFromLuaConfig surfaces NoDefaultModel when default_model uns
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1014,7 +1014,7 @@ test "createProviderFromLuaConfig returns MissingCredential when provider not in
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1034,7 +1034,7 @@ test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints"
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1054,7 +1054,7 @@ test "createProviderFromLuaConfig returns UnknownProvider for unsupported provid
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1084,7 +1084,7 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);

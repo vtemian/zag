@@ -392,7 +392,7 @@ test "executeExec cancels in-flight child via aborter" {
     const thread = try std.Thread.spawn(.{}, worker.run, .{ alloc, &job });
 
     // Give the worker enough time to actually spawn /bin/sleep
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    clock.sleep(100 * std.time.ns_per_ms);
 
     // Cancel. Should invoke Job.aborter which SIGKILLs the child
     try root.cancel("test");

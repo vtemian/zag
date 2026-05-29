@@ -1055,7 +1055,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
     _ = conn.stream.writeAll(head_only) catch {};
-    std.Thread.sleep(sleep_ns);
+    clock.sleep(sleep_ns);
 }
 
 test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-body" {

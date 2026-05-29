@@ -2046,7 +2046,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -2160,7 +2160,7 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -2203,7 +2203,7 @@ test "createProviderFromLuaConfig fails fast when oauth provider has no credenti
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -2374,7 +2374,7 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buf)];
     const log_full = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     defer file_log.deinit();
@@ -2433,7 +2433,7 @@ test "chatgpt SSE: response.incomplete invokes telemetry.onStreamError with .cha
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buf)];
     const log_full = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     defer file_log.deinit();

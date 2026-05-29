@@ -227,7 +227,7 @@ fn writeRegistry(w: *std.Io.Writer, items: []const Project) !void {
 test "register dedupes and bumps last_seen_ms" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     var reg = try ProjectRegistry.init(std.testing.allocator, tmp_path);
@@ -253,7 +253,7 @@ test "register dedupes and bumps last_seen_ms" {
 test "register persists across reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -278,7 +278,7 @@ test "register persists across reopen" {
 test "malformed registry file recovers to empty list" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     try tmp.dir.writeFile(.{
@@ -307,7 +307,7 @@ test "malformed registry file recovers to empty list" {
 test "listProjects sorts most-recent-first" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     var reg = try ProjectRegistry.init(std.testing.allocator, tmp_path);
@@ -333,7 +333,7 @@ test "listProjects sorts most-recent-first" {
 test "saveAtomic uses a process-scoped tmp filename" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     // Plant a stale tmp file belonging to a *different* pid. saveAtomic

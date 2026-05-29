@@ -279,7 +279,7 @@ const Scope = @import("../Scope.zig").Scope;
 
 fn makeTmpAbs(tmp: *std.testing.TmpDir, sub: []const u8, out: []u8) ![]u8 {
     var realbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &realbuf);
+    const base = realbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &realbuf)];
     return try std.fmt.bufPrint(out, "{s}/{s}", .{ base, sub });
 }
 

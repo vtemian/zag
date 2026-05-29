@@ -356,7 +356,7 @@ const testing = std.testing;
 /// land there. Returns the directory absolute path; caller defers
 /// cleanup of `tmp` and `file_log.deinit()`.
 fn setupTmpLog(tmp: *std.testing.TmpDir, path_buf: []u8, full_buf: []u8) ![]const u8 {
-    const tmp_abs = try tmp.dir.realpath(".", path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", path_buf)];
     const log_full = try std.fmt.bufPrint(full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     return tmp_abs;

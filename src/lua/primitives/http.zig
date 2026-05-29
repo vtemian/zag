@@ -513,7 +513,7 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
             // Simulate an upstream that's thinking about it. 10s is
             // well past the 1s deadline the test enforces and well
             // under any reasonable CI wall-clock cap.
-            std.Thread.sleep(10 * std.time.ns_per_s);
+            clock.sleep(10 * std.time.ns_per_s);
 
             const resp =
                 "HTTP/1.1 200 OK\r\n" ++
@@ -543,7 +543,7 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
     // ErrTag.cancelled by `mapAndStoreErr`.
     const CancelCtx = struct {
         fn run(s: *Scope) void {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            clock.sleep(100 * std.time.ns_per_ms);
             s.cancel("test-abort") catch {};
         }
     };

@@ -539,7 +539,7 @@ test "task_start payload escapes JSON special characters in prompt" {
 fn restoreCwdForTest(abs_path: []const u8) void {
     var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
     defer dir.close();
-    dir.setAsCwd() catch {};
+    std.process.setCurrentDir(std.testing.io, dir) catch {};
 }
 
 test "child_history pre-seeded with task_start_id chains child events under the delegation" {
@@ -555,9 +555,9 @@ test "child_history pre-seeded with task_start_id chains child events under the 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwdForTest(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);
