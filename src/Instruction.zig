@@ -183,7 +183,7 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
 // --- tests ---
 
 fn writeFile(dir: std.Io.Dir, name: []const u8, body: []const u8) !void {
-    var f = try dir.createFile(name, .{});
+    var f = try dir.createFile(std.testing.io, name, .{});
     defer f.close(std.testing.io);
     try f.writeStreamingAll(std.testing.io, body);
 }

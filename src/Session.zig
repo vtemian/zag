@@ -1843,7 +1843,7 @@ test "round-trip: append then load reflects generated id" {
     try fw.interface.flush();
     file.close(std.testing.io);
 
-    const content = try tmp.dir.readFileAlloc(std.testing.io, allocator, tmp.dir, .limited("rt.jsonl"));
+    const content = try tmp.dir.readFileAlloc(std.testing.io, "rt.jsonl", allocator, .limited(1024 * 1024));
     defer allocator.free(content);
 
     var count: usize = 0;
@@ -1998,7 +1998,7 @@ test "create, append, and load round-trip" {
 
     // Test the serialize/parse path end-to-end using a temp file
     const tmp_dir = tmp.dir;
-    const file = try tmp_dir.createFile("test.jsonl", .{ .truncate = true });
+    const file = try tmp_dir.createFile(std.testing.io, "test.jsonl", .{ .truncate = true });
 
     // Write entries
     var entries_to_write = [_]Entry{
@@ -2182,7 +2182,7 @@ test "File.sync runs without error on a fresh file" {
     const file = try tmp.dir.createFile(std.testing.io, "sync-probe", .{ .truncate = true });
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, "{\"type\":\"user_message\"}\n");
-    try file.sync();
+    try file.sync(std.testing.io);
 }
 
 test "writeMetaFile replaces any stale .tmp via atomic rename" {
@@ -2459,7 +2459,7 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     try std.testing.expectEqual(@as(u32, 2), report.actual_line_count);
     try std.testing.expectEqual(@as(usize, "{\"c\":".len), report.truncated_bytes);
 
-    const after = try tmp.dir.readFileAlloc(std.testing.io, allocator, tmp.dir, .limited("abc.jsonl"));
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "abc.jsonl", allocator, .limited(1024));
     defer allocator.free(after);
     try std.testing.expectEqualStrings("{\"a\":1}\n{\"b\":2}\n", after);
 }

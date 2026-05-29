@@ -8342,13 +8342,7 @@ test "splitFocusedWithSession attaches loaded session to a new pane" {
     const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
-    defer {
-        if (std.Io.Dir.openDirAbsolute(std.testing.io, orig_cwd, .{})) |d_const| {
-            var d = d_const;
-            std.process.setCurrentDir(std.testing.io, d) catch {};
-            d.close();
-        } else |_| {}
-    }
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
 
     var mgr_opt: ?Session.SessionManager = try Session.SessionManager.init(allocator);
     var seed_handle = try mgr_opt.?.createSession("test-model");

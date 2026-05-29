@@ -277,11 +277,18 @@ test "initWithPath opens an existing directory and appends" {
     handler(.warn, .agent, "tool {s}", .{"bash"});
 
     // Read back.
-    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var read_scratch: [64]u8 = undefined;
     var contents_buf: [1024]u8 = undefined;
-    const n = try file.readAll(&contents_buf);
-    const contents = contents_buf[0..n];
+    const contents = blk: {
+        const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        var fr = file.reader(std.testing.io, &read_scratch);
+        const n = fr.interface.readSliceShort(&contents_buf) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        break :blk contents_buf[0..n];
+    };
 
     try std.testing.expect(std.mem.indexOf(u8, contents, "[default] info: hello world\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "[agent] warn: tool bash\n") != null);
@@ -299,7 +306,7 @@ test "initWithPath opens the log file with mode 0o600" {
     // Pre-create with loose permissions to exercise the chmod-after-open path.
     {
         const pre = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
-        defer pre.close();
+        defer pre.close(std.testing.io);
         _ = std.c.fchmod(pre.handle, 0o644);
     }
 
@@ -382,11 +389,18 @@ test "handler drops messages below min level" {
     handler(.debug, .agent, "noisy debug", .{});
     handler(.info, .agent, "kept info", .{});
 
-    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var read_scratch: [64]u8 = undefined;
     var contents_buf: [1024]u8 = undefined;
-    const n = try file.readAll(&contents_buf);
-    const contents = contents_buf[0..n];
+    const contents = blk: {
+        const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        var fr = file.reader(std.testing.io, &read_scratch);
+        const n = fr.interface.readSliceShort(&contents_buf) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        break :blk contents_buf[0..n];
+    };
 
     try std.testing.expect(std.mem.indexOf(u8, contents, "noisy debug") == null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "kept info") != null);
@@ -410,11 +424,18 @@ test "raising min level to debug lets debug through" {
     min_level_tag.store(@intFromEnum(std.log.Level.debug), .monotonic);
     handler(.debug, .agent, "verbose: {d}", .{42});
 
-    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var read_scratch: [64]u8 = undefined;
     var contents_buf: [1024]u8 = undefined;
-    const n = try file.readAll(&contents_buf);
-    const contents = contents_buf[0..n];
+    const contents = blk: {
+        const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        var fr = file.reader(std.testing.io, &read_scratch);
+        const n = fr.interface.readSliceShort(&contents_buf) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        break :blk contents_buf[0..n];
+    };
     try std.testing.expect(std.mem.indexOf(u8, contents, "verbose: 42") != null);
 }
 

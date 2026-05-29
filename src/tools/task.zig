@@ -537,9 +537,7 @@ test "task_start payload escapes JSON special characters in prompt" {
 }
 
 fn restoreCwdForTest(abs_path: []const u8) void {
-    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, abs_path, .{}) catch return;
-    defer dir.close();
-    std.process.setCurrentDir(std.testing.io, dir) catch {};
+    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
 }
 
 test "child_history pre-seeded with task_start_id chains child events under the delegation" {

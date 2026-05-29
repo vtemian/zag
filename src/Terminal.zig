@@ -278,7 +278,6 @@ test "getSize returns non-zero dimensions" {
     // runners may not provide. We allow IoctlFailed gracefully.
     const size = getSize() catch |err| switch (err) {
         error.IoctlFailed, error.InvalidSize => return,
-        else => return err,
     };
     try std.testing.expect(size.rows > 0);
     try std.testing.expect(size.cols > 0);
