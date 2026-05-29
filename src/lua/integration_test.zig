@@ -20,16 +20,16 @@ const Session = @import("../Session.zig");
 const BufferRegistry = @import("../BufferRegistry.zig");
 const Hooks = @import("../Hooks.zig");
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
 // 0.16 made the process environment non-global: production code reads env
 // through `env_mod` over a captured `Environ.Map` rather than libc, and the
 // test runner never calls `env_mod.init`. These tests therefore drive a
 // module-owned map that `env_mod` points at, seeded from the real libc
 // environ once, so a test's `setEnvForTest("HOME", fake)` is visible to the
-// code under test. `setenv`/`unsetenv` are kept in sync for any residual
-// libc readers (e.g. child processes).
+// code under test. We deliberately do NOT call libc `setenv`/`unsetenv`:
+// `std.Io.Threaded` freezes a pointer to libc `environ` at init, and `setenv`
+// reallocates that array, leaving the frozen pointer dangling and crashing a
+// later `.inherit` `std.process.spawn` (use-after-free). `.inherit` children
+// receive the frozen snapshot regardless, so libc mutation never reached them.
 var test_env_map: ?std.process.Environ.Map = null;
 
 fn ensureTestEnv() *std.process.Environ.Map {
@@ -54,13 +54,7 @@ fn getEnvForTest(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
 }
 
 fn setEnvForTest(name: [:0]const u8, value: []const u8) void {
-    const m = ensureTestEnv();
-    m.put(name, value) catch {};
-    var value_buf: [std.fs.max_path_bytes]u8 = undefined;
-    std.debug.assert(value.len + 1 <= value_buf.len);
-    @memcpy(value_buf[0..value.len], value);
-    value_buf[value.len] = 0;
-    _ = setenv(name.ptr, value_buf[0..value.len :0].ptr, 1);
+    ensureTestEnv().put(name, value) catch {};
 }
 
 fn restoreEnvForTest(name: [:0]const u8, prev: ?[]const u8) void {
@@ -69,7 +63,6 @@ fn restoreEnvForTest(name: [:0]const u8, prev: ?[]const u8) void {
         setEnvForTest(name, p);
     } else {
         _ = m.swapRemove(name);
-        _ = unsetenv(name.ptr);
     }
 }
 

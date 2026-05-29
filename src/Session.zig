@@ -3225,6 +3225,7 @@ test "recordCwdInRegistry persists the canonicalized cwd" {
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
 
+    _ = ensureTestEnv();
     const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
     defer if (prev_home) |p| allocator.free(p);
 
@@ -3266,6 +3267,7 @@ test "SessionManager.init leaves the global registry alone" {
     const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
 
+    _ = ensureTestEnv();
     const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
     defer if (prev_home) |p| allocator.free(p);
 
@@ -3303,34 +3305,51 @@ test "SessionManager.init succeeds when HOME is unset" {
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
+    _ = ensureTestEnv();
     const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
     defer if (prev_home) |p| allocator.free(p);
 
-    _ = unsetenv("HOME");
+    _ = ensureTestEnv().swapRemove("HOME");
     defer restoreEnvForTest("HOME", prev_home);
 
     var mgr = try SessionManager.init(allocator);
     _ = &mgr;
 }
 
-// `setenv(3)` / `unsetenv(3)` are POSIX. Zig 0.15's std does not expose a
-// portable `setEnvVar`, so tests reach for the C entry points directly.
-// This is test-only; production code reads HOME via `getEnvVarOwned`.
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+// 0.16 made the process environment non-global: production reads env through
+// `env_mod` over a captured `Environ.Map`, and the test runner never calls
+// `env_mod.init`. So tests drive a module-owned map that `env_mod` points at,
+// seeded once from libc `environ`. We deliberately do NOT call libc
+// `setenv`/`unsetenv`: `std.Io.Threaded` freezes a pointer to libc `environ`
+// at init, and `setenv` reallocates that array, leaving the frozen pointer
+// dangling and crashing a later `.inherit` `std.process.spawn` (use-after-free).
+// `Map.put` dupes key+value, so overrides outlive the borrowed test slices.
+var test_env_map: ?std.process.Environ.Map = null;
+
+fn ensureTestEnv() *std.process.Environ.Map {
+    if (test_env_map == null) {
+        var m: std.process.Environ.Map = .init(std.heap.page_allocator);
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry| : (i += 1) {
+            const pair = std.mem.span(entry);
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            m.put(pair[0..eq], pair[eq + 1 ..]) catch {};
+        }
+        test_env_map = m;
+        env_mod.init(&test_env_map.?);
+    }
+    return &test_env_map.?;
+}
 
 fn setEnvForTest(name: [:0]const u8, value: []const u8) void {
-    var value_buf: [std.fs.max_path_bytes]u8 = undefined;
-    std.debug.assert(value.len + 1 <= value_buf.len);
-    @memcpy(value_buf[0..value.len], value);
-    value_buf[value.len] = 0;
-    _ = setenv(name.ptr, value_buf[0..value.len :0].ptr, 1);
+    ensureTestEnv().put(name, value) catch {};
 }
 
 fn restoreEnvForTest(name: [:0]const u8, prev: ?[]const u8) void {
+    const m = ensureTestEnv();
     if (prev) |p| {
-        setEnvForTest(name, p);
+        m.put(name, p) catch {};
     } else {
-        _ = unsetenv(name.ptr);
+        _ = m.swapRemove(name);
     }
 }
