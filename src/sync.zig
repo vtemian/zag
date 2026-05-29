@@ -29,7 +29,11 @@ pub fn setIo(io: std.Io) void {
 }
 
 inline fn theIo() std.Io {
-    return process_io orelse @panic("sync: process io used before sync.setIo()");
+    if (process_io) |io| return io;
+    // Under the test runner there is no `main` to call `setIo`; fall back to
+    // the runner-provided `std.testing.io`. Production keeps the hard panic.
+    if (@import("builtin").is_test) return std.testing.io;
+    @panic("sync: process io used before sync.setIo()");
 }
 
 /// Drop-in for `std.Thread.Mutex`. Default-initializes with `.{}`.

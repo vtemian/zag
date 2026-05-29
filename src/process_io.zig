@@ -23,6 +23,12 @@ pub fn init(io: std.Io) void {
 }
 
 /// The process-wide io. Panics if read before `init`.
+///
+/// Under the test runner there is no `main` to call `init`, so fall back to
+/// the runner-provided `std.testing.io` (a real blocking io). Production
+/// builds keep the hard panic so a startup-ordering bug surfaces loudly.
 pub fn get() std.Io {
-    return process_io orelse @panic("process_io: used before process_io.init()");
+    if (process_io) |io| return io;
+    if (@import("builtin").is_test) return std.testing.io;
+    @panic("process_io: used before process_io.init()");
 }
