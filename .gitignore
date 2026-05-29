@@ -9,3 +9,4 @@ zag-trace.json
 /test_*
 artifacts/
 docs/plans/
+/zig-pkg/

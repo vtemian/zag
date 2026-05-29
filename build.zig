@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         "lua_sandbox",
         "Restrict Lua plugins: strip os/io/debug/package/require etc.",
     ) orelse false;
-    const sim_enabled = b.option(bool, "sim", "Build zag-sim") orelse true;
+    const sim_enabled = b.option(bool, "sim", "Build zag-sim") orelse false;
 
     // Shared build options module for comptime feature flags
     const build_options = b.addOptions();
@@ -101,9 +101,8 @@ pub fn build(b: *std.Build) void {
         const sim_e2e_step = b.step("test-sim-e2e", "Run sim e2e scenarios that require zag (set ZAG_E2E=1)");
         sim_e2e_step.dependOn(b.getInstallStep());
 
-        const zag_e2e = std.process.getEnvVarOwned(b.allocator, "ZAG_E2E") catch null;
+        const zag_e2e = b.graph.environ_map.get("ZAG_E2E");
         if (zag_e2e) |val| {
-            defer b.allocator.free(val);
             if (std.mem.eql(u8, val, "1")) {
                 // Scenarios that don't depend on previous state. Order does not
                 // matter; we serialise via the chain below to keep token spend
