@@ -123,6 +123,12 @@ pub const CmdHandle = struct {
     /// Set once `child.stdout.read` returned 0 (EOF). Sticky: once
     /// true, subsequent `:lines()` iterations return nil.
     stdout_eof: bool = false,
+    /// Set true the first time `cmd:lines()` builds an iterator for
+    /// this handle. `stdout_buf` is helper-owned and read without a
+    /// lock on the iterator fast path; that is only sound with a
+    /// single consumer, so a second `:lines()` is rejected by the
+    /// binding rather than silently interleaving reads.
+    lines_consumed: bool = false,
     /// Mirrors `SpawnOpts.max_line_bytes`. Consulted in `runReadLine`
     /// after each append to `stdout_buf` so an unbounded line is
     /// rejected before the buffer starves the helper thread.
