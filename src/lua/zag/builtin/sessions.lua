@@ -3,8 +3,8 @@
 -- `M.toggle()` opens a left-anchored vertical split bound to a scratch
 -- buffer, then renders one row per registered session. Tree expansion
 -- of subagents lands in Phase 5; today the row shows the session
--- name (or its truncated id) with a ▸ / ▾ glyph reflecting the
--- expanded set.
+-- name (or "EMPTY SESSION" for unnamed ones) with a ▸ / ▾ glyph
+-- reflecting the expanded set.
 --
 -- State lives in this module table so it survives pane close/reopen.
 -- It is intentionally module-local (`local state`); nothing outside
@@ -735,7 +735,7 @@ end
 -- (see `_filter_printables`) and the on-disk deriver lands names at
 -- 32 bytes worst-case using word-boundary rewind, so byte truncation
 -- can never land mid-codepoint.
-local PREFIX_CELLS = 6 -- glyph(2) + date(3) + gap(1)
+local PREFIX_CELLS = 7 -- status(1) + glyph(2) + date(3) + gap(1)
 local LABEL_MAX_CELLS = SIDEBAR_TARGET_CELLS - PREFIX_CELLS
 local TRUNCATED_NAME_BYTES = LABEL_MAX_CELLS - 1
 local DATE_COL_WIDTH = 3
@@ -833,11 +833,15 @@ function M._collect_rows()
     -- already sorted by `updated_ms` descending by the binding).
     local now_s = state.now_for_test or os.time()
     for _, s in ipairs(sessions) do
-        local full = (s.name ~= nil and s.name ~= "") and s.name or string.sub(s.id, 1, 8)
+        local full = (s.name ~= nil and s.name ~= "") and s.name or "EMPTY SESSION"
         local matches = filter_lc == nil or full:lower():find(filter_lc, 1, true) ~= nil
         if matches then
             local glyph = state.expanded[s.id] and "▾" or "▸"
             local age = _pad_date(_relative_age(s.updated_ms, now_s))
+            local status = s.status or "idle"
+            local status_glyph = " "
+            if status == "working" then status_glyph = "●" end
+            if status == "failed" then status_glyph = "✗" end
             -- `name` keeps the full label so rename pre-fill and delete
             -- popup show the untruncated value; `label` is what lands
             -- in the sidebar buffer and must fit the panel width.
@@ -847,7 +851,7 @@ function M._collect_rows()
                 project = s.project,
                 name = full,
                 depth = 0,
-                label = glyph .. " " .. age .. " " .. _truncate_label(full),
+                label = status_glyph .. glyph .. " " .. age .. " " .. _truncate_label(full),
             })
             if state.expanded[s.id] then
                 for _, child in ipairs(_collect_subagents(s)) do
