@@ -144,6 +144,30 @@ pub fn build(b: *std.Build) void {
     script.step.dependOn(b.getInstallStep());
     validate_step.dependOn(&script.step);
 
+    // --- test-sandbox-linux -------------------------------------------------
+    // Spawns the built zag as the --__sandbox-helper subcommand on a real
+    // Linux kernel and asserts the landlock+seccomp boundary actually denies
+    // ~/.ssh reads (EPERM/EACCES) and AF_INET sockets (EACCES). This is the
+    // only automated coverage of the strict-mode boundary: `zig build test`
+    // cannot exercise it because the test runner replaces main(), so the
+    // helper short-circuit never fires and no real landlock/seccomp installs.
+    //
+    // Kept OUT of the default `test` step on purpose: it needs the installed
+    // binary plus a live kernel with landlock/seccomp. The assertions only
+    // run on a Linux host; on any other host the step is a clean no-op that
+    // prints a skip notice and exits 0, so `zig build test-sandbox-linux`
+    // and the default build graph stay green everywhere.
+    const sandbox_linux_step = b.step("test-sandbox-linux", "Linux-only: assert the bash sandbox helper denies secrets + AF_INET");
+    if (target.result.os.tag == .linux) {
+        const sandbox_probe = b.addSystemCommand(&.{"scripts/test-sandbox-linux.sh"});
+        sandbox_probe.addArtifactArg(exe);
+        sandbox_probe.step.dependOn(b.getInstallStep());
+        sandbox_linux_step.dependOn(&sandbox_probe.step);
+    } else {
+        const skip = b.addSystemCommand(&.{ "echo", "test-sandbox-linux: skipped (Linux only)" });
+        sandbox_linux_step.dependOn(&skip.step);
+    }
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
