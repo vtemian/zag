@@ -454,6 +454,12 @@ pub const SplitBuffer = union(enum) {
     /// The main thread resolves it at request time; a stale or invalid
     /// handle surfaces as `stale_buffer` / `invalid_buffer_id`.
     handle: u32,
+    /// Inline UTF-8 text for a brand-new scratch pane. The main thread
+    /// creates a registry-owned `ScratchBuffer`, fills it line by line
+    /// (splitting on `\n`), and attaches it as the new pane's surface.
+    /// Lets the agent answer "split and show me X" in a single call
+    /// instead of producing an empty pane it cannot fill.
+    scratch: []const u8,
 };
 
 /// Operations a layout_request can carry. Mirrors the `layout.*` tool

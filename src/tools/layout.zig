@@ -141,11 +141,11 @@ fn execute_focus(
 pub const split_tool: types.Tool = .{
     .definition = .{
         .name = "layout_split",
-        .description = "Split a pane into two; direction is \"horizontal\" or \"vertical\".",
+        .description = "Split a pane into two; direction is \"horizontal\" or \"vertical\". To display text in the new pane (a file listing, command output, notes), pass buffer={\"type\":\"scratch\",\"text\":\"...\"}. Omit buffer to open a new empty agent pane.",
         .input_schema_json =
-        \\{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"},"buffer":{"oneOf":[{"type":"object","properties":{"type":{"type":"string"}},"required":["type"],"additionalProperties":false},{"type":"string"}]}},"required":["id","direction"],"additionalProperties":false}
+        \\{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"},"buffer":{"oneOf":[{"type":"object","properties":{"type":{"type":"string"},"text":{"type":"string"}},"required":["type"],"additionalProperties":false},{"type":"string"}]}},"required":["id","direction"],"additionalProperties":false}
         ,
-        .prompt_snippet = "layout_split: split a pane horizontally or vertically",
+        .prompt_snippet = "layout_split: split a pane; buffer={type:\"scratch\",text:\"...\"} fills the new pane with text",
     },
     .execute = &execute_split,
 };
@@ -170,9 +170,10 @@ fn execute_split(
     };
     defer parsed.deinit();
 
-    // Branch on the buffer selector's JSON shape. Object implies the
-    // legacy `{type: "conversation"}` form; string implies an opaque
-    // `"b<u32>"` registry handle. Anything else is a client bug.
+    // Branch on the buffer selector's JSON shape. Object implies either
+    // a named `{type: "conversation"}` pane or a `{type: "scratch",
+    // text: "..."}` text pane; string implies an opaque `"b<u32>"`
+    // registry handle. Anything else is a client bug.
     const split_buffer: ?agent_events.SplitBuffer = blk: {
         const raw_value = parsed.value.buffer orelse break :blk null;
         switch (raw_value) {
@@ -187,6 +188,21 @@ fn execute_split(
                     .is_error = true,
                     .owned = false,
                 };
+                // A scratch pane carries inline text the main thread
+                // renders into a fresh ScratchBuffer. Missing `text`
+                // defaults to an empty pane; a non-string `text` is a
+                // client bug.
+                if (std.mem.eql(u8, type_val.string, "scratch")) {
+                    const text: []const u8 = if (obj.get("text")) |tv| switch (tv) {
+                        .string => |s| s,
+                        else => return .{
+                            .content = "error: buffer.text must be a string",
+                            .is_error = true,
+                            .owned = false,
+                        },
+                    } else "";
+                    break :blk .{ .scratch = text };
+                }
                 break :blk .{ .kind = type_val.string };
             },
             .string => |s| {
@@ -400,4 +416,34 @@ test "dispatch returns error when no queue is bound" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(!result.owned);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "no event queue") != null);
+}
+
+test "layout_split parses a scratch buffer with inline text" {
+    // A well-formed scratch buffer must parse past the buffer branch and
+    // reach dispatch; with no queue bound that surfaces as the
+    // "no event queue" error, proving the scratch+text shape was accepted
+    // rather than rejected at parse time.
+    const saved = tools_mod.lua_request_queue;
+    tools_mod.lua_request_queue = null;
+    defer tools_mod.lua_request_queue = saved;
+
+    const res = try execute_split(
+        "{\"id\":\"n1\",\"direction\":\"vertical\",\"buffer\":{\"type\":\"scratch\",\"text\":\"line one\\nline two\"}}",
+        std.testing.allocator,
+        null,
+    );
+    try std.testing.expect(res.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, res.content, "no event queue") != null);
+    if (res.owned) std.testing.allocator.free(res.content);
+}
+
+test "layout_split rejects a scratch buffer with non-string text" {
+    const res = try execute_split(
+        "{\"id\":\"n1\",\"direction\":\"vertical\",\"buffer\":{\"type\":\"scratch\",\"text\":42}}",
+        std.testing.allocator,
+        null,
+    );
+    try std.testing.expect(res.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, res.content, "buffer.text") != null);
+    if (res.owned) std.testing.allocator.free(res.content);
 }
