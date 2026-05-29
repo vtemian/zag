@@ -36,13 +36,23 @@ pub fn connectLoopback(port: u16) !Io.net.Stream {
     return addr.connect(std.testing.io, .{ .mode = .stream });
 }
 
-/// Read up to `dest.len` bytes from `stream`. 0.16 reads through a
-/// `Stream.Reader`; give it a zero-length internal buffer so it issues a
-/// single direct `recv` into `dest` rather than buffering surplus bytes into
-/// a scratch that this short-lived reader would then drop. Returns 0 at EOF.
+/// Read whatever bytes are currently available from `stream`, up to
+/// `dest.len`. 0.16 reads through a `Stream.Reader`; give it a zero-length
+/// internal buffer so the read lands directly in `dest` with no surplus
+/// buffered into a scratch this short-lived reader would then drop.
+///
+/// Uses `readVec` (one underlying `recv`) rather than `readSliceShort`:
+/// `readSliceShort` only returns short on EOF and otherwise loops until
+/// `dest` is completely filled, which deadlocks a mock server that reads a
+/// 4 KiB buffer against a peer that sends a sub-4-KiB request and then waits
+/// for the server's reply. Returns 0 at EOF.
 pub fn streamRead(stream: Io.net.Stream, dest: []u8) !usize {
     var r = stream.reader(std.testing.io, &.{});
-    return r.interface.readSliceShort(dest);
+    var data: [1][]u8 = .{dest};
+    return r.interface.readVec(&data) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => |e| e,
+    };
 }
 
 /// Write all of `bytes` to `stream` and flush. Drop-in for the old
