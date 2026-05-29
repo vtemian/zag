@@ -2346,16 +2346,15 @@ test "drainPendingRoundTrips signals done and stamps shutdown reason" {
     );
 }
 
-test "shutdown frees arena-owned residual events through the arena, not the gpa" {
-    // Regression: the agent thread is spawned with wire_arena.allocator()
-    // (see `submit`), so every payload it queues is arena-owned. The
-    // normal drain path in `drainEvents` routes freeOwned through the
-    // arena. Before this test, `shutdown` did not — it called
-    // `event.freeOwned(self.allocator)` directly, which under the
-    // DebugAllocator panics with "Invalid free" on the cross-allocator
-    // pointer. Mirrors the production crash chain
-    // main.deinit -> orchestrator.deinit -> shutdownAgents -> shutdown
-    // when an .err event is still sitting in the queue at quit time.
+test "shutdown frees mixed-ownership residual events at their true source" {
+    // Residual queued events have two owners (see `streamEventToQueue` vs
+    // `runToolStep`): streaming deltas and the streaming-preview tool_start
+    // are arena-owned, while the full tool_start (with call_id) and every
+    // tool_result are gpa-owned (duped on queue.allocator to survive
+    // worker-arena teardown). shutdown must free each at its true source via
+    // `freeOwnedMixed`. Modelling that ownership exactly matters: gpa-freeing
+    // an arena pointer panics "Invalid free", and arena-freeing a gpa pointer
+    // leaks — both caught by the testing allocator here.
     const allocator = std.testing.allocator;
     var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
@@ -2370,19 +2369,26 @@ test "shutdown frees arena-owned residual events through the arena, not the gpa"
     runner.event_queue = try agent_events.EventQueue.initBounded(allocator, 8);
     runner.queue_active = true;
 
-    // Push one payload-bearing event per arm freed in `freeOwned`, all
-    // arena-allocated to mirror the production producer.
+    // Arena-owned streaming deltas + a name-only preview tool_start.
     try runner.event_queue.push(.{ .err = try arena_alloc.dupe(u8, "cancelled") });
     try runner.event_queue.push(.{ .text_delta = try arena_alloc.dupe(u8, "hello") });
     try runner.event_queue.push(.{ .info = try arena_alloc.dupe(u8, "tokens: 42") });
+    try runner.event_queue.push(.{ .tool_start = .{ .name = try arena_alloc.dupe(u8, "bash") } });
+    // gpa-owned full tool_start (with call_id) and tool_result.
     try runner.event_queue.push(.{ .tool_start = .{
-        .name = try arena_alloc.dupe(u8, "bash"),
-        .call_id = try arena_alloc.dupe(u8, "toolu_1"),
-        .input_raw = try arena_alloc.dupe(u8, "{\"cmd\":\"ls\"}"),
+        .name = try allocator.dupe(u8, "bash"),
+        .call_id = try allocator.dupe(u8, "toolu_1"),
+        .input_raw = try allocator.dupe(u8, "{\"cmd\":\"ls\"}"),
+    } });
+    try runner.event_queue.push(.{ .tool_result = .{
+        .call_id = try allocator.dupe(u8, "toolu_1"),
+        .content = try allocator.dupe(u8, "file-a\nfile-b"),
+        .is_error = false,
     } });
 
-    // Pre-fix: panics in DebugAllocator.free with "Invalid free".
-    // Post-fix: arena free is a no-op; arena.deinit reclaims the bytes.
+    // No "Invalid free" (arena arms never gpa-freed) and no leak (gpa arms
+    // freed through the gpa); the testing allocator enforces both. The
+    // arena arms are reclaimed by wire_arena.deinit in runner.deinit.
     runner.shutdown();
 
     try std.testing.expect(!runner.queue_active);

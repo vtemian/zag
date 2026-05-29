@@ -272,6 +272,39 @@ pub const AgentEvent = union(enum) {
             },
         }
     }
+
+    /// Free a CONSUMER-drained event whose payload ownership is mixed.
+    /// Queued events come from two producers: streaming deltas
+    /// (`streamEventToQueue`) are duped on the wire `arena`, while the full
+    /// `tool_start` (with `call_id`) and every `tool_result` are duped on
+    /// `gpa` (== queue.allocator) by `runToolStep` so they survive
+    /// parallel-worker arena teardown. A drain that frees everything with a
+    /// single allocator either crashes (gpa-freeing arena memory) or leaks
+    /// (arena-freeing gpa memory); this frees each arm at its true source.
+    /// The streaming-preview `tool_start` (null `call_id`) is arena-owned.
+    /// Round-trip request and no-byte arms defer to `freeOwned`.
+    pub fn freeOwnedMixed(self: AgentEvent, arena: Allocator, gpa: Allocator) void {
+        switch (self) {
+            .text_delta => |s| arena.free(s),
+            .compaction_summary_delta => |s| arena.free(s),
+            .thinking_delta => |td| arena.free(td.text),
+            .info => |s| arena.free(s),
+            .err => |s| arena.free(s),
+            .tool_start => |t| {
+                const owner = if (t.call_id == null) arena else gpa;
+                owner.free(t.name);
+                if (t.call_id) |id| owner.free(id);
+                if (t.input_raw) |raw| owner.free(raw);
+            },
+            .tool_result => |r| {
+                gpa.free(r.content);
+                if (r.call_id) |id| gpa.free(id);
+            },
+            // No-byte arms and round-trip requests: identical to freeOwned
+            // (no allocations to free; parked workers are signalled).
+            else => self.freeOwned(arena),
+        }
+    }
 };
 
 /// Thread-safe, fixed-capacity event queue backed by a ring buffer.
