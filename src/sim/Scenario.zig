@@ -153,7 +153,7 @@ fn executeStep(r: *Runner, step: Dsl.Step, opts: RunOptions) !void {
         .wait_text => try r.executeWaitText(step.args, opts.wait_default_ms),
         .wait_idle => {
             const ms = try Args.parseDurationMs(step.args);
-            try r.executeWaitIdle(ms);
+            try r.executeWaitIdle(ms, opts.wait_default_ms);
         },
         .wait_exit => try r.executeWaitExit(step.args, opts.wait_default_ms),
         .expect_text => try r.executeExpectText(step.args),
