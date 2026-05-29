@@ -1204,110 +1204,235 @@ fn serializeEntryToBuf(entry: *Entry, buf: []u8) ![]const u8 {
 const writeJsonString = types.writeJsonString;
 
 /// Parse a single JSONL line into an Entry. Allocates string fields.
+/// Skip the remainder of a container whose opening `[`/`{` token the caller
+/// has already consumed. Used to tolerate a present-but-wrong-typed field
+/// whose value happens to be an array/object: we discard it and fall back to
+/// the field default, matching the DOM reader's `else => default` arms.
+fn skipRestOfContainer(scanner: *std.json.Scanner) !void {
+    var depth: usize = 1;
+    while (depth > 0) {
+        switch (try scanner.next()) {
+            .object_begin, .array_begin => depth += 1,
+            .object_end, .array_end => depth -= 1,
+            .end_of_document => return error.UnexpectedEndOfInput,
+            else => {},
+        }
+    }
+}
+
+/// Read the next JSON value as an owned, unescaped string, or null when the
+/// value is not a string (the non-string value is fully consumed). Mirrors
+/// the DOM reader's `.string => dupe, else => default` semantics: a present-
+/// but-wrong-typed field never fails the line.
+fn readStringField(scanner: *std.json.Scanner, allocator: Allocator) !?[]u8 {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .string => |s| return try allocator.dupe(u8, s),
+        .allocated_string => |s| return s,
+        .allocated_number => |s| {
+            allocator.free(s);
+            return null;
+        },
+        .number, .true, .false, .null => return null,
+        .array_begin, .object_begin => {
+            try skipRestOfContainer(scanner);
+            return null;
+        },
+        else => return error.UnexpectedToken,
+    }
+}
+
+/// Read the next JSON value as an i64, or `default` when it is not an integer.
+fn readIntField(scanner: *std.json.Scanner, allocator: Allocator, default: i64) !i64 {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .number => |s| return std.fmt.parseInt(i64, s, 10) catch default,
+        .allocated_number => |s| {
+            defer allocator.free(s);
+            return std.fmt.parseInt(i64, s, 10) catch default;
+        },
+        .allocated_string => |s| {
+            allocator.free(s);
+            return default;
+        },
+        .string, .true, .false, .null => return default,
+        .array_begin, .object_begin => {
+            try skipRestOfContainer(scanner);
+            return default;
+        },
+        else => return error.UnexpectedToken,
+    }
+}
+
+/// Read the next JSON value as a bool, or `default` when it is not a bool.
+fn readBoolField(scanner: *std.json.Scanner, allocator: Allocator, default: bool) !bool {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .true => return true,
+        .false => return false,
+        .allocated_string, .allocated_number => |s| {
+            allocator.free(s);
+            return default;
+        },
+        .string, .number, .null => return default,
+        .array_begin, .object_begin => {
+            try skipRestOfContainer(scanner);
+            return default;
+        },
+        else => return error.UnexpectedToken,
+    }
+}
+
+/// Read the next JSON value as a `[]u32` path, or null when it is not an
+/// array. Out-of-range or non-integer elements fail the line with
+/// `error.InvalidSubagentPath`, matching the DOM reader.
+fn readPathField(scanner: *std.json.Scanner, allocator: Allocator) !?[]const u32 {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .array_begin => {},
+        .allocated_string, .allocated_number => |s| {
+            allocator.free(s);
+            return null;
+        },
+        .string, .number, .true, .false, .null => return null,
+        .object_begin => {
+            try skipRestOfContainer(scanner);
+            return null;
+        },
+        else => return error.UnexpectedToken,
+    }
+
+    var list: std.ArrayList(u32) = .empty;
+    errdefer list.deinit(allocator);
+    while (true) {
+        switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+            .array_end => break,
+            .number => |s| {
+                const n = std.fmt.parseInt(i64, s, 10) catch return error.InvalidSubagentPath;
+                if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidSubagentPath;
+                try list.append(allocator, @intCast(n));
+            },
+            else => return error.InvalidSubagentPath,
+        }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Parse a single JSONL line into an Entry. Allocates string fields with
+/// `allocator`; the caller frees them via `freeEntry`. Streams the line with
+/// a `std.json.Scanner` rather than building a `std.json.Value` DOM, which
+/// skips the per-line object hashmap and value boxing that dominated bulk
+/// session loads. String unescaping and the lenient field semantics (a
+/// present-but-wrong-typed field falls back to its default rather than
+/// failing the line) match the prior DOM reader; see the round-trip,
+/// escape, wrong-type, and legacy-subagent tests below.
 fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
+    var scanner = std.json.Scanner.initCompleteInput(allocator, line);
+    defer scanner.deinit();
 
-    const entry_kind = if (obj.get("type")) |v| switch (v) {
-        .string => |s| s,
-        else => return error.InvalidEntryType,
-    } else return error.MissingType;
+    if (try scanner.next() != .object_begin) return error.NotAnObject;
 
-    const entry_type = EntryType.fromSlice(entry_kind) orelse return error.UnknownEntryType;
-
-    const content = if (obj.get("content")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => "",
-    } else "";
-
-    const tool_name = if (obj.get("tool_name")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => "",
-    } else "";
-
-    const tool_input = if (obj.get("tool_input")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => "",
-    } else "";
-
-    const is_error = if (obj.get("is_error")) |v| switch (v) {
-        .bool => |b| b,
-        else => false,
-    } else false;
-
-    const timestamp = if (obj.get("ts")) |v| switch (v) {
-        .integer => |i| i,
-        else => @as(i64, 0),
-    } else @as(i64, 0);
-
-    // Absent or unparseable `id` leaves the field as the zero sentinel so
-    // a later backfill pass (see Task 4 of the JSONL tree migration) can
-    // assign one deterministically without confusing it for a writer-set
-    // value. Same logic for `parent_id`, except the field stays null.
+    var entry_type: ?EntryType = null;
+    var content: []const u8 = "";
+    var tool_name: []const u8 = "";
+    var tool_input: []const u8 = "";
+    var is_error = false;
+    var timestamp: i64 = 0;
+    // Absent or unparseable `id` leaves the field as the zero sentinel so a
+    // later backfill pass can assign one deterministically without confusing
+    // it for a writer-set value. `parent_id` stays null on the same path.
     var id: ulid.Ulid = [_]u8{0} ** 26;
-    if (obj.get("id")) |v| switch (v) {
-        .string => |s| id = ulid.parse(s) catch [_]u8{0} ** 26,
-        else => {},
-    };
-
     var parent_id: ?ulid.Ulid = null;
-    if (obj.get("parent_id")) |v| switch (v) {
-        .string => |s| parent_id = ulid.parse(s) catch null,
-        else => {},
-    };
+    var signature: ?[]const u8 = null;
+    var thinking_provider: ?[]const u8 = null;
+    var encrypted_data: ?[]const u8 = null;
+    var tool_use_id: ?[]const u8 = null;
+    var subagent_path: ?[]const u32 = null;
+    var saw_subagent_path = false;
+    var legacy_subagent_id: ?u32 = null;
 
-    const signature = if (obj.get("signature")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+    // Any error after we start keeping owned fields must release them so a
+    // malformed line cannot leak. freeEntry is for fully-built entries; this
+    // mirrors it over the in-progress locals.
+    errdefer {
+        if (content.len > 0) allocator.free(content);
+        if (tool_name.len > 0) allocator.free(tool_name);
+        if (tool_input.len > 0) allocator.free(tool_input);
+        if (signature) |s| allocator.free(s);
+        if (thinking_provider) |s| allocator.free(s);
+        if (encrypted_data) |s| allocator.free(s);
+        if (tool_use_id) |s| allocator.free(s);
+        if (subagent_path) |p| allocator.free(p);
+    }
 
-    const thinking_provider = if (obj.get("thinking_provider")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+    while (true) {
+        const key_tok = try scanner.nextAlloc(allocator, .alloc_if_needed);
+        const key = switch (key_tok) {
+            .object_end => break,
+            .string => |s| s,
+            .allocated_string => |s| s,
+            else => return error.MalformedKey,
+        };
+        // Free an allocated (escaped) key once dispatch is done. Keys are
+        // ASCII in practice, so this is almost always the borrowed branch.
+        defer switch (key_tok) {
+            .allocated_string => |s| allocator.free(s),
+            else => {},
+        };
 
-    const encrypted_data = if (obj.get("encrypted_data")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+        if (std.mem.eql(u8, key, "type")) {
+            const s = (try readStringField(&scanner, allocator)) orelse return error.InvalidEntryType;
+            defer allocator.free(s);
+            entry_type = EntryType.fromSlice(s) orelse return error.UnknownEntryType;
+        } else if (std.mem.eql(u8, key, "content")) {
+            content = (try readStringField(&scanner, allocator)) orelse "";
+        } else if (std.mem.eql(u8, key, "tool_name")) {
+            tool_name = (try readStringField(&scanner, allocator)) orelse "";
+        } else if (std.mem.eql(u8, key, "tool_input")) {
+            tool_input = (try readStringField(&scanner, allocator)) orelse "";
+        } else if (std.mem.eql(u8, key, "is_error")) {
+            is_error = try readBoolField(&scanner, allocator, false);
+        } else if (std.mem.eql(u8, key, "ts")) {
+            timestamp = try readIntField(&scanner, allocator, 0);
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (try readStringField(&scanner, allocator)) |s| {
+                defer allocator.free(s);
+                id = ulid.parse(s) catch [_]u8{0} ** 26;
+            }
+        } else if (std.mem.eql(u8, key, "parent_id")) {
+            if (try readStringField(&scanner, allocator)) |s| {
+                defer allocator.free(s);
+                parent_id = ulid.parse(s) catch null;
+            }
+        } else if (std.mem.eql(u8, key, "signature")) {
+            signature = try readStringField(&scanner, allocator);
+        } else if (std.mem.eql(u8, key, "thinking_provider")) {
+            thinking_provider = try readStringField(&scanner, allocator);
+        } else if (std.mem.eql(u8, key, "encrypted_data")) {
+            encrypted_data = try readStringField(&scanner, allocator);
+        } else if (std.mem.eql(u8, key, "tool_use_id")) {
+            tool_use_id = try readStringField(&scanner, allocator);
+        } else if (std.mem.eql(u8, key, "subagent_path")) {
+            saw_subagent_path = true;
+            subagent_path = try readPathField(&scanner, allocator);
+        } else if (std.mem.eql(u8, key, "subagent_id")) {
+            const n = try readIntField(&scanner, allocator, -1);
+            if (n >= 0 and n <= std.math.maxInt(u32)) legacy_subagent_id = @intCast(n);
+        } else {
+            try scanner.skipValue();
+        }
+    }
 
-    const tool_use_id = if (obj.get("tool_use_id")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+    const et = entry_type orelse return error.MissingType;
 
     // Prefer the new array shape; fall back to the legacy single-int
-    // `subagent_id` field by treating it as a 1-element path.
-    var subagent_path: ?[]const u32 = null;
-    if (obj.get("subagent_path")) |v| switch (v) {
-        .array => |arr| {
-            const items = arr.items;
-            const buf = try allocator.alloc(u32, items.len);
-            errdefer allocator.free(buf);
-            for (items, 0..) |elem, i| switch (elem) {
-                .integer => |n| {
-                    if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidSubagentPath;
-                    buf[i] = @intCast(n);
-                },
-                else => return error.InvalidSubagentPath,
-            };
+    // `subagent_id` only when no `subagent_path` field was present at all.
+    if (!saw_subagent_path) {
+        if (legacy_subagent_id) |sid| {
+            const buf = try allocator.alloc(u32, 1);
+            buf[0] = sid;
             subagent_path = buf;
-        },
-        else => {},
-    } else if (obj.get("subagent_id")) |v| switch (v) {
-        .integer => |i| {
-            if (i >= 0 and i <= std.math.maxInt(u32)) {
-                const buf = try allocator.alloc(u32, 1);
-                buf[0] = @intCast(i);
-                subagent_path = buf;
-            }
-        },
-        else => {},
-    };
+        }
+    }
 
     return Entry{
-        .entry_type = entry_type,
+        .entry_type = et,
         .content = content,
         .tool_name = tool_name,
         .tool_input = tool_input,
@@ -1491,6 +1616,42 @@ test "serializeEntry and parseEntry round-trip" {
     try std.testing.expectEqual(EntryType.user_message, parsed.entry_type);
     try std.testing.expectEqualStrings("hello world", parsed.content);
     try std.testing.expectEqual(@as(i64, 1234567890), parsed.timestamp);
+}
+
+test "parseEntry unescapes JSON string escapes in content" {
+    const allocator = std.testing.allocator;
+
+    // A raw JSONL line whose `content` carries the four escape shapes the
+    // serializer can emit (newline, quote, backslash) plus a \u codepoint.
+    // The reader must hand back the DECODED bytes, not the escaped source.
+    const line =
+        "{\"type\":\"assistant_text\",\"content\":\"line1\\nline2 \\\"q\\\" \\\\ \\u00e9\",\"ts\":7}";
+
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.assistant_text, parsed.entry_type);
+    try std.testing.expectEqualStrings("line1\nline2 \"q\" \\ \u{00e9}", parsed.content);
+    try std.testing.expectEqual(@as(i64, 7), parsed.timestamp);
+}
+
+test "parseEntry tolerates wrong-typed fields by falling back to defaults" {
+    const allocator = std.testing.allocator;
+
+    // Present-but-wrong-typed fields must not error the line; each falls back
+    // to its default (string -> "", bool -> false, int -> 0) so a single
+    // malformed field cannot drop an otherwise-loadable entry.
+    const line =
+        "{\"type\":\"info\",\"content\":123,\"is_error\":\"yes\",\"ts\":\"nope\",\"tool_name\":true}";
+
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.info, parsed.entry_type);
+    try std.testing.expectEqualStrings("", parsed.content);
+    try std.testing.expectEqualStrings("", parsed.tool_name);
+    try std.testing.expectEqual(false, parsed.is_error);
+    try std.testing.expectEqual(@as(i64, 0), parsed.timestamp);
 }
 
 test "serializeEntry with tool fields" {
