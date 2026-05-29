@@ -2346,6 +2346,42 @@ test "drainPendingRoundTrips signals done and stamps shutdown reason" {
     );
 }
 
+test "handleAgentEvent .done keeps a failed turn's status, does not settle to idle" {
+    const allocator = std.testing.allocator;
+
+    // SessionManager.createSession writes under a cwd-relative dir, so point
+    // cwd at a temp dir and restore it afterwards.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    defer {
+        var d = std.fs.openDirAbsolute(orig_cwd, .{}) catch unreachable;
+        defer d.close();
+        d.setAsCwd() catch {};
+    }
+    try tmp.dir.setAsCwd();
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    defer handle.close();
+
+    var conv = try Conversation.init(allocator, 0, "test");
+    defer conv.deinit();
+    conv.attachSession(&handle);
+
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &conv);
+    defer runner.deinit();
+
+    // A turn that errors then completes: the `.err` arm moves status to
+    // .failed; the `.done` arm (drained right after, same batch) must NOT
+    // clobber it back to .idle, so the sidebar keeps showing the failure.
+    runner.handleAgentEvent(.{ .err = try allocator.dupe(u8, "boom") }, allocator);
+    try std.testing.expectEqual(Session.SessionStatus.failed, handle.meta.status);
+    runner.handleAgentEvent(.done, allocator);
+    try std.testing.expectEqual(Session.SessionStatus.failed, handle.meta.status);
+}
+
 test "shutdown frees mixed-ownership residual events at their true source" {
     // Residual queued events have two owners (see `streamEventToQueue` vs
     // `runToolStep`): streaming deltas and the streaming-preview tool_start
