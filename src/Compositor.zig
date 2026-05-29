@@ -841,7 +841,12 @@ fn workingLineText(buf: []u8, secs: u64, tokens: u32) []const u8 {
 }
 
 /// Count wrapped rows for `text` starting at `start_col` and wrapping at `max_col`.
-fn wrappedRowCountWithStart(start_col: u16, max_col: u16, text: []const u8) u16 {
+/// Count the wrapped rows `text` occupies starting at column `start_col`,
+/// wrapping at `max_col`. Shared by `drawPanePrompt` (the render) and
+/// `EventOrchestrator.publishCursorAnchor` (the cursor anchor) so both
+/// agree on prompt geometry. Row count saturates at u16 max so a
+/// pathologically large all-newline draft cannot overflow into a panic.
+pub fn wrappedRowCountWithStart(start_col: u16, max_col: u16, text: []const u8) u16 {
     if (max_col <= start_col) return 1;
     var rows: u16 = 1;
     var col = start_col;
@@ -851,14 +856,14 @@ fn wrappedRowCountWithStart(start_col: u16, max_col: u16, text: []const u8) u16 
         const w = cluster.width;
         if (w == 0) {
             if (cluster.base == '\n') {
-                rows += 1;
+                rows +|= 1;
                 col = start_col;
             }
             continue;
         }
         if (w > max_col - start_col) break;
         if (col + w > max_col) {
-            rows += 1;
+            rows +|= 1;
             col = start_col;
         }
         col += w;
@@ -895,8 +900,9 @@ fn writeWrappedTail(
                 // Advance the logical row always, but the screen row only
                 // once we are past the skipped (scrolled-off) rows, so the
                 // visible tail starts at start_row instead of being pushed
-                // off the bottom of the prompt area.
-                current_row += 1;
+                // off the bottom of the prompt area. Saturating so a huge
+                // all-newline draft cannot overflow current_row.
+                current_row +|= 1;
                 col = start_col;
                 if (current_row > skip_rows) {
                     row += 1;
@@ -906,7 +912,7 @@ fn writeWrappedTail(
             continue;
         }
         if (col + w > max_col) {
-            current_row += 1;
+            current_row +|= 1;
             col = start_col;
             if (current_row > skip_rows) {
                 row += 1;
@@ -923,7 +929,10 @@ fn writeWrappedTail(
 }
 
 /// Compute the logical wrapped row and column of a byte offset in `text`.
-fn wrappedCursorPos(
+/// Shared by `drawPanePrompt` and `EventOrchestrator.publishCursorAnchor`
+/// so the rendered cursor and the published anchor land on the same cell.
+/// Row saturates at u16 max so an enormous draft cannot overflow.
+pub fn wrappedCursorPos(
     start_col: u16,
     max_col: u16,
     text: []const u8,
@@ -939,14 +948,14 @@ fn wrappedCursorPos(
         const w = cluster.width;
         if (w == 0) {
             if (cluster.base == '\n') {
-                row += 1;
+                row +|= 1;
                 col = start_col;
             }
             i += cluster.byte_len;
             continue;
         }
         if (col + w > max_col) {
-            row += 1;
+            row +|= 1;
             col = start_col;
         }
         col += w;
