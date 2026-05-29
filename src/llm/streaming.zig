@@ -539,6 +539,19 @@ pub const StreamingResponse = struct {
         try self.pending_line.appendSlice(self.allocator, bytes);
     }
 
+    /// Append one SSE `data:` field value to the in-flight event buffer,
+    /// inserting the spec-mandated '\n' separator between successive data
+    /// lines of the same event. Enforces MAX_SSE_EVENT_DATA including the
+    /// separator byte.
+    fn appendSseData(self: *StreamingResponse, event_data: *std.ArrayList(u8), val: []const u8) !void {
+        const sep: usize = if (event_data.items.len > 0) 1 else 0;
+        if (event_data.items.len + sep + val.len > MAX_SSE_EVENT_DATA) {
+            return error.SseEventDataTooLarge;
+        }
+        if (sep == 1) try event_data.append(self.allocator, '\n');
+        try event_data.appendSlice(self.allocator, val);
+    }
+
     fn stripCr(line: []const u8) []const u8 {
         if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
         return line;
@@ -577,9 +590,15 @@ pub const StreamingResponse = struct {
             const line = maybe_line orelse {
                 // End of stream: return a final event if data accumulated
                 if (event_data.items.len > 0) {
+                    // Invalid UTF-8 at the stream boundary means the response
+                    // was cut mid-codepoint: the body is incomplete, not a
+                    // clean end. Surface it as a provider failure so the
+                    // caller falls back / retries instead of silently
+                    // assembling a truncated turn (which `return null` here
+                    // would do, looking exactly like a normal end of stream).
                     if (!std.unicode.utf8ValidateSlice(event_data.items)) {
-                        log.warn("SSE event contains invalid UTF-8 ({d} bytes) at stream end; skipping", .{event_data.items.len});
-                        return null;
+                        log.warn("SSE stream ended mid-event with invalid UTF-8 ({d} bytes); treating as truncated response", .{event_data.items.len});
+                        return error.ProviderResponseFailed;
                     }
                     return SseEvent{
                         .event_type = event_buf[0..event_len],
@@ -629,17 +648,9 @@ pub const StreamingResponse = struct {
                 @memcpy(event_buf[0..val.len], val);
                 event_len = val.len;
             } else if (std.mem.startsWith(u8, line, "data: ")) {
-                const val = line["data: ".len..];
-                if (event_data.items.len + val.len > MAX_SSE_EVENT_DATA) {
-                    return error.SseEventDataTooLarge;
-                }
-                try event_data.appendSlice(self.allocator, val);
+                try self.appendSseData(event_data, line["data: ".len..]);
             } else if (std.mem.startsWith(u8, line, "data:")) {
-                const val = line["data:".len..];
-                if (event_data.items.len + val.len > MAX_SSE_EVENT_DATA) {
-                    return error.SseEventDataTooLarge;
-                }
-                try event_data.appendSlice(self.allocator, val);
+                try self.appendSseData(event_data, line["data:".len..]);
             }
         }
     }
@@ -888,6 +899,72 @@ test "nextSseEvent skips event with invalid UTF-8 in data" {
 
     const second = try sr.nextSseEvent(&cancel, &event_buf, &event_data);
     try std.testing.expect(second == null);
+}
+
+test "nextSseEvent returns ProviderResponseFailed on truncated invalid-UTF8 at EOF" {
+    const allocator = std.testing.allocator;
+
+    // A lone lead byte (0xC3 starts a 2-byte sequence with nothing after)
+    // reaches the EOF branch because the stream ends WITHOUT a terminating
+    // blank line. A truncated codepoint at the boundary means the body was
+    // cut mid-stream, so the caller must learn the response is incomplete
+    // rather than seeing a clean null end-of-stream.
+    const stream = "data: hello \xC3";
+
+    var fake = std.Io.Reader.fixed(stream);
+
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var event_buf: [128]u8 = undefined;
+    var event_data: std.ArrayList(u8) = .empty;
+    defer event_data.deinit(allocator);
+
+    try std.testing.expectError(
+        error.ProviderResponseFailed,
+        sr.nextSseEvent(&cancel, &event_buf, &event_data),
+    );
+}
+
+test "nextSseEvent joins multi-line data fields with newline" {
+    const allocator = std.testing.allocator;
+
+    // Two `data:` lines within one event must be joined by a single '\n'
+    // per the WHATWG SSE spec, not concatenated raw.
+    const stream = "data: line1\ndata: line2\n\n";
+
+    var fake = std.Io.Reader.fixed(stream);
+
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var event_buf: [128]u8 = undefined;
+    var event_data: std.ArrayList(u8) = .empty;
+    defer event_data.deinit(allocator);
+
+    const event = try sr.nextSseEvent(&cancel, &event_buf, &event_data);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqualStrings("line1\nline2", event.?.data);
 }
 
 test "buildSideChannelHeaders strips Accept and adds JSON" {

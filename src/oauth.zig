@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 
 const auth = @import("auth.zig");
 const Endpoint = @import("llm/registry.zig").Endpoint;
+const socket_timeouts = @import("llm/socket_timeouts.zig");
 
 const log = std.log.scoped(.oauth);
 
@@ -513,6 +514,130 @@ pub const ExchangeParams = struct {
     client_id: []const u8,
 };
 
+/// Socket timeouts for the token endpoint. A token exchange/refresh is a
+/// single small round-trip, so the registry's 600s read default (meant for
+/// long streaming turns) is far longer than this path ever needs. A wedged
+/// IdP must fail fast instead of stalling the whole turn while the agent
+/// holds for a refresh, so the read budget is tightened to 30s. Connect and
+/// write keep the registry defaults; connect is documented-but-unenforced in
+/// Zig 0.15 (the OS default applies before the socket fd is reachable).
+const token_endpoint_timeouts = Endpoint.TimeoutConfig{ .read_ms = 30_000 };
+
+/// Status + body of a token-endpoint POST, returned regardless of HTTP
+/// status. The body is allocator-owned; the caller frees it.
+const RawPostResponse = struct {
+    status: std.http.Status,
+    body: []const u8,
+
+    fn deinit(self: RawPostResponse, alloc: Allocator) void {
+        alloc.free(self.body);
+    }
+};
+
+/// POST `body` to `url` with the given extra headers, applying socket-level
+/// read/write timeouts after the response head arrives so a wedged IdP
+/// cannot hang the agent thread on the OS-default (~75s macOS / ~127s Linux)
+/// socket timeout. Mirrors `llm/http.zig`'s manual-request flow but lets the
+/// caller own the `Content-Type` header (the stdlib's overridable
+/// content-type is set to `.omit` so it is never double-emitted; OAuth uses
+/// both form-urlencoded and JSON content types).
+///
+/// Errors are reserved for genuine plumbing failures (URI parse, TCP, TLS,
+/// allocator, timeout); any HTTP status is returned as data so the caller's
+/// secret-safe error parsing stays in charge. `timeouts` is threaded only so
+/// the inline timeout test can drive a short budget; production callers pass
+/// `token_endpoint_timeouts`.
+fn oauthPostRaw(
+    alloc: Allocator,
+    url: []const u8,
+    body: []const u8,
+    extra_headers: []const std.http.Header,
+    timeouts: Endpoint.TimeoutConfig,
+) !RawPostResponse {
+    var client = std.http.Client{ .allocator = alloc };
+    defer client.deinit();
+
+    const uri = std.Uri.parse(url) catch return error.InvalidUri;
+
+    var req = client.request(.POST, uri, .{
+        .extra_headers = extra_headers,
+        .headers = .{ .content_type = .omit },
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+    }) catch |err| {
+        log.warn("oauth: request creation failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = body.len };
+    var bw = req.sendBodyUnflushed(&.{}) catch |err| {
+        log.warn("oauth: sendBodyUnflushed failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    bw.writer.writeAll(body) catch |err| {
+        log.warn("oauth: body write failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    bw.end() catch |err| {
+        log.warn("oauth: body end failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+    (req.connection orelse {
+        log.warn("oauth: no connection after body send", .{});
+        return error.ApiError;
+    }).flush() catch |err| {
+        log.warn("oauth: flush failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+
+    var no_redirects: [0]u8 = .{};
+    var response = req.receiveHead(&no_redirects) catch |err| {
+        log.warn("oauth: receiveHead failed: {s}", .{@errorName(err)});
+        return error.ApiError;
+    };
+
+    // First point the socket fd is reachable; cap read/write so a stalled
+    // IdP fails fast instead of wedging the turn.
+    if (req.connection) |conn| {
+        socket_timeouts.applySocketTimeouts(
+            conn.stream_reader.getStream().handle,
+            timeouts.read_ms,
+            timeouts.write_ms,
+        );
+    }
+
+    var transfer_buf: [8192]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    while (true) {
+        var chunk: [4096]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&chunk);
+        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.WriteFailed => unreachable, // fixed writer sized to chunk.len
+            error.ReadFailed => {
+                if (req.connection) |conn| {
+                    if (conn.getReadError()) |inner| {
+                        if (inner == error.WouldBlock) return error.ReadTimeout;
+                    }
+                }
+                return error.ApiError;
+            },
+        };
+        if (n == 0) break;
+        try out.appendSlice(alloc, chunk[0..n]);
+    }
+
+    return .{
+        .status = response.head.status,
+        .body = try out.toOwnedSlice(alloc),
+    };
+}
+
 pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     // Build form body.
     var body_aw: std.io.Writer.Allocating = .init(alloc);
@@ -525,36 +650,25 @@ pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     try writeFormField(body_w, "client_id", p.client_id, false);
     try writeFormField(body_w, "code_verifier", p.verifier, false);
 
-    // Send.
-    var client = std.http.Client{ .allocator = alloc };
-    defer client.deinit();
-
-    var resp_aw: std.io.Writer.Allocating = .init(alloc);
-    defer resp_aw.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = p.token_url },
-        .method = .POST,
-        .payload = body_aw.written(),
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
-            .{ .name = "Accept", .value = "application/json" },
-        },
-        .response_writer = &resp_aw.writer,
-        .keep_alive = false,
-    }) catch |err| {
+    // Send via the timeout-bounded manual-request path so a wedged IdP
+    // cannot hang the turn on the OS-default socket timeout.
+    const raw = oauthPostRaw(alloc, p.token_url, body_aw.written(), &.{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+        .{ .name = "Accept", .value = "application/json" },
+    }, token_endpoint_timeouts) catch |err| {
         log.warn("exchangeCode transport failed: {s}", .{@errorName(err)});
         return error.TokenExchangeFailed;
     };
+    defer raw.deinit(alloc);
 
-    if (result.status != .ok) {
+    if (raw.status != .ok) {
         var err_buf: [128]u8 = undefined;
-        const code = extractErrorCode(resp_aw.written(), &err_buf) orelse "unparseable";
-        log.warn("exchangeCode failed: status={}, error={s}", .{ result.status, code });
+        const code = extractErrorCode(raw.body, &err_buf) orelse "unparseable";
+        log.warn("exchangeCode failed: status={}, error={s}", .{ raw.status, code });
         return error.TokenExchangeFailed;
     }
 
-    return parseTokenResponse(alloc, resp_aw.written(), .exchange);
+    return parseTokenResponse(alloc, raw.body, .exchange);
 }
 
 fn writeFormField(w: *std.io.Writer, key: []const u8, val: []const u8, first: bool) !void {
@@ -707,40 +821,30 @@ pub fn refreshAccessToken(alloc: Allocator, p: RefreshParams) !TokenResponse {
     const body_json = try std.json.Stringify.valueAlloc(alloc, body_obj, .{});
     defer alloc.free(body_json);
 
-    var client = std.http.Client{ .allocator = alloc };
-    defer client.deinit();
-
-    var resp_aw: std.io.Writer.Allocating = .init(alloc);
-    defer resp_aw.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = p.token_url },
-        .method = .POST,
-        .payload = body_json,
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept", .value = "application/json" },
-        },
-        .response_writer = &resp_aw.writer,
-        .keep_alive = false,
-    }) catch |err| {
+    // Send via the timeout-bounded manual-request path so a wedged IdP
+    // cannot hang the turn on the OS-default socket timeout.
+    const raw = oauthPostRaw(alloc, p.token_url, body_json, &.{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Accept", .value = "application/json" },
+    }, token_endpoint_timeouts) catch |err| {
         log.warn("refreshAccessToken transport failed: {s}", .{@errorName(err)});
         return error.TokenRefreshFailed;
     };
+    defer raw.deinit(alloc);
 
-    switch (result.status) {
-        .ok => return parseTokenResponse(alloc, resp_aw.written(), .refresh),
+    switch (raw.status) {
+        .ok => return parseTokenResponse(alloc, raw.body, .refresh),
         .unauthorized, .bad_request => {
-            if (isInvalidGrant(resp_aw.written())) return error.LoginExpired;
+            if (isInvalidGrant(raw.body)) return error.LoginExpired;
             var err_buf: [128]u8 = undefined;
-            const code = extractErrorCode(resp_aw.written(), &err_buf) orelse "unparseable";
-            log.warn("refreshAccessToken failed: status={}, error={s}", .{ result.status, code });
+            const code = extractErrorCode(raw.body, &err_buf) orelse "unparseable";
+            log.warn("refreshAccessToken failed: status={}, error={s}", .{ raw.status, code });
             return error.TokenRefreshFailed;
         },
         else => {
             var err_buf: [128]u8 = undefined;
-            const code = extractErrorCode(resp_aw.written(), &err_buf) orelse "unparseable";
-            log.warn("refreshAccessToken failed: status={}, error={s}", .{ result.status, code });
+            const code = extractErrorCode(raw.body, &err_buf) orelse "unparseable";
+            log.warn("refreshAccessToken failed: status={}, error={s}", .{ raw.status, code });
             return error.TokenRefreshFailed;
         },
     }
@@ -923,6 +1027,61 @@ test "refreshAccessToken maps invalid_grant to error.LoginExpired" {
         .refresh_token = "EXPIRED",
         .client_id = "app_test",
     }));
+}
+
+/// Mock IdP that accepts one connection, drains the request, then writes
+/// only the response head (chunked transfer, no chunk) and sleeps. Any read
+/// on the body side blocks until `SO_RCVTIMEO` fires. Mirrors
+/// `mockTimeoutServer` in `llm/http.zig`.
+fn mockStallingIdp(srv: *std.net.Server, sleep_ns: u64) void {
+    const conn = srv.accept() catch return;
+    defer conn.stream.close();
+
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = conn.stream.read(&buf) catch return;
+        if (n == 0) return;
+        if (std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") != null) break;
+    }
+
+    const head_only = "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Connection: close\r\n\r\n";
+    _ = conn.stream.writeAll(head_only) catch {};
+    std.Thread.sleep(sleep_ns);
+}
+
+test "oauthPostRaw surfaces error.ReadTimeout when the IdP stalls mid-body" {
+    // A wedged IdP returns 200 OK with chunked headers but never sends a
+    // chunk. Without SO_RCVTIMEO the client would wait the OS default
+    // (~75s macOS / ~127s Linux), hanging the agent thread. With a 500 ms
+    // read timeout the body read fails fast with EAGAIN, recovered as
+    // error.ReadTimeout. A short timeout is threaded in directly so the
+    // test stays sub-second rather than waiting the 30s production budget.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+
+    const thr = try std.Thread.spawn(.{}, mockStallingIdp, .{ &server, 3 * std.time.ns_per_s });
+    defer {
+        server.deinit();
+        thr.join();
+    }
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
+
+    const start = std.time.milliTimestamp();
+    const result = oauthPostRaw(std.testing.allocator, url, "{}", &.{
+        .{ .name = "Content-Type", .value = "application/json" },
+    }, .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 });
+    const elapsed = std.time.milliTimestamp() - start;
+
+    try std.testing.expectError(error.ReadTimeout, result);
+    // 500 ms timeout plus slack for connect/handshake; OS-default behaviour
+    // would push this past 60 s.
+    try std.testing.expect(elapsed < 1500);
 }
 
 // === End-to-end login flow ===

@@ -593,22 +593,20 @@ pub fn render(self: *Screen, file: std.fs.File) !void {
 ///
 /// Continuation cells (second half of a wide char) are swallowed into
 /// the run - they inherit style from their primary and the terminal
-/// advances the cursor through them implicitly. A wide-char primary
-/// whose successor is not a continuation cell terminates the run so
-/// the next iteration re-syncs cursor position explicitly.
+/// advances the cursor through them implicitly. Wide-ness is read from
+/// the continuation bit on the successor cell rather than recomputed,
+/// since writeCluster (the sole grid writer) sets it for every wide write.
 fn findRunEnd(self: *const Screen, row: u16, start_col: u16, head: Cell) u16 {
     const row_base = @as(usize, row) * @as(usize, self.width);
     var c: u16 = start_col;
 
-    // Advance past the head cell. If head is wide and col+1 is a proper
-    // continuation, include it; otherwise stop before col+1 so the next
-    // outer iteration issues a fresh cursor move.
-    const head_width = width_mod.codepointWidth(head.codepoint);
+    // Advance past the head cell. A wide head is encoded by a continuation
+    // bit on the cell at col+1 (writeCluster is the sole grid writer and sets
+    // it for every w==2 write), so swallow that successor instead of
+    // re-deriving the width with codepointWidth on every frame.
     c += 1;
-    if (head_width == 2 and c < self.width and self.current[row_base + c].continuation) {
+    if (c < self.width and self.current[row_base + c].continuation) {
         c += 1;
-    } else if (head_width == 2) {
-        return c;
     }
 
     while (c < self.width) {
@@ -622,15 +620,10 @@ fn findRunEnd(self: *const Screen, row: u16, start_col: u16, head: Cell) u16 {
         if (!colorsEqual(head.fg, cell.fg)) break;
         if (!colorsEqual(head.bg, cell.bg)) break;
 
-        const w = width_mod.codepointWidth(cell.codepoint);
+        // A wide cell's continuation successor is consumed by the
+        // continuation branch on the next iteration, so a plain advance is
+        // correct for both single- and double-width cells.
         c += 1;
-        if (w == 2) {
-            if (c < self.width and self.current[row_base + c].continuation) {
-                c += 1;
-            } else {
-                break;
-            }
-        }
     }
     return c;
 }

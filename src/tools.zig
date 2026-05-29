@@ -160,6 +160,7 @@ pub const Registry = struct {
     /// reshuffle the system prompt's tool block every restart.
     pub fn definitions(self: *const Registry, allocator: Allocator) ![]const types.ToolDefinition {
         var list: std.ArrayList(types.ToolDefinition) = .empty;
+        errdefer list.deinit(allocator);
         var it = self.tools.valueIterator();
         while (it.next()) |tool| {
             try list.append(allocator, tool.definition);
@@ -318,9 +319,6 @@ pub fn luaToolExecute(
     allocator: Allocator,
     cancel: ?*std.atomic.Value(bool),
 ) types.ToolError!types.ToolResult {
-    _ = cancel; // Lua tools round-trip through the main thread; the cancel pointer
-    // could be wired into the request so long-running Lua tools poll it,
-    // but today all Lua tools complete quickly.
     const queue = lua_request_queue orelse return .{
         .content = "error: no lua queue bound for this thread",
         .is_error = true,
@@ -350,7 +348,31 @@ pub fn luaToolExecute(
             .owned = false,
         },
     };
-    req.done.wait();
+    // Poll `done` on a 50ms cadence so a cancelled turn does not park a tool
+    // worker on a slow Lua tool. Mirrors the round-trip in `agent.marshalRequest`.
+    while (true) {
+        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
+            break;
+        } else |_| {
+            if (cancel) |c| {
+                if (c.load(.acquire)) {
+                    // The main thread may still be inside `executeTool` writing
+                    // `req.result_content` with `allocator`. Wait for `done`
+                    // before touching the result, then release any owned content
+                    // with the producing allocator (never queue.allocator).
+                    req.done.wait();
+                    if (req.result_owned) {
+                        if (req.result_content) |content| allocator.free(content);
+                    }
+                    return .{
+                        .content = "error: lua tool cancelled",
+                        .is_error = true,
+                        .owned = false,
+                    };
+                }
+            }
+        }
+    }
     if (req.error_name) |name| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "error: lua tool failed: {s}", .{name}),

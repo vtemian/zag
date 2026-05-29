@@ -5,9 +5,9 @@
 //! them in the orchestrator's event loop and resumes the owning
 //! coroutine via `resumeFromJob`. An eventfd/pipe `wake_fd` is written
 //! on every push so the orchestrator's poll wakes immediately instead
-//! of relying on a timeout. Overflow is tracked via `dropped` rather
-//! than blocking producers, since blocking a worker inside the lock
-//! would stall the whole pool.
+//! of relying on a timeout. Producers retry on a full ring rather than
+//! dropping, since the only handle that resumes a waiting coroutine is
+//! the job itself; the main thread drains continuously so full is brief.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -22,7 +22,6 @@ pub const Queue = struct {
     tail: usize = 0,
     len: usize = 0,
     wake_fd: std.posix.fd_t = -1,
-    dropped: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: Allocator, capacity: usize) !Queue {
         return .{

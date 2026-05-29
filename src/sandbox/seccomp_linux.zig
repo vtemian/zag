@@ -6,6 +6,13 @@
 //! remain unrestricted. Loopback TCP/UDP is blocked as a side effect;
 //! AF_UNIX local sockets (docker.sock, psql.sock) still work.
 //!
+//! io_uring_setup(2) is also denied: an io_uring ring can submit
+//! IORING_OP_SOCKET / IORING_OP_CONNECT to create and connect AF_INET
+//! sockets without ever calling socket(2), bypassing the family filter.
+//! Denying ring creation forces userspace back onto the regular syscalls
+//! the family arms then catch. This is a hard io_uring deny in strict
+//! mode; shell commands do not need io_uring.
+//!
 //! Inherits across execve so the bash child enforces the restriction.
 //! Installed by `helper_linux.run` after landlock_restrict_self.
 //!
@@ -77,9 +84,11 @@ pub const InstallError = error{
 /// is idempotent if landlock_linux already did the same prctl).
 ///
 /// Filter semantics:
-///   * Any syscall on the current arch other than socket(2): ALLOW.
+///   * io_uring_setup(2): return EACCES (no ring -> no IORING_OP_SOCKET
+///     bypass of the socket-family filter).
 ///   * socket(AF_INET, ...) or socket(AF_INET6, ...): return EACCES.
 ///   * socket(AF_UNIX/AF_NETLINK/...): ALLOW.
+///   * Any other syscall on the current arch: ALLOW.
 ///   * Syscall on a different arch (compat-32 etc.): KILL_PROCESS.
 ///
 /// Filter is inherited across execve so the bash child enforces it.
@@ -93,6 +102,7 @@ pub fn installSocketFamilyFilter() InstallError!void {
         else => @intFromEnum(linux.AUDIT.ARCH.current),
     };
     const sys_socket: u32 = @intFromEnum(linux.SYS.socket);
+    const sys_io_uring_setup: u32 = @intFromEnum(linux.SYS.io_uring_setup);
     const af_inet: u32 = linux.AF.INET;
     const af_inet6: u32 = linux.AF.INET6;
 
@@ -102,22 +112,30 @@ pub fn installSocketFamilyFilter() InstallError!void {
 
     // Instruction layout (PC: action — jt/jf targets):
     //   0  LD  arch                          -> A = data.arch
-    //   1  JEQ arch_current  jt=0  jf=8      -> if mismatch, jump to 10 (KILL)
+    //   1  JEQ arch_current     jt=0  jf=9   -> if mismatch, jump to 11 (KILL)
     //   2  LD  nr                            -> A = data.nr
-    //   3  JEQ sys_socket    jt=0  jf=4      -> if not socket, jump to 8 (ALLOW)
-    //   4  LD  arg0_lo                       -> A = data.args[0] low word
-    //   5  JEQ AF_INET       jt=3  jf=0      -> if match, jump to 9 (EACCES)
-    //   6  JEQ AF_INET6      jt=2  jf=0      -> if match, jump to 9 (EACCES)
-    //   7  RET ALLOW                         -> fallthrough for AF_UNIX et al.
-    //   8  RET ALLOW                         -> target of 3.jf
-    //   9  RET ERRNO(EACCES)                 -> target of 5.jt / 6.jt
-    //  10  RET KILL_PROCESS                  -> target of 1.jf
+    //   3  JEQ io_uring_setup   jt=6  jf=0   -> if match, jump to 10 (EACCES)
+    //   4  JEQ sys_socket       jt=0  jf=4   -> if not socket, jump to 9 (ALLOW)
+    //   5  LD  arg0_lo                       -> A = data.args[0] low word
+    //   6  JEQ AF_INET          jt=3  jf=0   -> if match, jump to 10 (EACCES)
+    //   7  JEQ AF_INET6         jt=2  jf=0   -> if match, jump to 10 (EACCES)
+    //   8  RET ALLOW                         -> fallthrough for AF_UNIX et al.
+    //   9  RET ALLOW                         -> target of 4.jf (non-socket)
+    //  10  RET ERRNO(EACCES)                 -> target of 3.jt / 6.jt / 7.jt
+    //  11  RET KILL_PROCESS                  -> target of 1.jf
+    //
+    // io_uring_setup is denied so a ring cannot be created and used to issue
+    // IORING_OP_SOCKET / IORING_OP_CONNECT, which would otherwise open and
+    // connect AF_INET sockets without ever calling socket(2) and bypass the
+    // family filter below. Userspace falls back to the regular syscalls,
+    // which the AF_INET/AF_INET6 arms then catch.
     //
     // BPF jump offsets are computed from PC+1; target = pc + 1 + offset.
     const filter = [_]SockFilter{
         .{ .code = BPF_LD | BPF_W | BPF_ABS, .jt = 0, .jf = 0, .k = OFFSET_ARCH },
-        .{ .code = BPF_JMP | BPF_JEQ | BPF_K, .jt = 0, .jf = 8, .k = arch_current },
+        .{ .code = BPF_JMP | BPF_JEQ | BPF_K, .jt = 0, .jf = 9, .k = arch_current },
         .{ .code = BPF_LD | BPF_W | BPF_ABS, .jt = 0, .jf = 0, .k = OFFSET_NR },
+        .{ .code = BPF_JMP | BPF_JEQ | BPF_K, .jt = 6, .jf = 0, .k = sys_io_uring_setup },
         .{ .code = BPF_JMP | BPF_JEQ | BPF_K, .jt = 0, .jf = 4, .k = sys_socket },
         .{ .code = BPF_LD | BPF_W | BPF_ABS, .jt = 0, .jf = 0, .k = OFFSET_ARG0_LO },
         .{ .code = BPF_JMP | BPF_JEQ | BPF_K, .jt = 3, .jf = 0, .k = af_inet },
@@ -177,4 +195,55 @@ test "filter constants resolve on linux targets" {
 test "installSocketFamilyFilter returns Unsupported off-linux" {
     if (builtin.os.tag == .linux) return error.SkipZigTest;
     try std.testing.expectError(error.Unsupported, installSocketFamilyFilter());
+}
+
+// The constants-resolve test above compiles the filter but never executes
+// it, so a wrong BPF offset still passes `zig build test`. This test forks a
+// child, installs the filter there (NEVER in the test runner, which would
+// lock the runner down), and probes the boundary so a bad jt/jf is caught:
+//   AF_UNIX socket(2)  -> allowed
+//   AF_INET socket(2)  -> EACCES
+//   io_uring_setup(2)  -> EACCES
+// The child encodes the first failing probe in its exit status (0 == all
+// probes behaved); the parent decodes and asserts. Gated on Linux and
+// skipped if a seccomp probe shows the filter cannot install at all.
+test "installSocketFamilyFilter denies AF_INET and io_uring_setup but allows AF_UNIX" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const pid = linux.fork();
+    if (linux.E.init(pid) != .SUCCESS) return error.SkipZigTest;
+
+    if (pid == 0) {
+        // Child: install the filter, then probe. Exit codes are a small
+        // contract decoded by the parent; never reach the test framework.
+        installSocketFamilyFilter() catch linux.exit(10);
+
+        // AF_UNIX must still be creatable.
+        const unix_rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
+        if (linux.E.init(unix_rc) != .SUCCESS) linux.exit(1);
+
+        // AF_INET must be denied with EACCES.
+        const inet_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        if (linux.E.init(inet_rc) != .ACCES) linux.exit(2);
+
+        // io_uring_setup must be denied with EACCES so a ring cannot be
+        // created. Pass a zero params struct; the seccomp deny fires before
+        // the kernel validates arguments. args: (entries, params_ptr).
+        var params: [16]u64 = std.mem.zeroes([16]u64);
+        const ring_rc = linux.syscall2(.io_uring_setup, 1, @intFromPtr(&params));
+        if (linux.E.init(ring_rc) != .ACCES) linux.exit(3);
+
+        linux.exit(0);
+    }
+
+    var status: u32 = 0;
+    const wait_rc = linux.waitpid(@intCast(pid), &status, 0);
+    if (linux.E.init(wait_rc) != .SUCCESS) return error.SkipZigTest;
+
+    // A filter that cannot install (no seccomp support in this environment)
+    // exits 10; treat that as a skip rather than a failure.
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 10) return error.SkipZigTest;
+
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
 }
