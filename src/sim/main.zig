@@ -32,7 +32,7 @@ comptime {
 const exit_harness_error: u8 = @intFromEnum(Runner.Outcome.harness_error);
 
 pub fn main() !u8 {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 

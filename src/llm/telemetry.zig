@@ -210,7 +210,7 @@ pub const Telemetry = struct {
         const path = (try file_log.artifactPath(self.allocator, suffix)) orelse return;
         defer self.allocator.free(path);
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         const w = &out.writer;
 
@@ -239,7 +239,7 @@ pub const Telemetry = struct {
 
         const capped = response_body[0..@min(response_body.len, MAX_RESP_BYTES)];
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         const w = &out.writer;
 
@@ -269,7 +269,7 @@ pub const Telemetry = struct {
         const path = (try file_log.artifactPath(self.allocator, suffix)) orelse return;
         defer self.allocator.free(path);
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         const w = &out.writer;
 

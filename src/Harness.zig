@@ -730,7 +730,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
 
     const file = try std.fs.cwd().createFile(deps.mode.trajectory_out, .{ .truncate = true });
     defer file.close();
-    var buffer: std.io.Writer.Allocating = .init(gpa);
+    var buffer: std.Io.Writer.Allocating = .init(gpa);
     defer buffer.deinit();
     try Trajectory.serialize(traj, gpa, &buffer.writer);
     try file.writeAll(buffer.written());

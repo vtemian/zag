@@ -284,7 +284,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
     // Accumulate body into an engine-owned slice. Mirrors
     // `llm.zig`'s StreamingResponse pattern. No errdefer; every
     // early-exit below calls `out.deinit()` explicitly.
-    var out: std.io.Writer.Allocating = .init(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
 
     // Stream the body. We don't bother with decompression here: v1
     // of zag.http.get surfaces raw bytes, so the caller's explicit

@@ -125,7 +125,7 @@ pub const AuthorizeParams = struct {
 };
 
 pub fn buildAuthorizeUrl(alloc: Allocator, p: AuthorizeParams) ![]const u8 {
-    var aw: std.io.Writer.Allocating = .init(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
     errdefer aw.deinit();
 
     try aw.writer.writeAll(p.issuer);
@@ -143,7 +143,7 @@ pub fn buildAuthorizeUrl(alloc: Allocator, p: AuthorizeParams) ![]const u8 {
     return aw.toOwnedSlice();
 }
 
-fn writeParam(w: *std.io.Writer, key: []const u8, value: []const u8) !void {
+fn writeParam(w: *std.Io.Writer, key: []const u8, value: []const u8) !void {
     try w.writeAll("&");
     try std.Uri.Component.formatEscaped(.{ .raw = key }, w);
     try w.writeAll("=");
@@ -515,7 +515,7 @@ pub const ExchangeParams = struct {
 
 pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     // Build form body.
-    var body_aw: std.io.Writer.Allocating = .init(alloc);
+    var body_aw: std.Io.Writer.Allocating = .init(alloc);
     defer body_aw.deinit();
     const body_w = &body_aw.writer;
 
@@ -529,7 +529,7 @@ pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     var client = std.http.Client{ .allocator = alloc };
     defer client.deinit();
 
-    var resp_aw: std.io.Writer.Allocating = .init(alloc);
+    var resp_aw: std.Io.Writer.Allocating = .init(alloc);
     defer resp_aw.deinit();
 
     const result = client.fetch(.{
@@ -557,7 +557,7 @@ pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     return parseTokenResponse(alloc, resp_aw.written(), .exchange);
 }
 
-fn writeFormField(w: *std.io.Writer, key: []const u8, val: []const u8, first: bool) !void {
+fn writeFormField(w: *std.Io.Writer, key: []const u8, val: []const u8, first: bool) !void {
     if (!first) try w.writeByte('&');
     try std.Uri.Component.formatEscaped(.{ .raw = key }, w);
     try w.writeByte('=');
@@ -710,7 +710,7 @@ pub fn refreshAccessToken(alloc: Allocator, p: RefreshParams) !TokenResponse {
     var client = std.http.Client{ .allocator = alloc };
     defer client.deinit();
 
-    var resp_aw: std.io.Writer.Allocating = .init(alloc);
+    var resp_aw: std.Io.Writer.Allocating = .init(alloc);
     defer resp_aw.deinit();
 
     const result = client.fetch(.{

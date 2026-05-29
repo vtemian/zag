@@ -1034,7 +1034,7 @@ pub fn resizeById(
 ///
 /// Caller owns the returned bytes.
 pub fn describe(self: *WindowManager, alloc: Allocator) ![]u8 {
-    var aw: std.io.Writer.Allocating = .init(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     var jw: std.json.Stringify = .{ .writer = &aw.writer };
 
@@ -1298,7 +1298,7 @@ pub fn readPaneById(
     const result = try conv_buf.readText(alloc, max_lines, self.compositor.theme);
     defer alloc.free(result.text);
 
-    var aw: std.io.Writer.Allocating = .init(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     var jw: std.json.Stringify = .{ .writer = &aw.writer };
 

@@ -85,7 +85,7 @@ pub fn handleSubcommand(
 pub fn runLoginCommand(
     allocator: std.mem.Allocator,
     provider_name: []const u8,
-    err_writer: *std.io.Writer,
+    err_writer: *std.Io.Writer,
 ) !u8 {
     // `--login` runs before the main Lua engine is built. Boot a throwaway
     // engine and load the stdlib so we can look up the OAuth spec for the
@@ -199,7 +199,7 @@ test "runLoginCommand rejects unknown providers with exit code 1" {
     // can't populate the registry, so skip there.
     if (@import("LuaEngine.zig").sandbox_enabled) return error.SkipZigTest;
 
-    var err_aw: std.io.Writer.Allocating = .init(std.testing.allocator);
+    var err_aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer err_aw.deinit();
 
     const code = try runLoginCommand(std.testing.allocator, "definitely-not-a-provider", &err_aw.writer);
@@ -215,7 +215,7 @@ test "runLoginCommand rejects providers whose auth is not oauth" {
     // command must refuse it rather than trying to run an OAuth flow.
     if (@import("LuaEngine.zig").sandbox_enabled) return error.SkipZigTest;
 
-    var err_aw: std.io.Writer.Allocating = .init(std.testing.allocator);
+    var err_aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer err_aw.deinit();
 
     const code = try runLoginCommand(std.testing.allocator, "anthropic", &err_aw.writer);

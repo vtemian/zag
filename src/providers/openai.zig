@@ -155,7 +155,7 @@ fn serializeRequest(
     thinking_effort: ?[]const u8,
     allocator: Allocator,
 ) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
 
@@ -1214,7 +1214,7 @@ test "openai writeMessage encodes tool_use arguments as JSON-encoded string per 
     } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1244,7 +1244,7 @@ test "openai writeMessage escapes tu.id, tu.name, and tr.tool_use_id" {
     } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1271,7 +1271,7 @@ test "openai writeMessage flattens tool_use into tool_calls" {
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1309,7 +1309,7 @@ test "openai writeMessage preserves all text blocks when interleaved with tool_u
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1339,7 +1339,7 @@ test "openai writeMessage concatenates multiple pure-text blocks" {
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1652,7 +1652,7 @@ test "parseSseStream survives repeated id field across deltas for parallel tool_
     // tool_result rows depend on these exact strings.
     const msg = types.Message{ .role = .assistant, .content = response.content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try writeMessage(msg, .{}, &out.writer);
     const json = out.written();
@@ -1746,7 +1746,7 @@ test "openai writeMessage emits tool role for tool_result" {
 
     const msg = types.Message{ .role = .user, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1813,7 +1813,7 @@ test "openai writeMessage echoes thinking text via echo_field on tool_use messag
     } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1850,7 +1850,7 @@ test "openai writeMessage skips echo when echo_field is null" {
     } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{}, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1886,7 +1886,7 @@ test "openai writeMessage echoes thinking from any provider tag when echo_field 
     } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1920,7 +1920,7 @@ test "openai writeMessage echoes thinking on plain-text assistant messages" {
     content[1] = .{ .text = .{ .text = "the answer is 42" } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(msg, .{ .echo_field = "reasoning_content" }, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -1971,7 +1971,7 @@ test "openai writeMessage echoes any-provider thinking after JSONL replay" {
     };
     const message: types.Message = .{ .role = .assistant, .content = &blocks };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage(message, .{ .echo_field = "reasoning_content" }, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);

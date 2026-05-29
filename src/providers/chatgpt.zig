@@ -228,7 +228,7 @@ fn serializeRequest(
     reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
 
@@ -910,7 +910,7 @@ fn flattenResponseError(allocator: Allocator, raw_data: []const u8) !?[]u8 {
     // Re-serialize the inner error object so the classifier sees a flat
     // `{"error":{...}}`. The double-pass cost is fine: response.failed is
     // strictly off the hot path.
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.writeAll("{\"error\":");
     try std.json.Stringify.value(err_value, .{}, &out.writer);
@@ -2500,7 +2500,7 @@ test "chatgpt writeFunctionCallItem escapes tu.id and tu.name" {
         .input_raw = "{}",
     };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeFunctionCallItem(tu, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2521,7 +2521,7 @@ test "chatgpt writeFunctionCallOutputItem escapes tr.tool_use_id" {
         .is_error = false,
     };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeFunctionCallOutputItem(tr, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
