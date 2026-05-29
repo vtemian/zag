@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const clock = @import("../clock.zig");
+const process_io = @import("../process_io.zig");
 
 const Allocator = std.mem.Allocator;
 const error_class = @import("error_class.zig");
@@ -223,7 +224,7 @@ pub const Telemetry = struct {
         try writeJsonOrString(w, request_body);
         try w.writeByte('}');
 
-        try writeFile(path, out.written());
+        try writeFile(path, out.writer.buffered());
     }
 
     fn dumpResponseArtifact(
@@ -252,7 +253,7 @@ pub const Telemetry = struct {
         try writeStringField(w, "classified_as", staticTagName(class), false);
         try w.writeByte('}');
 
-        try writeFile(path, out.written());
+        try writeFile(path, out.writer.buffered());
     }
 
     fn dumpStreamErrorArtifact(
@@ -281,7 +282,7 @@ pub const Telemetry = struct {
         try writeJsonOrString(w, envelope_json);
         try w.writeByte('}');
 
-        try writeFile(path, out.written());
+        try writeFile(path, out.writer.buffered());
     }
 };
 
@@ -341,9 +342,10 @@ fn writeJsonOrString(w: anytype, body: []const u8) !void {
 }
 
 fn writeFile(path: []const u8, bytes: []const u8) !void {
-    var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer f.close();
-    try f.writeAll(bytes);
+    const io = process_io.get();
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, bytes);
 }
 
 // -- Tests --------------------------------------------------------------

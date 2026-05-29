@@ -160,7 +160,7 @@ pub fn runLoginCommand(
         "Signed in to {s}. Credentials saved to {s}.\n",
         .{ provider_name, auth_path },
     ) catch "Signed in.\n";
-    _ = stdout_file.write(msg) catch {};
+    stdout_file.writeStreamingAll(process_io.get(), msg) catch {};
     return 0;
 }
 

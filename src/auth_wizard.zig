@@ -269,20 +269,31 @@ fn renderConfigLua(
         \\
     );
 
-    try body.writer(allocator).print("require(\"zag.providers.{s}\")\n", .{picked.name});
+    {
+        const line = try std.fmt.allocPrint(allocator, "require(\"zag.providers.{s}\")\n", .{picked.name});
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
+    }
 
     try body.appendSlice(allocator, "\n-- Uncomment to enable additional providers:\n");
     for (embedded.entries) |entry| {
         if (!std.mem.startsWith(u8, entry.name, "zag.providers.")) continue;
         const short = stripProviderPrefix(entry.name);
         if (std.mem.eql(u8, short, picked.name)) continue;
-        try body.writer(allocator).print("-- require(\"zag.providers.{s}\")\n", .{short});
+        const line = try std.fmt.allocPrint(allocator, "-- require(\"zag.providers.{s}\")\n", .{short});
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
     }
 
-    try body.writer(allocator).print(
-        "\nzag.set_default_model(\"{s}/{s}\")\n",
-        .{ picked.name, chosen_model orelse picked.default_model },
-    );
+    {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "\nzag.set_default_model(\"{s}/{s}\")\n",
+            .{ picked.name, chosen_model orelse picked.default_model },
+        );
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
+    }
 
     return body.toOwnedSlice(allocator);
 }
@@ -332,10 +343,13 @@ pub fn persistDefaultModel(
 
     if (last_active_line_start) |start| {
         try out.appendSlice(allocator, existing[0..start]);
-        try out.writer(allocator).print(
+        const line = try std.fmt.allocPrint(
+            allocator,
             "zag.set_default_model(\"{s}\")",
             .{new_model_id},
         );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
         try out.appendSlice(allocator, existing[last_active_line_end.?..]);
 
         // Strip any OTHER active lines that survived the naive copy so
@@ -353,10 +367,13 @@ pub fn persistDefaultModel(
         if (existing.len > 0 and existing[existing.len - 1] != '\n') {
             try out.append(allocator, '\n');
         }
-        try out.writer(allocator).print(
+        const line = try std.fmt.allocPrint(
+            allocator,
             "zag.set_default_model(\"{s}\")\n",
             .{new_model_id},
         );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
     }
 
     try atomicWrite(allocator, config_path, out.items);
