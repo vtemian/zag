@@ -219,7 +219,7 @@ test "runLoopStreaming constructs Telemetry per turn with session_id and provide
     defer {
         var drain_buf: [64]agent_events.AgentEvent = undefined;
         const n = queue.drain(&drain_buf);
-        for (drain_buf[0..n]) |ev| ev.freeOwned(allocator);
+        for (drain_buf[0..n]) |ev| ev.freeOwned();
         queue.deinit();
     }
     var cancel = agent_events.CancelFlag.init(false);
@@ -311,66 +311,15 @@ fn freeToolResults(blocks: []types.ContentBlock, allocator: Allocator) void {
     allocator.free(blocks);
 }
 
-/// Helper: drain and discard all events from a queue, freeing owned strings.
-fn drainAndFreeQueue(queue: *agent_events.EventQueue, allocator: Allocator) void {
+/// Helper: drain and discard all events from a queue. `freeOwned` frees
+/// each payload through its own producing allocator and signals `done` on
+/// any round-trip request so a producer parked on `req.done` unblocks.
+fn drainAndFreeQueue(queue: *agent_events.EventQueue, _: Allocator) void {
     var buf: [64]agent_events.AgentEvent = undefined;
     while (true) {
         const count = queue.drain(&buf);
         if (count == 0) break;
-        for (buf[0..count]) |ev| {
-            switch (ev) {
-                .text_delta => |s| allocator.free(s),
-                .compaction_summary_delta => |s| allocator.free(s),
-                .compaction_event => {},
-                .thinking_delta => |td| allocator.free(td.text),
-                .tool_start => |s| {
-                    allocator.free(s.name);
-                    if (s.call_id) |id| allocator.free(id);
-                    if (s.input_raw) |raw| allocator.free(raw);
-                },
-                .tool_result => |r| {
-                    allocator.free(r.content);
-                    if (r.call_id) |id| allocator.free(id);
-                },
-                .info => |s| allocator.free(s),
-                .err => |s| allocator.free(s),
-                // Hook and Lua-tool requests are a round-trip: the producer
-                // is blocked on `req.done`. Signal here so a request that
-                // reached the normal drain (e.g. dispatcher early-returned
-                // on null engine) still unblocks its pusher.
-                .hook_request => |req| req.done.set(),
-                .lua_tool_request => |req| req.done.set(),
-                .layout_request => |req| {
-                    req.is_error = true;
-                    req.done.set();
-                },
-                .prompt_assembly_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .jit_context_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .tool_transform_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .tool_gate_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .loop_detect_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .compact_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .thinking_stop, .done, .reset_assistant_text, .usage => {},
-            }
-        }
+        for (buf[0..count]) |ev| ev.freeOwned();
     }
 }
 
@@ -2618,9 +2567,9 @@ test "runDefaultSummarization streams deltas to queue and assembles summary" {
             switch (ev) {
                 .compaction_summary_delta => |t| {
                     delta_count += 1;
-                    allocator.free(t);
+                    t.free();
                 },
-                else => ev.freeOwned(allocator),
+                else => ev.freeOwned(),
             }
         }
     }
@@ -3060,4 +3009,180 @@ test "round-trip Request types all expose freeResult" {
             }
         }
     }
+}
+
+test "OWN-1 regression: tool round-trip frees through producing allocator, no leak" {
+    // The queue allocator (GPA role) is deliberately split from the
+    // per-worker arena, exactly like production: runToolStep dupes
+    // tool_start/tool_result payloads through queue.allocator (the GPA),
+    // while the tool runs against a per-worker arena that is torn down at
+    // join. The old freeOwned took the drainer's allocator as an argument,
+    // so draining through the arena (an arena free is a no-op) orphaned the
+    // GPA-owned tool bytes -> one leak per tool_start/tool_result. With
+    // OwnedPayload each event carries the GPA it was duped from, so a bare
+    // freeOwned() reaches the right heap and testing.allocator sees no leak
+    // at teardown.
+    const gpa = std.testing.allocator; // queue storage + tool payloads
+    var registry = tools.Registry.init(gpa);
+    defer registry.deinit();
+    try registry.register(echo_fast_tool);
+
+    var queue = try agent_events.EventQueue.initBounded(gpa, 256);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var worker_arena = std.heap.ArenaAllocator.init(gpa); // worker scratch
+    defer worker_arena.deinit();
+
+    const tool_calls = [_]types.ContentBlock.ToolUse{
+        .{ .id = "call_1", .name = "echo_fast", .input_raw = "{}" },
+    };
+    const blocks = try agent.executeTools(
+        &tool_calls,
+        &registry,
+        worker_arena.allocator(),
+        &queue,
+        &cancel,
+        null,
+        null,
+    );
+    defer freeToolResults(blocks, worker_arena.allocator());
+
+    // Drain without supplying an allocator. freeOwned() frees the
+    // GPA-duped tool bytes through their own allocator; the arena is
+    // untouched. A regression that frees through the wrong heap would
+    // either trip the DebugAllocator's "Invalid free" or leak.
+    var buf: [64]agent_events.AgentEvent = undefined;
+    var saw_tool_start = false;
+    var saw_tool_result = false;
+    while (true) {
+        const n = queue.drain(&buf);
+        if (n == 0) break;
+        for (buf[0..n]) |ev| {
+            switch (ev) {
+                .tool_start => saw_tool_start = true,
+                .tool_result => saw_tool_result = true,
+                else => {},
+            }
+            ev.freeOwned();
+        }
+    }
+    try std.testing.expect(saw_tool_start);
+    try std.testing.expect(saw_tool_result);
+}
+
+// Streaming stub whose callStreaming emits one text_delta then fails with
+// a configurable error, and whose non-streaming call() bumps a counter so
+// a test can assert whether the fallback fired. Lets RESIL-1/RESIL-6
+// exercise both the fatal-propagate and retry branches deterministically.
+const FailingStreamProvider = struct {
+    streaming_err: llm.ProviderError,
+    call_count: u32 = 0,
+    emit_text_delta: bool = false,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "failing_stream_stub",
+    };
+
+    fn callImpl(ptr: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *FailingStreamProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        return .{
+            .content = &.{},
+            .stop_reason = .end_turn,
+            .input_tokens = 0,
+            .output_tokens = 0,
+        };
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *FailingStreamProvider = @ptrCast(@alignCast(ptr));
+        if (self.emit_text_delta) {
+            req.callback.on_event(req.callback.ctx, .{ .text_delta = "partial" });
+        }
+        return self.streaming_err;
+    }
+
+    fn provider(self: *FailingStreamProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "RESIL-1: a fatal streaming error skips the non-streaming fallback" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stub = FailingStreamProvider{ .streaming_err = error.LoginExpired };
+    const p = stub.provider();
+
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    try std.testing.expectError(error.LoginExpired, result);
+    // Fatal: the fallback non-streaming call must NOT have fired.
+    try std.testing.expectEqual(@as(u32, 0), stub.call_count);
+}
+
+test "RESIL-1: a retryable streaming error fires the non-streaming fallback" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var stub = FailingStreamProvider{ .streaming_err = error.SseLineTooLong };
+    const p = stub.provider();
+
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    defer response.deinit(allocator);
+    // Retryable: the fallback ran exactly once and produced the response.
+    try std.testing.expectEqual(@as(u32, 1), stub.call_count);
+    try std.testing.expectEqual(types.StopReason.end_turn, response.stop_reason);
+}
+
+test "RESIL-6: fatal streaming error after partial text emits reset_assistant_text" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+
+    // Stream one text_delta, then fail fatally. The partial assistant node
+    // would be stranded without a reset, so callLlm must push
+    // reset_assistant_text before propagating the fatal error even though
+    // the fallback does not run.
+    var stub = FailingStreamProvider{ .streaming_err = error.NotLoggedIn, .emit_text_delta = true };
+    const p = stub.provider();
+
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    try std.testing.expectError(error.NotLoggedIn, result);
+    try std.testing.expectEqual(@as(u32, 0), stub.call_count);
+
+    var buf: [16]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    var saw_reset = false;
+    var saw_text = false;
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .reset_assistant_text => saw_reset = true,
+            .text_delta => saw_text = true,
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    // The partial text delta was rendered, and the fatal path reset it.
+    try std.testing.expect(saw_text);
+    try std.testing.expect(saw_reset);
 }

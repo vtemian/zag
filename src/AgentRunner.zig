@@ -176,26 +176,19 @@ pub fn shutdown(self: *AgentRunner) void {
         self.agent_thread = null;
     }
     if (self.queue_active) {
-        // The agent thread queues payloads allocated through
-        // `wire_arena` (see `submit`), so freeing them through
-        // `self.allocator` (the gpa) is cross-allocator UB and trips
-        // the DebugAllocator's canary check as "Invalid free" during
-        // quit-time drain. Mirror `drainEvents`' allocator pick: route
-        // through the arena when one is live (arena free is a no-op;
-        // the bytes get reclaimed by the arena.deinit in `deinit`),
-        // and only fall back to `self.allocator` for tests that
-        // scaffold queue_active without going through `submit`.
-        const drain_alloc: Allocator = if (self.wire_arena) |*arena|
-            arena.allocator()
-        else
-            self.allocator;
+        // Each queued event carries its own producing allocator via
+        // `OwnedPayload`, so `freeOwned` frees every payload through the
+        // heap that allocated it: streaming/error deltas through the
+        // per-turn wire arena (a no-op; reclaimed at arena.deinit) and
+        // queued tool events through the runner GPA. No cross-allocator
+        // free is possible here by construction.
         var scratch: [64]agent_events.AgentEvent = undefined;
         var freed: usize = 0;
         while (true) {
             const drained = self.event_queue.drain(&scratch);
             if (drained == 0) break;
             for (scratch[0..drained]) |event| {
-                event.freeOwned(drain_alloc);
+                event.freeOwned();
                 freed += 1;
             }
         }
@@ -508,13 +501,15 @@ fn threadMain(
         const message = formatAgentErrorMessage(err, model_spec.provider_name, allocator, &detail) catch {
             announceSessionStatus(lua_engine, conversation, .failed);
             _ = queue.dropped.fetchAdd(1, .monotonic);
-            queue.tryPush(allocator, .done);
+            queue.tryPush(.done);
             return;
         };
         announceSessionStatus(lua_engine, conversation, .failed);
-        queue.tryPush(allocator, .{ .err = message });
+        // The message is duped from `allocator` (the wire arena), so bind
+        // it to that allocator for the queue's self-owning free path.
+        queue.tryPush(.{ .err = .{ .bytes = message, .allocator = allocator } });
     };
-    queue.tryPush(allocator, .done);
+    queue.tryPush(.done);
 }
 
 /// Cancel every runner cooperatively in a first pass, then `shutdown()`
@@ -732,31 +727,75 @@ pub fn dispatchHookRequests(
     engine: ?*LuaEngine,
     window_manager: ?*WindowManager,
 ) void {
-    queue.mutex.lock();
-    defer queue.mutex.unlock();
+    // Two-phase to avoid running Lua handlers under the ring mutex. A slow
+    // handler (or a Lua tool that round-trips a new event back through this
+    // same queue) would otherwise block every agent-thread producer on
+    // `push` for the handler's whole duration, risking large drops or a
+    // deadlock. Phase 1 collects the round-trip events into a local batch
+    // and compacts survivors back into the ring under the lock; phase 2
+    // dispatches the collected requests after releasing the lock.
+    var pending: [256]agent_events.AgentEvent = undefined;
+    var n_pending: usize = 0;
+    {
+        queue.mutex.lock();
+        defer queue.mutex.unlock();
 
-    if (queue.len == 0) return;
+        if (queue.len == 0) return;
+        // The local batch must hold every event in the ring in the worst
+        // case (all round-trip). Capacity is 256 today (AgentSupervisor);
+        // assert so a future Lua-config bump to the queue cap can't silently
+        // overflow `pending`.
+        std.debug.assert(queue.buffer.len <= pending.len);
 
-    // Walk the ring from head to tail, in-place compacting non-round-
-    // trip events back into contiguous slots starting at `head`.
-    // Round-trip requests are fired synchronously and dropped from
-    // the ring.
-    const cap = queue.buffer.len;
-    var read = queue.head;
-    var write = queue.head;
-    var remaining = queue.len;
-    var kept: usize = 0;
-    while (remaining > 0) : (remaining -= 1) {
-        const ev = queue.buffer[read];
-        read = (read + 1) % cap;
-        if (!serviceRoundTripEvent(ev, engine, window_manager)) {
-            queue.buffer[write] = ev;
-            write = (write + 1) % cap;
-            kept += 1;
+        // Walk the ring from head to tail. Round-trip events are pulled into
+        // `pending`; non-round-trip events are in-place compacted back into
+        // contiguous slots starting at `head`, preserving their order.
+        const cap = queue.buffer.len;
+        var read = queue.head;
+        var write = queue.head;
+        var remaining = queue.len;
+        var kept: usize = 0;
+        while (remaining > 0) : (remaining -= 1) {
+            const ev = queue.buffer[read];
+            read = (read + 1) % cap;
+            if (isRoundTripEvent(ev)) {
+                pending[n_pending] = ev;
+                n_pending += 1;
+            } else {
+                queue.buffer[write] = ev;
+                write = (write + 1) % cap;
+                kept += 1;
+            }
         }
+        queue.len = kept;
+        queue.tail = write;
     }
-    queue.len = kept;
-    queue.tail = write;
+
+    // Dispatch outside the lock so Lua handlers (and any re-entrant push of
+    // a new round-trip event) run without holding the ring mutex.
+    for (pending[0..n_pending]) |ev| {
+        _ = serviceRoundTripEvent(ev, engine, window_manager);
+    }
+}
+
+/// Classify an event as a round-trip request without dispatching it.
+/// Must stay in sync with the round-trip arms `serviceRoundTripEvent`
+/// handles; the comptime variant-count assertion below guards against a
+/// new variant being added without revisiting both.
+fn isRoundTripEvent(event: agent_events.AgentEvent) bool {
+    return switch (event) {
+        .hook_request,
+        .lua_tool_request,
+        .layout_request,
+        .prompt_assembly_request,
+        .jit_context_request,
+        .tool_transform_request,
+        .tool_gate_request,
+        .loop_detect_request,
+        .compact_request,
+        => true,
+        else => false,
+    };
 }
 
 comptime {
@@ -859,21 +898,13 @@ pub const DrainResult = struct {
     finished: bool = false,
 };
 
-/// Drain pending agent events. Frees event-owned payloads through the
-/// per-turn `wire_arena`: the agent thread allocates every payload there
-/// (see `submit`), so freeing through the heap allocator would be
-/// cross-allocator UB. Arena `free` is a no-op; the bytes are reclaimed
-/// when the next `submit` resets the arena. Falls back to `self.allocator`
-/// when `wire_arena` is null (only reachable from tests that scaffold
-/// `agent_thread` and `event_queue` manually without going through
-/// `submit`; those tests push payload-less events like `.done`).
+/// Drain pending agent events. Each event carries its own producing
+/// allocator via `OwnedPayload`, so `handleAgentEvent` frees every payload
+/// through the heap that allocated it (streaming deltas through the per-turn
+/// wire arena, queued tool events through the runner GPA). No cross-
+/// allocator free is possible by construction.
 pub fn drainEvents(self: *AgentRunner) DrainResult {
     if (self.agent_thread == null) return .{};
-
-    const allocator: Allocator = if (self.wire_arena) |*arena|
-        arena.allocator()
-    else
-        self.allocator;
 
     // Split drain into two timed sub-phases so /perf can localize a long
     // drain to either synchronous Lua hook dispatch (jit_context, tool
@@ -896,7 +927,7 @@ pub fn drainEvents(self: *AgentRunner) DrainResult {
 
         for (drain[0..count]) |event| {
             result.any_drained = true;
-            self.handleAgentEvent(event, allocator);
+            self.handleAgentEvent(event);
 
             if (event == .done) {
                 if (self.agent_thread) |t| t.join();
@@ -906,6 +937,11 @@ pub fn drainEvents(self: *AgentRunner) DrainResult {
                 self.turn_started_ms = null;
                 self.output_tokens.store(0, .release);
                 result.finished = true;
+                // The queue is now deinit'd; iterating further would touch
+                // torn-down state. threadMain always pushes `.done` last, so
+                // there is nothing after it in this batch, but break
+                // defensively rather than rely on that invariant alone.
+                break;
             }
         }
     }
@@ -929,7 +965,7 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
         .text_delta => |text| {
             self.conversation.persistEvent(.{
                 .entry_type = .assistant_text,
-                .content = text,
+                .content = text.bytes,
                 .timestamp = ts,
             });
         },
@@ -949,7 +985,7 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
             };
             self.conversation.persistEvent(.{
                 .entry_type = .thinking,
-                .content = td.text,
+                .content = td.text.bytes,
                 .thinking_provider = provider_name,
                 .timestamp = ts,
             });
@@ -959,7 +995,7 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
             // a duplicate, unpaired tool_call row that breaks wire
             // reconstruction on resume. Only the full pre-execution event,
             // which carries the provider-issued call id, is persisted.
-            if (ev.call_id == null) return;
+            const call_id = ev.call_id orelse return;
             // Pair tool_call rows with their tool_result via the
             // provider-issued call id; otherwise parallel tool calls,
             // retries, and subagent dispatches cannot be replayed
@@ -968,25 +1004,25 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
             // the model emitted instead of fabricating "{}".
             self.conversation.persistEvent(.{
                 .entry_type = .tool_call,
-                .tool_name = ev.name,
-                .tool_input = if (ev.input_raw) |raw| raw else "",
-                .tool_use_id = ev.call_id,
+                .tool_name = ev.name.bytes,
+                .tool_input = if (ev.input_raw) |raw| raw.bytes else "",
+                .tool_use_id = call_id.bytes,
                 .timestamp = ts,
             });
         },
         .tool_result => |result| {
             self.conversation.persistEvent(.{
                 .entry_type = .tool_result,
-                .content = result.content,
+                .content = result.content.bytes,
                 .is_error = result.is_error,
-                .tool_use_id = result.call_id,
+                .tool_use_id = if (result.call_id) |id| id.bytes else null,
                 .timestamp = ts,
             });
         },
         .err => |text| {
             self.conversation.persistEvent(.{
                 .entry_type = .err,
-                .content = text,
+                .content = text.bytes,
                 .timestamp = ts,
             });
         },
@@ -998,7 +1034,7 @@ pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) voi
 /// and persist to session. Fires post-hooks into the Lua engine when
 /// one is attached. The sink owns all node-correlation state; the
 /// runner just forwards the event payload.
-pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allocator: Allocator) void {
+pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) void {
     // Round-trip requests normally land in `dispatchHookRequests`, but a
     // request pushed between dispatch and drain can slip into the drain
     // queue. Service it here on the same terms the dispatch path uses
@@ -1008,29 +1044,29 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
     self.persistAgentEvent(event);
     switch (event) {
         .text_delta => |text| {
-            defer allocator.free(text);
+            defer text.free();
             if (self.lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = text } };
+                var payload: Hooks.HookPayload = .{ .text_delta = .{ .text = text.bytes } };
                 // Observer-only event; discard any return from fireHook.
                 _ = eng.fireHook(&payload) catch |err| blk: {
                     log.warn("hook failed: {}", .{err});
                     break :blk null;
                 };
             }
-            self.sink.push(.{ .assistant_delta = .{ .text = text } });
+            self.sink.push(.{ .assistant_delta = .{ .text = text.bytes } });
         },
         .thinking_delta => |td| {
-            defer allocator.free(td.text);
-            self.sink.push(.{ .thinking_delta = .{ .text = td.text } });
+            defer td.text.free();
+            self.sink.push(.{ .thinking_delta = .{ .text = td.text.bytes } });
         },
         .compaction_summary_delta => |text| {
-            defer allocator.free(text);
+            defer text.free();
             // Forward to the sink so downstream renderers can display
             // transient "compacting..." progress. Sinks that don't
             // care (Collector, Null) drop the variant; BufferSink and
             // the TUI's main sink can route to a status line / dim
             // text / side panel — visual choice belongs to each sink.
-            self.sink.push(.{ .compaction_summary_delta = .{ .text = text } });
+            self.sink.push(.{ .compaction_summary_delta = .{ .text = text.bytes } });
         },
         .compaction_event => |ev| {
             // Structured per-cycle event. Log for ops visibility AND
@@ -1053,35 +1089,35 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             self.sink.push(.thinking_stop);
         },
         .tool_start => |ev| {
-            defer allocator.free(ev.name);
-            defer if (ev.input_raw) |raw| allocator.free(raw);
-            defer if (ev.call_id) |id| allocator.free(id);
+            defer ev.name.free();
+            defer if (ev.input_raw) |raw| raw.free();
+            defer if (ev.call_id) |id| id.free();
             // A streaming-preview tool_start (null call_id) carries no id and
             // no input, so it cannot render usefully or pair with a result.
             // The full pre-execution tool_start (with call_id) is the
             // node-bearing event; skip the preview to avoid a duplicate,
             // unpaired tool_call node.
-            if (ev.call_id == null) return;
+            const call_id = ev.call_id orelse return;
             self.sink.push(.{ .tool_use = .{
-                .name = ev.name,
-                .call_id = ev.call_id,
-                .input_raw = ev.input_raw,
+                .name = ev.name.bytes,
+                .call_id = call_id.bytes,
+                .input_raw = if (ev.input_raw) |raw| raw.bytes else null,
             } });
         },
         .tool_result => |result| {
-            defer allocator.free(result.content);
-            defer if (result.call_id) |id| allocator.free(id);
+            defer result.content.free();
+            defer if (result.call_id) |id| id.free();
             self.sink.push(.{ .tool_result = .{
-                .content = result.content,
+                .content = result.content.bytes,
                 .is_error = result.is_error,
-                .call_id = result.call_id,
+                .call_id = if (result.call_id) |id| id.bytes else null,
             } });
         },
         .info => |text| {
             // `.info` is freeform telemetry from the agent loop (token
             // counts, timing). It is still persisted by `persistAgentEvent`
             // for the JSONL audit log, but no live UI consumer remains.
-            defer allocator.free(text);
+            defer text.free();
         },
         .usage => |u| {
             // Live output-token count for the working line. UI-only: not a
@@ -1101,15 +1137,15 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
         },
         .reset_assistant_text => self.sink.push(.assistant_reset),
         .err => |text| {
-            defer allocator.free(text);
+            defer text.free();
             if (self.lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text } };
+                var payload: Hooks.HookPayload = .{ .agent_err = .{ .message = text.bytes } };
                 _ = eng.fireHook(&payload) catch |err| blk: {
                     log.warn("hook failed: {}", .{err});
                     break :blk null;
                 };
             }
-            self.sink.push(.{ .error_event = .{ .text = text } });
+            self.sink.push(.{ .error_event = .{ .text = text.bytes } });
             announceSessionStatus(self.lua_engine, self.conversation, .failed);
         },
         // Round-trip request variants are handled by the early
@@ -1228,11 +1264,13 @@ test "persistAgentEvent is a no-op without an attached session handle" {
     var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
     defer runner.deinit();
 
-    runner.persistAgentEvent(.{ .text_delta = "hello" });
-    runner.persistAgentEvent(.{ .thinking_delta = .{ .text = "thinking", .provider = .anthropic } });
-    runner.persistAgentEvent(.{ .tool_start = .{ .name = "bash" } });
-    runner.persistAgentEvent(.{ .tool_result = .{ .content = "ok", .is_error = false } });
-    runner.persistAgentEvent(.{ .err = "boom" });
+    // persistAgentEvent only reads `.bytes`; it never frees, so these
+    // literals carry an unused allocator.
+    runner.persistAgentEvent(.{ .text_delta = .{ .bytes = "hello", .allocator = allocator } });
+    runner.persistAgentEvent(.{ .thinking_delta = .{ .text = .{ .bytes = "thinking", .allocator = allocator }, .provider = .anthropic } });
+    runner.persistAgentEvent(.{ .tool_start = .{ .name = .{ .bytes = "bash", .allocator = allocator } } });
+    runner.persistAgentEvent(.{ .tool_result = .{ .content = .{ .bytes = "ok", .allocator = allocator }, .is_error = false } });
+    runner.persistAgentEvent(.{ .err = .{ .bytes = "boom", .allocator = allocator } });
     runner.persistAgentEvent(.reset_assistant_text);
     runner.persistAgentEvent(.thinking_stop);
     runner.persistAgentEvent(.done);
@@ -1277,12 +1315,12 @@ test "handleAgentEvent .usage stores the running output-token count" {
 
     try std.testing.expectEqual(@as(u32, 0), runner.outputTokens());
 
-    runner.handleAgentEvent(.{ .usage = .{ .output_tokens = 42 } }, allocator);
+    runner.handleAgentEvent(.{ .usage = .{ .output_tokens = 42 } });
     try std.testing.expectEqual(@as(u32, 42), runner.outputTokens());
 
     // A later, larger count overwrites the earlier one (the figure is
     // cumulative, so the handler stores the latest reading verbatim).
-    runner.handleAgentEvent(.{ .usage = .{ .output_tokens = 100 } }, allocator);
+    runner.handleAgentEvent(.{ .usage = .{ .output_tokens = 100 } });
     try std.testing.expectEqual(@as(u32, 100), runner.outputTokens());
 
     // The counter is UI-only: nothing reaches the sink.
@@ -1305,15 +1343,15 @@ test "handleAgentEvent ignores the streaming-preview tool_start" {
     defer runner.deinit();
 
     // Streaming preview: must not reach the sink.
-    runner.handleAgentEvent(.{ .tool_start = .{ .name = try allocator.dupe(u8, "bash") } }, allocator);
+    runner.handleAgentEvent(.{ .tool_start = .{ .name = try agent_events.OwnedPayload.dupe(allocator, "bash") } });
     try std.testing.expectEqual(@as(usize, 0), mock.events.items.len);
 
     // Full pre-execution event: exactly one tool_use sink event.
     runner.handleAgentEvent(.{ .tool_start = .{
-        .name = try allocator.dupe(u8, "bash"),
-        .call_id = try allocator.dupe(u8, "bash:0"),
-        .input_raw = try allocator.dupe(u8, "{\"command\":\"echo hi\"}"),
-    } }, allocator);
+        .name = try agent_events.OwnedPayload.dupe(allocator, "bash"),
+        .call_id = try agent_events.OwnedPayload.dupe(allocator, "bash:0"),
+        .input_raw = try agent_events.OwnedPayload.dupe(allocator, "{\"command\":\"echo hi\"}"),
+    } });
     try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
     try std.testing.expect(mock.events.items[0] == .tool_use);
 }
@@ -1333,15 +1371,14 @@ test "handleAgentEvent forwards compaction_summary_delta and compaction_event to
     defer runner.deinit();
 
     runner.handleAgentEvent(
-        .{ .compaction_summary_delta = try allocator.dupe(u8, "## Goal") },
-        allocator,
+        .{ .compaction_summary_delta = try agent_events.OwnedPayload.dupe(allocator, "## Goal") },
     );
     runner.handleAgentEvent(.{ .compaction_event = .{
         .outcome = "summarized",
         .messages_before = 12,
         .messages_after = 4,
         .estimate_tokens = 245760,
-    } }, allocator);
+    } });
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
     try std.testing.expectEqual(
@@ -1368,7 +1405,7 @@ test "handleAgentEvent .reset_assistant_text pushes assistant_reset" {
     var runner = AgentRunner.init(allocator, mock.sink(), &scb);
     defer runner.deinit();
 
-    runner.handleAgentEvent(.reset_assistant_text, allocator);
+    runner.handleAgentEvent(.reset_assistant_text);
 
     try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
     try std.testing.expectEqual(SinkEvent.assistant_reset, std.meta.activeTag(mock.events.items[0]));
@@ -1385,10 +1422,10 @@ test "text_delta emits assistant_delta sink event" {
 
     // Two deltas followed by a reset then a third delta. The runner just
     // forwards each event; node-correlation is the sink's responsibility.
-    runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello ") }, allocator);
-    runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "wor") }, allocator);
-    runner.handleAgentEvent(.reset_assistant_text, allocator);
-    runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "Hello world") }, allocator);
+    runner.handleAgentEvent(.{ .text_delta = try agent_events.OwnedPayload.dupe(allocator, "Hello ") });
+    runner.handleAgentEvent(.{ .text_delta = try agent_events.OwnedPayload.dupe(allocator, "wor") });
+    runner.handleAgentEvent(.reset_assistant_text);
+    runner.handleAgentEvent(.{ .text_delta = try agent_events.OwnedPayload.dupe(allocator, "Hello world") });
 
     try std.testing.expectEqual(@as(usize, 4), mock.events.items.len);
     try std.testing.expectEqualStrings("Hello ", mock.events.items[0].assistant_delta.text);
@@ -1407,9 +1444,9 @@ test "handleAgentEvent .tool_start emits a tool_use sink event" {
     defer runner.deinit();
 
     runner.handleAgentEvent(.{ .tool_start = .{
-        .name = try allocator.dupe(u8, "bash"),
-        .call_id = try allocator.dupe(u8, "A"),
-    } }, allocator);
+        .name = try agent_events.OwnedPayload.dupe(allocator, "bash"),
+        .call_id = try agent_events.OwnedPayload.dupe(allocator, "A"),
+    } });
 
     try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
     const ev = mock.events.items[0].tool_use;
@@ -1428,13 +1465,13 @@ test "thinking_delta emits a thinking_delta sink event" {
     defer runner.deinit();
 
     runner.handleAgentEvent(.{ .thinking_delta = .{
-        .text = try allocator.dupe(u8, "let me "),
+        .text = try agent_events.OwnedPayload.dupe(allocator, "let me "),
         .provider = .anthropic,
-    } }, allocator);
+    } });
     runner.handleAgentEvent(.{ .thinking_delta = .{
-        .text = try allocator.dupe(u8, "reason"),
+        .text = try agent_events.OwnedPayload.dupe(allocator, "reason"),
         .provider = .anthropic,
-    } }, allocator);
+    } });
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
     try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
@@ -1452,10 +1489,10 @@ test "thinking_stop emits a thinking_stop sink event" {
     defer runner.deinit();
 
     runner.handleAgentEvent(.{ .thinking_delta = .{
-        .text = try allocator.dupe(u8, "hmm"),
+        .text = try agent_events.OwnedPayload.dupe(allocator, "hmm"),
         .provider = .anthropic,
-    } }, allocator);
-    runner.handleAgentEvent(.thinking_stop, allocator);
+    } });
+    runner.handleAgentEvent(.thinking_stop);
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
     try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
@@ -1476,10 +1513,10 @@ test "text_delta after thinking_delta still emits two sink events in order" {
     defer runner.deinit();
 
     runner.handleAgentEvent(.{ .thinking_delta = .{
-        .text = try allocator.dupe(u8, "reason"),
+        .text = try agent_events.OwnedPayload.dupe(allocator, "reason"),
         .provider = .anthropic,
-    } }, allocator);
-    runner.handleAgentEvent(.{ .text_delta = try allocator.dupe(u8, "answer") }, allocator);
+    } });
+    runner.handleAgentEvent(.{ .text_delta = try agent_events.OwnedPayload.dupe(allocator, "answer") });
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
     try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
@@ -1496,16 +1533,16 @@ test "tool_start after thinking_delta emits both sink events in order" {
     defer runner.deinit();
 
     runner.handleAgentEvent(.{ .thinking_delta = .{
-        .text = try allocator.dupe(u8, "plan"),
+        .text = try agent_events.OwnedPayload.dupe(allocator, "plan"),
         .provider = .anthropic,
-    } }, allocator);
+    } });
     // A full pre-execution tool_start (with call_id) is the node-bearing
     // event; a name-only preview is intentionally suppressed elsewhere.
     runner.handleAgentEvent(.{ .tool_start = .{
-        .name = try allocator.dupe(u8, "bash"),
-        .call_id = try allocator.dupe(u8, "bash:0"),
-        .input_raw = try allocator.dupe(u8, "{}"),
-    } }, allocator);
+        .name = try agent_events.OwnedPayload.dupe(allocator, "bash"),
+        .call_id = try agent_events.OwnedPayload.dupe(allocator, "bash:0"),
+        .input_raw = try agent_events.OwnedPayload.dupe(allocator, "{}"),
+    } });
 
     try std.testing.expectEqual(@as(usize, 2), mock.events.items.len);
     try std.testing.expectEqual(SinkEvent.thinking_delta, std.meta.activeTag(mock.events.items[0]));
@@ -1522,10 +1559,10 @@ test "handleAgentEvent .tool_result emits a tool_result sink event" {
     defer runner.deinit();
 
     runner.handleAgentEvent(.{ .tool_result = .{
-        .call_id = try allocator.dupe(u8, "B"),
-        .content = try allocator.dupe(u8, "result B"),
+        .call_id = try agent_events.OwnedPayload.dupe(allocator, "B"),
+        .content = try agent_events.OwnedPayload.dupe(allocator, "result B"),
         .is_error = false,
-    } }, allocator);
+    } });
 
     try std.testing.expectEqual(@as(usize, 1), mock.events.items.len);
     const ev = mock.events.items[0].tool_result;
@@ -1839,6 +1876,41 @@ test "tool_transform_request with no engine signals done" {
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(req.result == null);
     try std.testing.expect(req.error_name == null);
+}
+
+test "dispatchHookRequests pulls round-trips and preserves payload-event order" {
+    // conc-3: the two-phase split must service every round-trip request
+    // while leaving non-round-trip events in the ring in their original
+    // order, so the normal drain that follows sees an untouched payload
+    // stream. Interleave payload and round-trip events and assert both
+    // halves of the contract.
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req_a = agent_events.JitContextRequest.init("a", "{}", "x", false, alloc);
+    var req_b = agent_events.JitContextRequest.init("b", "{}", "x", false, alloc);
+
+    try queue.push(.{ .text_delta = try agent_events.OwnedPayload.dupe(alloc, "first") });
+    try queue.push(.{ .jit_context_request = &req_a });
+    try queue.push(.{ .info = try agent_events.OwnedPayload.dupe(alloc, "second") });
+    try queue.push(.{ .jit_context_request = &req_b });
+    try queue.push(.{ .text_delta = try agent_events.OwnedPayload.dupe(alloc, "third") });
+
+    // Null engine: round-trips are serviced (done signalled) without Lua.
+    dispatchHookRequests(&queue, null, null);
+
+    try std.testing.expect(req_a.done.isSet());
+    try std.testing.expect(req_b.done.isSet());
+
+    // Only the three payload events remain, in their original relative order.
+    var buf: [16]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    defer for (buf[0..n]) |ev| ev.freeOwned();
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("first", buf[0].text_delta.bytes);
+    try std.testing.expectEqualStrings("second", buf[1].info.bytes);
+    try std.testing.expectEqualStrings("third", buf[2].text_delta.bytes);
 }
 
 test "tool_gate_request round-trips via main thread" {
@@ -2330,14 +2402,14 @@ test "drainPendingRoundTrips signals done and stamps shutdown reason" {
 
 test "shutdown frees arena-owned residual events through the arena, not the gpa" {
     // Regression: the agent thread is spawned with wire_arena.allocator()
-    // (see `submit`), so every payload it queues is arena-owned. The
-    // normal drain path in `drainEvents` routes freeOwned through the
-    // arena. Before this test, `shutdown` did not — it called
-    // `event.freeOwned(self.allocator)` directly, which under the
-    // DebugAllocator panics with "Invalid free" on the cross-allocator
-    // pointer. Mirrors the production crash chain
-    // main.deinit -> orchestrator.deinit -> shutdownAgents -> shutdown
-    // when an .err event is still sitting in the queue at quit time.
+    // (see `submit`), so every payload it queues is arena-owned. Each
+    // event carries that allocator via OwnedPayload, so shutdown's drain
+    // frees through the arena (a no-op) instead of the GPA. Routing an
+    // arena pointer through the GPA is cross-allocator UB the
+    // DebugAllocator aborts on as "Invalid free". Mirrors the production
+    // crash chain main.deinit -> orchestrator.deinit -> shutdownAgents ->
+    // shutdown when an .err event is still sitting in the queue at quit
+    // time.
     const allocator = std.testing.allocator;
     var scb = try Conversation.init(allocator, 0, "test");
     defer scb.deinit();
@@ -2353,14 +2425,16 @@ test "shutdown frees arena-owned residual events through the arena, not the gpa"
     runner.queue_active = true;
 
     // Push one payload-bearing event per arm freed in `freeOwned`, all
-    // arena-allocated to mirror the production producer.
-    try runner.event_queue.push(.{ .err = try arena_alloc.dupe(u8, "cancelled") });
-    try runner.event_queue.push(.{ .text_delta = try arena_alloc.dupe(u8, "hello") });
-    try runner.event_queue.push(.{ .info = try arena_alloc.dupe(u8, "tokens: 42") });
+    // arena-allocated to mirror the production producer. Each OwnedPayload
+    // binds the bytes to the arena, so freeOwned routes the free back
+    // through the arena (a no-op) and never through the GPA.
+    try runner.event_queue.push(.{ .err = try agent_events.OwnedPayload.dupe(arena_alloc, "cancelled") });
+    try runner.event_queue.push(.{ .text_delta = try agent_events.OwnedPayload.dupe(arena_alloc, "hello") });
+    try runner.event_queue.push(.{ .info = try agent_events.OwnedPayload.dupe(arena_alloc, "tokens: 42") });
     try runner.event_queue.push(.{ .tool_start = .{
-        .name = try arena_alloc.dupe(u8, "bash"),
-        .call_id = try arena_alloc.dupe(u8, "toolu_1"),
-        .input_raw = try arena_alloc.dupe(u8, "{\"cmd\":\"ls\"}"),
+        .name = try agent_events.OwnedPayload.dupe(arena_alloc, "bash"),
+        .call_id = try agent_events.OwnedPayload.dupe(arena_alloc, "toolu_1"),
+        .input_raw = try agent_events.OwnedPayload.dupe(arena_alloc, "{\"cmd\":\"ls\"}"),
     } });
 
     // Pre-fix: panics in DebugAllocator.free with "Invalid free".
