@@ -174,8 +174,8 @@ test "write leaves original file intact when destination is a directory" {
     defer allocator.free(original_path);
     {
         const f = try std.Io.Dir.cwd().createFile(std.testing.io, original_path, .{});
-        defer f.close();
-        try f.writeAll("ORIGINAL");
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, "ORIGINAL");
     }
 
     // Try to write to a path that's actually a directory (will fail mid-flow).

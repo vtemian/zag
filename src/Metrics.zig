@@ -514,7 +514,7 @@ pub fn dump(path: []const u8) !usize {
     if (!enabled) return 0;
 
     const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
-    defer file.close();
+    defer file.close(std.testing.io);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.heap.page_allocator);
@@ -556,7 +556,7 @@ pub fn dump(path: []const u8) !usize {
         total_frame_allocs,
     });
 
-    try file.writeAll(buf.items);
+    try file.writeStreamingAll(std.testing.io, buf.items);
     return count;
 }
 
@@ -907,7 +907,7 @@ test "dump writes valid JSON" {
 
     // Read and verify basic structure
     const file = try std.Io.Dir.cwd().openFile(std.testing.io, tmp_path, .{});
-    defer file.close();
+    defer file.close(std.testing.io);
     var trace_scratch: [8192]u8 = undefined;
     const len = try file.readAll(&trace_scratch);
     const content = trace_scratch[0..len];

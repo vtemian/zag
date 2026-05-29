@@ -3401,11 +3401,11 @@ test "loadConfig loads a Lua file and collects tools" {
         \\})
     ;
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(config_content);
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, config_content);
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     try engine.loadConfig(tmp_path);
     try std.testing.expectEqual(@as(usize, 1), engine.tools.items.len);
@@ -3429,12 +3429,12 @@ test "loadConfig reports syntax error gracefully instead of crashing" {
 
     const tmp_path = "/tmp/zag_test_config_syntax_error.lua";
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
         // Unclosed table literal: classic syntax error.
-        try file.writeAll("local x = { 1, 2,\n");
+        try file.writeStreamingAll(std.testing.io, "local x = { 1, 2,\n");
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     try std.testing.expectError(error.LuaSyntax, engine.loadConfig(tmp_path));
 }
@@ -3446,11 +3446,11 @@ test "loadConfig reports runtime error gracefully" {
 
     const tmp_path = "/tmp/zag_test_config_runtime_error.lua";
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
-        try file.writeAll("error('user aborted config')\n");
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "error('user aborted config')\n");
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     try std.testing.expectError(error.LuaRuntime, engine.loadConfig(tmp_path));
 }
@@ -3617,11 +3617,11 @@ test "end-to-end: config file to registry execution" {
         \\})
     ;
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(config_content);
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, config_content);
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     // Load config
     try engine.loadConfig(tmp_path);

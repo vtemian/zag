@@ -356,9 +356,9 @@ test "writeTaskInputSchema emits enum and per-entry description" {
     });
 
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.writeTaskInputSchema(fbs.writer());
-    const out = fbs.getWritten();
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.writeTaskInputSchema(&fbs);
+    const out = fbs.buffered();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
     defer parsed.deinit();
@@ -401,9 +401,9 @@ test "writeTaskInputSchema handles empty registry" {
     defer registry.deinit(alloc);
 
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.writeTaskInputSchema(fbs.writer());
-    const out = fbs.getWritten();
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.writeTaskInputSchema(&fbs);
+    const out = fbs.buffered();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
     defer parsed.deinit();

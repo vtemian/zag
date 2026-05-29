@@ -8343,7 +8343,7 @@ test "splitFocusedWithSession attaches loaded session to a new pane" {
     defer allocator.free(orig_cwd);
     try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer {
-        if (std.fs.openDirAbsolute(orig_cwd, .{})) |d_const| {
+        if (std.Io.Dir.openDirAbsolute(std.testing.io, orig_cwd, .{})) |d_const| {
             var d = d_const;
             std.process.setCurrentDir(std.testing.io, d) catch {};
             d.close();

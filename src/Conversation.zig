@@ -2467,7 +2467,7 @@ test "loadFromEntries reloads tool_call nodes collapsed" {
 // swallowed because a failed restore inside `defer` can't be reported
 // and the tmpDir cleanup still wins.
 fn restoreTestCwd(abs_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
+    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, abs_path, .{}) catch return;
     defer dir.close();
     std.process.setCurrentDir(std.testing.io, dir) catch {};
 }

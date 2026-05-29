@@ -1841,7 +1841,7 @@ test "round-trip: append then load reflects generated id" {
         try fw.interface.writeAll("\n");
     }
     try fw.interface.flush();
-    file.close();
+    file.close(std.testing.io);
 
     const content = try tmp.dir.readFileAlloc(std.testing.io, allocator, tmp.dir, .limited("rt.jsonl"));
     defer allocator.free(content);
@@ -2016,7 +2016,7 @@ test "create, append, and load round-trip" {
         try fw.interface.writeAll("\n");
     }
     try fw.interface.flush();
-    file.close();
+    file.close(std.testing.io);
 
     // Read back
     const content = try tmp_dir.readFileAlloc(allocator, "test.jsonl", 1024 * 1024);
@@ -2180,8 +2180,8 @@ test "File.sync runs without error on a fresh file" {
     defer tmp.cleanup();
 
     const file = try tmp.dir.createFile(std.testing.io, "sync-probe", .{ .truncate = true });
-    defer file.close();
-    try file.writeAll("{\"type\":\"user_message\"}\n");
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "{\"type\":\"user_message\"}\n");
     try file.sync();
 }
 
@@ -2452,7 +2452,7 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl", .data = jsonl_body });
 
     var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
-    defer iter_dir.close();
+    defer iter_dir.close(std.testing.io);
 
     const report = try recoverSessionFiles(iter_dir, "abc", allocator);
 
@@ -2476,7 +2476,7 @@ test "recoverSessionFiles deletes orphan .tmp files for the session" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.meta.json.tmp", .data = "{}" });
 
     var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
-    defer iter_dir.close();
+    defer iter_dir.close(std.testing.io);
 
     const report = try recoverSessionFiles(iter_dir, "abc", allocator);
     try std.testing.expectEqual(@as(usize, 2), report.orphaned_tmp_cleaned);
@@ -2496,7 +2496,7 @@ test "recoverSessionFiles reports line count for count reconciliation" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sess.jsonl", .data = jsonl_body });
 
     var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
-    defer iter_dir.close();
+    defer iter_dir.close(std.testing.io);
 
     const report = try recoverSessionFiles(iter_dir, "sess", allocator);
     try std.testing.expectEqual(@as(u32, 4), report.actual_line_count);
@@ -2918,9 +2918,9 @@ test "loadEntries skips a corrupt mid-file entry without dropping later rows" {
     );
     {
         var f = try std.Io.Dir.cwd().openFile(std.testing.io, jsonl_path, .{ .mode = .read_write });
-        defer f.close();
+        defer f.close(std.testing.io);
         try f.seekFromEnd(0);
-        try f.writeAll("{\"type\":\"BOGUS\"}\n");
+        try f.writeStreamingAll(std.testing.io, "{\"type\":\"BOGUS\"}\n");
     }
 
     // Reopen the session and append a second valid entry after the
@@ -3276,7 +3276,7 @@ test "SessionManager.init leaves the global registry alone" {
         else => return err,
     };
     var dir = probe;
-    defer dir.close();
+    defer dir.close(std.testing.io);
     try std.testing.expect(false); // reached only if .config was created
 }
 

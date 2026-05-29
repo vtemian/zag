@@ -277,8 +277,8 @@ test "initWithPath opens an existing directory and appends" {
     handler(.warn, .agent, "tool {s}", .{"bash"});
 
     // Read back.
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
     var contents_buf: [1024]u8 = undefined;
     const n = try file.readAll(&contents_buf);
     const contents = contents_buf[0..n];
@@ -298,7 +298,7 @@ test "initWithPath opens the log file with mode 0o600" {
 
     // Pre-create with loose permissions to exercise the chmod-after-open path.
     {
-        const pre = try std.fs.createFileAbsolute(path, .{ .mode = 0o644, .truncate = true });
+        const pre = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
         defer pre.close();
         try posix.fchmod(pre.handle, 0o644);
     }
@@ -382,8 +382,8 @@ test "handler drops messages below min level" {
     handler(.debug, .agent, "noisy debug", .{});
     handler(.info, .agent, "kept info", .{});
 
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
     var contents_buf: [1024]u8 = undefined;
     const n = try file.readAll(&contents_buf);
     const contents = contents_buf[0..n];
@@ -410,8 +410,8 @@ test "raising min level to debug lets debug through" {
     min_level_tag.store(@intFromEnum(std.log.Level.debug), .monotonic);
     handler(.debug, .agent, "verbose: {d}", .{42});
 
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
     var contents_buf: [1024]u8 = undefined;
     const n = try file.readAll(&contents_buf);
     const contents = contents_buf[0..n];

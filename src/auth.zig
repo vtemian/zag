@@ -661,8 +661,8 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     // Pre-create the file with a world-readable mode, as if the user chmod'd
     // it or restored from a tarball that stripped the original 0o600.
     {
-        const pre = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .mode = 0o644, .truncate = true });
-        defer pre.close();
+        const pre = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
+        defer pre.close(std.testing.io);
         try std.posix.fchmod(pre.handle, 0o644);
     }
 

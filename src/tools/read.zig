@@ -98,8 +98,8 @@ test "read existing file" {
     // Write a temp file to read back
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll(test_content);
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, test_content);
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
@@ -149,8 +149,8 @@ test "read with max_lines truncation" {
     const test_content = "a\nb\nc\nd\ne\n";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll(test_content);
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, test_content);
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 

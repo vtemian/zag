@@ -184,8 +184,8 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
 
 fn writeFile(dir: std.Io.Dir, name: []const u8, body: []const u8) !void {
     var f = try dir.createFile(name, .{});
-    defer f.close();
-    try f.writeAll(body);
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, body);
 }
 
 test "systemPaths returns only existing paths" {
@@ -345,11 +345,11 @@ test "findUp skips files larger than MAX_BYTES" {
     // should treat AGENTS.md as if absent and surface CLAUDE.md instead.
     {
         var f = try tmp.dir.createFile(std.testing.io, "AGENTS.md", .{});
-        defer f.close();
+        defer f.close(std.testing.io);
         const chunk = [_]u8{'x'} ** 4096;
         var written: usize = 0;
         while (written < MAX_BYTES + 1) : (written += chunk.len) {
-            try f.writeAll(&chunk);
+            try f.writeStreamingAll(std.testing.io, &chunk);
         }
     }
     try writeFile(tmp.dir, "CLAUDE.md", "fallback");

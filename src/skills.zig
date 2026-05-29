@@ -470,9 +470,9 @@ test "catalog emits well-formed XML with escaping" {
     try registry.skills.append(alloc, .{ .name = name, .description = desc, .path = path });
 
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.catalog(fbs.writer());
-    const out = fbs.getWritten();
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.catalog(&fbs);
+    const out = fbs.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "<available_skills>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "</available_skills>") != null);
@@ -510,9 +510,9 @@ test "catalog is empty when no skills" {
     defer registry.deinit(alloc);
 
     var buf: [64]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.catalog(fbs.writer());
-    try testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.catalog(&fbs);
+    try testing.expectEqual(@as(usize, 0), fbs.buffered().len);
 }
 
 test "warnAboutIgnoredAllowedToolsOnce skips when no skill declares allowed-tools" {

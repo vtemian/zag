@@ -242,8 +242,8 @@ test "successful replacement" {
     const tmp_path = "/tmp/zag-test-edit-replace.txt";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll("hello world\n");
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "hello world\n");
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
@@ -268,8 +268,8 @@ test "old_text not found returns error" {
     const tmp_path = "/tmp/zag-test-edit-notfound.txt";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll("hello world\n");
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "hello world\n");
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
@@ -287,8 +287,8 @@ test "multiple matches returns error" {
     const tmp_path = "/tmp/zag-test-edit-multi.txt";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll("aaa bbb aaa\n");
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "aaa bbb aaa\n");
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
@@ -308,8 +308,8 @@ test "edit: CRLF file matches LF-supplied old_text" {
     const tmp_path = "/tmp/zag-test-edit-crlf.txt";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll("hello\r\nworld\r\n");
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "hello\r\nworld\r\n");
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
@@ -339,8 +339,8 @@ test "edit rejects empty old_text" {
     const tmp_path = "/tmp/zag-test-edit-empty-old.txt";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll("hello world");
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "hello world");
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
@@ -363,8 +363,8 @@ test "edit: LF file with LF old_text continues to work (no regression)" {
     const tmp_path = "/tmp/zag-test-edit-lf-nr.txt";
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
-        defer file.close();
-        try file.writeAll("hello\nworld\n");
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "hello\nworld\n");
     }
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 

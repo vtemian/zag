@@ -537,7 +537,7 @@ test "task_start payload escapes JSON special characters in prompt" {
 }
 
 fn restoreCwdForTest(abs_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
+    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, abs_path, .{}) catch return;
     defer dir.close();
     std.process.setCurrentDir(std.testing.io, dir) catch {};
 }

@@ -2099,7 +2099,7 @@ test "runWizard on forced_provider prints paste-me model hint, does not scaffold
     // config.lua must NOT exist on disk: the hint is print-only.
     try testing.expectError(
         error.FileNotFound,
-        std.fs.accessAbsolute(paths.config_path, .{}),
+        std.Io.Dir.accessAbsolute(std.testing.io, paths.config_path, .{}),
     );
 }
 
