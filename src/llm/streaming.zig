@@ -980,12 +980,16 @@ test "captureHeaders caps at MAX_RESPONSE_HEADERS" {
     // Build a HEAD with 100 trivial headers; capture should stop at 64.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "HTTP/1.1 200 OK\r\n");
-    var i: usize = 0;
-    while (i < 100) : (i += 1) {
-        try buf.writer(allocator).print("X-Hdr-{d}: v\r\n", .{i});
+    {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+        defer buf = aw.toArrayList();
+        try aw.writer.writeAll("HTTP/1.1 200 OK\r\n");
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            try aw.writer.print("X-Hdr-{d}: v\r\n", .{i});
+        }
+        try aw.writer.writeAll("\r\n");
     }
-    try buf.appendSlice(allocator, "\r\n");
 
     const head = try std.http.Client.Response.Head.parse(buf.items);
     const captured = try StreamingResponse.captureHeaders(allocator, &head);

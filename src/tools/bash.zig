@@ -363,7 +363,7 @@ fn buildLinuxArgv(
     command: []const u8,
 ) !SandboxArgv {
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = try std.fs.selfExePath(&self_buf);
+    const self_path = self_buf[0..try std.process.executablePath(process_io.get(), &self_buf)];
 
     const self_owned = try allocator.dupe(u8, self_path);
     errdefer allocator.free(self_owned);

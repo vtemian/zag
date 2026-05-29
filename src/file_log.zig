@@ -300,14 +300,14 @@ test "initWithPath opens the log file with mode 0o600" {
     {
         const pre = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
         defer pre.close();
-        try posix.fchmod(pre.handle, 0o644);
+        _ = std.c.fchmod(pre.handle, 0o644);
     }
 
     try initWithPath(path);
     defer deinit();
 
     const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "handler is a silent no-op when uninitialized" {

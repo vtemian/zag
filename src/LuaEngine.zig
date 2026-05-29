@@ -10401,9 +10401,13 @@ test "zag.transforms.rg_trim trims grep output past 200 lines" {
     // marker so the agent sees the early hits but not the long tail.
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 300) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 300) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10436,9 +10440,13 @@ test "zag.transforms.rg_trim leaves short grep output untouched" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 100) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 100) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10465,9 +10473,13 @@ test "zag.transforms.rg_trim passes through error output" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 300) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 300) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10492,9 +10504,13 @@ test "zag.transforms.bash_trim trims bash output past 500 lines" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 700) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 700) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10525,9 +10541,13 @@ test "zag.transforms.bash_trim leaves short bash output untouched" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 100) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 100) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(

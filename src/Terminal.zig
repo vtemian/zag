@@ -328,7 +328,7 @@ test "detectTrueColor honours COLORTERM env var" {
     // in Zig 0.15 (no std.posix.setenv). Assert it agrees with the current
     // $COLORTERM: if set to truecolor/24bit the fn returns true, otherwise
     // false. Either way this exercises the env-read path.
-    const expected = if (posix.getenv("COLORTERM")) |v| trueColorFromValue(v) else false;
+    const expected = if (env_mod.get("COLORTERM")) |v| trueColorFromValue(v) else false;
     try std.testing.expectEqual(expected, detectTrueColor());
 }
 

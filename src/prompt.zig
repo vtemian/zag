@@ -884,7 +884,7 @@ test "findGitToplevel finds the repo root from a subdirectory" {
     // Discover the actual zag repo path from the process cwd so this
     // test works inside worktrees. getCwdAlloc may fail in odd
     // sandboxes; skip the check rather than erroring out.
-    const here = std.process.getCwdAlloc(alloc) catch return;
+    const here = std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", alloc) catch return;
     defer alloc.free(here);
 
     const found = try findGitToplevel(alloc, here);

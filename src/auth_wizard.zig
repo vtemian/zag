@@ -2000,7 +2000,7 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
 
     // auth.json: 0o600, openai key present.
     const auth_stat = try std.Io.Dir.cwd().statFile(std.testing.io, paths.auth_path, .{});
-    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(auth_stat.mode & 0o777)));
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(auth_stat.permissions.toMode() & 0o777)));
 
     var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
     defer loaded.deinit();

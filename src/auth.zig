@@ -647,7 +647,7 @@ test "saveAuthFile writes mode 0600" {
     try saveAuthFile(path, file);
 
     const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
@@ -663,7 +663,7 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     {
         const pre = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
         defer pre.close(std.testing.io);
-        try std.posix.fchmod(pre.handle, 0o644);
+        _ = std.c.fchmod(pre.handle, 0o644);
     }
 
     var file = AuthFile.init(std.testing.allocator);
@@ -672,7 +672,7 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     try saveAuthFile(path, file);
 
     const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "round-trip preserves api_key entries" {
@@ -747,7 +747,7 @@ test "saveAuthFile preserves 0o600 after atomic rename" {
     try saveAuthFile(path, file);
 
     const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "removeEntry deletes existing and is a no-op for missing" {

@@ -2919,8 +2919,14 @@ test "loadEntries skips a corrupt mid-file entry without dropping later rows" {
     {
         var f = try std.Io.Dir.cwd().openFile(std.testing.io, jsonl_path, .{ .mode = .read_write });
         defer f.close(std.testing.io);
-        try f.seekFromEnd(0);
-        try f.writeStreamingAll(std.testing.io, "{\"type\":\"BOGUS\"}\n");
+        // 0.16 removed File.seekFromEnd; drive a positional writer placed at
+        // the current end so the bogus line appends rather than overwrites.
+        const st = try f.stat(std.testing.io);
+        var append_buf: [64]u8 = undefined;
+        var fw = f.writer(std.testing.io, &append_buf);
+        try fw.seekTo(st.size);
+        try fw.interface.writeAll("{\"type\":\"BOGUS\"}\n");
+        try fw.interface.flush();
     }
 
     // Reopen the session and append a second valid entry after the
