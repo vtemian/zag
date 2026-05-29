@@ -34,6 +34,7 @@ const NodeRegistry = @import("NodeRegistry.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const Keymap = @import("Keymap.zig");
+const width = @import("width.zig");
 const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
 const skills_mod = @import("skills.zig");
@@ -795,6 +796,12 @@ fn handleKey(self: *EventOrchestrator, k: input.KeyEvent) Action {
     // the focused buffer, which owns draft editing through its vtable.
     switch (k.key) {
         .enter => {
+            // Shift+Enter inserts a newline; unmodified Enter submits.
+            if (k.modifiers.shift) {
+                focused.appendToDraft('\n');
+                return .redraw;
+            }
+
             // The Enter submit pipeline reads the pane's draft and hands
             // it to the agent runner. Scratch-backed panes have no
             // runner, so Enter there falls through to the buffer's own
@@ -1046,16 +1053,58 @@ fn publishCursorAnchor(self: *EventOrchestrator, leaf_drafts: []const Compositor
         }
     }
 
+    // Prompt area height must stay in sync with Compositor.drawPanePrompt.
+    const reserve_prompt_rows: u16 = blk: {
+        if (leaf.rect.height == 4) break :blk 1;
+        if (leaf.rect.height < 12) break :blk 2;
+        break :blk 4;
+    };
+    const has_working_line = leaf.rect.height >= 5;
+    const prompt_rows = if (has_working_line) reserve_prompt_rows - 1 else reserve_prompt_rows;
+
     // `\u{203A} ` is the prompt glyph plus a trailing space, two
-    // visual cells. Cursor sits one cell after the draft, matching
-    // Compositor.drawPanePrompt.
+    // visual cells.
     const after_prompt: u16 = content_x +| 2;
-    const draft_len: u16 = @intCast(@min(draft.len, std.math.maxInt(u16)));
-    const cursor_col: u16 = after_prompt +| draft_len;
+    const right_edge: u16 = leaf.rect.x + leaf.rect.width - 1;
+    const available: u16 = if (right_edge > after_prompt + 1) right_edge - after_prompt - 1 else 0;
+
+    // Compute wrapped cursor position within the draft.
+    var cursor_row: u16 = 0;
+    var cursor_col = after_prompt;
+    if (available > 0 and draft.len > 0) {
+        const view = std.unicode.Utf8View.initUnchecked(draft);
+        var iter = view.iterator();
+        var i: usize = 0;
+        while (i < draft.len) {
+            const cluster = width.nextCluster(&iter) orelse break;
+            const w = cluster.width;
+            if (w == 0) {
+                if (cluster.base == '\n') {
+                    cursor_row += 1;
+                    cursor_col = after_prompt;
+                }
+                i += cluster.byte_len;
+                continue;
+            }
+            if (cursor_col + w > right_edge) {
+                cursor_row += 1;
+                cursor_col = after_prompt;
+            }
+            cursor_col += w;
+            i += cluster.byte_len;
+        }
+    }
+
+    // Tail-visible rendering: if the draft overflows the prompt area,
+    // only the last `prompt_rows` are visible.
+    const total_rows = cursor_row + 1;
+    const skip_rows = if (total_rows > prompt_rows) total_rows - prompt_rows else 0;
+    const start_row = prompt_row -| @min(total_rows, prompt_rows) + 1;
+    const screen_row = start_row + cursor_row - skip_rows;
 
     layout.cursor_anchor = .{
         .x = cursor_col,
-        .y = prompt_row,
+        .y = screen_row,
         .width = 1,
         .height = 1,
     };

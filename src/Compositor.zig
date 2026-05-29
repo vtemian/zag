@@ -307,8 +307,9 @@ fn drawDirtyLeaves(self: *Compositor, node: *const Layout.LayoutNode, leaf_draft
                 if (leaf.rect.width >= 3 and leaf.rect.height >= 3) {
                     const reserve: u16 = blk: {
                         if (!has_prompt or leaf.rect.height < 4) break :blk 0;
-                        if (leaf.rect.height >= 5) break :blk 2;
-                        break :blk 1;
+                        if (leaf.rect.height == 4) break :blk 1;
+                        if (leaf.rect.height < 12) break :blk 2;
+                        break :blk 4;
                     };
                     self.screen.clearRect(
                         leaf.rect.y + 1,
@@ -399,8 +400,9 @@ fn drawBufferIntoRect(
     const reserve_prompt_rows: u16 = blk: {
         if (!reserve_prompt_row) break :blk 0;
         if (outer.height < 4) break :blk 0;
-        if (outer.height >= 5) break :blk 2;
-        break :blk 1;
+        if (outer.height == 4) break :blk 1;
+        if (outer.height < 12) break :blk 2;
+        break :blk 4; // working line + up to 3 prompt rows
     };
     const rect = Layout.Rect{
         .x = outer.x + 1,
@@ -838,7 +840,114 @@ fn workingLineText(buf: []u8, secs: u64, tokens: u32) []const u8 {
     return std.fmt.bufPrint(buf, "* Working\u{2026} ({d}s)", .{secs}) catch "* Working\u{2026}";
 }
 
-/// Paint one pane's prompt row. No-op when the pane is too short/narrow.
+/// Count wrapped rows for `text` starting at `start_col` and wrapping at `max_col`.
+fn wrappedRowCountWithStart(start_col: u16, max_col: u16, text: []const u8) u16 {
+    if (max_col <= start_col) return 1;
+    var rows: u16 = 1;
+    var col = start_col;
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var iter = view.iterator();
+    while (width.nextCluster(&iter)) |cluster| {
+        const w = cluster.width;
+        if (w == 0) {
+            if (cluster.base == '\n') {
+                rows += 1;
+                col = start_col;
+            }
+            continue;
+        }
+        if (w > max_col - start_col) break;
+        if (col + w > max_col) {
+            rows += 1;
+            col = start_col;
+        }
+        col += w;
+    }
+    return rows;
+}
+
+/// Write `text` into `screen` starting at (`start_row`, `start_col`), wrapping
+/// at `max_col` and clipping at `max_row`. Skips the first `skip_rows` wrapped
+/// rows so the tail of a long draft is visible.
+fn writeWrappedTail(
+    screen: *Screen,
+    start_row: u16,
+    start_col: u16,
+    max_row: u16,
+    max_col: u16,
+    text: []const u8,
+    style: Screen.Style,
+    fg: Screen.Color,
+    skip_rows: u16,
+) struct { row: u16, col: u16 } {
+    var row = start_row;
+    var col = start_col;
+    var current_row: u16 = 0;
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var iter = view.iterator();
+    while (true) {
+        if (row >= max_row) break;
+        const cluster_start = iter.i;
+        const cluster = width.nextCluster(&iter) orelse break;
+        const w = cluster.width;
+        if (w == 0) {
+            if (cluster.base == '\n') {
+                row += 1;
+                col = start_col;
+                current_row += 1;
+                if (row >= max_row) break;
+            }
+            continue;
+        }
+        if (col + w > max_col) {
+            row += 1;
+            col = start_col;
+            current_row += 1;
+            if (row >= max_row) break;
+            if (col + w > max_col) break;
+        }
+        if (current_row >= skip_rows) {
+            screen.writeCluster(row, col, text[cluster_start..][0..cluster.byte_len], cluster.base, w, style, fg);
+        }
+        col += w;
+    }
+    return .{ .row = row, .col = col };
+}
+
+/// Compute the logical wrapped row and column of a byte offset in `text`.
+fn wrappedCursorPos(
+    start_col: u16,
+    max_col: u16,
+    text: []const u8,
+    byte_offset: usize,
+) struct { row: u16, col: u16 } {
+    var row: u16 = 0;
+    var col = start_col;
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var iter = view.iterator();
+    var i: usize = 0;
+    while (i < byte_offset) {
+        const cluster = width.nextCluster(&iter) orelse break;
+        const w = cluster.width;
+        if (w == 0) {
+            if (cluster.base == '\n') {
+                row += 1;
+                col = start_col;
+            }
+            i += cluster.byte_len;
+            continue;
+        }
+        if (col + w > max_col) {
+            row += 1;
+            col = start_col;
+        }
+        col += w;
+        i += cluster.byte_len;
+    }
+    return .{ .row = row, .col = col };
+}
+
+/// Paint one pane's prompt area. No-op when the pane is too short/narrow.
 /// On the focused pane, `input.status` replaces the prompt whenever it's
 /// non-empty (split announces only). The transient working line above the
 /// prompt is the sole running indicator now.
@@ -860,23 +969,22 @@ fn drawPanePrompt(
     const right_edge = rect.x + rect.width - 1;
     if (content_x >= right_edge) return;
 
-    // Clear the prompt row interior so stale cursor bg from a prior
-    // frame doesn't bleed behind the newly written draft. `writeStr`
-    // never touches `bg`, so once a cell was painted with accent bg
-    // for the cursor block it keeps that bg until we explicitly reset it.
-    self.screen.clearRect(prompt_row, content_x, right_edge - content_x, 1);
+    // Prompt area height: number of rows the draft itself may occupy.
+    const reserve_prompt_rows: u16 = blk: {
+        if (rect.height == 4) break :blk 1;
+        if (rect.height < 12) break :blk 2;
+        break :blk 4; // working line + up to 3 prompt rows
+    };
+    const has_working_line = rect.height >= 5;
+    const prompt_rows = if (has_working_line) reserve_prompt_rows - 1 else reserve_prompt_rows;
+    const prompt_top = prompt_row - prompt_rows + 1;
 
-    // Working line: drawn on the row above the prompt for the focused
-    // running pane. The row is reserved by `drawBufferIntoRect` whenever
-    // the pane has a prompt and is tall enough, so content never paints
-    // here — the slot is ours to clear every frame regardless of run
-    // state. Clearing unconditionally is what kills the
-    // "Working… (Ns)" ghost that lingered after the agent finished:
-    // when `agent_running` flipped false in the prior fix the
-    // working-line clear stopped firing, no fresh paint covered the
-    // row, and the stale text stayed on screen across idle frames.
-    if (rect.height >= 5) {
-        const work_row = prompt_row - 1;
+    // Clear the full prompt area so shrinking drafts don't leave ghosts.
+    self.screen.clearRect(prompt_top, content_x, right_edge - content_x, prompt_rows);
+
+    // Working line: drawn on the row directly above the prompt area.
+    if (has_working_line) {
+        const work_row = prompt_top - 1;
         const span: u16 = right_edge - content_x;
         self.screen.clearRect(work_row, content_x, span, 1);
         if (focused and input.agent_running) {
@@ -889,9 +997,7 @@ fn drawPanePrompt(
         }
     }
 
-    // Focused pane: a transient status toast (split announces) takes over
-    // the prompt row entirely. Running state is shown by the working line
-    // above, not here.
+    // Focused pane: a transient status toast takes over the prompt area.
     if (focused and input.status.len > 0) {
         const resolved = Theme.resolve(self.theme.highlights.status, self.theme);
         const available_status: usize = right_edge - content_x;
@@ -904,9 +1010,7 @@ fn drawPanePrompt(
     }
 
     // Pane-scoped draft: the orchestrator pre-resolves the draft for
-    // each visible leaf before calling `composite()`. Leaves with no
-    // registered pane (drift case) get a null draft and we skip the
-    // prompt row entirely instead of guessing.
+    // each visible leaf before calling `composite()`.
     const draft = draft_opt orelse return;
 
     const prompt = Theme.resolve(self.theme.highlights.input_prompt, self.theme);
@@ -914,36 +1018,36 @@ fn drawPanePrompt(
 
     // `› ` glyph + trailing space; 2 columns of chrome.
     if (content_x + 2 > right_edge) return;
-    const after_prompt = self.screen.writeStr(prompt_row, content_x, "\u{203A} ", prompt.screen_style, prompt.fg);
+    const after_prompt = content_x + 2;
 
-    // Byte-level clip for the draft; input handler only accepts ASCII today,
-    // so this is safe. Leaves one cell for the cursor block when the pane
-    // is focused in insert mode.
-    const available: usize = if (right_edge > after_prompt + 1)
-        right_edge - after_prompt - 1
-    else
-        0;
+    // Compute how many wrapped rows the draft occupies and show the tail
+    // if it overflows the prompt area.
+    const total_rows = wrappedRowCountWithStart(after_prompt, right_edge, draft);
+    const skip_rows = if (total_rows > prompt_rows) total_rows - prompt_rows else 0;
+    const start_row = prompt_row -| @min(total_rows, prompt_rows) + 1;
 
-    // Horizontal scroll so the cursor stays visible within the prompt.
-    var visible_start: usize = 0;
-    if (draft.len > available) {
-        if (draft_cursor >= available) {
-            visible_start = draft_cursor - available + 1;
-        }
-    }
-    const visible_end = @min(draft.len, visible_start + available);
-    const shown = draft[visible_start..visible_end];
+    // Draw the prompt glyph on the first visible row.
+    _ = self.screen.writeStr(start_row, content_x, "\u{203A} ", prompt.screen_style, prompt.fg);
 
-    _ = self.screen.writeStr(prompt_row, after_prompt, shown, text.screen_style, text.fg);
+    // Render the draft wrapped, skipping rows that overflow above.
+    _ = writeWrappedTail(
+        self.screen,
+        start_row,
+        after_prompt,
+        prompt_row + 1,
+        right_edge,
+        draft,
+        text.screen_style,
+        text.fg,
+        skip_rows,
+    );
 
-    // `draft_cursor - visible_start` is bounded by `available`, which is
-    // bounded by `right_edge - after_prompt - 1`; the cast to u16 cannot
-    // overflow on any real terminal.
-    const cursor_offset: u16 = @intCast(draft_cursor - visible_start);
-    const cursor_col = after_prompt + cursor_offset;
-    // Cursor cell: only on the focused pane in insert mode.
-    if (focused and input.mode == .insert and cursor_col < right_edge) {
-        const cell = self.screen.getCell(prompt_row, cursor_col);
+    // Cursor position within the visible tail.
+    const cursor_rel = wrappedCursorPos(after_prompt, right_edge, draft, draft_cursor);
+    const cursor_row = start_row + cursor_rel.row - skip_rows;
+    const cursor_col = cursor_rel.col;
+    if (focused and input.mode == .insert and cursor_row >= start_row and cursor_row <= prompt_row and cursor_col < right_edge) {
+        const cell = self.screen.getCell(cursor_row, cursor_col);
         cell.codepoint = ' ';
         cell.style = .{};
         cell.fg = self.theme.colors.fg;
