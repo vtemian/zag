@@ -58,6 +58,16 @@ local state = {
                               -- the user opened it from the prompt's
                               -- insert mode. close() restores this so
                               -- the prompt picks up where it left off.
+    session_list_cache = nil, -- memoized zag.sessions.list() result. Every
+                              -- _render rebuilds the row list, and without
+                              -- this each j/k keystroke re-read every
+                              -- .meta.json across every project from disk.
+                              -- Invalidated on SessionListChanged and on
+                              -- open(); a pure cursor move reuses it.
+    subagent_cache = {},      -- session_id -> task_start rows. Re-rendering an
+                              -- expanded session otherwise re-parsed its whole
+                              -- (multi-MiB) JSONL via zag.sessions.subagents on
+                              -- every keystroke. Same invalidation as the list.
 }
 
 function M.toggle()
@@ -121,6 +131,12 @@ function M.open()
     state.prior_mode = ok and prev or nil
     pcall(zag.mode.set, "normal")
 
+    -- Drop any caches from a prior open: while the sidebar was closed its
+    -- SessionListChanged hook was unsubscribed, so the list/subagents may
+    -- have changed on disk without invalidation. Start fresh.
+    state.session_list_cache = nil
+    state.subagent_cache = {}
+
     M._bind_keymaps()
     M._subscribe_hooks()
     M._render()
@@ -149,6 +165,12 @@ end
 function M._subscribe_hooks()
     table.insert(state.hook_ids, zag.hook("SessionListChanged", function(_evt)
         if not state.buffer_id then return end
+        -- A create/rename/delete/status change is the only thing that can
+        -- alter the cached list or a session's subagent set, so this is the
+        -- one place both caches must drop. Plain cursor moves and focus
+        -- swaps re-render off the cache without touching disk.
+        state.session_list_cache = nil
+        state.subagent_cache = {}
         M._render()
     end))
     table.insert(state.hook_ids, zag.hook("PaneFocused", function(_evt)
@@ -793,7 +815,17 @@ end
 -- (project rm-rf'd between list and read, malformed JSONL), in which
 -- case we log and return an empty list so the parent session row
 -- still renders. Returns nil-safe: an empty result is `{}` not nil.
+--
+-- Memoized per session id in `state.subagent_cache`: `zag.sessions.subagents`
+-- parses the session's entire JSONL, so re-running it on every render (each
+-- j/k keystroke re-renders) re-read a multi-MiB file per keystroke for a
+-- session that stayed expanded. The cache drops on SessionListChanged and on
+-- open(), the only events that can change a session's subagent set. A failed
+-- read is NOT cached so a transient error retries on the next render.
 local function _collect_subagents(session)
+    local cached = state.subagent_cache[session.id]
+    if cached ~= nil then return cached end
+
     local ok, subs = pcall(zag.sessions.subagents, session.id, session.project)
     if not ok then
         zag.log.warn("sessions sidebar: subagents(%s) failed: %s",
@@ -812,6 +844,7 @@ local function _collect_subagents(session)
             label = "  └ " .. _short_prompt(sub.tool_input, 40),
         })
     end
+    state.subagent_cache[session.id] = rows
     return rows
 end
 
@@ -825,7 +858,13 @@ end
 -- filtered themselves. Keeps the filter cognitively simple.
 function M._collect_rows()
     local rows = {}
-    local sessions = zag.sessions.list()
+    -- Memoized: zag.sessions.list() re-reads every .meta.json across every
+    -- project from disk, and _render runs on every j/k keystroke. Cache it in
+    -- state and refetch only when SessionListChanged or open() clears it.
+    if state.session_list_cache == nil then
+        state.session_list_cache = zag.sessions.list()
+    end
+    local sessions = state.session_list_cache
     local filter_lc = state.filter ~= "" and state.filter:lower() or nil
     -- Sample `os.time()` once per render. Every row's date column is
     -- "age relative to NOW"; using the same NOW across rows keeps the
