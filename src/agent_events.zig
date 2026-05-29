@@ -416,8 +416,11 @@ pub const EventQueue = struct {
         self.buffer[self.tail] = event;
         self.tail = (self.tail + 1) % self.buffer.len;
         self.len += 1;
+        // Raw async-signal-safe wake (std.posix.write is gone in 0.16); see
+        // the matching write in `push`.
         if (self.wake_fd) |fd| {
-            _ = std.posix.write(fd, &[_]u8{1}) catch {};
+            const byte: [1]u8 = .{1};
+            _ = std.c.write(fd, &byte, 1);
         }
     }
 

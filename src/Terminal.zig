@@ -7,6 +7,7 @@
 const std = @import("std");
 const posix = std.posix;
 const process_io = @import("process_io.zig");
+const env_mod = @import("env.zig");
 
 const log = std.log.scoped(.terminal);
 
@@ -148,7 +149,7 @@ pub fn init() !Terminal {
 /// is to set `COLORTERM=truecolor` or `COLORTERM=24bit`. Anything else -
 /// including an empty value - means "fall back to 256-color palette".
 pub fn detectTrueColor() bool {
-    const val = posix.getenv("COLORTERM") orelse return false;
+    const val = env_mod.get("COLORTERM") orelse return false;
     return trueColorFromValue(val);
 }
 
@@ -247,7 +248,7 @@ fn installSigwinchHandler() void {
     posix.sigaction(posix.SIG.WINCH, &act, null);
 }
 
-fn handleSigwinch(sig: i32, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+fn handleSigwinch(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
     _ = sig;
     _ = info;
     _ = ctx;
