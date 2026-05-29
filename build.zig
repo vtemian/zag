@@ -111,6 +111,7 @@ pub fn build(b: *std.Build) void {
                 const independent_scenarios = [_][]const u8{
                     "src/sim/scenarios/slash_quit.zsm",
                     "src/sim/scenarios/real_smoke_hello.zsm",
+                    "src/sim/scenarios/headless_smoke.zsm",
                     "src/sim/scenarios/tool_use_bash.zsm",
                     "src/sim/scenarios/tool_use_read_edit.zsm",
                     "src/sim/scenarios/tool_parallel.zsm",

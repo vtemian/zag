@@ -224,9 +224,28 @@ pub const Runner = struct {
 
     pub fn executeSpawn(self: *Runner, program: []const u8) !void {
         if (self.child != null) return error.AlreadySpawned;
-        const prog_z = try self.alloc.dupeZ(u8, program);
-        defer self.alloc.free(prog_z);
-        const argv = [_][*:0]const u8{prog_z.ptr};
+
+        // Split the spawn line into whitespace-separated argv tokens so a
+        // scenario can pass flags, e.g.
+        //   spawn ./zig-out/bin/zag --headless --instruction-file=...
+        // A single-token program (the common case) yields a one-element
+        // argv, matching the previous behaviour. No quote handling: tokens
+        // must not contain spaces, which holds for paths and `--flag=value`.
+        var argv_owned: std.ArrayList([:0]u8) = .empty;
+        defer {
+            for (argv_owned.items) |a| self.alloc.free(a);
+            argv_owned.deinit(self.alloc);
+        }
+        var argv: std.ArrayList([*:0]const u8) = .empty;
+        defer argv.deinit(self.alloc);
+        var tok = std.mem.tokenizeAny(u8, program, " \t");
+        while (tok.next()) |word| {
+            const z = try self.alloc.dupeZ(u8, word);
+            try argv_owned.append(self.alloc, z);
+            try argv.append(self.alloc, z.ptr);
+        }
+        if (argv.items.len == 0) return error.EmptySpawn;
+
         var envp: std.ArrayList([*:0]const u8) = .empty;
         defer {
             for (envp.items) |e| self.alloc.free(std.mem.span(e));
@@ -238,7 +257,7 @@ pub const Runner = struct {
             errdefer self.alloc.free(joined);
             try envp.append(self.alloc, joined.ptr);
         }
-        self.child = try Spawn.spawn(&argv, envp.items, 80, 24);
+        self.child = try Spawn.spawn(argv.items, envp.items, 80, 24);
     }
 
     fn stripRegexDelims(raw: []const u8) []const u8 {
@@ -313,6 +332,16 @@ test "executeWaitText finds echoed literal within timeout" {
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
     try r.executeSend("\"banana\" <Enter>");
     try r.executeWaitText("/banana/", 2000);
+}
+
+test "executeSpawn tokenizes a multi-argument program line" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    // `/bin/sh -c true` exits 0. If the line were treated as a single
+    // argv[0] the exec would fail with ChildSetupFailed, so a clean
+    // wait_exit proves the tokenizer split the flags into separate args.
+    try r.executeSpawn("/bin/sh -c true");
+    try r.executeWaitExit("", 2000);
 }
 
 test "executeWaitIdle completes when child quiet" {
