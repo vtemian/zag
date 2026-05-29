@@ -352,11 +352,11 @@ test "saveAtomic uses a process-scoped tmp filename" {
     const our_pid: i32 = @intCast(std.c.getpid());
     var our_tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const our_tmp_name = try std.fmt.bufPrint(&our_tmp_buf, "projects.json.{d}.tmp", .{our_pid});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.tmp.dir(std.testing.io, our_tmp_name, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, our_tmp_name, .{}));
 
     // The foreign-pid tmp and the legacy shared tmp must still be there.
-    try tmp.dir.tmp.dir(std.testing.io, "projects.json.99999999.tmp", .{});
-    try tmp.dir.tmp.dir(std.testing.io, "projects.json.tmp", .{});
+    try tmp.dir.access(std.testing.io, "projects.json.99999999.tmp", .{});
+    try tmp.dir.access(std.testing.io, "projects.json.tmp", .{});
 
     // And the real registry got written.
     const list = try reg.listProjects();

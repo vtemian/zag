@@ -1825,7 +1825,7 @@ test "round-trip: append then load reflects generated id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.tmp.dir(std.testing.io, "rt.jsonl", .{ .truncate = true });
+    const file = try tmp.dir.createFile(std.testing.io, "rt.jsonl", .{ .truncate = true });
 
     var entries = [_]Entry{
         .{ .entry_type = .session_start, .timestamp = 100 },
@@ -2179,7 +2179,7 @@ test "File.sync runs without error on a fresh file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.tmp.dir(std.testing.io, "sync-probe", .{ .truncate = true });
+    const file = try tmp.dir.createFile(std.testing.io, "sync-probe", .{ .truncate = true });
     defer file.close();
     try file.writeAll("{\"type\":\"user_message\"}\n");
     try file.sync();
@@ -2451,7 +2451,7 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     const jsonl_body = "{\"a\":1}\n{\"b\":2}\n{\"c\":";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl", .data = jsonl_body });
 
-    var iter_dir = try tmp.dir.tmp.dir(std.testing.io, ".", .{ .iterate = true });
+    var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close();
 
     const report = try recoverSessionFiles(iter_dir, "abc", allocator);
@@ -2475,16 +2475,16 @@ test "recoverSessionFiles deletes orphan .tmp files for the session" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl.tmp", .data = "{}" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.meta.json.tmp", .data = "{}" });
 
-    var iter_dir = try tmp.dir.tmp.dir(std.testing.io, ".", .{ .iterate = true });
+    var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close();
 
     const report = try recoverSessionFiles(iter_dir, "abc", allocator);
     try std.testing.expectEqual(@as(usize, 2), report.orphaned_tmp_cleaned);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, tmp.dir, .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, tmp.dir, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "abc.meta.json.tmp", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "abc.jsonl.tmp", .{}));
     // Unrelated session's tmp must NOT be touched.
-    _ = try tmp.dir.statFile(std.testing.io, tmp.dir, .{});
+    _ = try tmp.dir.statFile(std.testing.io, "other.meta.json.tmp", .{});
 }
 
 test "recoverSessionFiles reports line count for count reconciliation" {
@@ -2495,7 +2495,7 @@ test "recoverSessionFiles reports line count for count reconciliation" {
     const jsonl_body = "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n{\"d\":4}\n";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sess.jsonl", .data = jsonl_body });
 
-    var iter_dir = try tmp.dir.tmp.dir(std.testing.io, ".", .{ .iterate = true });
+    var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close();
 
     const report = try recoverSessionFiles(iter_dir, "sess", allocator);

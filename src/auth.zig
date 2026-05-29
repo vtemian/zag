@@ -729,7 +729,7 @@ test "saveAuthFile is atomic under simulated crash" {
 
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.statFile(std.testing.io, tmp.dir, .{}),
+        tmp.dir.statFile(std.testing.io, "auth.json.tmp", .{}),
     );
 }
 

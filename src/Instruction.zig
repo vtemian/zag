@@ -203,7 +203,7 @@ test "systemPaths returns only existing paths" {
 
     // Create only ~/.claude/CLAUDE.md.
     try tmp.dir.createDirPath(std.testing.io, ".claude");
-    try writeFile(try tmp.dir.tmp.dir(std.testing.io, ".claude", .{}), "CLAUDE.md", "global claude");
+    try writeFile(try tmp.dir.openDir(std.testing.io, ".claude", .{}), "CLAUDE.md", "global claude");
     {
         const paths = try systemPaths(home, testing.allocator);
         defer freeSystemPaths(paths, testing.allocator);
@@ -213,7 +213,7 @@ test "systemPaths returns only existing paths" {
 
     // Add ~/.config/zag/AGENTS.md too; both should appear in declared order.
     try tmp.dir.createDirPath(std.testing.io, ".config/zag");
-    try writeFile(try tmp.dir.tmp.dir(std.testing.io, ".config/zag", .{}), "AGENTS.md", "global zag");
+    try writeFile(try tmp.dir.openDir(std.testing.io, ".config/zag", .{}), "AGENTS.md", "global zag");
     {
         const paths = try systemPaths(home, testing.allocator);
         defer freeSystemPaths(paths, testing.allocator);
@@ -309,7 +309,7 @@ test "findUp first-hit: nested AGENTS.md beats ancestor AGENTS.md" {
     defer tmp.cleanup();
     try writeFile(tmp.dir, "AGENTS.md", "ancestor");
     try tmp.dir.createDirPath(std.testing.io, "nested");
-    try writeFile(try tmp.dir.tmp.dir(std.testing.io, "nested", .{}), "AGENTS.md", "nested");
+    try writeFile(try tmp.dir.openDir(std.testing.io, "nested", .{}), "AGENTS.md", "nested");
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
     const cwd = try std.fs.path.join(testing.allocator, &.{ root, "nested" });
@@ -344,7 +344,7 @@ test "findUp skips files larger than MAX_BYTES" {
     // Write an oversized AGENTS.md plus a small CLAUDE.md fallback. The walk
     // should treat AGENTS.md as if absent and surface CLAUDE.md instead.
     {
-        var f = try tmp.dir.tmp.dir(std.testing.io, "AGENTS.md", .{});
+        var f = try tmp.dir.createFile(std.testing.io, "AGENTS.md", .{});
         defer f.close();
         const chunk = [_]u8{'x'} ** 4096;
         var written: usize = 0;

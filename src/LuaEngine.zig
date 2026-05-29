@@ -6739,8 +6739,8 @@ test "zag.fs.mkdir creates directories, parents=true handles nesting" {
     eng.lua.pop(1);
 
     // Verify both directories actually exist on disk.
-    try tmp.dir.tmp.dir(std.testing.io, "flat", .{});
-    try tmp.dir.tmp.dir(std.testing.io, "nested/inner/leaf", .{});
+    try tmp.dir.access(std.testing.io, "flat", .{});
+    try tmp.dir.access(std.testing.io, "nested/inner/leaf", .{});
 }
 
 test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
@@ -6788,8 +6788,8 @@ test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
     eng.lua.pop(1);
 
     // Nothing should remain at those paths.
-    try std.testing.expectError(error.FileNotFound, tmp.dir.tmp.dir(std.testing.io, "trash.txt", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.tmp.dir(std.testing.io, "tree", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "trash.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "tree", .{}));
 }
 
 test "zag.fs.list returns directory entries" {
@@ -6803,7 +6803,7 @@ test "zag.fs.list returns directory entries" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "one.txt", .data = "1" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "two.txt", .data = "2" });
-    try tmp.dir.createDir(std.testing.io, tmp.dir, .default_dir);
+    try tmp.dir.createDir(std.testing.io, "sub", .default_dir);
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
     const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
