@@ -1726,19 +1726,20 @@ pub fn openSessionPane(self: *WindowManager, id: []const u8) !Pane {
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
 
-    // Load the session AFTER the Conversation exists: loadEntries
-    // allocates an `Entry[]` we must free before returning regardless
-    // of success.
+    // Load the session AFTER the Conversation exists. The parsed Entry slice
+    // is transient: loadFromEntries copies every field into the conversation's
+    // own buffers, so nothing in the tree outlives it. Bump-allocate it in a
+    // scratch arena and drop the whole thing in one deinit rather than paying
+    // tens of thousands of individual alloc/free calls through the
+    // general-purpose allocator, which dominated large-session opens.
     const sh = try self.allocator.create(Session.SessionHandle);
     errdefer self.allocator.destroy(sh);
     sh.* = try mgr.loadSession(id);
     errdefer sh.close();
 
-    const entries = try Session.loadEntries(id, self.allocator);
-    defer {
-        for (entries) |entry| Session.freeEntry(entry, self.allocator);
-        self.allocator.free(entries);
-    }
+    var load_arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer load_arena.deinit();
+    const entries = try Session.loadEntries(id, load_arena.allocator());
     try cb.loadFromEntries(entries);
     cb.attachSession(sh);
 
@@ -2217,11 +2218,14 @@ pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Alloca
     const view = pane.conversation orelse return error.NotAnAgentPane;
 
     const session_id = handle.id[0..handle.id_len];
-    const entries = try Session.loadEntries(session_id, allocator);
-    defer {
-        for (entries) |entry| Session.freeEntry(entry, allocator);
-        allocator.free(entries);
-    }
+
+    // The parsed Entry slice is transient (loadFromEntries copies every field
+    // into the conversation's own buffers), so bump-allocate it in a scratch
+    // arena and free it all at once instead of per-entry through the
+    // general-purpose allocator. See openSessionPane for the rationale.
+    var load_arena = std.heap.ArenaAllocator.init(allocator);
+    defer load_arena.deinit();
+    const entries = try Session.loadEntries(session_id, load_arena.allocator());
 
     try view.loadFromEntries(entries);
     view.attachSession(handle);
