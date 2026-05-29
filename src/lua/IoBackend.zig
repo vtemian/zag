@@ -12,13 +12,13 @@ const Allocator = std.mem.Allocator;
 const Pool = @import("LuaIoPool.zig").Pool;
 const Queue = @import("LuaCompletionQueue.zig").Queue;
 
-pub const AsyncRuntime = struct {
+pub const IoBackend = struct {
     pool: *Pool,
     completions: *Queue,
     alloc: Allocator,
 
-    pub fn init(alloc: Allocator, num_workers: usize, capacity: usize) !*AsyncRuntime {
-        const self = try alloc.create(AsyncRuntime);
+    pub fn init(alloc: Allocator, num_workers: usize, capacity: usize) !*IoBackend {
+        const self = try alloc.create(IoBackend);
         errdefer alloc.destroy(self);
 
         const completions = try alloc.create(Queue);
@@ -39,7 +39,7 @@ pub const AsyncRuntime = struct {
 
     /// Order matters: stop the pool first so workers stop pushing onto
     /// the completion queue before we tear the queue down.
-    pub fn deinit(self: *AsyncRuntime) void {
+    pub fn deinit(self: *IoBackend) void {
         self.pool.deinit();
         self.completions.deinit();
         self.alloc.destroy(self.completions);

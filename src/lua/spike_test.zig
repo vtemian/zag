@@ -3,7 +3,7 @@
 //! These exercise zlua coroutine semantics (resume / yield / xMove)
 //! directly against the C API rather than any single zag production
 //! module. They live here as a regression net pinning down the
-//! invariants the AsyncRuntime relies on; pairing them with a single
+//! invariants the IoBackend relies on; pairing them with a single
 //! production file would be arbitrary.
 
 const std = @import("std");

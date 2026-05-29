@@ -1,7 +1,7 @@
 //! End-to-end wiring tests for the Lua async runtime that cannot live
 //! inline.
 //!
-//! These exercise the LuaEngine + AsyncRuntime + IoPool +
+//! These exercise the LuaEngine + IoBackend + IoPool +
 //! CompletionQueue pipeline as a single integrated stack. Pairing the
 //! tests with any one of those modules would either pull the rest into
 //! that module's test scope (defeating module isolation) or duplicate
