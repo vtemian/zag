@@ -351,15 +351,15 @@ fn buildChildRegistry(
 /// empty audit row. The caller owns the returned slice and must free
 /// it with `allocator`.
 fn formatStartPayload(allocator: Allocator, agent_name: []const u8, prompt: []const u8) ![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    const w = list.writer(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
     try w.writeAll("{\"agent\":");
     try types.writeJsonString(w, agent_name);
     try w.writeAll(",\"prompt\":");
     try types.writeJsonString(w, prompt);
     try w.writeAll("}");
-    return list.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 fn formatUnknownAgent(
@@ -367,9 +367,9 @@ fn formatUnknownAgent(
     name: []const u8,
     subagents: *const @import("../subagents.zig").SubagentRegistry,
 ) ![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    const w = list.writer(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
     try w.print("error: unknown subagent '{s}'. Registered: ", .{name});
     if (subagents.entries.items.len == 0) {
         try w.writeAll("(none)");
@@ -379,7 +379,7 @@ fn formatUnknownAgent(
             try w.writeAll(entry.name);
         }
     }
-    return list.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// JSON schema and metadata sent to the LLM. The `agent` enum is built

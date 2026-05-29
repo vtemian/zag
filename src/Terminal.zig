@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const process_io = @import("process_io.zig");
 
 const log = std.log.scoped(.terminal);
 
@@ -232,7 +233,7 @@ fn writeEscapeSequence(seq: []const u8) !void {
     // 256 bytes: longest escape sequence we emit is ~30 bytes (mouse tracking
     // enable/disable pair). 256 gives generous headroom without touching the heap.
     var buf: [256]u8 = undefined;
-    var w = stdout.writer(&buf);
+    var w = stdout.writer(process_io.get(), &buf);
     try w.interface.writeAll(seq);
     try w.interface.flush();
 }

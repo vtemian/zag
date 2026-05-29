@@ -134,7 +134,7 @@ fn executeJob(alloc: Allocator, job: *Job) void {
                     job.err_tag = .cancelled;
                     return;
                 }
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                clock.sleep(10 * std.time.ns_per_ms);
             }
             job.result = .empty;
         },

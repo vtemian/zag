@@ -471,7 +471,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
 fn runWithProvider(deps: HeadlessDeps) !void {
     const gpa = deps.gpa;
 
-    const instruction = try std.fs.cwd().readFileAlloc(gpa, deps.mode.instruction_file, 1 << 20);
+    const instruction = try std.Io.Dir.cwd().readFileAlloc(process_io.get(), deps.mode.instruction_file, gpa, .limited(1 << 20));
     defer gpa.free(instruction);
 
     // Reproduce the agent loop's prompt assembly so the captured trajectory's

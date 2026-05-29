@@ -396,16 +396,20 @@ const SeatbeltInputs = struct {
 /// matters: deny rules placed AFTER an allow rule for an overlapping
 /// subpath override the allow.
 fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    // 0.16 dropped the ArrayList writer adapter; build the profile through an
+    // Allocating writer, which owns the growing buffer and hands back an owned
+    // slice at the end. A mid-build failure frees the buffer via errdefer.
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
-    try buf.appendSlice(allocator, "(version 1)\n");
-    try buf.appendSlice(allocator, "(deny default)\n");
-    try buf.appendSlice(allocator, "(allow process-fork)\n");
-    try buf.appendSlice(allocator, "(allow process-exec)\n");
-    try buf.appendSlice(allocator, "(allow signal (target self))\n");
-    try buf.appendSlice(allocator, "(allow sysctl-read)\n");
-    try buf.appendSlice(allocator, "(allow file-read-metadata)\n");
+    try w.writeAll("(version 1)\n");
+    try w.writeAll("(deny default)\n");
+    try w.writeAll("(allow process-fork)\n");
+    try w.writeAll("(allow process-exec)\n");
+    try w.writeAll("(allow signal (target self))\n");
+    try w.writeAll("(allow sysctl-read)\n");
+    try w.writeAll("(allow file-read-metadata)\n");
 
     // Read: broad allow on /, then deny secrets explicitly. The broad
     // allow is necessary because /bin/sh's dyld needs to read
@@ -413,32 +417,32 @@ fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![
     // and other paths an enumerated allow-list cannot reasonably cover.
     // Secrets are denied below; seatbelt evaluates rules top-to-bottom
     // and later rules override earlier ones.
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/\"))\n");
+    try w.writeAll("(allow file-read* (subpath \"/\"))\n");
 
     // Deny secrets (ordered AFTER the broad allow so they override).
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (literal \"{s}/.netrc\"))\n", .{inputs.home});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.config\"))\n", .{inputs.home});
-    try buf.appendSlice(allocator, "(deny file-read* (subpath \"/Library/Keychains\"))\n");
-    try buf.appendSlice(allocator, "(deny file-read* (subpath \"/private/etc/master.passwd\"))\n");
+    try w.print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{inputs.home});
+    try w.print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{inputs.home});
+    try w.print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{inputs.home});
+    try w.print("(deny file-read* (literal \"{s}/.netrc\"))\n", .{inputs.home});
+    try w.print("(deny file-read* (subpath \"{s}/.config\"))\n", .{inputs.home});
+    try w.writeAll("(deny file-read* (subpath \"/Library/Keychains\"))\n");
+    try w.writeAll("(deny file-read* (subpath \"/private/etc/master.passwd\"))\n");
 
     // Write: cwd, /tmp, plus the standard /dev sinks as literals.
-    try buf.writer(allocator).print("(allow file-write* (subpath \"{s}\"))\n", .{inputs.cwd});
-    try buf.appendSlice(allocator, "(allow file-write* (subpath \"/tmp\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (subpath \"/private/tmp\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/null\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/stdout\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/stderr\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/tty\"))\n");
+    try w.print("(allow file-write* (subpath \"{s}\"))\n", .{inputs.cwd});
+    try w.writeAll("(allow file-write* (subpath \"/tmp\"))\n");
+    try w.writeAll("(allow file-write* (subpath \"/private/tmp\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/null\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/stdout\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/stderr\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/tty\"))\n");
 
     // Network: loopback only. sandbox-exec accepts only `*` or `localhost`
     // as the host literal in (remote ip ...); numeric IPs make the entire
     // profile parse-fail, so we keep just the symbolic localhost rule.
-    try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"localhost:*\"))\n");
+    try w.writeAll("(allow network-outbound (remote ip \"localhost:*\"))\n");
 
-    return buf.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 test {
