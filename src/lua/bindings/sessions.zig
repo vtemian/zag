@@ -534,6 +534,12 @@ fn zagSessionsOpenFn(lua: *Lua) i32 {
     const id = lua.toString(1) catch {
         lua.raiseErrorStr("zag.sessions.open: id must be a string", .{});
     };
+    // Validate the id here rather than relying on `splitFocusedWithSession`
+    // surfacing `error.InvalidSessionId`: 0.16's stricter inferred-error-set
+    // resolution does not expose that deeply-nested error to this call site.
+    if (!Session.isValidSessionId(id)) {
+        lua.raiseErrorStr("zag.sessions.open: invalid session id", .{});
+    }
 
     // When the caller hands us a project_path (the sidebar does, every
     // row carries one) we verify it matches the cwd realpath. Sessions
@@ -559,7 +565,6 @@ fn zagSessionsOpenFn(lua: *Lua) i32 {
     }
 
     _ = wm.splitFocusedWithSession(id) catch |err| switch (err) {
-        error.InvalidSessionId => lua.raiseErrorStr("zag.sessions.open: invalid session id", .{}),
         error.SessionManagerUnavailable => lua.raiseErrorStr("zag.sessions.open: persistence disabled", .{}),
         else => {
             var buf: [128]u8 = undefined;

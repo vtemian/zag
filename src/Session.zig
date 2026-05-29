@@ -192,7 +192,7 @@ fn isZeroUlid(id: ulid.Ulid) bool {
 /// name a parent directory. `createSession` generates ids from `generateId`
 /// (hex digits only), so this guard is for callers that arrived from a
 /// less-trusted surface (Lua bindings, future IPC).
-fn isValidSessionId(id: []const u8) bool {
+pub fn isValidSessionId(id: []const u8) bool {
     if (id.len == 0) return false;
     if (id.len > 32) return false;
     for (id) |c| {
