@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.agent_runner);
 const Conversation = @import("Conversation.zig");
+const Session = @import("Session.zig");
 const agent_events = @import("agent_events.zig");
 const agent = @import("agent.zig");
 const LuaEngine = @import("LuaEngine.zig").LuaEngine;
@@ -505,34 +506,12 @@ fn threadMain(
         // queue counter and `.done` is still pushed so the UI returns to
         // idle rather than getting stuck.
         const message = formatAgentErrorMessage(err, model_spec.provider_name, allocator, &detail) catch {
-            conversation.setSessionStatus(.failed) catch |status_err| {
-                log.warn("failed to set session status to failed: {s}", .{@errorName(status_err)});
-            };
-            if (lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .session_list_changed = .{
-                    .change = .status_changed,
-                    .session_id = conversation.session_handle.?.meta.idSlice(),
-                } };
-                _ = eng.fireHook(&payload) catch |hook_err| {
-                    log.warn("SessionListChanged hook fire failed: {s}", .{@errorName(hook_err)});
-                };
-            }
+            announceSessionStatus(lua_engine, conversation, .failed);
             _ = queue.dropped.fetchAdd(1, .monotonic);
             queue.tryPush(allocator, .done);
             return;
         };
-        conversation.setSessionStatus(.failed) catch |status_err| {
-            log.warn("failed to set session status to failed: {s}", .{@errorName(status_err)});
-        };
-        if (lua_engine) |eng| {
-            var payload: Hooks.HookPayload = .{ .session_list_changed = .{
-                .change = .status_changed,
-                .session_id = conversation.session_handle.?.meta.idSlice(),
-            } };
-            _ = eng.fireHook(&payload) catch |hook_err| {
-                log.warn("SessionListChanged hook fire failed: {s}", .{@errorName(hook_err)});
-            };
-        }
+        announceSessionStatus(lua_engine, conversation, .failed);
         queue.tryPush(allocator, .{ .err = message });
     };
     queue.tryPush(allocator, .done);
@@ -585,20 +564,34 @@ pub fn droppedEventCount(self: *const AgentRunner) u64 {
 /// does not spawn the agent thread; the orchestrator calls this
 /// method and then decides whether to start the agent.
 pub fn submitInput(self: *AgentRunner, text: []const u8) !void {
-    self.conversation.setSessionStatus(.working) catch |err| {
-        log.warn("failed to set session status to working: {s}", .{@errorName(err)});
-    };
-    if (self.lua_engine) |eng| {
-        var payload: Hooks.HookPayload = .{ .session_list_changed = .{
-            .change = .status_changed,
-            .session_id = self.conversation.session_handle.?.meta.idSlice(),
-        } };
-        _ = eng.fireHook(&payload) catch |hook_err| {
-            log.warn("SessionListChanged hook fire failed: {s}", .{@errorName(hook_err)});
-        };
-    }
+    announceSessionStatus(self.lua_engine, self.conversation, .working);
     self.conversation.persistUserMessage(text);
     self.sink.push(.{ .run_start = .{ .user_text = text } });
+}
+
+/// Update the conversation's session status and notify the sidebar via a
+/// `SessionListChanged{status_changed}` hook. The hook fire is skipped
+/// when there is no attached session handle (headless `--no-session`) or
+/// no Lua engine, so the status transition never dereferences a null
+/// handle on those paths. Shared by `submitInput`, the agent thread's
+/// error path, and the `done`/`err` drain arms.
+fn announceSessionStatus(
+    lua_engine: ?*LuaEngine,
+    conversation: *Conversation,
+    status: Session.SessionStatus,
+) void {
+    conversation.setSessionStatus(status) catch |err| {
+        log.warn("failed to set session status to {s}: {s}", .{ status.toSlice(), @errorName(err) });
+    };
+    const sh = conversation.session_handle orelse return;
+    const eng = lua_engine orelse return;
+    var payload: Hooks.HookPayload = .{ .session_list_changed = .{
+        .change = .status_changed,
+        .session_id = sh.meta.idSlice(),
+    } };
+    _ = eng.fireHook(&payload) catch |hook_err| {
+        log.warn("SessionListChanged hook fire failed: {s}", .{@errorName(hook_err)});
+    };
 }
 
 /// Service one round-trip request event end-to-end: invoke the engine
@@ -1104,18 +1097,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 };
             }
             self.sink.push(.run_end);
-            self.conversation.setSessionStatus(.idle) catch |err| {
-                log.warn("failed to set session status to idle: {s}", .{@errorName(err)});
-            };
-            if (self.lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .session_list_changed = .{
-                    .change = .status_changed,
-                    .session_id = self.conversation.session_handle.?.meta.idSlice(),
-                } };
-                _ = eng.fireHook(&payload) catch |hook_err| {
-                    log.warn("SessionListChanged hook fire failed: {s}", .{@errorName(hook_err)});
-                };
-            }
+            announceSessionStatus(self.lua_engine, self.conversation, .idle);
         },
         .reset_assistant_text => self.sink.push(.assistant_reset),
         .err => |text| {
@@ -1128,18 +1110,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 };
             }
             self.sink.push(.{ .error_event = .{ .text = text } });
-            self.conversation.setSessionStatus(.failed) catch |err| {
-                log.warn("failed to set session status to failed: {s}", .{@errorName(err)});
-            };
-            if (self.lua_engine) |eng| {
-                var payload: Hooks.HookPayload = .{ .session_list_changed = .{
-                    .change = .status_changed,
-                    .session_id = self.conversation.session_handle.?.meta.idSlice(),
-                } };
-                _ = eng.fireHook(&payload) catch |hook_err| {
-                    log.warn("SessionListChanged hook fire failed: {s}", .{@errorName(hook_err)});
-                };
-            }
+            announceSessionStatus(self.lua_engine, self.conversation, .failed);
         },
         // Round-trip request variants are handled by the early
         // `serviceRoundTripEvent` call at the top of this function; the
