@@ -1305,6 +1305,25 @@ fn readPathField(scanner: *std.json.Scanner, allocator: Allocator) !?[]const u32
     return try list.toOwnedSlice(allocator);
 }
 
+/// Assign an owned string field, releasing any value a prior occurrence of
+/// the same key already stored. A well-formed JSONL line names each field
+/// once, but a duplicate key would otherwise overwrite (and leak) the first
+/// allocation; the old DOM reader was immune because `parsed.deinit` freed
+/// the whole document. `new_val` is taken verbatim (its ownership transfers
+/// to `slot`); call this only after the read that produced it succeeded so a
+/// failed read leaves `slot` for the function-level errdefer to release once.
+fn takeOwned(allocator: Allocator, slot: *[]const u8, new_val: ?[]u8) void {
+    if (slot.len > 0) allocator.free(slot.*);
+    slot.* = new_val orelse "";
+}
+
+/// Optional-field variant of `takeOwned`: null when the value was absent or
+/// not a string, freeing any prior allocation first.
+fn takeOwnedOpt(allocator: Allocator, slot: *?[]const u8, new_val: ?[]u8) void {
+    if (slot.*) |old| allocator.free(old);
+    slot.* = new_val;
+}
+
 /// Parse a single JSONL line into an Entry. Allocates string fields with
 /// `allocator`; the caller frees them via `freeEntry`. Streams the line with
 /// a `std.json.Scanner` rather than building a `std.json.Value` DOM, which
@@ -1372,11 +1391,11 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
             defer allocator.free(s);
             entry_type = EntryType.fromSlice(s) orelse return error.UnknownEntryType;
         } else if (std.mem.eql(u8, key, "content")) {
-            content = (try readStringField(&scanner, allocator)) orelse "";
+            takeOwned(allocator, &content, try readStringField(&scanner, allocator));
         } else if (std.mem.eql(u8, key, "tool_name")) {
-            tool_name = (try readStringField(&scanner, allocator)) orelse "";
+            takeOwned(allocator, &tool_name, try readStringField(&scanner, allocator));
         } else if (std.mem.eql(u8, key, "tool_input")) {
-            tool_input = (try readStringField(&scanner, allocator)) orelse "";
+            takeOwned(allocator, &tool_input, try readStringField(&scanner, allocator));
         } else if (std.mem.eql(u8, key, "is_error")) {
             is_error = try readBoolField(&scanner, allocator, false);
         } else if (std.mem.eql(u8, key, "ts")) {
@@ -1392,16 +1411,18 @@ fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
                 parent_id = ulid.parse(s) catch null;
             }
         } else if (std.mem.eql(u8, key, "signature")) {
-            signature = try readStringField(&scanner, allocator);
+            takeOwnedOpt(allocator, &signature, try readStringField(&scanner, allocator));
         } else if (std.mem.eql(u8, key, "thinking_provider")) {
-            thinking_provider = try readStringField(&scanner, allocator);
+            takeOwnedOpt(allocator, &thinking_provider, try readStringField(&scanner, allocator));
         } else if (std.mem.eql(u8, key, "encrypted_data")) {
-            encrypted_data = try readStringField(&scanner, allocator);
+            takeOwnedOpt(allocator, &encrypted_data, try readStringField(&scanner, allocator));
         } else if (std.mem.eql(u8, key, "tool_use_id")) {
-            tool_use_id = try readStringField(&scanner, allocator);
+            takeOwnedOpt(allocator, &tool_use_id, try readStringField(&scanner, allocator));
         } else if (std.mem.eql(u8, key, "subagent_path")) {
             saw_subagent_path = true;
-            subagent_path = try readPathField(&scanner, allocator);
+            const v = try readPathField(&scanner, allocator);
+            if (subagent_path) |old| allocator.free(old);
+            subagent_path = v;
         } else if (std.mem.eql(u8, key, "subagent_id")) {
             const n = try readIntField(&scanner, allocator, -1);
             if (n >= 0 and n <= std.math.maxInt(u32)) legacy_subagent_id = @intCast(n);
@@ -1643,6 +1664,27 @@ test "parseEntry tolerates wrong-typed fields by falling back to defaults" {
     try std.testing.expectEqualStrings("", parsed.tool_name);
     try std.testing.expectEqual(false, parsed.is_error);
     try std.testing.expectEqual(@as(i64, 0), parsed.timestamp);
+}
+
+test "parseEntry frees the prior value on a duplicate key (no leak, last wins)" {
+    const allocator = std.testing.allocator;
+
+    // A malformed-but-valid-JSON line repeating owning keys. The reader takes
+    // the last occurrence (matching the old DOM's use_last) and MUST free the
+    // earlier allocation: std.testing.allocator fails this test on a leak,
+    // which is exactly what the pre-fix overwrite-without-free path did.
+    const line =
+        "{\"type\":\"assistant_text\"," ++
+        "\"content\":\"first\",\"content\":\"second\"," ++
+        "\"signature\":\"sig1\",\"signature\":\"sig2\",\"ts\":3}";
+
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.assistant_text, parsed.entry_type);
+    try std.testing.expectEqualStrings("second", parsed.content);
+    try std.testing.expect(parsed.signature != null);
+    try std.testing.expectEqualStrings("sig2", parsed.signature.?);
 }
 
 test "serializeEntry with tool fields" {
