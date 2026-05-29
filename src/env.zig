@@ -37,3 +37,17 @@ pub fn getOwned(allocator: Allocator, key: []const u8) GetOwnedError![]u8 {
     const value = get(key) orelse return error.EnvironmentVariableNotFound;
     return allocator.dupe(u8, value);
 }
+
+/// A fresh `Environ.Map` seeded with a copy of the process environment.
+/// Drop-in for the removed `std.process.getEnvMap`: the returned map owns its
+/// key/value copies under `allocator`, so callers may overlay extra entries
+/// before handing it to `std.process.spawn`. Caller deinits (or relies on an
+/// arena). An empty map is returned if `init` was never called.
+pub fn dupeMap(allocator: Allocator) Allocator.Error!std.process.Environ.Map {
+    var out: std.process.Environ.Map = .init(allocator);
+    errdefer out.deinit();
+    const m = map orelse return out;
+    var it = m.iterator();
+    while (it.next()) |e| try out.put(e.key_ptr.*, e.value_ptr.*);
+    return out;
+}

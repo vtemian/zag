@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const sync = @import("sync.zig");
+const process_io = @import("process_io.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const llm = @import("llm.zig");
@@ -150,6 +151,8 @@ pub fn main(start: std.process.Init) !void {
     // Install the process io for the sync primitives (sync.Mutex/Condition/
     // ResetEvent) before any locking thread is spawned.
     sync.setIo(io);
+    // Same io, exposed for the shallow fs helpers that have no io in scope.
+    process_io.init(io);
 
     // Borrowed process environment (non-global in 0.16). Captured once in the
     // env module so deep, io-free call sites can read it via `env.get` /

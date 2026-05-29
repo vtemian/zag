@@ -17,6 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const process_io = @import("process_io.zig");
 const log = std.log.scoped(.instruction);
 
 /// Hard cap on instruction file size. Prevents accidental ingestion of huge
@@ -60,7 +61,7 @@ pub fn systemPaths(home: []const u8, alloc: Allocator) ![]const []const u8 {
     for (candidates) |segments| {
         const path = try std.fs.path.join(alloc, segments);
         errdefer alloc.free(path);
-        std.fs.accessAbsolute(path, .{}) catch {
+        std.Io.Dir.accessAbsolute(process_io.get(), path, .{}) catch {
             alloc.free(path);
             continue;
         };
@@ -124,11 +125,12 @@ fn trimTrailingSep(path: []const u8) []const u8 {
 }
 
 fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?Found {
+    const io = process_io.get();
     for (names) |name| {
         const path = try std.fs.path.join(alloc, &.{ dir_abs, name });
         errdefer alloc.free(path);
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.IsDir, error.NotDir => {
                 alloc.free(path);
                 continue;
@@ -143,9 +145,9 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
                 return err;
             },
         };
-        defer file.close();
+        defer file.close(io);
 
-        const stat = file.stat() catch |err| {
+        const stat = file.stat(io) catch |err| {
             log.warn("stat {s} failed: {}", .{ path, err });
             alloc.free(path);
             continue;
@@ -159,7 +161,9 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
             continue;
         }
 
-        const content = file.readToEndAlloc(alloc, MAX_BYTES) catch |err| switch (err) {
+        var read_buf: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buf);
+        const content = file_reader.interface.allocRemaining(alloc, .limited(MAX_BYTES)) catch |err| switch (err) {
             error.OutOfMemory => {
                 alloc.free(path);
                 return err;

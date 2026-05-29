@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const Allocator = std.mem.Allocator;
 
 const oauth = @import("oauth.zig");
@@ -201,10 +202,12 @@ pub fn checkFileMode(mode: std.posix.mode_t) bool {
 /// Load the auth file at `path`. A missing file returns an empty `AuthFile`
 /// (first-run UX). Any other IO or parse failure surfaces as an error.
 pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
     // Stat first so we can warn on wrong mode without failing the load.
     // Windows has no POSIX mode bits, so skip the check there.
     if (@import("builtin").os.tag != .windows) {
-        if (std.fs.cwd().statFile(path)) |stat| {
+        if (cwd.statFile(io, path, .{})) |stat| {
             const mode: std.posix.mode_t = @intCast(stat.mode & 0o7777);
             if (!checkFileMode(mode)) {
                 log.warn("auth file at '{s}' has mode 0o{o} (expected 0o600); credentials may be readable by other users", .{ path, mode });
@@ -218,7 +221,7 @@ pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
         }
     }
 
-    const bytes = std.fs.cwd().readFileAlloc(alloc, path, max_auth_bytes) catch |err| switch (err) {
+    const bytes = cwd.readFileAlloc(io, path, alloc, .limited(max_auth_bytes)) catch |err| switch (err) {
         error.FileNotFound => return AuthFile.init(alloc),
         else => return err,
     };
@@ -295,8 +298,10 @@ fn stringField(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
 /// (mirroring `Session.zig`) so a mid-write crash can never leave a
 /// partially-written `auth.json`.
 pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+        cwd.createDirPath(io, parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -306,31 +311,29 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch
         return error.PathTooLong;
 
-    const cwd = std.fs.cwd();
-
     // Belt-and-suspenders: a stale <path>.tmp from a prior crash would
     // otherwise inherit its old mode bits via O_CREAT|O_TRUNC. Unlinking
     // first guarantees a fresh 0o600 file. Combined with the rename-to-path
     // below, every save re-asserts 0o600 even when auth.json pre-exists with
     // laxer permissions (addressing the same concern as the POSIX fchmod
     // approach from wip/chatgpt-oauth 65a25e4).
-    cwd.deleteFile(tmp_path) catch |err| switch (err) {
+    cwd.deleteFile(io, tmp_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 
     {
-        const tmp_file = try cwd.createFile(tmp_path, .{ .mode = 0o600, .truncate = true });
-        defer tmp_file.close();
+        const tmp_file = try cwd.createFile(io, tmp_path, .{ .mode = 0o600, .truncate = true });
+        defer tmp_file.close(io);
 
         var scratch: [512]u8 = undefined;
-        var w = tmp_file.writer(&scratch);
+        var w = tmp_file.writer(io, &scratch);
         try writeAuthJson(&w.interface, file);
         try w.interface.flush();
-        try tmp_file.sync();
+        try tmp_file.sync(io);
     }
 
-    try cwd.rename(tmp_path, path);
+    try cwd.rename(tmp_path, cwd, path, io);
 }
 
 /// Emit `file` as a JSON object keyed by provider name. Order is the hash

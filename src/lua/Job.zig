@@ -40,7 +40,7 @@ pub const CmdExecSpec = struct {
     /// How to construct the child's environment.
     env_mode: CmdExecEnvMode = .inherit,
     /// Optional env overrides. Semantics depend on env_mode.
-    env_map: ?std.process.EnvMap = null,
+    env_map: ?std.process.Environ.Map = null,
     /// Bytes to write to the child's stdin before draining output. Borrowed
     /// from the caller. null means no stdin pipe is opened.
     stdin_bytes: ?[]const u8 = null,

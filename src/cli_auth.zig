@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const process_io = @import("process_io.zig");
 const llm = @import("llm.zig");
 const oauth = @import("oauth.zig");
 const auth_wizard = @import("auth_wizard.zig");
@@ -56,7 +57,7 @@ pub fn handleSubcommand(
         .allocator = allocator,
         .stdin = stdin,
         .stdout = stdout,
-        .is_tty = std.posix.isatty(posix.STDIN_FILENO),
+        .is_tty = (std.Io.File{ .handle = posix.STDIN_FILENO, .flags = .{ .nonblocking = false } }).isTty(process_io.get()) catch false,
         .auth_path = paths.auth_path,
         .config_path = paths.config_path,
         .scaffold_config = false,

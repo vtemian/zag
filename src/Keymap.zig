@@ -193,8 +193,8 @@ pub fn parseKeySpec(s: []const u8) ParseError!KeySpec {
 /// other forms use angle brackets ("<C-S-x>", "<Esc>", "<CR>", ...).
 /// Returns the slice of `buf` actually filled.
 pub fn formatKeySpec(buf: []u8, ev: input.KeyEvent) []const u8 {
-    var stream = std.io.fixedBufferStream(buf);
-    const w = stream.writer();
+    var stream = std.Io.Writer.fixed(buf);
+    const w = &stream;
 
     // Bare-char shortcut: a single printable ASCII char with no
     // modifiers round-trips through `parseKeySpec` as a bare char,
@@ -203,7 +203,7 @@ pub fn formatKeySpec(buf: []u8, ev: input.KeyEvent) []const u8 {
     if (!has_mods) switch (ev.key) {
         .char => |ch| if (ch >= 0x20 and ch < 0x7f and ch != ' ') {
             w.writeByte(@intCast(ch)) catch {};
-            return stream.getWritten();
+            return stream.buffered();
         },
         else => {},
     };
@@ -239,7 +239,7 @@ pub fn formatKeySpec(buf: []u8, ev: input.KeyEvent) []const u8 {
         .function => |n| std.fmt.format(w, "F{d}", .{n}) catch {},
     }
     w.writeAll(">") catch {};
-    return stream.getWritten();
+    return stream.buffered();
 }
 
 /// A single (mode, key-spec) -> action entry stored in the registry.

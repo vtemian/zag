@@ -14,6 +14,7 @@ const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const async_job = @import("../Job.zig");
 const cmd_handle_mod = @import("../primitives/cmd_handle.zig");
+const env_mod = @import("../../env.zig");
 
 const log = std.log.scoped(.lua);
 
@@ -90,7 +91,7 @@ fn zagCmdCallFn(co: *Lua) i32 {
     var max_output: usize = 10 * 1024 * 1024;
     var opts_stdin: ?[]const u8 = null;
     var opts_env_mode: async_job.CmdExecEnvMode = .inherit;
-    var opts_env: ?std.process.EnvMap = null;
+    var opts_env: ?std.process.Environ.Map = null;
 
     if (co.isTable(opts_idx)) {
         _ = co.getField(opts_idx, "cwd");
@@ -160,7 +161,7 @@ fn zagCmdCallFn(co: *Lua) i32 {
             // copies internally, and the arena owns the EnvMap's
             // backing storage. The worker never frees either; Task
             // cleanup deinits the arena after resumeFromJob.
-            opts_env = std.process.EnvMap.init(arena);
+            opts_env = std.process.Environ.Map.init(arena);
 
             const field_name: [:0]const u8 = if (has_env) "env" else "env_extra";
             _ = co.getField(opts_idx, field_name);
@@ -391,18 +392,17 @@ fn zagCmdSpawnFn(co: *Lua) i32 {
         }
 
         if (has_env or has_env_extra) {
-            var env_map = std.process.EnvMap.init(arena);
-            // env_extra overlays on top of the inherited env, so
-            // seed the map with the parent's environment first.
-            if (has_env_extra) {
-                var sys_env = std.process.getEnvMap(arena) catch {
+            // env_extra overlays on top of the inherited env, so seed the
+            // map with the parent's environment first; a plain `env` starts
+            // empty.
+            var env_map = if (has_env_extra)
+                env_mod.dupeMap(arena) catch {
                     arena_ptr.deinit();
                     engine.allocator.destroy(arena_ptr);
-                    co.raiseErrorStr("zag.cmd.spawn: getEnvMap failed", .{});
-                };
-                var sit = sys_env.iterator();
-                while (sit.next()) |e| env_map.put(e.key_ptr.*, e.value_ptr.*) catch {};
-            }
+                    co.raiseErrorStr("zag.cmd.spawn: dupeMap failed", .{});
+                }
+            else
+                std.process.Environ.Map.init(arena);
 
             const field_name: [:0]const u8 = if (has_env) "env" else "env_extra";
             _ = co.getField(opts_idx, field_name);
@@ -491,7 +491,7 @@ fn zagCmdKillFn(co: *Lua) i32 {
     };
 
     const pid: std.posix.pid_t = @intCast(pid_raw);
-    std.posix.kill(pid, signo) catch |err| {
+    std.posix.kill(pid, cmd_handle_mod.signalNumToSig(signo)) catch |err| {
         co.pushNil();
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrintZ(&buf, "{s}", .{@errorName(err)}) catch "kill failed";

@@ -95,7 +95,7 @@ pub const CmdHandle = struct {
     /// Stable storage for the EnvMap when the caller wires env/env_extra.
     /// Child.env_map holds a pointer into this field (not into the
     /// caller's stack frame), so the address must outlive the child.
-    env_map_storage: ?std.process.EnvMap = null,
+    env_map_storage: ?std.process.Environ.Map = null,
     /// Helper thread running `helperLoop`.
     helper: std.Thread,
 
@@ -137,7 +137,7 @@ pub const CmdHandle = struct {
     pub const SpawnOpts = struct {
         cwd: ?[]const u8 = null,
         env_mode: job_mod.CmdExecEnvMode = .inherit,
-        env_map: ?std.process.EnvMap = null,
+        env_map: ?std.process.Environ.Map = null,
         /// When true, stdout is a pipe and `:lines()` reads from it.
         /// When false (default), stdout is routed to `/dev/null` and
         /// `:lines()` surfaces `io_error: stdout not captured`. Keeping
@@ -267,7 +267,7 @@ pub const CmdHandle = struct {
     /// and we skip the kill entirely.
     fn runKill(self: *CmdHandle, signo: u8) void {
         if (self.state.load(.acquire) == .exited) return;
-        std.posix.kill(self.child.id, signo) catch |err| {
+        std.posix.kill(self.child.id, signalNumToSig(signo)) catch |err| {
             log.debug("cmd:kill helper kill failed: {s}", .{@errorName(err)});
         };
     }
@@ -679,31 +679,41 @@ pub const CmdHandle = struct {
 
 /// Parse a signal name string into a POSIX signal number. Accepts the
 /// common ones; anything else is rejected by the Lua binding.
+/// Maps a signal name to its numeric value. 0.16's `std.posix.SIG` is an
+/// enum (`c.SIG__enum_NNNN`) rather than an integer constant, so the values
+/// are unwrapped to `u8` here for storage on the worker queue; the syscall
+/// re-wraps them via `@enumFromInt` (see `signalNumToSig`).
 pub fn signalNameToNum(name: []const u8) ?u8 {
-    if (std.mem.eql(u8, name, "TERM")) return std.posix.SIG.TERM;
-    if (std.mem.eql(u8, name, "KILL")) return std.posix.SIG.KILL;
-    if (std.mem.eql(u8, name, "INT")) return std.posix.SIG.INT;
-    if (std.mem.eql(u8, name, "HUP")) return std.posix.SIG.HUP;
-    if (std.mem.eql(u8, name, "QUIT")) return std.posix.SIG.QUIT;
-    if (std.mem.eql(u8, name, "USR1")) return std.posix.SIG.USR1;
-    if (std.mem.eql(u8, name, "USR2")) return std.posix.SIG.USR2;
-    if (std.mem.eql(u8, name, "STOP")) return std.posix.SIG.STOP;
-    if (std.mem.eql(u8, name, "CONT")) return std.posix.SIG.CONT;
+    if (std.mem.eql(u8, name, "TERM")) return @intFromEnum(std.posix.SIG.TERM);
+    if (std.mem.eql(u8, name, "KILL")) return @intFromEnum(std.posix.SIG.KILL);
+    if (std.mem.eql(u8, name, "INT")) return @intFromEnum(std.posix.SIG.INT);
+    if (std.mem.eql(u8, name, "HUP")) return @intFromEnum(std.posix.SIG.HUP);
+    if (std.mem.eql(u8, name, "QUIT")) return @intFromEnum(std.posix.SIG.QUIT);
+    if (std.mem.eql(u8, name, "USR1")) return @intFromEnum(std.posix.SIG.USR1);
+    if (std.mem.eql(u8, name, "USR2")) return @intFromEnum(std.posix.SIG.USR2);
+    if (std.mem.eql(u8, name, "STOP")) return @intFromEnum(std.posix.SIG.STOP);
+    if (std.mem.eql(u8, name, "CONT")) return @intFromEnum(std.posix.SIG.CONT);
     return null;
+}
+
+/// Re-wrap a stored signal number into the `std.posix.SIG` enum that
+/// `std.posix.kill`/`raise` now require.
+pub fn signalNumToSig(signo: u8) std.posix.SIG {
+    return @enumFromInt(signo);
 }
 
 const testing = std.testing;
 
 test "signalNameToNum maps the common signals" {
-    try testing.expectEqual(@as(?u8, std.posix.SIG.TERM), signalNameToNum("TERM"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.KILL), signalNameToNum("KILL"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.INT), signalNameToNum("INT"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.HUP), signalNameToNum("HUP"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.QUIT), signalNameToNum("QUIT"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.USR1), signalNameToNum("USR1"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.USR2), signalNameToNum("USR2"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.STOP), signalNameToNum("STOP"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.CONT), signalNameToNum("CONT"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.TERM)), signalNameToNum("TERM"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.KILL)), signalNameToNum("KILL"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.INT)), signalNameToNum("INT"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.HUP)), signalNameToNum("HUP"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.QUIT)), signalNameToNum("QUIT"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.USR1)), signalNameToNum("USR1"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.USR2)), signalNameToNum("USR2"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.STOP)), signalNameToNum("STOP"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.CONT)), signalNameToNum("CONT"));
     try testing.expect(signalNameToNum("BOGUS") == null);
 }
 

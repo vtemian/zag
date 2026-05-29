@@ -7,6 +7,7 @@ const std = @import("std");
 const sync = @import("sync.zig");
 const env_mod = @import("env.zig");
 const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const ulid = @import("ulid.zig");
@@ -714,11 +715,12 @@ pub const SessionHandle = struct {
     /// Bypass paths (panic, SIGINT, OOM during deinit) skip this barrier;
     /// the trade-off documented in commit 2c3feb8 still applies.
     pub fn close(self: *SessionHandle) void {
-        self.file.sync() catch |e| {
+        const io = process_io.get();
+        self.file.sync(io) catch |e| {
             log.warn("session close: final fsync failed: {}", .{e});
         };
         self.fsync_count += 1;
-        self.file.close();
+        self.file.close(io);
     }
 
     /// Update the session status and persist the companion .meta.json file.
@@ -1126,7 +1128,12 @@ fn serializeEntry(entry: *Entry, out: *std.ArrayList(u8), allocator: Allocator) 
         entry.id = ulid.generate(clock.random());
     }
 
-    const w = out.writer(allocator);
+    // 0.16 dropped the ArrayList writer adapter. Drive the list through an
+    // Allocating writer, then sync the grown buffer back into `out` on every
+    // exit path (including errors) so the caller still owns the bytes it frees.
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, out);
+    defer out.* = aw.toArrayList();
+    const w = &aw.writer;
     try w.writeAll("{\"type\":\"");
     try w.writeAll(entry.entry_type.toSlice());
     try w.writeAll("\"");

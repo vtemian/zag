@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const clock = @import("../../clock.zig");
+const env_mod = @import("../../env.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -60,7 +61,7 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
     // lifetime must outlive `child.spawn` and the poll loop since
     // `child.env_map` borrows its storage. A single defer at function
     // scope handles cleanup on every return path.
-    var merged_env: ?std.process.EnvMap = null;
+    var merged_env: ?std.process.Environ.Map = null;
     defer if (merged_env) |*m| m.deinit();
 
     switch (spec.env_mode) {
@@ -70,16 +71,11 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
         },
         .extend => {
             if (spec.env_map) |extras| {
-                var sys_env = std.process.getEnvMap(alloc) catch |err| {
+                merged_env = env_mod.dupeMap(alloc) catch |err| {
                     job.err_tag = .io_error;
                     job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
                     return;
                 };
-                defer sys_env.deinit();
-
-                merged_env = std.process.EnvMap.init(alloc);
-                var it = sys_env.iterator();
-                while (it.next()) |e| merged_env.?.put(e.key_ptr.*, e.value_ptr.*) catch {};
                 var it2 = extras.iterator();
                 while (it2.next()) |e| merged_env.?.put(e.key_ptr.*, e.value_ptr.*) catch {};
 
