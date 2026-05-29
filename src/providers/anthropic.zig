@@ -323,14 +323,13 @@ fn writeMessage(model: []const u8, msg: types.Message, w: anytype) !void {
                 // a thinking block Anthropic rejects with HTTP 400.
                 if (th.provider != .anthropic) continue;
             },
-            .redacted_thinking => {
+            .redacted_thinking => |r| {
                 if (!emit_thinking) continue;
-                // Same gate: redacted_thinking carries encrypted_content
-                // that only the originating provider can validate. We
-                // have no provider field on this variant today; the
-                // safe default is to drop on cross-provider replay.
-                // When this gate causes a real loss of context, add a
-                // provider tag to RedactedThinking and gate on it.
+                // Same gate as .thinking: redacted_thinking carries
+                // ciphertext that only the originating provider can
+                // validate. Cross-provider history reaching here would
+                // draw an HTTP 400 if serialized, so drop it.
+                if (r.provider != .anthropic) continue;
             },
             else => {},
         }
@@ -382,56 +381,91 @@ fn writeMessage(model: []const u8, msg: types.Message, w: anytype) !void {
     try w.writeAll("]}");
 }
 
+/// Clamp a std.json i64 token count into the u32 usage field, flooring
+/// negatives and saturating overflow. Malformed providers occasionally
+/// report nonsense counts on an otherwise-200 body; never panic on them.
+fn clampTokens(v: i64) u32 {
+    if (v <= 0) return 0;
+    if (v > std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(v);
+}
+
 /// Parses a raw JSON response from the Anthropic API into a typed LlmResponse.
 /// Allocates content block strings (text, id, name, input_raw) that the caller must free.
+///
+/// This is the non-streaming fallback path that runs when streaming fails, so a
+/// malformed-but-HTTP-200 body must surface as error.MalformedResponse rather
+/// than panic. Every field read is guarded the same way the streaming parser
+/// (`processSseEvent`) guards its reads.
 pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.LlmResponse {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_bytes, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.MalformedResponse;
     const root = parsed.value.object;
 
-    // Parse stop_reason
-    const stop_reason_value = root.get("stop_reason").?.string;
-    const stop_reason: types.StopReason = if (std.mem.eql(u8, stop_reason_value, "end_turn"))
-        .end_turn
-    else if (std.mem.eql(u8, stop_reason_value, "tool_use"))
-        .tool_use
-    else if (std.mem.eql(u8, stop_reason_value, "max_tokens"))
-        .max_tokens
-    else
-        .end_turn;
+    // Parse stop_reason. Absent or non-string maps to end_turn, matching the
+    // historical unknown-stop_reason fallthrough.
+    const stop_reason: types.StopReason = blk: {
+        const sr = root.get("stop_reason") orelse break :blk .end_turn;
+        if (sr != .string) break :blk .end_turn;
+        if (std.mem.eql(u8, sr.string, "tool_use")) break :blk .tool_use;
+        if (std.mem.eql(u8, sr.string, "max_tokens")) break :blk .max_tokens;
+        break :blk .end_turn;
+    };
 
     // Parse usage
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
     var cache_creation_tokens: u32 = 0;
     var cache_read_tokens: u32 = 0;
-    if (root.get("usage")) |usage| {
+    if (root.get("usage")) |usage| if (usage == .object) {
         const usage_obj = usage.object;
-        if (usage_obj.get("input_tokens")) |it| input_tokens = @intCast(it.integer);
-        if (usage_obj.get("output_tokens")) |ot| output_tokens = @intCast(ot.integer);
-        if (usage_obj.get("cache_creation_input_tokens")) |v| cache_creation_tokens = @intCast(v.integer);
-        if (usage_obj.get("cache_read_input_tokens")) |v| cache_read_tokens = @intCast(v.integer);
-    }
+        if (usage_obj.get("input_tokens")) |it| if (it == .integer) {
+            input_tokens = clampTokens(it.integer);
+        };
+        if (usage_obj.get("output_tokens")) |ot| if (ot == .integer) {
+            output_tokens = clampTokens(ot.integer);
+        };
+        if (usage_obj.get("cache_creation_input_tokens")) |v| if (v == .integer) {
+            cache_creation_tokens = clampTokens(v.integer);
+        };
+        if (usage_obj.get("cache_read_input_tokens")) |v| if (v == .integer) {
+            cache_read_tokens = clampTokens(v.integer);
+        };
+    };
 
     // Parse content blocks
-    const content = root.get("content").?.array;
+    const content_value = root.get("content") orelse return error.MalformedResponse;
+    if (content_value != .array) return error.MalformedResponse;
+    const content = content_value.array;
+
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
 
     for (content.items) |item| {
+        if (item != .object) continue;
         const obj = item.object;
-        const block_type = obj.get("type").?.string;
+        const type_value = obj.get("type") orelse continue;
+        if (type_value != .string) continue;
+        const block_type = type_value.string;
 
         if (std.mem.eql(u8, block_type, "text")) {
-            try builder.addText(obj.get("text").?.string, allocator);
+            const text_value = obj.get("text") orelse continue;
+            if (text_value != .string) continue;
+            try builder.addText(text_value.string, allocator);
         } else if (std.mem.eql(u8, block_type, "tool_use")) {
+            const id_value = obj.get("id") orelse continue;
+            const name_value = obj.get("name") orelse continue;
+            const input_value = obj.get("input") orelse continue;
+            if (id_value != .string or name_value != .string) continue;
+
             // Serialize the input object back to JSON string
             var input_out: std.io.Writer.Allocating = .init(allocator);
-            try std.json.Stringify.value(obj.get("input").?, .{}, &input_out.writer);
+            try std.json.Stringify.value(input_value, .{}, &input_out.writer);
             const input_raw = try input_out.toOwnedSlice();
             defer allocator.free(input_raw);
 
-            try builder.addToolUse(obj.get("id").?.string, obj.get("name").?.string, input_raw, allocator);
+            try builder.addToolUse(id_value.string, name_value.string, input_raw, allocator);
         }
     }
 
@@ -1001,6 +1035,43 @@ test "parseResponse maps unknown stop_reason to end_turn" {
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(.end_turn, response.stop_reason);
+}
+
+test "parseResponse tolerates malformed 200 body without panicking" {
+    const allocator = std.testing.allocator;
+
+    // (a) Top-level JSON array (not an object) returns an error.
+    try std.testing.expectError(
+        error.MalformedResponse,
+        parseResponse("[1, 2, 3]", allocator),
+    );
+
+    // (b) A body missing the `content` field returns an error.
+    try std.testing.expectError(
+        error.MalformedResponse,
+        parseResponse(
+            \\{"id":"msg_1","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}
+        , allocator),
+    );
+
+    // (c) Garbage usage (input_tokens as a string, negative output_tokens) and
+    // an absent stop_reason parse without panicking: counts clamp to 0 and the
+    // stop_reason defaults to end_turn.
+    {
+        const json =
+            \\{
+            \\  "id": "msg_1",
+            \\  "content": [{"type": "text", "text": "hi"}],
+            \\  "usage": {"input_tokens": "lots", "output_tokens": -5}
+            \\}
+        ;
+        const response = try parseResponse(json, allocator);
+        defer response.deinit(allocator);
+
+        try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
+        try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
+        try std.testing.expectEqual(.end_turn, response.stop_reason);
+    }
 }
 
 test "buildRequestBody produces valid JSON" {
