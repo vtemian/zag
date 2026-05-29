@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
@@ -527,7 +528,7 @@ pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     try writeFormField(body_w, "code_verifier", p.verifier, false);
 
     // Send.
-    var client = std.http.Client{ .allocator = alloc };
+    var client = std.http.Client{ .allocator = alloc, .io = process_io.get() };
     defer client.deinit();
 
     var resp_aw: std.Io.Writer.Allocating = .init(alloc);
@@ -708,7 +709,7 @@ pub fn refreshAccessToken(alloc: Allocator, p: RefreshParams) !TokenResponse {
     const body_json = try std.json.Stringify.valueAlloc(alloc, body_obj, .{});
     defer alloc.free(body_json);
 
-    var client = std.http.Client{ .allocator = alloc };
+    var client = std.http.Client{ .allocator = alloc, .io = process_io.get() };
     defer client.deinit();
 
     var resp_aw: std.Io.Writer.Allocating = .init(alloc);
@@ -999,11 +1000,13 @@ pub fn runLoginFlowWithCodes(
     pkce: PkceCodes,
     state: []const u8,
 ) !void {
-    // 1) Bind the callback listener.
-    const addr = try std.net.Address.parseIp("127.0.0.1", opts.redirect_port);
-    var listener = try addr.listen(.{ .reuse_address = true });
-    defer listener.deinit();
-    const bound_port = listener.listen_address.getPort();
+    // 1) Bind the callback listener. 0.16 moved sockets under std.Io.net,
+    // so the listen/accept/read path all take the process io explicitly.
+    const io = process_io.get();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", opts.redirect_port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const bound_port = listener.socket.address.getPort();
 
     const redirect_uri = try std.fmt.allocPrint(
         alloc,
@@ -1030,7 +1033,7 @@ pub fn runLoginFlowWithCodes(
     // 3) Launch the browser unless tests opted out.
     if (!opts.skip_browser) {
         var stdout_buf: [1024]u8 = undefined;
-        var stdout_w = std.Io.File.stdout().writer(&stdout_buf);
+        var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
         stdout_w.interface.print(
             "Opening your browser to sign in. If it doesn't open, paste:\n  {s}\n\n",
             .{auth_url},
@@ -1042,14 +1045,14 @@ pub fn runLoginFlowWithCodes(
     }
 
     // 4) Accept exactly one inbound connection.
-    const conn = try listener.accept();
-    defer conn.stream.close();
+    const stream = try listener.accept(io);
+    defer stream.close(io);
 
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [8 * 1024]u8 = undefined;
-    var net_reader = conn.stream.reader(&read_buf);
-    var net_writer = conn.stream.writer(&write_buf);
-    var server = std.http.Server.init(net_reader.interface(), &net_writer.interface);
+    var net_reader = stream.reader(io, &read_buf);
+    var net_writer = stream.writer(io, &write_buf);
+    var server = std.http.Server.init(&net_reader.interface, &net_writer.interface);
     var request = try server.receiveHead();
 
     // 5) Parse /auth/callback?code=...&state=...

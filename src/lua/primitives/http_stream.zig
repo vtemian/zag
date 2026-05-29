@@ -22,6 +22,7 @@
 const std = @import("std");
 const sync = @import("../../sync.zig");
 const clock = @import("../../clock.zig");
+const process_io = @import("../../process_io.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -159,7 +160,7 @@ pub const HttpStreamHandle = struct {
             .completions = completions,
             .root_scope = root_scope,
             .arena = arena,
-            .client = .{ .allocator = alloc },
+            .client = .{ .allocator = alloc, .io = process_io.get() },
             .req = undefined,
             .body_reader = undefined,
             .status = 0,
@@ -206,7 +207,7 @@ pub const HttpStreamHandle = struct {
         self.helper = std.Thread.spawn(.{}, helperLoop, .{self}) catch {
             return error.IoError;
         };
-        self.helper.setName("zag.http_stream") catch |err| {
+        self.helper.setName(process_io.get(), "zag.http_stream") catch |err| {
             log.debug("http_stream helper setName failed: {s}", .{@errorName(err)});
         };
         return self;
@@ -443,7 +444,7 @@ pub const HttpStreamHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -469,7 +470,7 @@ pub const HttpStreamHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -497,8 +498,9 @@ pub const HttpStreamHandle = struct {
     fn shutdownSocket(self: *HttpStreamHandle) void {
         if (self.shutdown_done.swap(true, .acq_rel)) return;
         const conn = self.req.connection orelse return;
-        const stream = conn.stream_reader.getStream();
-        std.posix.shutdown(stream.handle, .both) catch |err| {
+        // 0.16 made getStream private; reach the Stream directly and use its
+        // io-aware shutdown rather than the removed std.posix.shutdown.
+        conn.stream_reader.stream.shutdown(process_io.get(), .both) catch |err| {
             log.debug("http_stream shutdown: {s}", .{@errorName(err)});
         };
     }
@@ -597,7 +599,7 @@ test "HttpStreamHandle close interrupts blocked helper read" {
             // as a read of 0 bytes. Sleep is the simplest way to say
             // "don't send anything else". Capped well above the 1s
             // deadline the test enforces.
-            std.Thread.sleep(10 * std.time.ns_per_s);
+            clock.sleep(10 * std.time.ns_per_s);
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -627,14 +629,14 @@ test "HttpStreamHandle close interrupts blocked helper read" {
             break;
         }
         if (clock.milliTimestamp() - poll_start > 2000) return error.TestTimedOutBeforeFirstLine;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
 
     // Kick a SECOND read_line. This one will block because the
     // server hasn't sent another line. The helper is now in a
     // blocked recv() inside body_reader.stream.
     try handle.submit(.{ .read_line = .{ .thread_ref = 43 } });
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    clock.sleep(50 * std.time.ns_per_ms);
 
     // The actual measurement: close() + shutdownAndCleanup() must
     // return in well under 1s. Without the socket shutdown the

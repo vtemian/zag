@@ -323,7 +323,7 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
     };
 
     {
-        const tmp_file = try cwd.createFile(io, tmp_path, .{ .mode = 0o600, .truncate = true });
+        const tmp_file = try cwd.createFile(io, tmp_path, .{ .permissions = .fromMode(0o600), .truncate = true });
         defer tmp_file.close(io);
 
         var scratch: [512]u8 = undefined;
@@ -406,21 +406,23 @@ pub fn upsertOAuth(alloc: Allocator, path: []const u8, name: []const u8, cred: O
     const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{path});
     defer alloc.free(lock_path);
 
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+        cwd.createDirPath(io, parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
 
-    const lock_file = try std.fs.cwd().createFile(lock_path, .{
+    const lock_file = try cwd.createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
-        .mode = 0o600,
+        .permissions = .fromMode(0o600),
     });
-    defer lock_file.close();
-    try lock_file.lock(.exclusive);
-    defer lock_file.unlock();
+    defer lock_file.close(io);
+    try lock_file.lock(io, .exclusive);
+    defer lock_file.unlock(io);
 
     var file = loadAuthFile(alloc, path) catch |err| switch (err) {
         error.FileNotFound => AuthFile.init(alloc),
