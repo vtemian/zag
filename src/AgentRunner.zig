@@ -176,16 +176,16 @@ pub fn shutdown(self: *AgentRunner) void {
         self.agent_thread = null;
     }
     if (self.queue_active) {
-        // The agent thread queues payloads allocated through
-        // `wire_arena` (see `submit`), so freeing them through
-        // `self.allocator` (the gpa) is cross-allocator UB and trips
-        // the DebugAllocator's canary check as "Invalid free" during
-        // quit-time drain. Mirror `drainEvents`' allocator pick: route
-        // through the arena when one is live (arena free is a no-op;
-        // the bytes get reclaimed by the arena.deinit in `deinit`),
-        // and only fall back to `self.allocator` for tests that
-        // scaffold queue_active without going through `submit`.
-        const drain_alloc: Allocator = if (self.wire_arena) |*arena|
+        // Residual queued events have mixed ownership: streaming deltas
+        // are arena-owned while the full tool_start / tool_result are
+        // gpa-owned (see `streamEventToQueue` vs `runToolStep`). Free each
+        // arm at its true source via `freeOwnedMixed` so gpa-owned tool
+        // payloads are reclaimed instead of leaked through an arena no-op,
+        // and arena memory is never gpa-freed (which would trip the
+        // DebugAllocator "Invalid free" canary). The arena is the
+        // wire_arena when live, falling back to `self.allocator` for tests
+        // that scaffold queue_active without going through `submit`.
+        const drain_arena: Allocator = if (self.wire_arena) |*arena|
             arena.allocator()
         else
             self.allocator;
@@ -195,7 +195,7 @@ pub fn shutdown(self: *AgentRunner) void {
             const drained = self.event_queue.drain(&scratch);
             if (drained == 0) break;
             for (scratch[0..drained]) |event| {
-                event.freeOwned(drain_alloc);
+                event.freeOwnedMixed(drain_arena, self.allocator);
                 freed += 1;
             }
         }
@@ -336,7 +336,6 @@ pub fn submit(
         if (deps.subagents != null) &self.task_ctx else null,
         &self.turn_in_progress,
         deps.session_id,
-        self.conversation,
     });
 }
 
@@ -448,7 +447,6 @@ fn threadMain(
     task_ctx: ?*const tools.TaskContext,
     turn_in_progress: *std.atomic.Value(bool),
     session_id: []const u8,
-    conversation: *Conversation,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -506,14 +504,16 @@ fn threadMain(
         // queue counter and `.done` is still pushed so the UI returns to
         // idle rather than getting stuck.
         const message = formatAgentErrorMessage(err, model_spec.provider_name, allocator, &detail) catch {
-            announceSessionStatus(lua_engine, conversation, .failed);
             _ = queue.dropped.fetchAdd(1, .monotonic);
             queue.tryPush(allocator, .done);
             return;
         };
-        announceSessionStatus(lua_engine, conversation, .failed);
         queue.tryPush(allocator, .{ .err = message });
     };
+    // Status transitions are announced from the main-thread drain arms
+    // (`.err` -> failed, `.done` -> idle) where the Lua VM lives. The
+    // agent thread must never fire a hook itself: Lua is pinned to the
+    // main thread and a hook fired here would race the VM.
     queue.tryPush(allocator, .done);
 }
 
@@ -1053,9 +1053,19 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             self.sink.push(.thinking_stop);
         },
         .tool_start => |ev| {
-            defer allocator.free(ev.name);
-            defer if (ev.input_raw) |raw| allocator.free(raw);
-            defer if (ev.call_id) |id| allocator.free(id);
+            // Two producers, two owners. The streaming preview (null
+            // call_id) is duped on the wire arena (the `allocator` arg by
+            // streamEventToQueue). The full pre-execution event (with
+            // call_id) is duped on queue.allocator (the gpa) by runToolStep
+            // so it survives parallel-worker arena teardown. Free each at
+            // its source: the queue's allocator is the authoritative owner
+            // while a run is active, with self.allocator as the
+            // no-active-queue fallback for direct-call tests.
+            const tool_owner = if (self.queue_active) self.event_queue.allocator else self.allocator;
+            const owner = if (ev.call_id == null) allocator else tool_owner;
+            defer owner.free(ev.name);
+            defer if (ev.input_raw) |raw| owner.free(raw);
+            defer if (ev.call_id) |id| owner.free(id);
             // A streaming-preview tool_start (null call_id) carries no id and
             // no input, so it cannot render usefully or pair with a result.
             // The full pre-execution tool_start (with call_id) is the
@@ -1069,8 +1079,12 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
             } });
         },
         .tool_result => |result| {
-            defer allocator.free(result.content);
-            defer if (result.call_id) |id| allocator.free(id);
+            // Always duped on queue.allocator (the gpa) by runToolStep,
+            // never the wire arena; free it there, not through the
+            // `allocator` arg.
+            const owner = if (self.queue_active) self.event_queue.allocator else self.allocator;
+            defer owner.free(result.content);
+            defer if (result.call_id) |id| owner.free(id);
             self.sink.push(.{ .tool_result = .{
                 .content = result.content,
                 .is_error = result.is_error,
@@ -1097,7 +1111,11 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent, allo
                 };
             }
             self.sink.push(.run_end);
-            announceSessionStatus(self.lua_engine, self.conversation, .idle);
+            // `.err` is drained just before `.done` in the same batch and
+            // already moved an errored turn to .failed; don't clobber that
+            // with .idle. Only a clean turn settles back to idle.
+            const errored = if (self.conversation.session_handle) |sh| sh.meta.status == .failed else false;
+            if (!errored) announceSessionStatus(self.lua_engine, self.conversation, .idle);
         },
         .reset_assistant_text => self.sink.push(.assistant_reset),
         .err => |text| {

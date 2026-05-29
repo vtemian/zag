@@ -892,18 +892,26 @@ fn writeWrappedTail(
         const w = cluster.width;
         if (w == 0) {
             if (cluster.base == '\n') {
-                row += 1;
-                col = start_col;
+                // Advance the logical row always, but the screen row only
+                // once we are past the skipped (scrolled-off) rows, so the
+                // visible tail starts at start_row instead of being pushed
+                // off the bottom of the prompt area.
                 current_row += 1;
-                if (row >= max_row) break;
+                col = start_col;
+                if (current_row > skip_rows) {
+                    row += 1;
+                    if (row >= max_row) break;
+                }
             }
             continue;
         }
         if (col + w > max_col) {
-            row += 1;
-            col = start_col;
             current_row += 1;
-            if (row >= max_row) break;
+            col = start_col;
+            if (current_row > skip_rows) {
+                row += 1;
+                if (row >= max_row) break;
+            }
             if (col + w > max_col) break;
         }
         if (current_row >= skip_rows) {
@@ -1044,7 +1052,12 @@ fn drawPanePrompt(
 
     // Cursor position within the visible tail.
     const cursor_rel = wrappedCursorPos(after_prompt, right_edge, draft, draft_cursor);
-    const cursor_row = start_row + cursor_rel.row - skip_rows;
+    // Guard the unsigned subtraction: a cursor pointing into a scrolled-off
+    // top row (cursor_rel.row < skip_rows) would underflow. Clamp to the
+    // first visible row; the `cursor_row >= start_row` gate below then hides
+    // a cursor that scrolled above the visible tail.
+    const visible_rel = if (cursor_rel.row > skip_rows) cursor_rel.row - skip_rows else 0;
+    const cursor_row = start_row + visible_rel;
     const cursor_col = cursor_rel.col;
     if (focused and input.mode == .insert and cursor_row >= start_row and cursor_row <= prompt_row and cursor_col < right_edge) {
         const cell = self.screen.getCell(cursor_row, cursor_col);
@@ -1262,6 +1275,25 @@ fn drawStatusLine(self: *Compositor, focused: *const Layout.LayoutNode, mode: Ke
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "writeWrappedTail shows the last rows of an overflowing draft at start_row" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 20, 6);
+    defer screen.deinit();
+
+    // Four logical rows into a 3-row window (max_row exclusive at 3) with
+    // skip_rows=1 must show the tail L1/L2/L3 at screen rows 0/1/2, dropping
+    // L0. Before the skip-advances-row fix, the visible rows were pushed
+    // past max_row and clipped to a fragment, leaving row 0 blank.
+    _ = writeWrappedTail(&screen, 0, 0, 3, 20, "L0\nL1\nL2\nL3", .{}, .default, 1);
+
+    try std.testing.expectEqual(@as(u21, 'L'), screen.getCell(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, '1'), screen.getCell(0, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'L'), screen.getCell(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, '2'), screen.getCell(1, 1).codepoint);
+    try std.testing.expectEqual(@as(u21, 'L'), screen.getCell(2, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, '3'), screen.getCell(2, 1).codepoint);
 }
 
 test "row_style override paints background bar without overwriting span fg" {

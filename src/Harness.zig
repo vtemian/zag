@@ -579,10 +579,17 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     };
                 },
                 .tool_start => |s| {
+                    // Mixed ownership: the streaming preview (null call_id)
+                    // dupes only `name` on the wire arena; the full event
+                    // (with call_id) dupes name/call_id/input_raw on
+                    // queue.allocator (the gpa) via runToolStep. Free each at
+                    // its source so the gpa-owned full event isn't leaked
+                    // through an arena no-op.
+                    const owner = if (s.call_id == null) event_alloc else gpa;
                     defer {
-                        event_alloc.free(s.name);
-                        if (s.call_id) |id| event_alloc.free(id);
-                        if (s.input_raw) |raw| event_alloc.free(raw);
+                        owner.free(s.name);
+                        if (s.call_id) |id| owner.free(id);
+                        if (s.input_raw) |raw| owner.free(raw);
                     }
                     const args_json = s.input_raw orelse "{}";
                     const tool_id = if (s.call_id) |id| id else blk: {
@@ -603,9 +610,11 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     };
                 },
                 .tool_result => |r| {
+                    // tool_result is always duped on queue.allocator (the
+                    // gpa) by runToolStep, never the wire arena.
                     defer {
-                        event_alloc.free(r.content);
-                        if (r.call_id) |id| event_alloc.free(id);
+                        gpa.free(r.content);
+                        if (r.call_id) |id| gpa.free(id);
                     }
                     // FIFO-match null-id results against the oldest outstanding
                     // synthetic id. Parallel calls without provider ids
