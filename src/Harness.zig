@@ -521,6 +521,21 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         .session_id = deps.session_id,
     });
 
+    // Stream-delta payloads (text, thinking, tool_start/result, info, err)
+    // are duped into the runner's wire_arena by the agent thread (see
+    // AgentRunner.submit), so they MUST be freed through that arena, not
+    // `gpa`. Mirror drainEvents/shutdown's allocator pick: arena free is a
+    // no-op and the bytes are reclaimed when the runner tears the arena
+    // down, whereas `gpa.free` on arena memory is cross-allocator UB that
+    // trips the DebugAllocator "Invalid free" canary mid-turn. Falls back
+    // to gpa only when no arena is live (tests that scaffold the queue
+    // without going through submit). The arena is stable for the whole
+    // drain because submit is called exactly once per headless run.
+    const event_alloc: std.mem.Allocator = if (deps.runner.wire_arena) |*arena|
+        arena.allocator()
+    else
+        gpa;
+
     // Synthetic ids for tool_start events without a provider-assigned call_id
     // (streaming previews). FIFO-correlated with tool_result events that also
     // lack an id.
@@ -558,16 +573,16 @@ fn runWithProvider(deps: HeadlessDeps) !void {
             deps.runner.persistAgentEvent(ev);
             switch (ev) {
                 .text_delta => |t| {
-                    defer gpa.free(t);
+                    defer event_alloc.free(t);
                     capture.addTextDelta(t) catch |err| {
                         log.warn("capture dropped text delta: {s}", .{@errorName(err)});
                     };
                 },
                 .tool_start => |s| {
                     defer {
-                        gpa.free(s.name);
-                        if (s.call_id) |id| gpa.free(id);
-                        if (s.input_raw) |raw| gpa.free(raw);
+                        event_alloc.free(s.name);
+                        if (s.call_id) |id| event_alloc.free(id);
+                        if (s.input_raw) |raw| event_alloc.free(raw);
                     }
                     const args_json = s.input_raw orelse "{}";
                     const tool_id = if (s.call_id) |id| id else blk: {
@@ -589,8 +604,8 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                 },
                 .tool_result => |r| {
                     defer {
-                        gpa.free(r.content);
-                        if (r.call_id) |id| gpa.free(id);
+                        event_alloc.free(r.content);
+                        if (r.call_id) |id| event_alloc.free(id);
                     }
                     // FIFO-match null-id results against the oldest outstanding
                     // synthetic id. Parallel calls without provider ids
@@ -610,7 +625,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     };
                 },
                 .info => |text| {
-                    defer gpa.free(text);
+                    defer event_alloc.free(text);
                 },
                 .usage => {
                     // Live output-token counter for the interactive working
@@ -622,7 +637,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     capture.endTurn(metrics) catch |err| {
                         log.warn("capture endTurn failed: {s}", .{@errorName(err)});
                     };
-                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(event_alloc);
                     if (deps.runner.agent_thread) |t| t.join();
                     deps.runner.agent_thread = null;
                     deps.runner.event_queue.deinit();
@@ -632,8 +647,8 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                 },
                 .err => |text| {
                     agent_err = gpa.dupe(u8, text) catch null;
-                    gpa.free(text);
-                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(gpa);
+                    event_alloc.free(text);
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(event_alloc);
                     capture.endTurn(.{}) catch {};
                     if (deps.runner.agent_thread) |t| t.join();
                     deps.runner.agent_thread = null;
@@ -648,7 +663,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     // deltas; the final compacted history is what the
                     // trajectory captures, not the intermediate
                     // summary tokens. Free and continue.
-                    gpa.free(text);
+                    event_alloc.free(text);
                 },
                 .compaction_event => {
                     // Telemetry-only structured event; trajectory
@@ -656,7 +671,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     // No allocations to free here.
                 },
                 .thinking_delta => |td| {
-                    defer gpa.free(td.text);
+                    defer event_alloc.free(td.text);
                     capture.addThinkingDelta(td.text) catch |err| {
                         log.warn("capture dropped thinking delta: {s}", .{@errorName(err)});
                     };
