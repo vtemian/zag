@@ -239,15 +239,19 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     const registrar = try std.Thread.spawn(.{}, Registrar.run, .{ &registry, &other_runner, &other_done, &registered });
 
     // The drain is still blocked (gate not set), yet the register must land.
-    // A 2s ceiling distinguishes "released the lock" from "deadlocked behind
-    // the join" without being flaky on a loaded CI box.
-    try registered.timedWait(2 * std.time.ns_per_s);
+    // Correctness comes from ordering, not magnitude: if the lock were held
+    // across the join, `registered` could only be set after `gate.set()` below,
+    // so any finite ceiling distinguishes "released the lock" from "deadlocked
+    // behind the join". The ceiling is only a liveness backstop, so keep it
+    // generous; a tight 2s value gets the test SIGKILL'd under heavy parallel
+    // builds when the spawned threads cannot schedule in time.
+    try registered.timedWait(30 * std.time.ns_per_s);
     registrar.join();
     try testing.expect(!drain_done.isSet()); // drainAll genuinely still stalled
 
     // Release the join; the child finishes, drainAll completes and removes it.
     gate.set();
-    try drain_done.timedWait(2 * std.time.ns_per_s);
+    try drain_done.timedWait(30 * std.time.ns_per_s);
     drainer.join();
 
     try testing.expect(child_done.isSet());
