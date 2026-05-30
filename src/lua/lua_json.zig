@@ -20,6 +20,12 @@ pub const MAX_JSON_DEPTH: u32 = 128;
 /// the value nests deeper than MAX_JSON_DEPTH, or error.LuaError if the Lua
 /// C stack cannot be grown.
 pub fn pushJsonValue(lua: *Lua, value: std.json.Value) !void {
+    // On error (JsonTooDeep or a stack-grow failure) the recursion can leave
+    // partially built tables stranded on the stack. Restore the stack so a
+    // caller sees the contract "exactly one value pushed, or the stack
+    // unchanged on error" rather than having to guess how many tables leaked.
+    const top = lua.getTop();
+    errdefer lua.setTop(top);
     return pushJsonValueDepth(lua, value, 0);
 }
 
@@ -282,10 +288,17 @@ test "pushJsonValue: JSON nested past MAX_JSON_DEPTH returns JsonTooDeep" {
     defer deep.deinit(allocator);
     try deep.appendNTimes(allocator, '[', levels);
     try deep.appendNTimes(allocator, ']', levels);
-    try std.testing.expectError(error.JsonTooDeep, pushJsonAsTable(lua, deep.items, allocator));
 
-    // A shallow value on the same path still encodes.
+    // The error path must leave the stack exactly as it found it. Otherwise the
+    // ~MAX_JSON_DEPTH partial tables built before the limit was hit strand on
+    // the caller's long-lived state and grow it unboundedly across retries.
+    const top = lua.getTop();
+    try std.testing.expectError(error.JsonTooDeep, pushJsonAsTable(lua, deep.items, allocator));
+    try std.testing.expectEqual(top, lua.getTop());
+
+    // A shallow value on the same path still encodes (pushes exactly one value).
     try pushJsonAsTable(lua, "[1,[2,[3]]]", allocator);
+    try std.testing.expectEqual(top + 1, lua.getTop());
 }
 
 test "luaValueToJson: cyclic table returns JsonTooDeep with no leak" {
