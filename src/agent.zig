@@ -1186,6 +1186,23 @@ pub fn estimateMessageTokens(msg: types.Message) u32 {
     return @intCast(tokens);
 }
 
+test "isStreamingRetryable classifies provider failure as retryable" {
+    // RESIL-1 decision: a mid-stream `event: error` envelope surfaces as
+    // error.ProviderResponseFailed, and the streaming->non-streaming fallback
+    // re-fires the request. The dominant cause is transient provider overload,
+    // so a single re-fire is the resilient recovery; keep it retryable. This
+    // test locks that choice so a future refactor cannot silently flip it.
+    try std.testing.expect(isStreamingRetryable(error.ProviderResponseFailed));
+    try std.testing.expect(isStreamingRetryable(error.ApiError));
+    try std.testing.expect(isStreamingRetryable(error.MalformedResponse));
+
+    // Cancellation, auth, and stalled-connection errors are not retryable:
+    // re-firing would either ignore user intent or stall again identically.
+    try std.testing.expect(!isStreamingRetryable(error.Cancelled));
+    try std.testing.expect(!isStreamingRetryable(error.ReadTimeout));
+    try std.testing.expect(!isStreamingRetryable(error.NotLoggedIn));
+}
+
 test "estimateMessageTokens text block counts ceil(chars/4)" {
     const blocks = [_]types.ContentBlock{
         .{ .text = .{ .text = "abcdefgh" } }, // 8 chars -> 2 tokens
