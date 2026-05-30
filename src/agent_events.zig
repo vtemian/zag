@@ -340,6 +340,12 @@ pub const EventQueue = struct {
     /// Optional file descriptor to write 1 byte to after a successful push.
     /// Used by the main loop to wake from poll() when new events arrive.
     wake_fd: ?std.posix.fd_t = null,
+    /// Set by `close()` at the start of runner shutdown, before the one-shot
+    /// round-trip drain. Once true, `push` refuses every event so a worker
+    /// that tries to enqueue a round-trip request after the drain has walked
+    /// the ring fails fast and unwinds, instead of parking on a `done` the
+    /// orchestrator will never signal. Guarded by `mutex`.
+    closing: bool = false,
 
     /// Allocate a ring buffer of exactly `capacity` slots. Caller owns the
     /// returned queue and must call `deinit` to release backing storage.
@@ -357,12 +363,30 @@ pub const EventQueue = struct {
         self.allocator.free(self.buffer);
     }
 
+    /// Refuse all subsequent pushes. Called once at the start of runner
+    /// shutdown, before the one-shot round-trip drain, to close the
+    /// push-after-drain race that would otherwise deadlock `t.join()`: any
+    /// round-trip enqueued while `closing` was still false happened-before
+    /// this returns, so the following drain is guaranteed to service it,
+    /// while every later push fails fast. Wakes any producer parked in
+    /// `pushWithBackpressure` so it re-checks state and gives up promptly.
+    /// Thread-safe.
+    pub fn close(self: *EventQueue) void {
+        self.mutex.lock();
+        self.closing = true;
+        self.mutex.unlock();
+        self.drained.broadcast();
+    }
+
     /// Push an event onto the queue. Returns `error.QueueFull` when the
     /// ring is at capacity so the caller can free any heap bytes the event
     /// owns. Thread-safe.
     pub fn push(self: *EventQueue, event: AgentEvent) error{QueueFull}!void {
         self.mutex.lock();
-        if (self.len == self.buffer.len) {
+        // A closing queue refuses everything: round-trip producers translate
+        // `QueueFull` into their skip-and-unwind path, so a push that loses
+        // the race with shutdown never parks on a `done` that will not fire.
+        if (self.closing or self.len == self.buffer.len) {
             self.mutex.unlock();
             return error.QueueFull;
         }
@@ -416,7 +440,16 @@ pub const EventQueue = struct {
 
         const deadline_ns: u64 = @as(u64, max_wait_ms) * std.time.ns_per_ms;
         var elapsed_ns: u64 = 0;
-        while (self.len == self.buffer.len) {
+        while (self.closing or self.len == self.buffer.len) {
+            // A closing queue drops immediately and silently: shutdown is
+            // tearing the runner down, so this is expected teardown, not a
+            // saturated main loop worth a warning.
+            if (self.closing) {
+                _ = self.dropped.fetchAdd(1, .monotonic);
+                self.mutex.unlock();
+                event.freeOwned();
+                return error.EventDropped;
+            }
             if (elapsed_ns >= deadline_ns) {
                 _ = self.dropped.fetchAdd(1, .monotonic);
                 log.warn(
@@ -1136,6 +1169,37 @@ test "freeOwned signals hook_request done" {
     ev.freeOwned();
     try std.testing.expect(req.done.isSet());
     try std.testing.expect(!req.cancelled);
+}
+
+test "close refuses subsequent pushes so a late round-trip cannot park" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 4);
+    defer queue.deinit();
+
+    // A normal push succeeds before close.
+    try queue.push(.done);
+
+    queue.close();
+
+    // After close, every push fails fast with QueueFull. Round-trip
+    // producers (marshalRequest, luaToolExecute) translate that into their
+    // skip-and-unwind path, so a worker that loses the race with shutdown
+    // never parks on a `done` the orchestrator will never signal.
+    try std.testing.expectError(error.QueueFull, queue.push(.done));
+    try std.testing.expectError(error.QueueFull, queue.push(.done));
+}
+
+test "close drops a backpressured push immediately instead of waiting out the budget" {
+    var queue = try EventQueue.initBounded(std.testing.allocator, 1);
+    defer queue.deinit();
+
+    queue.close();
+
+    // A large budget would normally block; closing must short-circuit it.
+    try std.testing.expectError(
+        error.EventDropped,
+        queue.pushWithBackpressure(.done, 60_000),
+    );
+    try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.monotonic));
 }
 
 const BackpressureDrainer = struct {

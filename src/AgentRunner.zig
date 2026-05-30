@@ -161,8 +161,11 @@ pub fn deinit(self: *AgentRunner) void {
 /// Two-step teardown to avoid two related bugs:
 ///   1. A worker parked on `req.done.wait()` only unblocks via the
 ///      orchestrator's dispatch path. Shutdown bypasses the orchestrator,
-///      so we drain pending round-trip requests under the queue mutex
-///      before joining; otherwise `t.join()` hangs forever.
+///      so we `close()` the queue (refusing new round-trips) and then drain
+///      the pending ones under the queue mutex before joining. `close()`
+///      runs first so a worker that pushes after the drain walks the ring
+///      gets `QueueFull` and unwinds rather than parking on a `done` nobody
+///      will signal; otherwise `t.join()` hangs forever.
 ///   2. `event_queue.deinit` does not free payload bytes for events
 ///      still in the ring. After joining we drain the remaining events
 ///      and call `freeOwned` on each before tearing the queue down.
@@ -170,6 +173,7 @@ pub fn shutdown(self: *AgentRunner) void {
     if (self.agent_thread) |t| {
         self.cancel_flag.store(true, .release);
         if (self.queue_active) {
+            self.event_queue.close();
             drainPendingRoundTrips(&self.event_queue, self.allocator);
         }
         t.join();
