@@ -99,6 +99,12 @@ local function open()
             -- popup.list calls close_internal _after_ on_commit returns,
             -- so we can still safely mutate the focused pane here.
             zag.pane.set_model(focused, item.word)
+            -- Persist the pick as the default so it survives a restart. The
+            -- swap above only changes the live pane; persistence is an
+            -- explicit, separate decision the picker owns (the window
+            -- primitive no longer writes config.lua as a side effect).
+            -- Best-effort: a persist failure must not break the commit.
+            pcall(zag.persist_default_model, item.word)
         end,
         on_cancel = function() end,
         -- on_close fires after popup teardown for ANY close path
