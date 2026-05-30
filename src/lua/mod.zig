@@ -1,5 +1,6 @@
-//! Lua async plugin runtime module root. Re-exports nothing yet; exists so
-//! subsystem tests are reachable from the project-wide test target.
+//! Lua async plugin runtime module root. Re-exports the subsystem's public
+//! handles (Scope, CompletionQueue, IoPool) and pulls every lua/ module into
+//! the project-wide test target.
 
 pub const Scope = @import("Scope.zig").Scope;
 pub const CompletionQueue = @import("LuaCompletionQueue.zig").Queue;
