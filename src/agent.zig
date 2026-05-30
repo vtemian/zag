@@ -500,6 +500,7 @@ pub fn runLoopStreaming(
 /// here or the compile fails loudly.
 fn makeAgentEvent(comptime T: type, req: *T) agent_events.AgentEvent {
     return switch (T) {
+        Hooks.HookRequest => .{ .hook_request = req },
         agent_events.PromptAssemblyRequest => .{ .prompt_assembly_request = req },
         agent_events.ToolGateRequest => .{ .tool_gate_request = req },
         agent_events.JitContextRequest => .{ .jit_context_request = req },
@@ -599,14 +600,12 @@ fn fireLifecycleHook(
 ) void {
     if (lua_engine == null or lua_engine.?.hook_dispatcher.registry.hooks.items.len == 0) return;
     var req = Hooks.HookRequest.init(payload);
-    queue.push(.{ .hook_request = &req }) catch return;
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            return;
-        } else |_| {
-            if (cancel.load(.acquire)) return;
-        }
-    }
+    // Route through marshalRequest so the cancel-then-wait ordering lives in
+    // one place: on cancel it waits for `done` before returning, so the main
+    // thread is finished with the queued `&req` before this frame unwinds.
+    // Observer-only hooks cannot veto, so no reason_allocator is needed.
+    // EventQueueFull and Cancelled both just unwind the no-op lifecycle path.
+    marshalRequest(Hooks.HookRequest, &req, queue, cancel) catch return;
 }
 
 /// Fire `zag.tools.gate` once per turn before `callLlm` via
@@ -963,17 +962,18 @@ fn firePreHook(
         .args_rewrite = null,
     } };
     var req = Hooks.HookRequest.init(&payload);
-    // Queue-full here means the main loop is saturated; skip the hook round
-    // trip and proceed with the original tool input rather than deadlocking
-    // on `req.done` that nobody will signal.
-    queue.push(.{ .hook_request = &req }) catch return .{ .proceed = null };
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) return error.Cancelled;
-        }
-    }
+    // The dispatcher allocates any veto reason with its own allocator; hand
+    // it to the request so marshalRequest can free the reason on the cancel
+    // path without a cross-allocator free.
+    req.reason_allocator = lua_engine.?.hook_dispatcher.allocator;
+    // marshalRequest owns the cancel-then-wait ordering: on cancel it waits
+    // for `done` (so the main thread is done writing `&req`) before this
+    // frame unwinds. Queue-full means the main loop is saturated; skip the
+    // round trip and proceed with the original tool input.
+    marshalRequest(Hooks.HookRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return .{ .proceed = null },
+        error.Cancelled => return error.Cancelled,
+    };
     if (req.cancelled) {
         const reason = req.cancel_reason orelse try allocator.dupe(u8, "vetoed by hook");
         return .{ .vetoed = reason };
@@ -1013,20 +1013,19 @@ fn firePostHook(
         .is_error_rewrite = null,
     } };
     var req = Hooks.HookRequest.init(&payload);
-    // Queue-full here means the main loop is saturated; skip the hook round
-    // trip and return an empty rewrite rather than deadlocking on `req.done`
-    // that nobody will signal.
-    queue.push(.{ .hook_request = &req }) catch return .{
-        .content_rewrite = null,
-        .is_error_rewrite = null,
+    // The dispatcher allocates any veto reason with its own allocator; hand
+    // it to the request so marshalRequest can free the reason on the cancel
+    // path without a cross-allocator free.
+    req.reason_allocator = lua_engine.?.hook_dispatcher.allocator;
+    // marshalRequest owns the cancel-then-wait ordering. Queue-full means the
+    // main loop is saturated; skip the round trip and return an empty rewrite.
+    marshalRequest(Hooks.HookRequest, &req, queue, cancel) catch |err| switch (err) {
+        error.EventQueueFull => return .{
+            .content_rewrite = null,
+            .is_error_rewrite = null,
+        },
+        error.Cancelled => return error.Cancelled,
     };
-    while (true) {
-        if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
-            break;
-        } else |_| {
-            if (cancel.load(.acquire)) return error.Cancelled;
-        }
-    }
     return .{
         .content_rewrite = payload.tool_post.content_rewrite,
         .is_error_rewrite = payload.tool_post.is_error_rewrite,
@@ -1201,6 +1200,78 @@ test "isStreamingRetryable classifies provider failure as retryable" {
     try std.testing.expect(!isStreamingRetryable(error.Cancelled));
     try std.testing.expect(!isStreamingRetryable(error.ReadTimeout));
     try std.testing.expect(!isStreamingRetryable(error.NotLoggedIn));
+}
+
+const MarshalCancelProbe = struct {
+    req: *Hooks.HookRequest,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+    // Set by the "main thread" right before it signals `done`.
+    main_finished_writing: std.atomic.Value(bool),
+    // The worker records what `main_finished_writing` was at the moment
+    // marshalRequest returned. A correct cancel path waits for `done`, so
+    // this must be true; the use-after-free bug returned early, when it
+    // would still be false.
+    saw_main_finished: std.atomic.Value(bool),
+    result: ?anyerror,
+
+    fn worker(self: *MarshalCancelProbe) void {
+        const outcome = marshalRequest(Hooks.HookRequest, self.req, self.queue, self.cancel);
+        self.saw_main_finished.store(self.main_finished_writing.load(.acquire), .release);
+        self.result = if (outcome) |_| null else |err| err;
+    }
+};
+
+test "marshalRequest waits for done before returning on cancel (no use-after-free)" {
+    // The cancel path of a round-trip MUST block on req.done before the
+    // caller's stack frame unwinds, because the main thread is still writing
+    // req fields until it signals done. This test drives that ordering
+    // deterministically: the "main thread" sets cancel but holds done well
+    // past the worker's 50ms poll, so the worker is forced through the
+    // cancel branch while main is still "mid-dispatch". If marshalRequest
+    // returned early, saw_main_finished would be false.
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 4);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+
+    var payload: Hooks.HookPayload = .{ .agent_done = {} };
+    var req = Hooks.HookRequest.init(&payload);
+
+    var probe = MarshalCancelProbe{
+        .req = &req,
+        .queue = &queue,
+        .cancel = &cancel,
+        .main_finished_writing = std.atomic.Value(bool).init(false),
+        .saw_main_finished = std.atomic.Value(bool).init(false),
+        .result = null,
+    };
+
+    var t = try std.Thread.spawn(.{}, MarshalCancelProbe.worker, .{&probe});
+
+    // Wait until the worker has enqueued its request.
+    while (true) {
+        queue.mutex.lock();
+        const enqueued = queue.len > 0;
+        queue.mutex.unlock();
+        if (enqueued) break;
+        std.Thread.yield() catch {};
+    }
+
+    // Simulate a user interrupt while main is still mid-dispatch: set cancel
+    // but do NOT signal done yet. The worker's 50ms timedWait expires, it
+    // observes cancel, and (with the fix) parks on req.done.wait().
+    cancel.store(true, .release);
+    std.Thread.sleep(120 * std.time.ns_per_ms);
+
+    // Finish the dispatch: mark our writes complete, then signal done.
+    probe.main_finished_writing.store(true, .release);
+    req.done.set();
+
+    t.join();
+
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), probe.result);
+    try std.testing.expect(probe.saw_main_finished.load(.acquire));
 }
 
 test "estimateMessageTokens text block counts ceil(chars/4)" {
