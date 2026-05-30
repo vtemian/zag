@@ -124,6 +124,13 @@ parent: ?*Conversation = null,
 /// `Session.Entry.subagent_path` for persisted events. Unused when
 /// `parent` is null.
 parent_subagent_id: u32 = 0,
+/// The `.subagent_link` node in `parent.tree` that renders this child's
+/// status line. Cached at spawn so `notifyChildChanged` can mark it dirty
+/// in O(1) per ancestor instead of rescanning `parent.tree.root_children`
+/// on every streamed token. The node is heap-allocated and only removed on
+/// spawn's failure path (which also destroys this child), so the pointer is
+/// stable for the child's whole lifetime. Null on the root.
+parent_link_node: ?*Node = null,
 /// Scratch slot used by `loadFromEntries` (and its `routeReplayEntry`
 /// recursion) to thread tool_call/tool_result pairing per Conversation
 /// during replay. Borrows a Node owned by `self.tree`; reset to null
@@ -1315,6 +1322,9 @@ pub fn spawnSubagent(self: *Conversation, name: []const u8, prompt: []const u8) 
     // single read site in NodeRenderer.subagentStatus.
     node.subagent_parent = @ptrCast(self);
 
+    // Cache the link node so per-token streaming invalidation is O(1).
+    child.parent_link_node = node;
+
     return child;
 }
 
@@ -1330,15 +1340,14 @@ pub fn spawnSubagent(self: *Conversation, name: []const u8, prompt: []const u8) 
 fn notifyChildChanged(self: *Conversation) void {
     var current: *Conversation = self;
     while (current.parent) |p| {
-        for (p.tree.root_children.items) |link_node| {
-            if (link_node.node_type == .subagent_link and
-                link_node.subagent_index == current.parent_subagent_id)
-            {
-                link_node.markDirty();
-                p.tree.dirty_nodes.push(link_node.id);
-                p.tree.generation +%= 1;
-                break;
-            }
+        // `parent_link_node` is the cached `.subagent_link` node in `p.tree`
+        // for `current`, set at spawn. Marking it directly is O(1) per
+        // ancestor; the old rescan of `p.tree.root_children` was O(parent
+        // top-level nodes) on every streamed token.
+        if (current.parent_link_node) |link_node| {
+            link_node.markDirty();
+            p.tree.dirty_nodes.push(link_node.id);
+            p.tree.generation +%= 1;
         }
         current = p;
     }
