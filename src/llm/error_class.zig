@@ -345,6 +345,14 @@ fn parseMonth(name: []const u8) ?u8 {
 /// timestamp. Uses Howard Hinnant's days-from-civil algorithm, which is
 /// valid for any proleptic Gregorian date.
 fn civilToEpoch(year: i64, month: u8, day: u8, time_tok: []const u8) ?i64 {
+    // Bound the year to the realistic HTTP-date range before the arithmetic
+    // below. The year arrives from an unbounded parseInt(i64) over a
+    // provider-controlled Retry-After header, and `era * 146097` overflows i64
+    // around year 2.5e16 (well inside parseInt's ~9.2e18 ceiling), so an
+    // out-of-range year would panic the process. The delay is clamped to u32
+    // seconds-from-now anyway, so nothing past ~year 2200 carries useful
+    // information; returning null degrades to "no Retry-After".
+    if (year < 0 or year > 9999) return null;
     if (month < 1 or month > 12 or day < 1 or day > 31) return null;
     var time_parts = std.mem.splitScalar(u8, time_tok, ':');
     const hour = std.fmt.parseInt(i64, time_parts.next() orelse return null, 10) catch return null;
@@ -558,6 +566,23 @@ test "529 with no Retry-After -> rate_limit no seconds" {
     const c = classify(529, "Overloaded", &.{});
     try testing.expect(c == .rate_limit);
     try testing.expectEqual(@as(?u32, null), c.rate_limit.retry_after_seconds);
+}
+
+test "retry-after with out-of-range HTTP-date year does not panic" {
+    // A hostile or buggy provider can send a malformed Retry-After date on the
+    // 429/529 retry path. An out-of-range year must degrade to "no Retry-After"
+    // (null), never overflow the civilToEpoch arithmetic and trap the process.
+    const cases = [_][]const u8{
+        "Sun, 06 Nov 99999999999999999 08:49:37 GMT", // IMF-fixdate, 17-digit year
+        "Sun Nov  6 08:49:37 99999999999999999", // asctime, 17-digit year
+        "Sun, 06 Nov -99999999999999999 08:49:37 GMT", // huge negative year
+    };
+    for (cases) |value| {
+        const headers = [_]std.http.Header{.{ .name = "Retry-After", .value = value }};
+        const c = classify(429, "", &headers);
+        try testing.expect(c == .rate_limit);
+        try testing.expectEqual(@as(?u32, null), c.rate_limit.retry_after_seconds);
+    }
 }
 
 test "parseHttpDate parses IMF-fixdate to epoch" {

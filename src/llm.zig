@@ -106,6 +106,16 @@ pub fn mapProviderError(err: anyerror) ProviderError {
     };
 }
 
+/// Clamp a std.json i64 token count into the u32 usage field, flooring
+/// negatives and saturating overflow. Malformed providers occasionally
+/// report nonsense counts on an otherwise-200 body, and a raw `@intCast`
+/// would panic on a negative or out-of-range value; never panic on them.
+pub fn clampTokens(v: i64) u32 {
+    if (v <= 0) return 0;
+    if (v > std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(v);
+}
+
 /// Streaming event emitted by call_streaming for incremental response delivery.
 /// Defined here (rather than beside the agent loop) so the provider VTable can
 /// reference it without creating a circular dependency.

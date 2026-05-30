@@ -874,17 +874,17 @@ fn handleCompleted(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
         if (usage == .object) {
             const usage_obj = usage.object;
             if (usage_obj.get("input_tokens")) |it| {
-                if (it == .integer) emit.input_tokens.* = @intCast(it.integer);
+                if (it == .integer) emit.input_tokens.* = llm.clampTokens(it.integer);
             }
             if (usage_obj.get("output_tokens")) |ot| {
-                if (ot == .integer) emit.output_tokens.* = @intCast(ot.integer);
+                if (ot == .integer) emit.output_tokens.* = llm.clampTokens(ot.integer);
             }
             // Cached prompt tokens are nested under input_tokens_details on the
             // Responses API (Chat Completions uses prompt_tokens_details). They
             // are a subset of input_tokens; cost.zig nets them out.
             if (usage_obj.get("input_tokens_details")) |d| if (d == .object) {
                 if (d.object.get("cached_tokens")) |v| if (v == .integer) {
-                    emit.cache_read_tokens.* = @intCast(v.integer);
+                    emit.cache_read_tokens.* = llm.clampTokens(v.integer);
                 };
             };
         }

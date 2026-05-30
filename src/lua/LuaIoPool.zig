@@ -117,10 +117,16 @@ pub const Pool = struct {
             // coroutine, so dropping it would strand that coroutine forever.
             // The main thread drains the completion queue continuously, so
             // QueueFull is transient: retry exactly like the CmdHandle and
-            // HttpStream helper threads.
+            // HttpStream helper threads. Bail out of the retry if shutdown is
+            // requested though: during teardown the main thread stops draining,
+            // so a full ring would spin here forever and `deinit`'s join would
+            // deadlock. The coroutine cannot be resumed during teardown anyway,
+            // so abandoning the job is the same teardown leak as the ring jobs
+            // the completion queue's deinit already drops.
             while (true) {
                 self.completions.push(job) catch |err| switch (err) {
                     error.QueueFull => {
+                        if (self.shutdown.load(.acquire)) break;
                         std.Thread.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },

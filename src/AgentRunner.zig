@@ -568,8 +568,9 @@ pub fn submitInput(self: *AgentRunner, text: []const u8) !void {
 /// `SessionListChanged{status_changed}` hook. The hook fire is skipped
 /// when there is no attached session handle (headless `--no-session`) or
 /// no Lua engine, so the status transition never dereferences a null
-/// handle on those paths. Shared by `submitInput`, the agent thread's
-/// error path, and the `done`/`err` drain arms.
+/// handle on those paths. Shared by `submitInput` and the `.done`/`.err`
+/// drain arms, all of which run on the main thread; status is never
+/// announced from the agent thread.
 fn announceSessionStatus(
     lua_engine: ?*LuaEngine,
     conversation: *Conversation,
