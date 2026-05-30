@@ -16,13 +16,20 @@ const std = @import("std");
 /// is a startup-ordering bug; `get` traps on null rather than corrupting state.
 var process_io: ?std.Io = null;
 
-/// Install the process io. Call once from `main` (and `Harness`) before any
-/// fs helper that reads `get` runs.
+/// Install the process io. Call exactly once in `main`, before any subcommand
+/// (including `Harness`/headless) runs and before any thread that reads `get`
+/// is spawned. Subcommands inherit this install; they must NOT re-install with
+/// a shorter-lived io, since `get` borrows it for the whole process lifetime.
 pub fn init(io: std.Io) void {
     process_io = io;
 }
 
 /// The process-wide io. Panics if read before `init`.
+///
+/// Lifetime contract: the installed io must outlive every thread that may call
+/// `get`. In `main` this holds because `io_threaded.deinit` is the last defer
+/// to run, after the engine/orchestrator/pool deinits have joined their
+/// workers. A detached thread that calls `get` after teardown is a UAF.
 ///
 /// Under the test runner there is no `main` to call `init`, so fall back to
 /// the runner-provided `std.testing.io` (a real blocking io). Production

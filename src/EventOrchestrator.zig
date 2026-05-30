@@ -1303,7 +1303,7 @@ test "drainWakePipe consumes all pending bytes" {
     drainWakePipe(fds[0]);
 
     // A subsequent non-blocking read must now return WouldBlock, proving the
-    // pipe is empty. EAGAIN maps to error.WouldBlock on Zig 0.15.
+    // pipe is empty. wake_pipe.read maps a raw EAGAIN to error.WouldBlock.
     var scratch: [8]u8 = undefined;
     const residual = wake_pipe.read(fds[0], &scratch);
     try std.testing.expectError(error.WouldBlock, residual);

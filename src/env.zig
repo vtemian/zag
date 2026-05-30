@@ -16,8 +16,9 @@ var map: ?*std.process.Environ.Map = null;
 
 pub const GetOwnedError = error{ EnvironmentVariableNotFound, OutOfMemory };
 
-/// Capture the process environment map. Call once from `main` before any env
-/// read. `Harness`/tests may also call this.
+/// Capture the process environment map. Installed once in `main` before any
+/// env read; subcommands (including `Harness`/headless) inherit it. Tests
+/// install their own seeded map via the per-module `ensureTestEnv` helpers.
 pub fn init(environ_map: *std.process.Environ.Map) void {
     map = environ_map;
 }

@@ -214,9 +214,13 @@ pub const HttpStreamHandle = struct {
         return self;
     }
 
-    /// Map std.http errors to our `InitError` set. Kept close to the
-    /// call site so additions to std.http's error list show up as a
-    /// compile error here rather than being silently bucketed.
+    /// Map std.http (anyerror) into our `InitError` set. Because the input is
+    /// `anyerror` with a terminal `else`, a renamed/added std error is silently
+    /// bucketed into IoError rather than caught at compile time — so the
+    /// route/connect and DNS arms must be kept in sync with lib/std/Io/net.zig
+    /// by hand (verified against 0.16: the 0.15 names ConnectionTimedOut /
+    /// TemporaryNameServerFailure / HostLacksNetworkAddresses /
+    /// UnexpectedConnectFailure no longer exist).
     fn mapHttpErr(err: anyerror) InitError {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -230,16 +234,25 @@ pub const HttpStreamHandle = struct {
             error.HttpRedirectLocationMissing,
             error.HttpRedirectLocationOversize,
             => error.InvalidUri,
-            error.TlsInitializationFailed => error.TlsError,
+            error.TlsInitializationFailed,
+            error.CertificateBundleLoadFailure,
+            => error.TlsError,
+            error.Timeout,
             error.ConnectionRefused,
-            error.NetworkUnreachable,
-            error.ConnectionTimedOut,
             error.ConnectionResetByPeer,
-            error.TemporaryNameServerFailure,
-            error.NameServerFailure,
+            error.HostUnreachable,
+            error.NetworkUnreachable,
+            error.NetworkDown,
+            error.AddressUnavailable,
+            error.AddressFamilyUnsupported,
             error.UnknownHostName,
-            error.HostLacksNetworkAddresses,
-            error.UnexpectedConnectFailure,
+            error.NameServerFailure,
+            error.NoAddressReturned,
+            error.ResolvConfParseFailed,
+            error.InvalidDnsARecord,
+            error.InvalidDnsAAAARecord,
+            error.InvalidDnsCnameRecord,
+            error.DetectingNetworkConfigurationFailed,
             => error.ConnectFailed,
             else => error.IoError,
         };

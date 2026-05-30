@@ -7,6 +7,7 @@ zag-trace.json
 .worktrees/
 .claude/
 /test_*
+/zag-*-e2e.txt
 artifacts/
 docs/plans/
 /zig-pkg/
