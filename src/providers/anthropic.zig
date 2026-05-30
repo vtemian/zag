@@ -381,15 +381,6 @@ fn writeMessage(model: []const u8, msg: types.Message, w: anytype) !void {
     try w.writeAll("]}");
 }
 
-/// Clamp a std.json i64 token count into the u32 usage field, flooring
-/// negatives and saturating overflow. Malformed providers occasionally
-/// report nonsense counts on an otherwise-200 body; never panic on them.
-fn clampTokens(v: i64) u32 {
-    if (v <= 0) return 0;
-    if (v > std.math.maxInt(u32)) return std.math.maxInt(u32);
-    return @intCast(v);
-}
-
 /// Parses a raw JSON response from the Anthropic API into a typed LlmResponse.
 /// Allocates content block strings (text, id, name, input_raw) that the caller must free.
 ///
@@ -421,16 +412,16 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
     if (root.get("usage")) |usage| if (usage == .object) {
         const usage_obj = usage.object;
         if (usage_obj.get("input_tokens")) |it| if (it == .integer) {
-            input_tokens = clampTokens(it.integer);
+            input_tokens = llm.clampTokens(it.integer);
         };
         if (usage_obj.get("output_tokens")) |ot| if (ot == .integer) {
-            output_tokens = clampTokens(ot.integer);
+            output_tokens = llm.clampTokens(ot.integer);
         };
         if (usage_obj.get("cache_creation_input_tokens")) |v| if (v == .integer) {
-            cache_creation_tokens = clampTokens(v.integer);
+            cache_creation_tokens = llm.clampTokens(v.integer);
         };
         if (usage_obj.get("cache_read_input_tokens")) |v| if (v == .integer) {
-            cache_read_tokens = clampTokens(v.integer);
+            cache_read_tokens = llm.clampTokens(v.integer);
         };
     };
 
@@ -694,105 +685,131 @@ fn processSseEvent(
         return;
     };
     defer parsed.deinit();
+    // A streaming event whose JSON is not an object is malformed; skip it
+    // and let the stream continue rather than panicking on the union access.
+    if (parsed.value != .object) return;
     const obj = parsed.value.object;
 
     if (std.mem.eql(u8, event_type, "message_start")) {
-        if (obj.get("message")) |msg| {
-            if (msg.object.get("usage")) |usage| {
-                const usage_obj = usage.object;
-                if (usage_obj.get("input_tokens")) |it| input_tokens.* = @intCast(it.integer);
-                if (usage_obj.get("output_tokens")) |ot| output_tokens.* = @intCast(ot.integer);
-                if (usage_obj.get("cache_creation_input_tokens")) |v| cache_creation_tokens.* = @intCast(v.integer);
-                if (usage_obj.get("cache_read_input_tokens")) |v| cache_read_tokens.* = @intCast(v.integer);
-            }
-        }
+        const msg = obj.get("message") orelse return;
+        if (msg != .object) return;
+        const usage = msg.object.get("usage") orelse return;
+        if (usage != .object) return;
+        const usage_obj = usage.object;
+        if (usage_obj.get("input_tokens")) |it| if (it == .integer) {
+            input_tokens.* = llm.clampTokens(it.integer);
+        };
+        if (usage_obj.get("output_tokens")) |ot| if (ot == .integer) {
+            output_tokens.* = llm.clampTokens(ot.integer);
+        };
+        if (usage_obj.get("cache_creation_input_tokens")) |v| if (v == .integer) {
+            cache_creation_tokens.* = llm.clampTokens(v.integer);
+        };
+        if (usage_obj.get("cache_read_input_tokens")) |v| if (v == .integer) {
+            cache_read_tokens.* = llm.clampTokens(v.integer);
+        };
     } else if (std.mem.eql(u8, event_type, "content_block_start")) {
-        if (obj.get("content_block")) |cb| {
-            const cb_obj = cb.object;
-            const block_kind = cb_obj.get("type").?.string;
+        const cb = obj.get("content_block") orelse return;
+        if (cb != .object) return;
+        const cb_obj = cb.object;
+        const type_value = cb_obj.get("type") orelse return;
+        if (type_value != .string) return;
+        const block_kind = type_value.string;
 
-            if (std.mem.eql(u8, block_kind, "text")) {
-                try blocks.append(allocator, .{ .text = .{ .content = .empty } });
-            } else if (std.mem.eql(u8, block_kind, "tool_use")) {
-                const id = try allocator.dupe(u8, cb_obj.get("id").?.string);
-                errdefer allocator.free(id);
-                const name = try allocator.dupe(u8, cb_obj.get("name").?.string);
-                errdefer allocator.free(name);
+        if (std.mem.eql(u8, block_kind, "text")) {
+            try blocks.append(allocator, .{ .text = .{ .content = .empty } });
+        } else if (std.mem.eql(u8, block_kind, "tool_use")) {
+            const id_value = cb_obj.get("id") orelse return;
+            const name_value = cb_obj.get("name") orelse return;
+            if (id_value != .string or name_value != .string) return;
+            const id = try allocator.dupe(u8, id_value.string);
+            errdefer allocator.free(id);
+            const name = try allocator.dupe(u8, name_value.string);
+            errdefer allocator.free(name);
 
-                callback.on_event(callback.ctx, .{ .tool_start = name });
+            callback.on_event(callback.ctx, .{ .tool_start = name });
 
-                try blocks.append(allocator, .{ .tool_use = .{
-                    .content = .empty,
-                    .tool_id = id,
-                    .tool_name = name,
-                } });
-            } else if (std.mem.eql(u8, block_kind, "thinking")) {
-                try blocks.append(allocator, .{ .thinking = .{
-                    .text = .empty,
-                    .signature = null,
-                } });
-            } else if (std.mem.eql(u8, block_kind, "redacted_thinking")) {
-                // `redacted_thinking` ships its ciphertext inline on the start
-                // frame rather than via deltas; stash it immediately.
-                var cipher: std.ArrayList(u8) = .empty;
-                errdefer cipher.deinit(allocator);
-                if (cb_obj.get("data")) |d| {
-                    try cipher.appendSlice(allocator, d.string);
-                }
-                try blocks.append(allocator, .{ .redacted_thinking = .{ .data = cipher } });
-            }
+            try blocks.append(allocator, .{ .tool_use = .{
+                .content = .empty,
+                .tool_id = id,
+                .tool_name = name,
+            } });
+        } else if (std.mem.eql(u8, block_kind, "thinking")) {
+            try blocks.append(allocator, .{ .thinking = .{
+                .text = .empty,
+                .signature = null,
+            } });
+        } else if (std.mem.eql(u8, block_kind, "redacted_thinking")) {
+            // `redacted_thinking` ships its ciphertext inline on the start
+            // frame rather than via deltas; stash it immediately.
+            var cipher: std.ArrayList(u8) = .empty;
+            errdefer cipher.deinit(allocator);
+            if (cb_obj.get("data")) |d| if (d == .string) {
+                try cipher.appendSlice(allocator, d.string);
+            };
+            try blocks.append(allocator, .{ .redacted_thinking = .{ .data = cipher } });
         }
     } else if (std.mem.eql(u8, event_type, "content_block_delta")) {
-        if (obj.get("delta")) |delta| {
-            const delta_obj = delta.object;
-            const delta_type = delta_obj.get("type").?.string;
+        const delta = obj.get("delta") orelse return;
+        if (delta != .object) return;
+        const delta_obj = delta.object;
+        const delta_type_value = delta_obj.get("type") orelse return;
+        if (delta_type_value != .string) return;
+        const delta_type = delta_type_value.string;
 
-            if (std.mem.eql(u8, delta_type, "text_delta")) {
-                const text = delta_obj.get("text").?.string;
-                if (blocks.items.len > 0) {
-                    const current = &blocks.items[blocks.items.len - 1];
-                    if (current.* == .text) {
-                        try current.text.content.appendSlice(allocator, text);
-                    }
+        if (std.mem.eql(u8, delta_type, "text_delta")) {
+            const text_value = delta_obj.get("text") orelse return;
+            if (text_value != .string) return;
+            const text = text_value.string;
+            if (blocks.items.len > 0) {
+                const current = &blocks.items[blocks.items.len - 1];
+                if (current.* == .text) {
+                    try current.text.content.appendSlice(allocator, text);
                 }
-                callback.on_event(callback.ctx, .{ .text_delta = text });
-            } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
-                const partial = delta_obj.get("partial_json").?.string;
-                if (blocks.items.len > 0) {
-                    const current = &blocks.items[blocks.items.len - 1];
-                    if (current.* == .tool_use) {
-                        try current.tool_use.content.appendSlice(allocator, partial);
-                    }
+            }
+            callback.on_event(callback.ctx, .{ .text_delta = text });
+        } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
+            const partial_value = delta_obj.get("partial_json") orelse return;
+            if (partial_value != .string) return;
+            const partial = partial_value.string;
+            if (blocks.items.len > 0) {
+                const current = &blocks.items[blocks.items.len - 1];
+                if (current.* == .tool_use) {
+                    try current.tool_use.content.appendSlice(allocator, partial);
                 }
-            } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
-                // Buffer thinking text onto the current block and forward
-                // the delta to the callback so consumers (Conversation,
-                // trajectory writer) can stream it in real time.
-                const text = delta_obj.get("thinking").?.string;
-                if (blocks.items.len > 0) {
-                    const current = &blocks.items[blocks.items.len - 1];
-                    if (current.* == .thinking) {
-                        try current.thinking.text.appendSlice(allocator, text);
-                    }
+            }
+        } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
+            // Buffer thinking text onto the current block and forward
+            // the delta to the callback so consumers (Conversation,
+            // trajectory writer) can stream it in real time.
+            const text_value = delta_obj.get("thinking") orelse return;
+            if (text_value != .string) return;
+            const text = text_value.string;
+            if (blocks.items.len > 0) {
+                const current = &blocks.items[blocks.items.len - 1];
+                if (current.* == .thinking) {
+                    try current.thinking.text.appendSlice(allocator, text);
                 }
-                callback.on_event(callback.ctx, .{ .thinking_delta = .{
-                    .text = text,
-                    .provider = .anthropic,
-                } });
-            } else if (std.mem.eql(u8, delta_type, "signature_delta")) {
-                // Anthropic emits a single `signature_delta` per thinking
-                // block as a full replacement, not an append. Drop any
-                // prior buffer before copying in the new value.
-                const sig = delta_obj.get("signature").?.string;
-                if (blocks.items.len > 0) {
-                    const current = &blocks.items[blocks.items.len - 1];
-                    if (current.* == .thinking) {
-                        if (current.thinking.signature) |*existing| existing.deinit(allocator);
-                        var buf: std.ArrayList(u8) = .empty;
-                        errdefer buf.deinit(allocator);
-                        try buf.appendSlice(allocator, sig);
-                        current.thinking.signature = buf;
-                    }
+            }
+            callback.on_event(callback.ctx, .{ .thinking_delta = .{
+                .text = text,
+                .provider = .anthropic,
+            } });
+        } else if (std.mem.eql(u8, delta_type, "signature_delta")) {
+            // Anthropic emits a single `signature_delta` per thinking
+            // block as a full replacement, not an append. Drop any
+            // prior buffer before copying in the new value.
+            const sig_value = delta_obj.get("signature") orelse return;
+            if (sig_value != .string) return;
+            const sig = sig_value.string;
+            if (blocks.items.len > 0) {
+                const current = &blocks.items[blocks.items.len - 1];
+                if (current.* == .thinking) {
+                    if (current.thinking.signature) |*existing| existing.deinit(allocator);
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    try buf.appendSlice(allocator, sig);
+                    current.thinking.signature = buf;
                 }
             }
         }
@@ -809,26 +826,26 @@ fn processSseEvent(
             }
         }
     } else if (std.mem.eql(u8, event_type, "message_delta")) {
-        if (obj.get("delta")) |delta| {
-            if (delta.object.get("stop_reason")) |sr| {
+        if (obj.get("delta")) |delta| if (delta == .object) {
+            if (delta.object.get("stop_reason")) |sr| if (sr == .string) {
                 if (std.mem.eql(u8, sr.string, "end_turn"))
                     stop_reason.* = .end_turn
                 else if (std.mem.eql(u8, sr.string, "tool_use"))
                     stop_reason.* = .tool_use
                 else if (std.mem.eql(u8, sr.string, "max_tokens"))
                     stop_reason.* = .max_tokens;
-            }
-        }
-        if (obj.get("usage")) |usage| {
+            };
+        };
+        if (obj.get("usage")) |usage| if (usage == .object) {
             const usage_obj = usage.object;
-            if (usage_obj.get("output_tokens")) |ot| {
-                output_tokens.* = @intCast(ot.integer);
+            if (usage_obj.get("output_tokens")) |ot| if (ot == .integer) {
+                output_tokens.* = llm.clampTokens(ot.integer);
                 // Surface the running count so the UI working line can show
                 // live output-token progress; the final LlmResponse still
                 // carries the authoritative total.
                 callback.on_event(callback.ctx, .{ .usage = .{ .output_tokens = output_tokens.* } });
-            }
-        }
+            };
+        };
     }
 }
 
@@ -1071,6 +1088,122 @@ test "parseResponse tolerates malformed 200 body without panicking" {
         try std.testing.expectEqual(@as(u32, 0), response.input_tokens);
         try std.testing.expectEqual(@as(u32, 0), response.output_tokens);
         try std.testing.expectEqual(.end_turn, response.stop_reason);
+    }
+}
+
+test "processSseEvent tolerates malformed streaming events without panicking" {
+    const allocator = std.testing.allocator;
+
+    const callback: llm.StreamCallback = .{ .ctx = undefined, .on_event = struct {
+        fn on(_: *anyopaque, _: llm.StreamEvent) void {}
+    }.on };
+
+    // Run one event against fresh state and surface the observable results.
+    // Each case starts clean so a skipped event leaves no residue behind.
+    const Case = struct {
+        fn run(
+            alloc: Allocator,
+            cb: llm.StreamCallback,
+            event_type: []const u8,
+            data: []const u8,
+        ) !struct { blocks: usize, input: u32, output: u32 } {
+            var blocks: std.ArrayList(StreamingBlock) = .empty;
+            defer {
+                for (blocks.items) |*b| b.deinit(alloc);
+                blocks.deinit(alloc);
+            }
+            var stop_reason: types.StopReason = .end_turn;
+            var input_tokens: u32 = 0;
+            var output_tokens: u32 = 0;
+            var cache_creation_tokens: u32 = 0;
+            var cache_read_tokens: u32 = 0;
+            try processSseEvent(
+                event_type,
+                data,
+                alloc,
+                &blocks,
+                &stop_reason,
+                &input_tokens,
+                &output_tokens,
+                &cache_creation_tokens,
+                &cache_read_tokens,
+                cb,
+            );
+            return .{ .blocks = blocks.items.len, .input = input_tokens, .output = output_tokens };
+        }
+    };
+
+    // Top-level JSON that is not an object is skipped, not an illegal union access.
+    {
+        const r = try Case.run(allocator, callback, "message_start", "[1,2,3]");
+        try std.testing.expectEqual(@as(usize, 0), r.blocks);
+        try std.testing.expectEqual(@as(u32, 0), r.input);
+    }
+    // A float input_tokens skips that field but a valid integer sibling still reads.
+    {
+        const r = try Case.run(allocator, callback, "message_start",
+            \\{"message":{"usage":{"input_tokens":1.5,"output_tokens":2}}}
+        );
+        try std.testing.expectEqual(@as(u32, 0), r.input);
+        try std.testing.expectEqual(@as(u32, 2), r.output);
+    }
+    // Negative and out-of-range counts clamp instead of panicking on @intCast.
+    {
+        const r = try Case.run(allocator, callback, "message_start",
+            \\{"message":{"usage":{"input_tokens":-5,"output_tokens":99999999999}}}
+        );
+        try std.testing.expectEqual(@as(u32, 0), r.input);
+        try std.testing.expectEqual(std.math.maxInt(u32), r.output);
+    }
+    // A `message` that is not an object is skipped.
+    {
+        const r = try Case.run(allocator, callback, "message_start",
+            \\{"message":5}
+        );
+        try std.testing.expectEqual(@as(u32, 0), r.input);
+    }
+    // content_block_start with no "type" appends no block.
+    {
+        const r = try Case.run(allocator, callback, "content_block_start",
+            \\{"content_block":{}}
+        );
+        try std.testing.expectEqual(@as(usize, 0), r.blocks);
+    }
+    // A tool_use block missing "id" is skipped with no leaked dupe.
+    {
+        const r = try Case.run(allocator, callback, "content_block_start",
+            \\{"content_block":{"type":"tool_use","name":"read"}}
+        );
+        try std.testing.expectEqual(@as(usize, 0), r.blocks);
+    }
+    // A text_delta carrying a non-string "text" is skipped.
+    {
+        const r = try Case.run(allocator, callback, "content_block_delta",
+            \\{"delta":{"type":"text_delta","text":5}}
+        );
+        try std.testing.expectEqual(@as(usize, 0), r.blocks);
+    }
+    // message_delta usage with a string output_tokens leaves the count at 0.
+    {
+        const r = try Case.run(allocator, callback, "message_delta",
+            \\{"usage":{"output_tokens":"big"}}
+        );
+        try std.testing.expectEqual(@as(u32, 0), r.output);
+    }
+    // Well-formed events still parse: a text block is appended.
+    {
+        const r = try Case.run(allocator, callback, "content_block_start",
+            \\{"content_block":{"type":"text"}}
+        );
+        try std.testing.expectEqual(@as(usize, 1), r.blocks);
+    }
+    // Well-formed usage reads both counts.
+    {
+        const r = try Case.run(allocator, callback, "message_start",
+            \\{"message":{"usage":{"input_tokens":10,"output_tokens":20}}}
+        );
+        try std.testing.expectEqual(@as(u32, 10), r.input);
+        try std.testing.expectEqual(@as(u32, 20), r.output);
     }
 }
 
