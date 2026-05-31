@@ -63,9 +63,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         sim_mod.addImport("build_options", build_options.createModule());
-        if (b.lazyDependency("ghostty", .{})) |dep| {
-            sim_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-        }
+        // ghostty (ghostty-vt) is dropped on the 0.16 branch (0.15-only; see
+        // build.zig.zon). zag-sim cannot build until ghostty supports 0.16
+        // (PR 12726); re-add the lazyDependency import here when it does.
         sim_mod.link_libc = true;
         if (target.result.os.tag == .linux) {
             sim_mod.linkSystemLibrary("util", .{});
