@@ -129,7 +129,7 @@ pub const Pool = struct {
                 self.completions.push(job) catch |err| switch (err) {
                     error.QueueFull => {
                         if (self.shutdown.load(.acquire)) break;
-                        std.Thread.sleep(1 * std.time.ns_per_ms);
+                        clock.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },
                 };

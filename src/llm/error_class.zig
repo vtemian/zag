@@ -23,6 +23,7 @@
 //! produced from it is still in use.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.error_class);
@@ -276,7 +277,7 @@ fn parseRetryAfter(headers: []const std.http.Header) ?u32 {
                 return secs;
             } else |_| {}
             const target = parseHttpDate(value) orelse return null;
-            const now = std.time.timestamp();
+            const now = clock.timestamp();
             if (target <= now) return 0;
             return std.math.cast(u32, target - now) orelse std.math.maxInt(u32);
         }
