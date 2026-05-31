@@ -77,6 +77,12 @@ pub const StreamingResponse = struct {
     /// does not. File upstream when you have a minute.
     body_done: bool = false,
 
+    /// Per-read body timeout in ms (0 = none), set from `opts.timeouts` in
+    /// `createWithOptions`. Enforced per chunk in `readChunk` by racing the
+    /// read against a deadline: 0.16 sockets are non-blocking within std.Io, so
+    /// SO_RCVTIMEO is inert (see socket_timeouts.streamWithTimeout).
+    read_ms: u32 = 0,
+
     /// Accumulates partial lines across network reads.
     pending_line: std.ArrayList(u8),
     /// Leftover bytes after a newline that belong to subsequent lines.
@@ -146,6 +152,7 @@ pub const StreamingResponse = struct {
             .remainder = .empty,
             .allocator = allocator,
             .body_done = false,
+            .read_ms = if (opts.timeouts) |to| to.read_ms else 0,
         };
         errdefer self.client.deinit();
 
@@ -204,21 +211,12 @@ pub const StreamingResponse = struct {
             return error.ApiError;
         };
 
-        // Socket-level read/write timeouts. Apply after `receiveHead` because
-        // that's the first point the underlying connection (and its socket
-        // fd) is reachable. The connect phase is left to the OS default
-        // (~75s on macOS, ~127s on Linux); Zig 0.15's std.http.Client does
-        // not surface the pre-handshake socket. SSE keep-alives every few
+        // Body read timeout is enforced per-chunk in `readChunk` via
+        // socket_timeouts.streamWithTimeout (self.read_ms), not by SO_RCVTIMEO:
+        // under 0.16 std.Io puts sockets in non-blocking mode and waits for
+        // readiness in its own poll() with no deadline, so SO_RCVTIMEO is inert.
+        // The connect phase is left to the OS default. SSE keep-alives every few
         // seconds satisfy the inter-byte read window in normal operation.
-        if (opts.timeouts) |to| {
-            if (self.req.connection) |conn| {
-                socket_timeouts.applySocketTimeouts(
-                    conn.stream_reader.stream.socket.handle,
-                    to.read_ms,
-                    to.write_ms,
-                );
-            }
-        }
 
         if (response.head.status != .ok) {
             const status: u16 = @intFromEnum(response.head.status);
@@ -506,28 +504,28 @@ pub const StreamingResponse = struct {
     /// without re-entering stdlib (which would panic on contentLengthStream;
     /// see the comment on body_done).
     ///
-    /// On `error.ReadFailed` the underlying socket error is recovered via
-    /// `connection.getReadError()`. `WouldBlock` (EAGAIN) means the
-    /// `SO_RCVTIMEO` set in `createWithOptions` fired; we surface it as
-    /// `error.ReadTimeout` so callers can distinguish a genuine timeout
-    /// from an opaque transport failure.
+    /// The read is bounded by `self.read_ms` (0 = none) via
+    /// socket_timeouts.streamWithTimeout: under 0.16 sockets are non-blocking
+    /// within std.Io, so the timeout is enforced by racing the read against a
+    /// deadline (not SO_RCVTIMEO). A deadline win surfaces `error.ReadTimeout`
+    /// so callers can distinguish a genuine timeout from a transport failure.
     fn readChunk(self: *StreamingResponse, chunk: []u8) !usize {
         if (self.body_done) return 0;
         var writer: std.Io.Writer = .fixed(chunk);
-        const n = self.body_reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+        const n = socket_timeouts.streamWithTimeout(
+            process_io.get(),
+            self.body_reader,
+            &writer,
+            .limited(chunk.len),
+            self.read_ms,
+        ) catch |err| switch (err) {
             error.EndOfStream => {
                 self.body_done = true;
                 return 0;
             },
+            error.ReadTimeout => return error.ReadTimeout,
             error.WriteFailed => unreachable, // fixed writer is sized to chunk.len
-            error.ReadFailed => {
-                if (self.req.connection) |conn| {
-                    if (conn.getReadError()) |inner| {
-                        if (inner == error.WouldBlock) return error.ReadTimeout;
-                    }
-                }
-                return error.ApiError;
-            },
+            error.ReadFailed => return error.ApiError,
         };
         return n;
     }
