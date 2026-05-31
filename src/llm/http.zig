@@ -310,11 +310,17 @@ pub fn httpPostJsonRaw(
         return error.ApiError;
     };
 
-    // Receive response headers.
+    // Receive response headers, bounding the head read so a provider that
+    // stalls before sending the head can't hang the turn (the body read below
+    // is already bounded; 0.16 has no OS read deadline on the non-blocking
+    // socket).
     var no_redirects: [0]u8 = .{};
-    var response = req.receiveHead(&no_redirects) catch |err| {
-        log.err("http: receiveHead failed: {s}", .{@errorName(err)});
-        return error.ApiError;
+    var response = socket_timeouts.receiveHeadWithTimeout(process_io.get(), &req, &no_redirects, if (timeouts) |to| to.read_ms else 0) catch |err| switch (err) {
+        error.ReadTimeout => return error.ReadTimeout,
+        else => {
+            log.err("http: receiveHead failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        },
     };
 
     // Read the body, bounding each read by the endpoint's read timeout.

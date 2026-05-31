@@ -595,9 +595,12 @@ fn oauthPostRaw(
     };
 
     var no_redirects: [0]u8 = .{};
-    var response = req.receiveHead(&no_redirects) catch |err| {
-        log.warn("oauth: receiveHead failed: {s}", .{@errorName(err)});
-        return error.ApiError;
+    var response = socket_timeouts.receiveHeadWithTimeout(process_io.get(), &req, &no_redirects, timeouts.read_ms) catch |err| switch (err) {
+        error.ReadTimeout => return error.ReadTimeout,
+        else => {
+            log.warn("oauth: receiveHead failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        },
     };
 
     // Bound the read so a wedged IdP fails fast instead of hanging the turn on

@@ -204,11 +204,17 @@ pub const StreamingResponse = struct {
             return error.ApiError;
         };
 
-        // Receive response headers.
+        // Receive response headers, bounding the head read by self.read_ms so a
+        // provider that stalls before sending the head can't hang the turn (the
+        // body read is already bounded per-chunk; 0.16 has no OS read deadline
+        // on the non-blocking socket).
         var no_redirects: [0]u8 = .{};
-        var response = self.req.receiveHead(&no_redirects) catch |err| {
-            log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
-            return error.ApiError;
+        var response = socket_timeouts.receiveHeadWithTimeout(process_io.get(), &self.req, &no_redirects, self.read_ms) catch |err| switch (err) {
+            error.ReadTimeout => return error.ReadTimeout,
+            else => {
+                log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
+                return error.ApiError;
+            },
         };
 
         // Body read timeout is enforced per-chunk in `readChunk` via

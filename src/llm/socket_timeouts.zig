@@ -80,6 +80,63 @@ pub fn streamWithTimeout(
     };
 }
 
+/// `error.ReadTimeout` for a stalled response-head read. Same shape as the
+/// per-read body timeout above, applied to `Request.receiveHead`.
+pub const ReceiveHeadTimeoutError = std.http.Client.Request.ReceiveHeadError || error{ReadTimeout};
+
+const HeadRace = union(enum) {
+    head: std.http.Client.Request.ReceiveHeadError!std.http.Client.Response,
+    timer: void,
+};
+
+fn receiveHeadOnce(
+    req: *std.http.Client.Request,
+    redirect_buffer: []u8,
+) std.http.Client.Request.ReceiveHeadError!std.http.Client.Response {
+    return req.receiveHead(redirect_buffer);
+}
+
+/// Run `req.receiveHead(redirect_buffer)` bounded by `read_ms` milliseconds
+/// (0 = unbounded). A wedged provider that accepts the connection but never
+/// (fully) sends the response head would otherwise hang `receiveHead` forever:
+/// 0.16 sockets are non-blocking inside `std.Io`, so there is no OS read
+/// deadline on the head read, only on the body (which `streamWithTimeout`
+/// already bounds). On deadline the in-flight head read is cancelled and
+/// `error.ReadTimeout` is returned.
+///
+/// Cancellation safety mirrors `streamWithTimeout`: only the worker touches
+/// `req` while the race runs (the caller is parked in `await`), so on a timeout
+/// the cancelled read leaves `req` partially-read and the caller's
+/// `req.deinit()` reclaims it; on a head win the worker has already returned by
+/// the time `await` does, so the returned `Response`'s borrows into the
+/// (caller-frame-stable) `req` are safe to use on the calling thread.
+pub fn receiveHeadWithTimeout(
+    io: std.Io,
+    req: *std.http.Client.Request,
+    redirect_buffer: []u8,
+    read_ms: u32,
+) ReceiveHeadTimeoutError!std.http.Client.Response {
+    if (read_ms == 0) return req.receiveHead(redirect_buffer);
+
+    var buffer: [2]HeadRace = undefined;
+    var sel = std.Io.Select(HeadRace).init(io, &buffer);
+    sel.concurrent(.head, receiveHeadOnce, .{ req, redirect_buffer }) catch {
+        // No concurrency available: block rather than fail the request.
+        return req.receiveHead(redirect_buffer);
+    };
+    sel.async(.timer, deadlineTask, .{ io, @as(u64, read_ms) * std.time.ns_per_ms });
+
+    const winner = sel.await() catch {
+        sel.cancelDiscard();
+        return error.ReadTimeout;
+    };
+    sel.cancelDiscard();
+    return switch (winner) {
+        .timer => error.ReadTimeout,
+        .head => |r| r,
+    };
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
