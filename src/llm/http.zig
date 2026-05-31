@@ -317,23 +317,14 @@ pub fn httpPostJsonRaw(
         return error.ApiError;
     };
 
-    // Socket-level read/write timeouts. Apply after `receiveHead`
-    // because that's the first point the underlying connection (and its
-    // socket fd) is reachable. Connect phase remains OS-default.
-    if (timeouts) |to| {
-        if (req.connection) |conn| {
-            socket_timeouts.applySocketTimeouts(
-                conn.stream_reader.stream.socket.handle,
-                to.read_ms,
-                to.write_ms,
-            );
-        }
-    }
-
-    // Read the body. EAGAIN (`error.WouldBlock`) recovered through
-    // `connection.getReadError()` after the wrapper `error.ReadFailed`
-    // surfaces as `error.ReadTimeout` so callers can distinguish a
-    // genuine timeout from an opaque transport failure.
+    // Read the body, bounding each read by the endpoint's read timeout.
+    // Under 0.16, sockets are non-blocking within std.Io, so the timeout is
+    // enforced by racing each `reader.stream` against a deadline (see
+    // socket_timeouts.streamWithTimeout), not by SO_RCVTIMEO. A deadline win
+    // cancels the in-flight read and surfaces `error.ReadTimeout` so callers
+    // can distinguish a genuine timeout from an opaque transport failure.
+    const io = process_io.get();
+    const read_ms: u32 = if (timeouts) |to| to.read_ms else 0;
     var transfer_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
@@ -343,17 +334,11 @@ pub fn httpPostJsonRaw(
     while (true) {
         var chunk: [4096]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&chunk);
-        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+        const n = socket_timeouts.streamWithTimeout(io, reader, &writer, .limited(chunk.len), read_ms) catch |err| switch (err) {
             error.EndOfStream => break,
+            error.ReadTimeout => return error.ReadTimeout,
             error.WriteFailed => unreachable, // fixed writer is sized to chunk.len
-            error.ReadFailed => {
-                if (req.connection) |conn| {
-                    if (conn.getReadError()) |inner| {
-                        if (inner == error.WouldBlock) return error.ReadTimeout;
-                    }
-                }
-                return error.ApiError;
-            },
+            error.ReadFailed => return error.ApiError,
         };
         if (n == 0) break;
         try out.appendSlice(allocator, chunk[0..n]);

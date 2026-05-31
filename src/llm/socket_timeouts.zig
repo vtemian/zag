@@ -50,6 +50,71 @@ pub fn applySocketTimeouts(handle: std.posix.socket_t, read_ms: u32, write_ms: u
     }
 }
 
+/// `error.ReadTimeout` is returned when the per-read deadline fires before the
+/// underlying `reader.stream` produces data; the in-flight read is cancelled.
+pub const StreamTimeoutError = std.Io.Reader.StreamError || error{ReadTimeout};
+
+const Race = union(enum) {
+    read: std.Io.Reader.StreamError!usize,
+    timer: void,
+};
+
+fn streamOnce(
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    limit: std.Io.Limit,
+) std.Io.Reader.StreamError!usize {
+    return reader.stream(writer, limit);
+}
+
+fn deadlineTask(io: std.Io, ns: u64) void {
+    io.sleep(.fromNanoseconds(@intCast(ns)), .awake) catch {};
+}
+
+/// Run one `reader.stream(writer, limit)` bounded by `read_ms` milliseconds
+/// (0 = unbounded). On deadline, the in-flight read is cancelled and
+/// `error.ReadTimeout` is returned; otherwise the stream result (including
+/// `error.EndOfStream`) is propagated unchanged.
+///
+/// Zig 0.16's `std.Io.Threaded` puts sockets in non-blocking mode and waits
+/// for readiness in its own `poll()` with no deadline, so `SO_RCVTIMEO` is
+/// inert: a wedged provider would block a body read forever. Instead we run
+/// the read as a concurrent task raced against a deadline via `std.Io.Select`;
+/// when the deadline wins, the in-flight read is cancelled (`std.Io.Threaded`
+/// interrupts the blocked recv via SIG.IO) and we surface `error.ReadTimeout`.
+/// The timeout is per-read (per chunk), matching the old per-`recv`
+/// `SO_RCVTIMEO` semantic. The result union carries only a byte count, never an
+/// owned resource, so `Select.cancelDiscard` cleans up the loser without a leak.
+/// If concurrency is unavailable (`error.ConcurrencyUnavailable`, e.g. a
+/// single-threaded build) we fall back to a plain blocking read.
+pub fn streamWithTimeout(
+    io: std.Io,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    limit: std.Io.Limit,
+    read_ms: u32,
+) StreamTimeoutError!usize {
+    if (read_ms == 0) return reader.stream(writer, limit);
+
+    var buffer: [2]Race = undefined;
+    var sel = std.Io.Select(Race).init(io, &buffer);
+    sel.concurrent(.read, streamOnce, .{ reader, writer, limit }) catch {
+        // No concurrency available: block rather than fail the request.
+        return reader.stream(writer, limit);
+    };
+    sel.async(.timer, deadlineTask, .{ io, @as(u64, read_ms) * std.time.ns_per_ms });
+
+    const winner = sel.await() catch {
+        sel.cancelDiscard();
+        return error.ReadTimeout;
+    };
+    sel.cancelDiscard();
+    return switch (winner) {
+        .timer => error.ReadTimeout,
+        .read => |r| r,
+    };
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
