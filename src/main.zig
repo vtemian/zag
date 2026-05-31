@@ -258,9 +258,8 @@ pub fn main() !void {
     // Layout needs a Viewport pointer at setRoot time but the live one
     // lives at `&orchestrator.window_manager.root_pane.viewport`, an
     // address that doesn't exist yet (the orchestrator is built below).
-    // Pass a stack-local placeholder; the `layout.setRootViewport(...)`
-    // call after orchestrator init rewrites the leaf's viewport pointer
-    // to the final home.
+    // Pass a stack-local placeholder; `EventOrchestrator.create` rewrites
+    // the leaf's viewport pointer to the final home once that address exists.
     var root_viewport: Viewport = .{};
     try layout.setRoot(.{ .buffer = root_buffer.buf(), .view = root_buffer.view(), .viewport = &root_viewport });
 
@@ -383,7 +382,11 @@ pub fn main() !void {
     root_runner.skills = &skills_registry;
 
     // -- Hand off to the orchestrator ----------------------------------------
-    var orchestrator = try EventOrchestrator.init(.{
+    // `create` heap-allocates the orchestrator and wires every back-reference
+    // that points into it (compositor, layout root viewport, lua engine, root
+    // runner, node registry) while `self` already has its final address, so
+    // there is no post-construction pointer-rewiring dance here.
+    const orchestrator = try EventOrchestrator.create(.{
         .allocator = allocator,
         .terminal = &term,
         .screen = &screen,
@@ -401,25 +404,11 @@ pub fn main() !void {
         .wake_write_fd = wake_write,
         .skills = &skills_registry,
     });
-    defer orchestrator.deinit();
+    defer orchestrator.destroy();
 
-    // The compositor needs the orchestrator to resolve per-pane diagnostics
-    // (e.g. the dropped-event counter) from a focused leaf's Buffer. Wire
-    // this after orchestrator construction so the pointer is stable.
-    compositor.orchestrator = &orchestrator;
-
-    // `&self.node_registry` is only a stable address now that `orchestrator`
-    // sits in its final home. Attach here so Layout starts tracking node
-    // create/destroy from this point on and back-registers the existing root.
-    // `attachLayoutRegistry` also wires the WM-owned BufferRegistry into
-    // the root pane's conversation (a borrowed pointer at root_buffer)
-    // so node-creation paths can allocate TextBuffer storage. Every node
-    // creation downstream of this call assumes the registry is live.
-    try orchestrator.window_manager.attachLayoutRegistry();
-
-    // Restore prior session content and post the startup banner only
-    // after the registry is wired: both paths call `appendNode`, which
-    // requires a registry for content-bearing node types after Phase C.
+    // Restore prior session content and post the startup banner only after
+    // the orchestrator is wired: both paths call `appendNode`, which requires
+    // the node registry that `create` attached.
     if (session_handle) |*sh| {
         if (resume_id != null) {
             EventOrchestrator.restorePane(root_pane, sh, allocator) catch |err| {
@@ -429,25 +418,6 @@ pub fn main() !void {
     }
     try postStartupBanner(&root_buffer, resume_id, if (session_handle) |*sh| sh else null, provider.model_id);
 
-    // Wire the window manager pointer into the root runner so the
-    // main-thread drain loop can service `layout_request` round-trips.
-    // Extra split panes pick this up inside `createSplitPane`.
-    root_runner.window_manager = &orchestrator.window_manager;
-
-    // The root Pane was passed by value into EventOrchestrator.init and
-    // now lives at a stable address inside orchestrator.window_manager.
-    // Rewire the layout's root leaf to that pane's inline viewport so
-    // leaf.viewport-routed readers (Compositor, EventOrchestrator) hit
-    // the live pane viewport instead of the placeholder used during
-    // `layout.setRoot`, which ran before this address existed.
-    layout.setRootViewport(&orchestrator.window_manager.root_pane.viewport);
-
-    // Lua bindings (zag.layout.*, zag.pane.*) call the window manager
-    // directly on the main thread. Wire after orchestrator construction
-    // so the pointer is stable for the lifetime of the engine.
-    lua_engine.window_manager = &orchestrator.window_manager;
-    lua_engine.buffer_registry = &orchestrator.window_manager.buffer_registry;
-
     // Bash sandbox config: borrowed by both the engine (for the Lua
     // setter) and the bash module (for execute-time branching). Stack
     // address is stable for the rest of the function, which is the
@@ -455,18 +425,6 @@ pub fn main() !void {
     var bash_config: bash_tool.Config = .{};
     lua_engine.bash_config = &bash_config;
     bash_tool.bindConfig(&bash_config);
-
-    // Publish the root leaf's packed handle on the root runner so the
-    // agent thread can mirror it into `tools.current_caller_pane_id`
-    // around every tool dispatch. `attachLayoutRegistry` ran above, so
-    // the root is already back-registered.
-    if (orchestrator.window_manager.layout.root) |root_node| {
-        if (orchestrator.window_manager.handleForNode(root_node)) |handle| {
-            root_runner.pane_handle_packed = @bitCast(handle);
-        } else |err| {
-            log.warn("root leaf missing from registry: {}", .{err});
-        }
-    }
 
     // Register any Lua-declared tools into the dispatch registry. Config.lua
     // already ran before provider creation, so the keymap overrides,

@@ -85,25 +85,16 @@ pub const CancelError = error{
 /// returned as `ApiError`. Used at provider entry points so stdlib HTTP
 /// and JSON errors don't leak past the vtable.
 pub fn mapProviderError(err: anyerror) ProviderError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ApiError => error.ApiError,
-        error.InvalidUri => error.InvalidUri,
-        error.MalformedResponse => error.MalformedResponse,
-        error.MissingApiKey => error.MissingApiKey,
-        error.SseLineTooLong => error.SseLineTooLong,
-        error.SseEventDataTooLarge => error.SseEventDataTooLarge,
-        error.SseEventTypeTooLong => error.SseEventTypeTooLong,
-        error.Cancelled => error.Cancelled,
-        error.ProviderResponseFailed => error.ProviderResponseFailed,
-        error.NotLoggedIn => error.NotLoggedIn,
-        error.LoginExpired => error.LoginExpired,
-        error.ReadTimeout => error.ReadTimeout,
-        else => blk: {
-            log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
-            break :blk error.ApiError;
-        },
-    };
+    // Identity-map every error already named in ProviderError; collapse
+    // anything else to ApiError. The passthrough is generated from the error
+    // set at comptime, so adding a ProviderError variant cannot be silently
+    // swallowed by a forgotten switch arm: a new member automatically passes
+    // through instead of being remapped to ApiError.
+    inline for (@typeInfo(ProviderError).error_set.?) |member| {
+        if (err == @field(ProviderError, member.name)) return @field(ProviderError, member.name);
+    }
+    log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
+    return error.ApiError;
 }
 
 /// Clamp a std.json i64 token count into the u32 usage field, flooring

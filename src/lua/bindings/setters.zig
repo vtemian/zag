@@ -5,11 +5,19 @@
 //! thinking effort) through the `_zag_engine` registry slot. They're
 //! grouped together because they share that thin "one knob per call"
 //! shape and zero coupling to async or registry machinery.
+//!
+//! `persist_default_model` is the one outlier: it writes the default to
+//! config.lua. It lives here next to `set_default_model` for discoverability
+//! and reaches the window manager only to read the auth path that locates the
+//! config file. Keeping it Lua-callable is what lets the window-system swap
+//! primitive stay free of config-persistence policy (the /model picker calls
+//! it explicitly after swapping a pane).
 
 const std = @import("std");
 const zlua = @import("zlua");
 const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
+const auth_wizard = @import("../../auth_wizard.zig");
 
 const log = std.log.scoped(.lua);
 
@@ -64,6 +72,39 @@ fn zagSetDefaultModelFn(lua: *Lua) !i32 {
     const owned = try engine.allocator.dupe(u8, model);
     if (engine.default_model) |old| engine.allocator.free(old);
     engine.default_model = owned;
+    return 0;
+}
+
+/// Zig function backing `zag.persist_default_model("prov/id")`.
+/// Writes the model as the default into the user's config.lua (the file
+/// beside auth.json) so a runtime pick survives a restart. Best-effort: a
+/// missing window manager (headless) or a throwaway auth path (tests) is a
+/// clean no-op, and a write failure warn-logs rather than raising, since the
+/// live swap has already happened by the time the picker calls this.
+fn zagPersistDefaultModelFn(lua: *Lua) !i32 {
+    if (lua.typeOf(1) != .string) {
+        log.warn("zag.persist_default_model(): arg 1 must be a string", .{});
+        return error.LuaError;
+    }
+    const model = lua.toString(1) catch {
+        log.warn("zag.persist_default_model(): arg 1 must be a string", .{});
+        return error.LuaError;
+    };
+
+    _ = lua.getField(zlua.registry_index, "_zag_engine");
+    const ptr = lua.toPointer(-1) catch {
+        log.warn("zag.persist_default_model(): engine pointer not set (call storeSelfPointer first)", .{});
+        return error.LuaError;
+    };
+    lua.pop(1);
+    const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+    // No window manager (headless / engine-only tests) means no provider to
+    // locate config.lua from; nothing to persist, and not an error.
+    const wm = engine.window_manager orelse return 0;
+    _ = auth_wizard.persistDefaultModelForAuth(engine.allocator, wm.provider.auth_path, model) catch |err| {
+        log.warn("zag.persist_default_model(): persist failed: {}", .{err});
+    };
     return 0;
 }
 
@@ -152,6 +193,8 @@ pub fn registerOn(lua: *Lua) void {
     lua.setField(-2, "set_escape_timeout_ms");
     lua.pushFunction(zlua.wrap(zagSetDefaultModelFn));
     lua.setField(-2, "set_default_model");
+    lua.pushFunction(zlua.wrap(zagPersistDefaultModelFn));
+    lua.setField(-2, "persist_default_model");
     lua.pushFunction(zlua.wrap(zagSetThinkingEffortFn));
     lua.setField(-2, "set_thinking_effort");
     lua.pushFunction(zlua.wrap(zagSetBashSandboxLevelFn));

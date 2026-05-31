@@ -517,7 +517,7 @@ test "Registry re-register overwrites" {
     );
 }
 
-test "loadDefaults installs the nine built-in bindings" {
+test "loadDefaults installs the built-in bindings" {
     var r = Keymap.Registry.init(std.testing.allocator);
     defer r.deinit();
     try r.loadDefaults();

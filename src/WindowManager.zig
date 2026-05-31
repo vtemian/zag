@@ -34,7 +34,6 @@ const NodeRegistry = @import("NodeRegistry.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const agent_events = @import("agent_events.zig");
-const auth_wizard = @import("auth_wizard.zig");
 const skills_mod = @import("skills.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
@@ -2296,8 +2295,9 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
 ///      new one. `self.provider` keeps the same pointer (it addresses
 ///      main's owned slot), so every downstream reader sees the new
 ///      serializer, registry, and model id on the next read.
-///   4. Emit a status line plus a paste-me hint so the user can persist
-///      the pick by hand; autopersist is a deliberate non-goal.
+///   4. Emit a status line announcing the live swap. Persisting the pick as
+///      the default is the caller's decision (the /model picker calls
+///      `zag.persist_default_model`); this primitive never writes config.lua.
 pub fn swapProvider(
     self: *WindowManager,
     provider_name: []const u8,
@@ -2328,7 +2328,7 @@ fn swapProviderForRootFallback(
 }
 
 /// Swap the model for the pane identified by `handle`. All the
-/// cancel/drain/persistence/status logic lives here; `swapProvider`
+/// cancel/drain/status logic lives here; `swapProvider`
 /// is the focused-pane convenience wrapper.
 pub fn swapProviderForPane(
     self: *WindowManager,
@@ -2445,51 +2445,16 @@ fn swapProviderOnPanePtr(
         pane.provider = owned;
     }
 
-    // Step 4: try to persist the pick to config.lua. On any failure fall
-    // back to the paste-me hint so the user knows how to make the swap
-    // permanent by hand. auth_path lives next to config.lua on disk, so
-    // we derive one from the other; config_path is heap-allocated and
-    // owned by the caller.
-    const config_path = buildConfigPathFromAuth(self.allocator, self.provider.auth_path) catch null;
-    defer if (config_path) |p| self.allocator.free(p);
-
-    const persisted = if (config_path) |p| blk: {
-        auth_wizard.persistDefaultModel(self.allocator, p, model_string) catch |err| {
-            log.warn("persistDefaultModel failed: {}", .{err});
-            break :blk false;
-        };
-        break :blk true;
-    } else false;
-
-    if (persisted) {
-        self.appendStatusFmt(
-            "model swapped",
-            "model -> {s}\n  saved as default in {s}",
-            .{ model_string, config_path.? },
-        );
-    } else {
-        self.appendStatusFmt(
-            "model swapped",
-            "model -> {s}\n  Persist with zag.set_default_model(\"{s}\") in config.lua",
-            .{ model_string, model_string },
-        );
-    }
-}
-
-/// Derive the `config.lua` path that lives alongside `auth_path`. zag
-/// stores both under `~/.config/zag/`, so swapping the filename
-/// component is enough. Returns null when `auth_path` does not end in
-/// `auth.json` (e.g. test fixtures that point at a throwaway temp
-/// file), which signals the caller to skip persistence rather than
-/// write a bogus sibling. The returned slice is caller-owned.
-fn buildConfigPathFromAuth(
-    allocator: std.mem.Allocator,
-    auth_path: []const u8,
-) !?[]u8 {
-    const basename = "auth.json";
-    if (!std.mem.endsWith(u8, auth_path, basename)) return null;
-    const prefix = auth_path[0 .. auth_path.len - basename.len];
-    return try std.fmt.allocPrint(allocator, "{s}config.lua", .{prefix});
+    // Step 4: announce the live swap. Persisting the pick as the default is
+    // a separate decision the caller owns: the /model picker calls
+    // `zag.persist_default_model` after this returns. The window-system
+    // primitive deliberately does not write config.lua as a side effect of
+    // swapping a pane's model.
+    self.appendStatusFmt(
+        "model swapped",
+        "model -> {s}",
+        .{model_string},
+    );
 }
 
 /// Append a plain text line to the root buffer as a status node. Absorbs
@@ -5417,7 +5382,7 @@ test "swapProvider rebuilds ProviderResult and updates model_id" {
     try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
 }
 
-test "swapProvider persists the pick to config.lua" {
+test "swapProvider does not write config.lua (persistence is the caller's job)" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -5433,17 +5398,17 @@ test "swapProvider persists the pick to config.lua" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    // Rewire the fixture's provider to point at a real tmp auth.json
-    // path so `buildConfigPathFromAuth` derives a sibling config.lua
-    // that we can inspect after the swap.
+    // Point the provider at a real tmp auth.json so the old persist path
+    // would have derived a sibling config.lua here.
     f.provider.deinit();
     f.provider = try llm.createProviderFromLuaConfig(&f.registry, "provA/a1", auth_path, allocator);
 
     try f.wm.swapProvider("provB", "b2");
 
-    const body = try std.fs.cwd().readFileAlloc(allocator, config_path, 1 << 16);
-    defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
+    // The swap is a live, in-memory change only; it must NOT touch config.lua.
+    // Persisting the default is the /model picker's explicit decision via
+    // zag.persist_default_model, never a side effect of the window primitive.
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(config_path, .{}));
 }
 
 test "providerFor falls back to shared default when override is null" {

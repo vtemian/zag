@@ -185,6 +185,66 @@ pub fn init(cfg: Config) !EventOrchestrator {
     return self;
 }
 
+/// Heap-allocate the orchestrator and wire every back-reference that points
+/// into it. Returns a stable `*EventOrchestrator`, so interior addresses
+/// (`&self.window_manager`, the root pane's inline viewport) are valid the
+/// instant this returns. That lets the self-referential wiring live here,
+/// where `self` already has its final address, instead of a hand-ordered
+/// block in main that had to run after a by-value return landed and was
+/// guarded by "this address isn't stable yet" comments. Composition that is
+/// genuinely main's job (session restore, startup banner, tool registration,
+/// async runtime) stays in main and runs after this returns; the node
+/// registry every content-bearing `appendNode` needs is attached here.
+pub fn create(cfg: Config) !*EventOrchestrator {
+    const self = try cfg.allocator.create(EventOrchestrator);
+    errdefer cfg.allocator.destroy(self);
+    self.* = try init(cfg);
+    errdefer self.deinit();
+
+    // The compositor resolves per-pane diagnostics (e.g. the dropped-event
+    // counter) through the orchestrator.
+    cfg.compositor.orchestrator = self;
+
+    // Attach the node registry so Layout tracks node create/destroy and the
+    // WM-owned BufferRegistry reaches the root pane's conversation. Every
+    // content-bearing `appendNode` downstream of this assumes it has run.
+    try self.window_manager.attachLayoutRegistry();
+
+    // Rewire the layout's root leaf to the pane's inline viewport. The
+    // pre-construction `layout.setRoot` used a stack placeholder because this
+    // address did not exist yet; it does now.
+    cfg.layout.setRootViewport(&self.window_manager.root_pane.viewport);
+
+    // Lua layout/pane bindings call the window manager directly on the main
+    // thread; point the engine at the now-stable manager and buffer registry.
+    if (cfg.lua_engine) |engine| {
+        engine.window_manager = &self.window_manager;
+        engine.buffer_registry = &self.window_manager.buffer_registry;
+    }
+
+    // The root runner services `layout_request` round-trips against this WM
+    // and mirrors the root leaf's packed handle into the agent thread.
+    if (cfg.root_pane.runner) |runner| {
+        runner.window_manager = &self.window_manager;
+        if (self.window_manager.layout.root) |root_node| {
+            if (self.window_manager.handleForNode(root_node)) |handle| {
+                runner.pane_handle_packed = @bitCast(handle);
+            } else |err| {
+                log.warn("root leaf missing from registry: {}", .{err});
+            }
+        }
+    }
+
+    return self;
+}
+
+/// Tear down and free a `create`-allocated orchestrator.
+pub fn destroy(self: *EventOrchestrator) void {
+    const allocator = self.allocator;
+    self.deinit();
+    allocator.destroy(self);
+}
+
 /// Expose the shared wake-pipe write end for subsystems that need to signal
 /// the main loop from worker threads (e.g. the Lua async completion queue).
 /// Borrowed, not owned: the fd stays open as long as main.zig's `defer
