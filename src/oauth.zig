@@ -557,7 +557,7 @@ fn oauthPostRaw(
     extra_headers: []const std.http.Header,
     timeouts: Endpoint.TimeoutConfig,
 ) !RawPostResponse {
-    var client = std.http.Client{ .allocator = alloc };
+    var client = std.http.Client{ .allocator = alloc, .io = process_io.get() };
     defer client.deinit();
 
     const uri = std.Uri.parse(url) catch return error.InvalidUri;
@@ -600,16 +600,12 @@ fn oauthPostRaw(
         return error.ApiError;
     };
 
-    // First point the socket fd is reachable; cap read/write so a stalled
-    // IdP fails fast instead of wedging the turn.
-    if (req.connection) |conn| {
-        socket_timeouts.applySocketTimeouts(
-            conn.stream_reader.getStream().handle,
-            timeouts.read_ms,
-            timeouts.write_ms,
-        );
-    }
-
+    // Bound the read so a wedged IdP fails fast instead of hanging the turn on
+    // the OS-default socket timeout. 0.16 makes the http reader non-blocking,
+    // so the bound is enforced by racing the read against a deadline
+    // (socket_timeouts.streamWithTimeout), not by SO_RCVTIMEO. (write_ms is no
+    // longer separately enforced: the send completes before receiveHead.)
+    const io = process_io.get();
     var transfer_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
@@ -619,17 +615,11 @@ fn oauthPostRaw(
     while (true) {
         var chunk: [4096]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&chunk);
-        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+        const n = socket_timeouts.streamWithTimeout(io, reader, &writer, .limited(chunk.len), timeouts.read_ms) catch |err| switch (err) {
             error.EndOfStream => break,
+            error.ReadTimeout => return error.ReadTimeout,
             error.WriteFailed => unreachable, // fixed writer sized to chunk.len
-            error.ReadFailed => {
-                if (req.connection) |conn| {
-                    if (conn.getReadError()) |inner| {
-                        if (inner == error.WouldBlock) return error.ReadTimeout;
-                    }
-                }
-                return error.ApiError;
-            },
+            error.ReadFailed => return error.ApiError,
         };
         if (n == 0) break;
         try out.appendSlice(alloc, chunk[0..n]);

@@ -401,7 +401,7 @@ pub const SessionManager = struct {
         // a session that ended on un-persisted streaming deltas; treat it as a
         // display hint, not an authoritative count. Entry loading reads actual
         // JSONL lines and never consults it.
-        var sessions = cwd.openDir(sessions_dir, .{ .iterate = true }) catch |e| {
+        var sessions = cwd.openDir(io, sessions_dir, .{ .iterate = true }) catch |e| {
             log.err("failed to open sessions dir for recovery: {}", .{e});
             return e;
         };
@@ -765,7 +765,7 @@ const max_session_bytes: usize = 128 * 1024 * 1024; // 128 MiB
 /// slice. Shared body of `loadEntries` (cwd session) and `loadEntriesAt`
 /// (arbitrary project root); both differ only in how they spell the path.
 fn loadEntriesFromPath(allocator: Allocator, path: []const u8) ![]Entry {
-    const content = std.fs.cwd().readFileAlloc(allocator, path, max_session_bytes) catch |e| {
+    const content = std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, allocator, .limited(max_session_bytes)) catch |e| {
         log.err("failed to read session file: {}", .{e});
         return e;
     };
@@ -1045,7 +1045,8 @@ pub const RecoveryReport = struct {
 /// line-aligned and is left untouched after a single end-byte read. Only a
 /// torn trailing line triggers a bounded backward scan to the last newline,
 /// so an uncrashed open never reads the whole (potentially multi-MiB) file.
-pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8) !RecoveryReport {
+pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8) !RecoveryReport {
+    const io = process_io.get();
     var report: RecoveryReport = .{};
 
     // Step 1: trim an incomplete final JSONL line, if any.
@@ -1057,14 +1058,17 @@ pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8) !RecoveryReport {
         defer file.close(io);
         const end_pos = (try file.stat(io)).size;
         if (end_pos > 0) {
-            // A trailing newline means the file is line-aligned; nothing to do.
-            try file.seekTo(end_pos - 1);
-            var last_byte: [1]u8 = undefined;
-            const got = try file.readAll(&last_byte);
-            if (got == 1 and last_byte[0] != '\n') {
-                const truncate_to = try lastNewlinePos(file, end_pos);
+            // Tail-only: a trailing newline means the file is line-aligned, so a
+            // single positioned end-byte read avoids scanning the (possibly
+            // multi-MiB) body. Only a torn final line triggers the bounded
+            // backward scan in lastNewlinePos.
+            var tail_buf: [1]u8 = undefined;
+            var tail_reader = file.reader(io, &tail_buf);
+            try tail_reader.seekTo(end_pos - 1);
+            if (try tail_reader.interface.takeByte() != '\n') {
+                const truncate_to = try lastNewlinePos(file, io, end_pos);
                 report.truncated_bytes = @intCast(end_pos - truncate_to);
-                try file.setEndPos(truncate_to);
+                try file.setLength(io, truncate_to);
                 log.warn("session {s}: dropped {d} bytes of incomplete trailing JSONL line", .{
                     id, report.truncated_bytes,
                 });
@@ -1096,15 +1100,17 @@ pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8) !RecoveryReport {
 /// when the range holds no newline. Reads backward in bounded chunks so
 /// trimming a torn trailing line costs a few small reads rather than a scan
 /// of the whole file.
-fn lastNewlinePos(file: std.fs.File, end_pos: u64) !u64 {
+fn lastNewlinePos(file: std.Io.File, io: std.Io, end_pos: u64) !u64 {
+    var rbuf: [4096]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
     var buf: [64 * 1024]u8 = undefined;
     var window_end = end_pos;
     while (window_end > 0) {
         const window_start = if (window_end > buf.len) window_end - buf.len else 0;
         const len: usize = @intCast(window_end - window_start);
-        try file.seekTo(window_start);
-        const n = try file.readAll(buf[0..len]);
-        var i: usize = n;
+        try reader.seekTo(window_start);
+        try reader.interface.readSliceAll(buf[0..len]);
+        var i: usize = len;
         while (i > 0) {
             i -= 1;
             if (buf[i] == '\n') return window_start + @as(u64, i) + 1;
