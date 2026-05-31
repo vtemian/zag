@@ -6,7 +6,7 @@ A composable agent development environment. Built in Zig.
 
 ## What is this
 
-Zag is an AI coding agent where the window system is the platform. Splits, focus, and buffers are primitives. Everything above that, from the session tree to how agent responses render, is meant to be a plugin.
+Zag is an AI coding agent where the window system is the platform. Splits, focus, and buffers are primitives. Everything above that, from the session tree to how agent responses render to which system prompt a model gets, is a plugin.
 
 Think Neovim's architecture, applied to AI agents.
 
@@ -14,102 +14,72 @@ Think Neovim's architecture, applied to AI agents.
 
 What actually runs today:
 
-- Full-screen TUI with vim-style modal editing and binary-tree window splits
-- Per-pane agent loop with streaming, cooperative cancellation, and per-turn steering hooks
-- Runtime model switching: `/model` opens a numbered picker that swaps provider + model live, mid-session, without restart
-- Crash-safe session persistence (append-only JSONL, fsync per append, atomic metadata rename)
-- Seven providers through two wire formats: Anthropic, Anthropic OAuth (Claude Max/Pro), OpenAI, OpenAI OAuth (ChatGPT sign-in), OpenRouter, Groq, Ollama
-- Built-in tools: `read`, `write`, `edit`, `bash`, plus window-tree tools (`layout_tree`, `layout_focus`, `layout_split`, `layout_close`, `layout_resize`) that let the agent see and restructure your workspace. Multiple tool calls in a single turn run in parallel
-- Neovim-style Lua plugin surface: tools, hooks, keymaps, provider definitions
-- Async plugin runtime with coroutine-friendly primitives for HTTP, subprocess, filesystem, timers, and task combinators
-- Span-based metrics framework with Chrome Trace Event output, compile-time toggled
+- **Composable window-system TUI.** Binary-tree pane splits, vim `h`/`j`/`k`/`l` focus by manhattan distance, per-pane scrolling, and a selective dirty-rectangle ANSI diff renderer. Floating windows ship too (anchored popups, size-to-content, z-order).
+- **Per-pane streaming agent loop.** Each pane runs its own agent thread (LLM call, parallel tool execution, repeat) with cooperative Ctrl+C cancellation. Lua is pinned to the main thread; all cross-thread work flows through a typed event queue.
+- **Eight providers across three wire formats.** Anthropic Messages, OpenAI Chat Completions, and the OpenAI Responses API (ChatGPT/Codex). Providers: anthropic, anthropic-oauth (Claude Max/Pro), openai, openai-oauth (ChatGPT sign-in), openrouter, groq, moonshot (Kimi), ollama.
+- **Live `/model` switching, per pane.** A Vim-style popup picker swaps provider and model mid-session (cancel, bounded drain, rebuild-before-discard) and persists the pick to `config.lua`. Different panes can run different models at once.
+- **Mid-turn steering.** Type while a turn is running and your message is queued as a system-reminder interrupt rather than dangling at the tail.
+- **Automatic context compaction.** A predictive cascade (Lua structured-summary strategy, then Zig summarization, then drop-oldest, then refuse) keeps long sessions inside the context window.
+- **Subagent delegation.** A built-in `task` tool dispatches sub-problems to named subagents with their own prompt and optional model and tool allowlist, discovered from `*.md` files or registered in Lua. Recursion capped at depth 8.
+- **Skills and context layers.** `SKILL.md` discovery injected as an `available_skills` catalog, `AGENTS.md`/`CLAUDE.md`/`CONTEXT.md` walked from cwd to worktree root, plus nested-instruction injection after `read`.
+- **Per-model system-prompt packs.** The active model id selects a tuned prompt (Claude, GPT-5/Codex, Qwen3-Coder, or a generic default).
+- **Crash-safe sessions.** Append-only JSONL with tail-only recovery, per-project scoping, and a `/sessions` sidebar (`Ctrl-E`) to browse, rename, delete, and resume, including subagent trees.
+- **Opt-in bash sandboxing.** macOS seatbelt and Linux Landlock plus seccomp, toggled from Lua.
+- **Inline images.** PNG decode to half-block truecolor cells, plus grapheme-cluster-aware width and markdown rendering.
+- **Neovim-style Lua surface.** Custom tools, 13 hook events, keymaps, slash commands, provider and prompt-layer definitions, and an async runtime with coroutine primitives for HTTP, subprocess, filesystem, LLM, and timers.
+- **Headless eval mode and simulator.** Single-shot `--headless` runs emit ATIF-v1.2 trajectories for harbor; `zag-sim` drives the real binary end-to-end under a PTY against your real provider.
+- **Span-based metrics.** Compile-time toggled Chrome Trace Event output.
 
 ## Running it
 
 ```bash
-zig build                          # build (Zig 0.15+)
-zig build run                      # run (model via config.lua, fallback: anthropic/claude-sonnet-4-20250514)
-zig build test                     # run tests
-zig build -Dmetrics=true           # compile in performance tracing
+zig build                          # build (Zig 0.15.2)
+zig build run                      # run (model from config.lua; no default starts the wizard)
+zig build test                     # unit tests
 zig fmt --check .                  # formatting check
+
+zig build -Dmetrics=true           # compile in performance tracing
+zig build -Dlua_sandbox=true       # strip dangerous globals from the Lua VM
 
 zig build run -- --session=<id>    # resume a specific session
 zig build run -- --last            # resume the most recent one
 ```
 
+Dependencies are fetched by the build: ziglua (Lua 5.4), zigimg (image decode), and ghostty-vt (lazy, used by the simulator).
+
+The simulator and eval tooling have their own steps:
+
+```bash
+zig build sim -- run <scenario.zsm>      # drive zag end-to-end under a PTY
+ZAG_E2E=1 zig build test-sim-e2e         # real-provider scenario suite
+zig build validate-trajectory            # headless run plus harbor trajectory check
+zig build test-sandbox-linux             # Linux-only sandbox boundary probe
+```
+
+`make release` / `make package` / `make checksums` cross-compile and package ReleaseSafe builds for x86_64 and aarch64 on linux-musl and macos.
+
 ## First run
 
-On a clean machine, `zig build run` drops you into an interactive onboarding wizard. It shows an arrow-key picker so you can choose a provider without memorising digit prompts:
+On a clean machine `zig build run` drops into an onboarding wizard with an arrow-key provider picker:
 
 ```
 zag needs a provider. Choose one:
 
-  > anthropic       (API key)      anthropic/claude-sonnet-4-20250514
-    anthropic-oauth (OAuth)        anthropic-oauth/claude-sonnet-4-20250514
-    openai          (API key)      openai/gpt-4o
-    openai-oauth    (OAuth)        openai-oauth/gpt-5.2
-    openrouter      (API key)      openrouter/anthropic/claude-sonnet-4
-    groq            (API key)      groq/llama-3.3-70b-versatile
-    ollama          (no credential) ollama/llama3
+  > anthropic        (API key)        anthropic/claude-sonnet-4-20250514
+    anthropic-oauth  (OAuth)          Claude Max/Pro sign-in
+    openai           (API key)        openai/gpt-4o
+    openai-oauth     (OAuth)          ChatGPT sign-in (gpt-5.2)
+    openrouter       (API key)        openrouter/anthropic/claude-sonnet-4
+    groq             (API key)        groq/llama-3.3-70b-versatile
+    moonshot         (API key)        moonshot/kimi-k2.6
+    ollama           (no credential)  ollama/llama3
 
-↑/↓ to navigate · Enter to select · Esc to abort
+up/down to navigate · Enter to select · Esc to abort
 ```
 
-API-key rows prompt for a paste with echo disabled. OAuth rows open your browser to the provider's authorize endpoint, catch the callback on `localhost`, and store the resulting tokens in `~/.config/zag/auth.json` (mode `0600`). The Ollama row needs no credential at all.
+API-key rows prompt for a paste with echo disabled. OAuth rows open your browser to the provider's authorize endpoint, catch the callback on `localhost`, and store tokens in `~/.config/zag/auth.json` (mode `0600`). A second picker chooses the model, then the wizard scaffolds `~/.config/zag/config.lua` with `zag.set_default_model(...)` and continues into the TUI. If you already have a `config.lua`, the wizard leaves it alone and only writes `auth.json`.
 
-Once a provider is picked the wizard shows a second picker for the model (the row flagged `(recommended)` starts pre-selected), scaffolds `~/.config/zag/config.lua` with `zag.set_default_model(...)`, and continues into the TUI.
-
-If you already have a `config.lua` the wizard leaves it alone and only writes `auth.json`.
-
-## Runtime model switching
-
-Inside the TUI, type `/model` at the prompt to open a numbered picker listing every `provider/model` pair currently registered. Select one and zag cancels the in-flight agent turn, drains the provider cleanly (with a 5 s safety cap), rebuilds the provider result, and resumes the same session with the new model. No restart, no lost history.
-
-This pairs naturally with adding your own provider definitions in `config.lua`. New entries show up in the picker automatically.
-
-## Headless mode (harbor / Terminal-Bench)
-
-Zag can run a single-shot agent task for benchmark frameworks like harbor:
-
-    zag --headless \
-        --instruction-file=prompt.txt \
-        --trajectory-out=trajectory.json \
-        --no-session
-
-The trajectory follows ATIF-v1.2 and validates against
-`python -m harbor.utils.trajectory_validator`.
-
-## Configuration
-
-Zag reads two files on startup, both under `~/.config/zag/`:
-
-- `config.lua` is user-editable. It enables providers from the embedded stdlib and picks the default model. `require("zag.providers.<name>")` resolves from `~/.config/zag/lua/zag/providers/<name>.lua` first (for user overrides), then from the seven stdlib modules baked into the binary (`anthropic`, `anthropic-oauth`, `openai`, `openai-oauth`, `openrouter`, `groq`, `ollama`). Declare a brand-new provider by writing your own module that calls `zag.provider{ name, url, wire, auth, default_model, models, ... }` and `require()`ing it.
-- `auth.json` is machine-written by the wizard and the `zag auth` subcommands below. Do not hand-edit it. The schema is stable and documented here for reference only.
-
-Example `config.lua`:
-
-```lua
-require("zag.providers.openai-oauth")
-require("zag.providers.anthropic")
-zag.set_default_model("openai-oauth/gpt-5.2")
-```
-
-`auth.json` schema (managed for you):
-
-```json
-{
-  "anthropic":       { "type": "api_key", "key": "sk-ant-..." },
-  "openai":          { "type": "api_key", "key": "sk-..." },
-  "openrouter":      { "type": "api_key", "key": "sk-or-..." },
-  "groq":            { "type": "api_key", "key": "gsk_..." },
-  "openai-oauth":    { "type": "oauth", "access_token": "...", "refresh_token": "..." },
-  "anthropic-oauth": { "type": "oauth", "access_token": "...", "refresh_token": "..." }
-}
-```
-
-## Credentials
-
-Manage provider credentials with the `zag auth` subcommands. Each runs the same atomic, mode-`0600` write path as the first-run wizard, so `auth.json` never ends up partially written.
+Manage credentials later with the `zag auth` subcommands, which use the same atomic, mode-`0600` write path:
 
 ```bash
 zag auth login <provider>    # add or replace a credential
@@ -117,13 +87,50 @@ zag auth list                # list configured providers with masked keys
 zag auth remove <provider>   # delete a credential
 ```
 
-`zag auth login openai-oauth` or `zag auth login anthropic-oauth` triggers the browser OAuth flow; the API-key providers prompt for a key paste with echo disabled. Either form is the canonical way to rotate a credential: run it again for the same provider and the entry is replaced in place.
+`zag auth login anthropic-oauth` or `openai-oauth` (re)runs the browser OAuth flow; the API-key providers prompt for a key paste.
+
+## Providers and models
+
+Eight provider modules ship inside the binary. Enable them in `config.lua` and pick a default:
+
+```lua
+require("zag.providers.openai-oauth")
+require("zag.providers.anthropic")
+zag.set_default_model("openai-oauth/gpt-5.2")
+```
+
+`require("zag.providers.<name>")` resolves from `~/.config/zag/lua/zag/providers/<name>.lua` first (user overrides), then the embedded stdlib: `anthropic`, `anthropic-oauth`, `openai`, `openai-oauth`, `openrouter`, `groq`, `moonshot`, `ollama`. Declare a brand-new provider by writing a module that calls:
+
+```lua
+zag.provider{ name = ..., url = ..., wire = "anthropic" | "openai" | "chatgpt",
+              auth = ..., default_model = ..., models = ..., timeouts = ... }
+```
+
+`wire` selects one of the three built-in serializers. New entries show up in the `/model` picker automatically. `timeouts = { connect_ms, read_ms, write_ms }` (defaults 60s / 600s / 60s) apply at the socket layer via `setsockopt`, so a wedged endpoint fails with `error.ReadTimeout` instead of hanging on TCP keepalive; setting a value to `0` disables that timeout. Connect-phase timeouts are documented but unenforced on Zig 0.15's `std.http.Client`, which does not surface the pre-handshake socket. Reasoning effort is a cross-wire knob: `zag.set_thinking_effort("minimal" | "low" | "medium" | "high")`.
+
+Inside the TUI, `/model` opens the picker. Selecting a row cancels the in-flight turn, drains it cleanly (5s cap), rebuilds the provider before discarding the old one, persists the pick to `config.lua`, and resumes the same session on the new model. Per-token cost is estimated from each model's rate card (cache accounting is wire-aware), and per-turn telemetry plus classified error artifacts are written next to the process log.
+
+`auth.json` is machine-written by the wizard and the `zag auth` subcommands. Do not hand-edit it. The schema is stable and shown here for reference only:
+
+```json
+{
+  "anthropic":       { "type": "api_key", "key": "sk-ant-..." },
+  "openai":          { "type": "api_key", "key": "sk-..." },
+  "openrouter":      { "type": "api_key", "key": "sk-or-..." },
+  "groq":            { "type": "api_key", "key": "gsk_..." },
+  "moonshot":        { "type": "api_key", "key": "sk-..." },
+  "openai-oauth":    { "type": "oauth", "access_token": "...", "refresh_token": "..." },
+  "anthropic-oauth": { "type": "oauth", "access_token": "...", "refresh_token": "..." }
+}
+```
+
+OAuth tokens refresh proactively about five minutes before expiry under a file lock. Ollama needs no credential.
 
 ## Window system
 
-Every pane holds a buffer. A buffer is a runtime-polymorphic interface (ptr + vtable) with entries for rendering visible lines, handling keys, and receiving resize, focus, and mouse notifications. The conversation buffer that shows the agent view is just one implementation of it.
+Every pane holds a buffer: a runtime-polymorphic interface (ptr plus vtable) with entries for rendering visible lines, handling keys, and receiving resize, focus, and mouse notifications. The conversation view is one implementation; scratch, image, and text buffers also exist, and plugins can create scratch and image buffers from Lua.
 
-Layout is a binary tree of splits. Focus navigation uses manhattan distance against visible leaf rectangles, so `h` / `j` / `k` / `l` always land on the closest neighbour regardless of split order.
+Layout is a binary tree of splits. Focus navigation uses manhattan distance against visible leaf rectangles, so `h`/`j`/`k`/`l` always land on the closest neighbour regardless of split order. Floating windows live outside the tree with Neovim-style anchors (editor, cursor, window, mouse, laststatus, tabline), size-to-content, and z-order; the `/model` and completion popups are built on them.
 
 ```
 v / s    split vertically / horizontally
@@ -134,7 +141,7 @@ i / Esc  insert / normal mode
 
 ## Modal editing
 
-Sessions start in **insert** mode (typing goes to the prompt). Press `Esc` for **normal** mode, where keys fire window bindings instead of appending to the input. The status line carries an explicit `[INSERT]` / `[NORMAL]` tag and the input prompt swaps its `>` for a hint, so the current mode is impossible to miss.
+Sessions start in **insert** mode (typing goes to the prompt). Press `Esc` for **normal** mode, where keys fire window bindings instead of appending to the input. The status line carries an explicit `[INSERT]` / `[NORMAL]` tag.
 
 Rebind from `~/.config/zag/config.lua`:
 
@@ -142,17 +149,13 @@ Rebind from `~/.config/zag/config.lua`:
 zag.keymap("normal", "w", "focus_right")
 ```
 
-Built-in actions: `focus_left/down/up/right`, `split_vertical/horizontal`, `close_window`, `enter_insert_mode`, `enter_normal_mode`. Key specs accept `<C-x>`, `<M-x>`, `<S-x>`, and combinations like `<C-M-a>`.
+Built-in actions: `focus_left/down/up/right`, `split_vertical/horizontal`, `close_window`, `enter_insert_mode`, `enter_normal_mode`. Key specs accept `<C-x>`, `<M-x>`, `<S-x>`, named keys (`<Esc>`, `<CR>`, `<Tab>`, arrows, function keys), and combinations like `<C-M-a>`. Examples in [`examples/keymap.lua`](examples/keymap.lua).
 
-Examples in [`examples/keymap.lua`](examples/keymap.lua). Design notes in [`docs/plans/2026-04-17-modal-keymap-design.md`](docs/plans/2026-04-17-modal-keymap-design.md).
+## Plugins (Lua)
 
-## Hooks
+Zag embeds Lua 5.4 and an async runtime. Blocking work (HTTP, subprocess, filesystem, LLM) runs on a worker pool and resumes your coroutine on the main thread, so nothing blocks the TUI. Your entry point is `~/.config/zag/config.lua`; modules load from `~/.config/zag/lua/?.lua` via `require`. A missing config is not an error. `-Dlua_sandbox=true` strips `os`/`io`/`debug`/`package`/`require` for untrusted plugins; it is off by default because `config.lua` is trusted user code (the Neovim `init.lua` model).
 
-Zag exposes a Neovim-style hook API via `zag.hook(event, opts?, fn)`. Plugins can observe, veto, or rewrite agent events from Lua.
-
-Nine events: `UserMessagePre`, `UserMessagePost`, `ToolPre`, `ToolPost`, `TurnStart`, `TurnEnd`, `TextDelta`, `AgentDone`, `AgentErr`. Tool hooks accept a `pattern` filter (`"bash"`, `"*"`, `"read,write"`).
-
-Return `{ cancel = true, reason = "..." }` to veto, a partial table to rewrite the payload, `nil` to observe.
+**Hooks.** `zag.hook(event, opts?, fn)` observes, vetoes, or rewrites agent events. Thirteen events: `ToolPre`, `ToolPost`, `TurnStart`, `TurnEnd`, `UserMessagePre`, `UserMessagePost`, `TextDelta`, `AgentDone`, `AgentErr`, `PaneDraftChange`, `SessionListChanged`, `PaneFocused`, `LayoutResize`. Tool hooks accept a `pattern` filter (`"bash"`, `"*"`, `"read,write"`). Return `{ cancel = true, reason = "..." }` to veto, a partial table to rewrite the payload, `nil` to observe.
 
 ```lua
 -- Block destructive bash commands
@@ -161,29 +164,9 @@ zag.hook("ToolPre", { pattern = "bash" }, function(evt)
     return { cancel = true, reason = "refused destructive rm" }
   end
 end)
-
--- Redact API keys from file reads before they reach the model
-zag.hook("ToolPost", { pattern = "read" }, function(evt)
-  local cleaned = evt.content:gsub("sk%-[%w%-]+", "[REDACTED]")
-  if cleaned ~= evt.content then
-    return { content = cleaned }
-  end
-end)
-
--- Log each turn's token usage
-zag.hook("TurnEnd", function(evt)
-  print(string.format("turn %d: %d in / %d out",
-    evt.turn_num, evt.input_tokens, evt.output_tokens))
-end)
 ```
 
-Agent-thread events (`Tool*`, `Turn*`) round-trip through the event queue so the Lua VM stays pinned to the main thread. Callbacks run synchronously; a runtime error inside one is caught, logged, and later hooks still fire.
-
-More examples in [`examples/hooks.lua`](examples/hooks.lua). Design notes in [`docs/plans/2026-04-16-lua-hooks-design.md`](docs/plans/2026-04-16-lua-hooks-design.md).
-
-## Lua tools
-
-A tool is a Lua table with `name`, `description`, an `input_schema` in JSON Schema shape, and `execute(input)`. Registered tools appear in the agent's registry alongside the built-ins.
+**Tools.** A tool is a table with `name`, `description`, an `input_schema` in JSON Schema shape, and `execute(input)`. Registered tools appear alongside the built-ins.
 
 ```lua
 zag.tool({
@@ -194,51 +177,96 @@ zag.tool({
 })
 ```
 
-Config entry point: `~/.config/zag/config.lua`. Modules load from `~/.config/zag/lua/?.lua` via `require`. A missing config file is not an error.
+**The `zag.*` surface.**
 
-## Plugins
+- Concurrency: `zag.spawn` / `zag.detach` (task handles with `:join()` / `:cancel()` / `:done()`), `zag.sleep`, `zag.all` / `zag.race` / `zag.timeout`.
+- I/O: `zag.cmd` (subprocesses with a `:lines()` iterator, `:write`, `:kill`, timeouts), `zag.http.get/post/stream`, `zag.fs.*` (read/write/append/mkdir/remove/list/stat/exists), `zag.llm.complete`.
+- Windowing: `zag.layout.*` (tree/focus/split/split_root/close/resize, float/float_move/float_raise/floats), `zag.pane.*` (read, model, draft), `zag.popup.list`, `zag.width.cells`.
+- Agent: `zag.command`, `zag.keymap`, `zag.subagent.register`, `zag.sessions`, `zag.reminders`, `zag.mode`, `zag.prompt.layer` / `zag.context`, `zag.tools.gate` / `transform_output`, `zag.loop.detect`, `zag.compact.strategy`.
+- Config: `zag.set_default_model`, `zag.persist_default_model`, `zag.set_thinking_effort`, `zag.set_escape_timeout_ms`, `zag.set_bash_sandbox_level`.
+- Diagnostics: `zag.log.debug/info/warn/err`, `zag.notify`.
 
-Zag embeds Lua 5.4 and ships an async plugin runtime. Hooks, custom tools, keymaps, and coroutine-friendly primitives for HTTP, subprocess, and filesystem work are all first-class. Drop a `~/.config/zag/config.lua` and you can veto tool calls, rewrite user messages, register new tools, or run background pollers without ever blocking the TUI.
+More examples in [`examples/hooks.lua`](examples/hooks.lua). The embedded stdlib (28 modules: providers, prompt packs, compaction, the model picker and sessions sidebar, context layers, loop detector, popup helper, tool-output trimmers) lives under `src/lua/zag/`.
 
-Primitives exposed on the `zag.*` table:
+## Built-in tools
 
-- `zag.spawn(fn, ...)` / `zag.detach(fn, ...)`: coroutine task handles with `:join()`, `:cancel()`, `:done()`
-- `zag.sleep(ms)`: yield the current coroutine
-- `zag.all(tasks)`, `zag.race(tasks)`, `zag.timeout(ms, task)`: task combinators
-- `zag.cmd(cmd, args...)`: spawn subprocesses with stdin/stdout/stderr, `:lines()` iterator, `:kill()`, timeouts
-- `zag.http.get/post/stream`: non-blocking HTTP with streaming body iteration
-- `zag.fs.read/write/append/mkdir/remove/list/stat/exists`: filesystem I/O
-- `zag.layout.tree/focus/split/close/resize`, `zag.pane.read`: introspect and mutate the window system
-- `zag.log.debug/info/warn/err`, `zag.notify`: structured logging and notifications
+Eleven tools the agent can call:
 
-Hooks, the primitive reference, error conventions, and worked examples (remote policy hooks, git watchers, file watchers) are documented inline in the source under `src/lua/` and the embedded stdlib at `src/lua/zag/`.
+- `read` (truncates at 2000 lines, rejects files over 10 MB), `write` (atomic tmp, fsync, rename), `edit` (unique-match replace with a CRLF fallback), `bash` (own process group, cancellable, 1 MiB output cap).
+- `layout_tree`, `layout_focus`, `layout_split`, `layout_close`, `layout_resize`, `pane_read`: let the agent see and restructure your workspace.
+- `task`: delegate to a subagent (advertised only when at least one subagent is registered).
 
-## Session persistence
+Multiple tool calls in one turn run in parallel, each on its own thread and arena, so the hot path needs no mutex. Every call is validated against its JSON Schema before dispatch; failures come back as tool-result errors rather than crashes. An opt-in `render_diagram` tool (`require("zag.tools.render_diagram")`) rasterizes graphviz or d2 source to a PNG in a new pane.
 
-Each pane owns a session backed by `.zag/sessions/<id>.jsonl` (append-only, one event per line, `fsync` after each append) and `.zag/sessions/<id>.meta.json` (written via atomic rename). Entry types cover user messages, assistant text deltas, tool calls, tool results, info lines, errors, and session renames. Resume with `--session=<id>` or `--last`.
+## Subagents
 
-On boot, the conversation tree is reconstructed by walking the JSONL chronologically and reparenting tool results under their originating tool calls.
+A subagent is a named delegate with its own system prompt and an optional model and tool allowlist. Register one in Lua, or drop a Markdown file with YAML frontmatter into `.zag/agents/`, `.agents/agents/`, or `~/.config/zag/agents/`:
+
+```markdown
+---
+name: reviewer
+description: Reviews a diff for correctness
+tools: [read, bash]
+---
+You are a meticulous code reviewer...
+```
+
+The `task` tool exposes registered subagents to the model as an enum. A general-purpose subagent ships by default, which is what turns the `task` tool on out of the box. Subagent turns persist into the parent session JSONL and can be browsed in the sessions sidebar.
+
+## Skills and context
+
+Three layers feed the system prompt, all on by default:
+
+- **Skills.** `SKILL.md` directories discovered across project and user roots (project shadows user) become an `available_skills` catalog the model can consult.
+- **Instruction files.** The first `AGENTS.md`, `CLAUDE.md`, or `CONTEXT.md` found walking cwd up to the worktree root is injected as an `<instructions>` block, refreshed each turn. After a `read`, any instruction file sitting beside the read target is appended to the result.
+- **Environment.** An `<environment>` block carries cwd, worktree, date, platform, and a git marker.
+
+## Sessions
+
+Each pane owns a session at `.zag/sessions/<id>.jsonl` (append-only, one event per line) and `.zag/sessions/<id>.meta.json` (written via atomic rename). Fifteen entry types cover user messages, assistant and thinking deltas, tool calls and results, info and error lines, renames, and the subagent family. Streaming deltas defer their fsync to the next durable entry; a torn trailing line is truncated on open. Projects are registered in a global `projects.json` for cross-project listing.
+
+On boot the conversation tree is rebuilt by walking the JSONL chronologically, coalescing deltas and reparenting tool results under their originating tool calls by id. Resume with `--session=<id>` or `--last`. The `/sessions` sidebar (`Ctrl-E`) lists sessions with relative age and status, expands a session into its subagent tree, and renames, deletes, filters, or activates them.
+
+## Bash sandboxing
+
+Off by default, because `config.lua` is trusted. Turn it on from Lua:
+
+```lua
+zag.set_bash_sandbox_level("strict")
+```
+
+On macOS this wraps `bash` in a `sandbox-exec` seatbelt profile: reads broadly but denies `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, the whole `~/.config` tree, and the keychains; writes only to cwd and temp; network restricted to loopback. On Linux, zag re-execs a helper that installs a Landlock ruleset (cwd and system paths readable, `$HOME` deliberately ungranted so secrets are denied by absence) plus a seccomp-bpf filter that blocks `AF_INET` / `AF_INET6` sockets and `io_uring_setup` while still allowing unix sockets. Both degrade gracefully with a logged warning on unsupported kernels.
+
+## Headless and simulation
+
+Single-shot eval for frameworks like harbor:
+
+```bash
+zag --headless --instruction-file=prompt.txt --trajectory-out=traj.json --no-session
+```
+
+The trajectory follows ATIF-v1.2 and validates against `python -m harbor.utils.trajectory_validator`.
+
+`zag-sim` is the end-to-end test driver. It spawns the real binary under a PTY and runs a `.zsm` scenario (verbs `set_env`, `spawn`, `send`, `wait_text`, `wait_idle`, `wait_exit`, `expect_text`, `snapshot`) against a real terminal grid, exiting `0`/`1`/`2`/`3` for pass / assertion failed / child crashed / harness error. `zag-sim replay-gen <session.jsonl>` turns a recorded session into a scenario by re-typing its user turns. By design the simulator inherits your real config and hits your real provider; there are no LLM mocks.
 
 ## Performance
 
 Performance is a feature, not an afterthought.
 
-- The renderer is selective. Per-buffer dirty bits, dirty-rectangle ANSI diff against the previous frame, and per-node styled-line caches keyed by content version.
+- The renderer is selective: per-buffer dirty bits, a dirty-rectangle ANSI diff against the previous frame, and per-node styled-line caches keyed by content version. Forced repaints emit a full erase so vacated cells never ghost.
 - Wide characters and graphemes are fused. `width.nextCluster()` groups a base codepoint with its combining marks, ZWJ sequences, skin-tone modifiers, and variation selectors before width classification and cell placement.
-- Parallel tool execution writes into disjoint slots of a shared result array, so no mutex is needed on the hot path.
-- `-Dmetrics=true` compiles in a lock-free ring buffer of span events that dumps to a Chrome Trace Event JSON file. When the flag is off, every call site becomes a no-op the compiler erases.
+- Parallel tools write into disjoint slots of a shared result array, so no mutex is needed on the hot path. Event payloads carry their producing allocator, which makes a cross-allocator free structurally impossible.
+- `-Dmetrics=true` compiles in a lock-free ring buffer of span events that dumps to a Chrome Trace Event JSON file (on exit and via `/perf-dump`). When the flag is off, every call site becomes a no-op the compiler erases.
 
 ## What's next
 
 Rough shape, not a promise.
 
-- Persisting `/model` picks to `config.lua` and per-pane model overrides
-- Floating windows (slash-command autocomplete, popups)
-- libghostty-vt integration
 - Tree-sitter buffer for syntax-aware code browsing
-- More buffer kinds (git, files, diagnostics) as plugins
+- Domain buffers (git, files, diagnostics) as plugins
+- libghostty-vt as the main terminal backend (it already powers the simulator)
 
-Active design work lives in [`docs/plans/`](docs/plans/). There are 50+ plans in there documenting the trade-offs and the reasoning, not just the what.
+Active design work lives in [`docs/plans/`](docs/plans/). The plans document the trade-offs and the reasoning, not just the what.
 
 ## Inspiration
 
