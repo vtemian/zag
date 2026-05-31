@@ -779,14 +779,14 @@ test "sessions sidebar caches list and subagents across renders" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(fake_home);
-    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    const prev_home = env_mod.getOwned(allocator, "HOME") catch null;
     defer if (prev_home) |p| allocator.free(p);
     setEnvForTest("HOME", fake_home);
     defer restoreEnvForTest("HOME", prev_home);

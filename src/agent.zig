@@ -1263,7 +1263,7 @@ test "marshalRequest waits for done before returning on cancel (no use-after-fre
     // but do NOT signal done yet. The worker's 50ms timedWait expires, it
     // observes cancel, and (with the fix) parks on req.done.wait().
     cancel.store(true, .release);
-    std.Thread.sleep(120 * std.time.ns_per_ms);
+    clock.sleep(120 * std.time.ns_per_ms);
 
     // Finish the dispatch: mark our writes complete, then signal done.
     probe.main_finished_writing.store(true, .release);

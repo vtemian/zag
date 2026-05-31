@@ -1026,23 +1026,31 @@ test "refreshAccessToken maps invalid_grant to error.LoginExpired" {
 /// only the response head (chunked transfer, no chunk) and sleeps. Any read
 /// on the body side blocks until `SO_RCVTIMEO` fires. Mirrors
 /// `mockTimeoutServer` in `llm/http.zig`.
-fn mockStallingIdp(srv: *std.net.Server, sleep_ns: u64) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockStallingIdp(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    const io = std.testing.io;
+    var stream = srv.accept(io) catch return;
+    defer stream.close(io);
 
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = conn.stream.read(&buf) catch return;
+    var read_scratch: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_scratch);
+    var req: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (total < req.len) {
+        const n = sr.interface.readSliceShort(req[total..]) catch return;
         if (n == 0) return;
-        if (std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") != null) break;
+        total += n;
+        if (std.mem.indexOf(u8, req[0..total], "\r\n\r\n") != null) break;
     }
 
     const head_only = "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: application/json\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
-    _ = conn.stream.writeAll(head_only) catch {};
-    std.Thread.sleep(sleep_ns);
+    var write_scratch: [256]u8 = undefined;
+    var sw = stream.writer(io, &write_scratch);
+    sw.interface.writeAll(head_only) catch {};
+    sw.interface.flush() catch {};
+    clock.sleep(sleep_ns);
 }
 
 test "oauthPostRaw surfaces error.ReadTimeout when the IdP stalls mid-body" {
@@ -1052,24 +1060,23 @@ test "oauthPostRaw surfaces error.ReadTimeout when the IdP stalls mid-body" {
     // read timeout the body read fails fast with EAGAIN, recovered as
     // error.ReadTimeout. A short timeout is threaded in directly so the
     // test stays sub-second rather than waiting the 30s production budget.
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     const thr = try std.Thread.spawn(.{}, mockStallingIdp, .{ &server, 3 * std.time.ns_per_s });
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const result = oauthPostRaw(std.testing.allocator, url, "{}", &.{
         .{ .name = "Content-Type", .value = "application/json" },
     }, .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 });
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     try std.testing.expectError(error.ReadTimeout, result);
     // 500 ms timeout plus slack for connect/handshake; OS-default behaviour

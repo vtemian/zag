@@ -2724,7 +2724,7 @@ test "persistDefaultModelForAuth writes the default beside auth.json" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const auth_path = try std.fs.path.join(gpa, &.{ dir_abs, "auth.json" });
     defer gpa.free(auth_path);
@@ -2734,7 +2734,7 @@ test "persistDefaultModelForAuth writes the default beside auth.json" {
     const wrote = try persistDefaultModelForAuth(gpa, auth_path, "provB/b2");
     try std.testing.expect(wrote);
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, config_path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
 }

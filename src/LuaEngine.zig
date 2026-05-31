@@ -3007,12 +3007,12 @@ test "taskForCoroutine fast path matches the linear scan for a yielding coroutin
     try std.testing.expectEqual(expected, found);
 
     // Drain to completion so the task retires and nothing leaks.
-    const deadline = std.time.milliTimestamp() + 500;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 500;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());

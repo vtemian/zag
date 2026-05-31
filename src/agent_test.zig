@@ -337,7 +337,7 @@ fn pumpHookRequests(
     const AgentRunner = @import("AgentRunner.zig");
     while (!stop_flag.load(.acquire)) {
         AgentRunner.dispatchHookRequests(q, eng, null);
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
     AgentRunner.dispatchHookRequests(q, eng, null);
 }

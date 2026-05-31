@@ -919,12 +919,12 @@ test "in-place fill over a vacated wide glyph repaints col1 (no continuation gho
     screen.writeCluster(0, 0, "\u{4E2D}", 0x4E2D, 2, .{}, .default);
     try std.testing.expect(screen.getCell(0, 1).continuation);
     {
-        const pipe = try std.posix.pipe();
-        const write_end: std.fs.File = .{ .handle = pipe[1] };
-        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        const pipe = try wake_pipe.openBlocking();
+        const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
+        const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
         try screen.render(write_end);
-        write_end.close();
-        read_end.close();
+        write_end.close(std.testing.io);
+        read_end.close(std.testing.io);
     }
     // The continuation bit is frame-scoped: end-of-render must clear it on
     // both grids so a later in-place fill cannot inherit a stale bit.
@@ -937,12 +937,12 @@ test "in-place fill over a vacated wide glyph repaints col1 (no continuation gho
     screen.getCell(0, 0).codepoint = 'A';
     screen.getCell(0, 1).codepoint = 'B';
 
-    const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
-    defer read_end.close();
+    const pipe = try wake_pipe.openBlocking();
+    const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
+    const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
+    defer read_end.close(std.testing.io);
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [8192]u8 = undefined;
     const output = try readPipe(read_end, &scratch);

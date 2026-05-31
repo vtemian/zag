@@ -2698,15 +2698,15 @@ test "recoverSessionFiles trims a torn trailing line longer than the scan window
     defer body.deinit(allocator);
     try body.appendSlice(allocator, head);
     try body.appendNTimes(allocator, 'x', torn_len);
-    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = body.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl", .data = body.items });
 
-    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
-    defer iter_dir.close();
+    var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer iter_dir.close(std.testing.io);
 
     const report = try recoverSessionFiles(iter_dir, "abc");
     try std.testing.expectEqual(@as(usize, torn_len), report.truncated_bytes);
 
-    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "abc.jsonl", allocator, .limited(1024));
     defer allocator.free(after);
     try std.testing.expectEqualStrings(head, after);
 }
@@ -2748,7 +2748,7 @@ test "recoverSessionFiles leaves a clean newline-terminated file untouched" {
     try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
 
     // The tail-only path must not rewrite a file that already ends in '\n'.
-    const after = try tmp.dir.readFileAlloc(allocator, "sess.jsonl", 1024);
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "sess.jsonl", allocator, .limited(1024));
     defer allocator.free(after);
     try std.testing.expectEqualStrings(jsonl_body, after);
 }
@@ -2757,10 +2757,10 @@ test "recoverSessionFiles is a no-op on an empty session file" {
     // end_pos == 0 short-circuits before any tail read or backward scan.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl", .data = "" });
 
-    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
-    defer iter_dir.close();
+    var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer iter_dir.close(std.testing.io);
 
     const report = try recoverSessionFiles(iter_dir, "abc");
     try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
@@ -2773,15 +2773,15 @@ test "recoverSessionFiles truncates a lone unterminated line with no newline" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const body = "{\"a\":1}"; // no trailing newline
-    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = body });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "abc.jsonl", .data = body });
 
-    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
-    defer iter_dir.close();
+    var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer iter_dir.close(std.testing.io);
 
     const report = try recoverSessionFiles(iter_dir, "abc");
     try std.testing.expectEqual(@as(usize, body.len), report.truncated_bytes);
 
-    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "abc.jsonl", allocator, .limited(1024));
     defer allocator.free(after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }
@@ -3129,12 +3129,12 @@ test "loadEntries loads a session JSONL larger than the former 10 MiB cap" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwd(orig_cwd);
 
-    try std.fs.cwd().makePath(sessions_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sessions_dir);
 
     const big_len = 11 * 1024 * 1024;
     const huge = try allocator.alloc(u8, big_len);
@@ -3151,7 +3151,7 @@ test "loadEntries loads a session JSONL larger than the former 10 MiB cap" {
     try line.appendSlice(allocator, "{\"type\":\"info\",\"content\":\"");
     try line.appendSlice(allocator, huge);
     try line.appendSlice(allocator, "\",\"ts\":1}\n");
-    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = line.items });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = jsonl_path, .data = line.items });
 
     const loaded = try loadEntries(session_id, allocator);
     defer {

@@ -609,10 +609,10 @@ test "bash group-kills sandboxed grandchild on cancel" {
     var result: ?types.ToolResult = null;
     var thread = try std.Thread.spawn(.{}, Runner.run, .{ &cancel, &result, allocator });
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    clock.sleep(200 * std.time.ns_per_ms);
     cancel.store(true, .release);
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     thread.join();
     const elapsed_ns = timer.read();
 

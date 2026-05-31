@@ -2418,14 +2418,10 @@ test "handleAgentEvent .done keeps a failed turn's status, does not settle to id
     // cwd at a temp dir and restore it afterwards.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    defer {
-        var d = std.fs.openDirAbsolute(orig_cwd, .{}) catch unreachable;
-        defer d.close();
-        d.setAsCwd() catch {};
-    }
-    try tmp.dir.setAsCwd();
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
 
     var mgr = try Session.SessionManager.init(allocator);
     var handle = try mgr.createSession("test-model");
