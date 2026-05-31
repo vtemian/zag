@@ -468,6 +468,12 @@ pub const StreamEmitter = struct {
     stop_reason: *types.StopReason,
     input_tokens: *u32,
     output_tokens: *u32,
+    /// Cached prompt tokens from `response.completed`
+    /// (`usage.input_tokens_details.cached_tokens`). A subset of
+    /// input_tokens; cost.zig nets it out under the chatgpt endpoint's
+    /// `cached_overlaps_input=true` semantics, so reporting 0 over-bills
+    /// cache hits.
+    cache_read_tokens: *u32,
     /// Emitted `StreamEvent`s go through this callback. Tests plug in a
     /// recorder; production plugs in the agent-loop event queue.
     callback: llm.StreamCallback,
@@ -870,11 +876,19 @@ fn handleCompleted(obj: std.json.ObjectMap, emit: *StreamEmitter) !void {
         if (usage == .object) {
             const usage_obj = usage.object;
             if (usage_obj.get("input_tokens")) |it| {
-                if (it == .integer) emit.input_tokens.* = @intCast(it.integer);
+                if (it == .integer) emit.input_tokens.* = llm.clampTokens(it.integer);
             }
             if (usage_obj.get("output_tokens")) |ot| {
-                if (ot == .integer) emit.output_tokens.* = @intCast(ot.integer);
+                if (ot == .integer) emit.output_tokens.* = llm.clampTokens(ot.integer);
             }
+            // Cached prompt tokens are nested under input_tokens_details on the
+            // Responses API (Chat Completions uses prompt_tokens_details). They
+            // are a subset of input_tokens; cost.zig nets them out.
+            if (usage_obj.get("input_tokens_details")) |d| if (d == .object) {
+                if (d.object.get("cached_tokens")) |v| if (v == .integer) {
+                    emit.cache_read_tokens.* = llm.clampTokens(v.integer);
+                };
+            };
         }
     }
 
@@ -1033,6 +1047,7 @@ pub fn parseSseStream(
     var stop_reason: types.StopReason = .end_turn;
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
+    var cache_read_tokens: u32 = 0;
 
     var blocks: std.ArrayList(StreamingBlock) = .empty;
     defer {
@@ -1046,6 +1061,7 @@ pub fn parseSseStream(
         .stop_reason = &stop_reason,
         .input_tokens = &input_tokens,
         .output_tokens = &output_tokens,
+        .cache_read_tokens = &cache_read_tokens,
         .callback = callback,
         .telemetry = telemetry,
         .error_detail_out = error_detail_out,
@@ -1076,9 +1092,10 @@ pub fn parseSseStream(
         }
     }
 
-    // ChatGPT Responses API doesn't expose cache token counts today; pass 0
-    // so the final LlmResponse still populates all four fields cleanly.
-    return builder.finish(stop_reason, input_tokens, output_tokens, 0, 0, allocator);
+    // ChatGPT Responses API reports cached prompt tokens as a subset of
+    // input_tokens; pass as cache_read so cost.zig nets it out under the
+    // endpoint's cached_overlaps_input semantics. cache_creation stays 0.
+    return builder.finish(stop_reason, input_tokens, output_tokens, 0, cache_read_tokens, allocator);
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -1340,6 +1357,7 @@ const DispatchFixture = struct {
     stop_reason: types.StopReason,
     input_tokens: u32,
     output_tokens: u32,
+    cache_read_tokens: u32,
     recorder: EventRecorder,
     telemetry: ?*llm.telemetry.Telemetry = null,
     error_detail_out: ?*llm.error_detail.ErrorDetail = null,
@@ -1350,6 +1368,7 @@ const DispatchFixture = struct {
             .stop_reason = .end_turn,
             .input_tokens = 0,
             .output_tokens = 0,
+            .cache_read_tokens = 0,
             .recorder = .{ .allocator = allocator },
         };
     }
@@ -1371,6 +1390,7 @@ const DispatchFixture = struct {
             .stop_reason = &self.stop_reason,
             .input_tokens = &self.input_tokens,
             .output_tokens = &self.output_tokens,
+            .cache_read_tokens = &self.cache_read_tokens,
             .callback = self.recorder.callback(),
             .telemetry = self.telemetry,
             .error_detail_out = self.error_detail_out,
@@ -1401,6 +1421,8 @@ test "chatgpt SSE: plain text response assembles into single text block" {
     try std.testing.expectEqual(.end_turn, fx.stop_reason);
     try std.testing.expectEqual(@as(u32, 7), fx.input_tokens);
     try std.testing.expectEqual(@as(u32, 3), fx.output_tokens);
+    // Legacy usage envelope (no input_tokens_details) leaves cache_read at 0.
+    try std.testing.expectEqual(@as(u32, 0), fx.cache_read_tokens);
 
     const ev = fx.recorder.events.items;
     try std.testing.expectEqual(@as(usize, 4), ev.len);
@@ -1409,6 +1431,25 @@ test "chatgpt SSE: plain text response assembles into single text block" {
     try std.testing.expectEqualStrings("lo, ", ev[1].payload);
     try std.testing.expectEqualStrings("world!", ev[2].payload);
     try std.testing.expectEqual(.done, ev[3].kind);
+}
+
+test "chatgpt SSE: response.completed parses cached_tokens into cache_read" {
+    const allocator = std.testing.allocator;
+    var fx = DispatchFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    try fx.run(allocator, &.{
+        .{ .event_type = "response.created", .data = "{\"response\":{\"id\":\"r_1\"}}" },
+        .{ .event_type = "response.output_text.delta", .data = "{\"delta\":\"hi\"}" },
+        .{
+            .event_type = "response.completed",
+            .data = "{\"response\":{\"id\":\"r_1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":80}}}}",
+        },
+    });
+
+    try std.testing.expectEqual(@as(u32, 100), fx.input_tokens);
+    try std.testing.expectEqual(@as(u32, 5), fx.output_tokens);
+    try std.testing.expectEqual(@as(u32, 80), fx.cache_read_tokens);
 }
 
 test "chatgpt SSE: function_call accumulates arguments across deltas" {

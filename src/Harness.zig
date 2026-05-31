@@ -527,18 +527,11 @@ fn runWithProvider(deps: HeadlessDeps) !void {
 
     // Stream-delta payloads (text, thinking, tool_start/result, info, err)
     // are duped into the runner's wire_arena by the agent thread (see
-    // AgentRunner.submit), so they MUST be freed through that arena, not
-    // `gpa`. Mirror drainEvents/shutdown's allocator pick: arena free is a
-    // no-op and the bytes are reclaimed when the runner tears the arena
-    // down, whereas `gpa.free` on arena memory is cross-allocator UB that
-    // trips the DebugAllocator "Invalid free" canary mid-turn. Falls back
-    // to gpa only when no arena is live (tests that scaffold the queue
-    // without going through submit). The arena is stable for the whole
-    // drain because submit is called exactly once per headless run.
-    const event_alloc: std.mem.Allocator = if (deps.runner.wire_arena) |*arena|
-        arena.allocator()
-    else
-        gpa;
+    // AgentRunner.submit). Each event carries its producing allocator via
+    // OwnedPayload, so `payload.free()` / `event.freeOwned()` routes the
+    // free back through the arena (a no-op; the bytes are reclaimed at
+    // arena.deinit) and never through `gpa`, where it would be cross-
+    // allocator UB the DebugAllocator aborts on as "Invalid free".
 
     // Synthetic ids for tool_start events without a provider-assigned call_id
     // (streaming previews). FIFO-correlated with tool_result events that also
@@ -577,19 +570,24 @@ fn runWithProvider(deps: HeadlessDeps) !void {
             deps.runner.persistAgentEvent(ev);
             switch (ev) {
                 .text_delta => |t| {
-                    defer event_alloc.free(t);
-                    capture.addTextDelta(t) catch |err| {
+                    defer t.free();
+                    capture.addTextDelta(t.bytes) catch |err| {
                         log.warn("capture dropped text delta: {s}", .{@errorName(err)});
                     };
                 },
                 .tool_start => |s| {
+                    // Each OwnedPayload carries its producing allocator, so
+                    // every arm frees through the heap that allocated it: the
+                    // streaming preview (null call_id) on the wire arena, the
+                    // full event (with call_id) on the runner GPA via
+                    // runToolStep. No cross-allocator free is possible here.
                     defer {
-                        event_alloc.free(s.name);
-                        if (s.call_id) |id| event_alloc.free(id);
-                        if (s.input_raw) |raw| event_alloc.free(raw);
+                        s.name.free();
+                        if (s.call_id) |id| id.free();
+                        if (s.input_raw) |raw| raw.free();
                     }
-                    const args_json = s.input_raw orelse "{}";
-                    const tool_id = if (s.call_id) |id| id else blk: {
+                    const args_json = if (s.input_raw) |raw| raw.bytes else "{}";
+                    const tool_id = if (s.call_id) |id| id.bytes else blk: {
                         synth_counter += 1;
                         var buf: [16]u8 = undefined;
                         const synth = std.fmt.bufPrint(&buf, "t{d}", .{synth_counter}) catch "t?";
@@ -602,14 +600,17 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                         };
                         break :blk owned;
                     };
-                    capture.addToolCall(tool_id, s.name, args_json) catch |err| {
+                    capture.addToolCall(tool_id, s.name.bytes, args_json) catch |err| {
                         log.warn("capture dropped tool call: {s}", .{@errorName(err)});
                     };
                 },
                 .tool_result => |r| {
+                    // tool_result is always duped on the runner GPA by
+                    // runToolStep, never the wire arena; the OwnedPayload
+                    // carries that allocator so it frees through the GPA.
                     defer {
-                        event_alloc.free(r.content);
-                        if (r.call_id) |id| event_alloc.free(id);
+                        r.content.free();
+                        if (r.call_id) |id| id.free();
                     }
                     // FIFO-match null-id results against the oldest outstanding
                     // synthetic id. Parallel calls without provider ids
@@ -618,18 +619,18 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     // owner after the call returns.
                     var synth_owned: ?[]const u8 = null;
                     defer if (synth_owned) |id| gpa.free(id);
-                    const tool_id = if (r.call_id) |id| id else blk: {
+                    const tool_id = if (r.call_id) |id| id.bytes else blk: {
                         if (pending_synth.items.len == 0) break :blk "";
                         const id = pending_synth.orderedRemove(0);
                         synth_owned = id;
                         break :blk id;
                     };
-                    capture.addToolResult(tool_id, r.content, r.is_error) catch |err| {
+                    capture.addToolResult(tool_id, r.content.bytes, r.is_error) catch |err| {
                         log.warn("capture dropped tool result: {s}", .{@errorName(err)});
                     };
                 },
                 .info => |text| {
-                    defer event_alloc.free(text);
+                    defer text.free();
                 },
                 .usage => {
                     // Live output-token counter for the interactive working
@@ -641,7 +642,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     capture.endTurn(metrics) catch |err| {
                         log.warn("capture endTurn failed: {s}", .{@errorName(err)});
                     };
-                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(event_alloc);
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned();
                     if (deps.runner.agent_thread) |t| t.join();
                     deps.runner.agent_thread = null;
                     deps.runner.event_queue.deinit();
@@ -650,9 +651,9 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     break;
                 },
                 .err => |text| {
-                    agent_err = gpa.dupe(u8, text) catch null;
-                    event_alloc.free(text);
-                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned(event_alloc);
+                    agent_err = gpa.dupe(u8, text.bytes) catch null;
+                    text.free();
+                    for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned();
                     capture.endTurn(.{}) catch {};
                     if (deps.runner.agent_thread) |t| t.join();
                     deps.runner.agent_thread = null;
@@ -667,7 +668,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     // deltas; the final compacted history is what the
                     // trajectory captures, not the intermediate
                     // summary tokens. Free and continue.
-                    event_alloc.free(text);
+                    text.free();
                 },
                 .compaction_event => {
                     // Telemetry-only structured event; trajectory
@@ -675,8 +676,8 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     // No allocations to free here.
                 },
                 .thinking_delta => |td| {
-                    defer event_alloc.free(td.text);
-                    capture.addThinkingDelta(td.text) catch |err| {
+                    defer td.text.free();
+                    capture.addThinkingDelta(td.text.bytes) catch |err| {
                         log.warn("capture dropped thinking delta: {s}", .{@errorName(err)});
                     };
                 },

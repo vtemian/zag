@@ -173,6 +173,13 @@ pub const HookRequest = struct {
     /// thread before `done` is signalled; the thread that pushed the
     /// request owns it and must free after `done.wait()` returns.
     cancel_reason: ?[]const u8,
+    /// Allocator that owns `cancel_reason`. The hook dispatcher allocates
+    /// the reason with its own allocator, so a veto-capable caller hands
+    /// that allocator here and `freeResult` releases the reason through the
+    /// heap that produced it (never a cross-allocator free) on the cancel
+    /// path. Null for observer-only lifecycle hooks, which cannot veto and
+    /// so never receive a reason.
+    reason_allocator: ?Allocator = null,
 
     pub fn init(payload: *HookPayload) HookRequest {
         return .{
@@ -181,6 +188,21 @@ pub const HookRequest = struct {
             .cancelled = false,
             .cancel_reason = null,
         };
+    }
+
+    /// Release the cancel reason, if any, through its owning allocator.
+    /// `agent.marshalRequest` calls this on the cancel path; satisfying the
+    /// helper's comptime contract lets every round-trip request, including
+    /// hooks, share the single cancel-then-wait code path so the "wait for
+    /// `done` before the stack frame dies" invariant cannot drift per call
+    /// site.
+    pub fn freeResult(self: *HookRequest) void {
+        if (self.reason_allocator) |a| {
+            if (self.cancel_reason) |reason| {
+                a.free(reason);
+                self.cancel_reason = null;
+            }
+        }
     }
 };
 

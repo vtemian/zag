@@ -1,7 +1,7 @@
 //! End-to-end wiring tests for the Lua async runtime that cannot live
 //! inline.
 //!
-//! These exercise the LuaEngine + AsyncRuntime + IoPool +
+//! These exercise the LuaEngine + IoBackend + IoPool +
 //! CompletionQueue pipeline as a single integrated stack. Pairing the
 //! tests with any one of those modules would either pull the rest into
 //! that module's test scope (defeating module isolation) or duplicate
@@ -766,6 +766,90 @@ test "sessions sidebar renders one row per session and filters by name" {
         \\local st_after = sidebar._state_for_test()
         \\assert(st_after.cursor_row == 2,
         \\       "cursor_row should survive close/open, got " .. tostring(st_after.cursor_row))
+    );
+}
+
+// Caching: _render runs on every j/k keystroke. Without memoization each
+// render re-read every .meta.json across every project via zag.sessions.list()
+// and re-parsed an expanded session's whole JSONL via zag.sessions.subagents().
+// Both are cached in module state and dropped only on SessionListChanged /
+// open(); a plain re-render reuses them.
+test "sessions sidebar caches list and subagents across renders" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(fake_home);
+    const prev_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("test-model");
+    const id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(id);
+    _ = try handle.appendEntry(.{
+        .entry_type = .task_start,
+        .content = "{\"agent\":\"general\",\"prompt\":\"first\"}",
+        .timestamp = 1000,
+    });
+    handle.close();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    _ = engine.lua.pushString(id);
+    engine.lua.setGlobal("_test_session_id");
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\local st = sidebar._state_for_test()
+        \\-- Module state persists across tests; start from a clean cache and
+        \\-- expand our session so subagents() participates in the render.
+        \\st.session_list_cache = nil
+        \\st.subagent_cache = {}
+        \\st.filter = ""
+        \\st.expanded = { [_test_session_id] = true }
+        \\
+        \\-- Count real binding calls via counting wrappers.
+        \\local real_list = zag.sessions.list
+        \\local list_calls = 0
+        \\zag.sessions.list = function(...) list_calls = list_calls + 1; return real_list(...) end
+        \\local real_subs = zag.sessions.subagents
+        \\local sub_calls = 0
+        \\zag.sessions.subagents = function(...) sub_calls = sub_calls + 1; return real_subs(...) end
+        \\
+        \\sidebar._render()
+        \\sidebar._render()
+        \\sidebar._render()
+        \\assert(list_calls == 1, "list() should be fetched once across renders, got " .. tostring(list_calls))
+        \\assert(sub_calls == 1, "subagents() should be fetched once across renders, got " .. tostring(sub_calls))
+        \\
+        \\-- Invalidate exactly as the SessionListChanged hook does, then render.
+        \\st.session_list_cache = nil
+        \\st.subagent_cache = {}
+        \\sidebar._render()
+        \\assert(list_calls == 2, "list() should refetch after invalidation, got " .. tostring(list_calls))
+        \\assert(sub_calls == 2, "subagents() should refetch after invalidation, got " .. tostring(sub_calls))
+        \\
+        \\-- Restore globals and leave state clean for later tests.
+        \\zag.sessions.list = real_list
+        \\zag.sessions.subagents = real_subs
+        \\st.expanded = {}
     );
 }
 

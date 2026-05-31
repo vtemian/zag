@@ -249,7 +249,10 @@ fn statusShortcut(
             }
             break :blk null;
         },
-        429 => .{ .rate_limit = .{
+        // 429 (Too Many Requests) and 529 (Anthropic "Overloaded") are
+        // both transient backpressure signals the agent loop can retry
+        // after honoring Retry-After.
+        429, 529 => .{ .rate_limit = .{
             .retry_after_seconds = parseRetryAfter(response_headers),
             .plan_type = null,
         } },
@@ -264,10 +267,107 @@ fn statusShortcut(
 fn parseRetryAfter(headers: []const std.http.Header) ?u32 {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) {
-            return std.fmt.parseInt(u32, std.mem.trim(u8, h.value, " \t"), 10) catch null;
+            const value = std.mem.trim(u8, h.value, " \t");
+            // RFC 7231: Retry-After is either delta-seconds (an integer) or
+            // an HTTP-date. Try the integer form first; on failure fall back
+            // to an absolute date, converting it to seconds-from-now so the
+            // caller always sees a relative delay.
+            if (std.fmt.parseInt(u32, value, 10)) |secs| {
+                return secs;
+            } else |_| {}
+            const target = parseHttpDate(value) orelse return null;
+            const now = std.time.timestamp();
+            if (target <= now) return 0;
+            return std.math.cast(u32, target - now) orelse std.math.maxInt(u32);
         }
     }
     return null;
+}
+
+/// Parse an HTTP-date (RFC 7231) into a Unix epoch timestamp. Handles the
+/// preferred IMF-fixdate form (`Sun, 06 Nov 1994 08:49:37 GMT`) and the
+/// obsolete RFC 850 (`Sunday, 06-Nov-94 08:49:37 GMT`) and asctime
+/// (`Sun Nov  6 08:49:37 1994`) forms. Returns null when the value does not
+/// match any of these. All HTTP-dates are in GMT.
+fn parseHttpDate(value: []const u8) ?i64 {
+    var it = std.mem.tokenizeAny(u8, value, " \t");
+    const first = it.next() orelse return null;
+
+    if (std.mem.endsWith(u8, first, ",")) {
+        // Leading weekday with a trailing comma: IMF-fixdate or RFC 850.
+        const day_tok = it.next() orelse return null;
+        if (std.mem.indexOfScalar(u8, day_tok, '-') != null) {
+            return parseRfc850(day_tok, &it);
+        }
+        return parseImfFixdate(day_tok, &it);
+    }
+    // No comma after the weekday: asctime form.
+    return parseAsctime(&it);
+}
+
+/// `06 Nov 1994 08:49:37 GMT`, with `day` already consumed.
+fn parseImfFixdate(day_tok: []const u8, it: *std.mem.TokenIterator(u8, .any)) ?i64 {
+    const day = std.fmt.parseInt(u8, day_tok, 10) catch return null;
+    const month = parseMonth(it.next() orelse return null) orelse return null;
+    const year = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    return civilToEpoch(year, month, day, it.next() orelse return null);
+}
+
+/// `06-Nov-94 08:49:37 GMT`, with the dashed date already consumed.
+fn parseRfc850(date_tok: []const u8, it: *std.mem.TokenIterator(u8, .any)) ?i64 {
+    var parts = std.mem.splitScalar(u8, date_tok, '-');
+    const day = std.fmt.parseInt(u8, parts.next() orelse return null, 10) catch return null;
+    const month = parseMonth(parts.next() orelse return null) orelse return null;
+    const yy = std.fmt.parseInt(i64, parts.next() orelse return null, 10) catch return null;
+    // Two-digit year: RFC 850 predates Y2K; window it the way curl/Date do.
+    const year: i64 = if (yy < 70) 2000 + yy else 1900 + yy;
+    return civilToEpoch(year, month, day, it.next() orelse return null);
+}
+
+/// `Nov  6 08:49:37 1994`, with the weekday already consumed.
+fn parseAsctime(it: *std.mem.TokenIterator(u8, .any)) ?i64 {
+    const month = parseMonth(it.next() orelse return null) orelse return null;
+    const day = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    const time_tok = it.next() orelse return null;
+    const year = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    return civilToEpoch(year, month, day, time_tok);
+}
+
+fn parseMonth(name: []const u8) ?u8 {
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (months, 1..) |m, idx| {
+        if (std.ascii.eqlIgnoreCase(name, m)) return @intCast(idx);
+    }
+    return null;
+}
+
+/// Combine a civil (Gregorian) date and an `HH:MM:SS` time into a Unix
+/// timestamp. Uses Howard Hinnant's days-from-civil algorithm, which is
+/// valid for any proleptic Gregorian date.
+fn civilToEpoch(year: i64, month: u8, day: u8, time_tok: []const u8) ?i64 {
+    // Bound the year to the realistic HTTP-date range before the arithmetic
+    // below. The year arrives from an unbounded parseInt(i64) over a
+    // provider-controlled Retry-After header, and `era * 146097` overflows i64
+    // around year 2.5e16 (well inside parseInt's ~9.2e18 ceiling), so an
+    // out-of-range year would panic the process. The delay is clamped to u32
+    // seconds-from-now anyway, so nothing past ~year 2200 carries useful
+    // information; returning null degrades to "no Retry-After".
+    if (year < 0 or year > 9999) return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+    var time_parts = std.mem.splitScalar(u8, time_tok, ':');
+    const hour = std.fmt.parseInt(i64, time_parts.next() orelse return null, 10) catch return null;
+    const minute = std.fmt.parseInt(i64, time_parts.next() orelse return null, 10) catch return null;
+    const second = std.fmt.parseInt(i64, time_parts.next() orelse return null, 10) catch return null;
+    if (hour > 23 or minute > 59 or second > 60) return null;
+
+    const y: i64 = if (month <= 2) year - 1 else year;
+    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe: i64 = y - era * 400;
+    const m: i64 = month;
+    const doy: i64 = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + day - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days: i64 = era * 146097 + doe - 719468;
+    return days * 86400 + hour * 3600 + minute * 60 + second;
 }
 
 fn snippet(body: []const u8) []const u8 {
@@ -453,6 +553,66 @@ test "429 with no Retry-After header -> rate_limit no seconds" {
     const c = classify(429, "", &.{});
     try testing.expect(c == .rate_limit);
     try testing.expectEqual(@as(?u32, null), c.rate_limit.retry_after_seconds);
+}
+
+test "529 Overloaded -> rate_limit" {
+    const headers = [_]std.http.Header{.{ .name = "Retry-After", .value = "10" }};
+    const c = classify(529, "Overloaded", &headers);
+    try testing.expect(c == .rate_limit);
+    try testing.expectEqual(@as(u32, 10), c.rate_limit.retry_after_seconds.?);
+}
+
+test "529 with no Retry-After -> rate_limit no seconds" {
+    const c = classify(529, "Overloaded", &.{});
+    try testing.expect(c == .rate_limit);
+    try testing.expectEqual(@as(?u32, null), c.rate_limit.retry_after_seconds);
+}
+
+test "retry-after with out-of-range HTTP-date year does not panic" {
+    // A hostile or buggy provider can send a malformed Retry-After date on the
+    // 429/529 retry path. An out-of-range year must degrade to "no Retry-After"
+    // (null), never overflow the civilToEpoch arithmetic and trap the process.
+    const cases = [_][]const u8{
+        "Sun, 06 Nov 99999999999999999 08:49:37 GMT", // IMF-fixdate, 17-digit year
+        "Sun Nov  6 08:49:37 99999999999999999", // asctime, 17-digit year
+        "Sun, 06 Nov -99999999999999999 08:49:37 GMT", // huge negative year
+    };
+    for (cases) |value| {
+        const headers = [_]std.http.Header{.{ .name = "Retry-After", .value = value }};
+        const c = classify(429, "", &headers);
+        try testing.expect(c == .rate_limit);
+        try testing.expectEqual(@as(?u32, null), c.rate_limit.retry_after_seconds);
+    }
+}
+
+test "parseHttpDate parses IMF-fixdate to epoch" {
+    // The canonical RFC 7231 example: Sun, 06 Nov 1994 08:49:37 GMT.
+    try testing.expectEqual(@as(?i64, 784111777), parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT"));
+}
+
+test "parseHttpDate parses RFC 850 form" {
+    try testing.expectEqual(@as(?i64, 784111777), parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT"));
+}
+
+test "parseHttpDate parses asctime form" {
+    try testing.expectEqual(@as(?i64, 784111777), parseHttpDate("Sun Nov  6 08:49:37 1994"));
+}
+
+test "parseHttpDate rejects garbage" {
+    try testing.expectEqual(@as(?i64, null), parseHttpDate("not a date"));
+    try testing.expectEqual(@as(?i64, null), parseHttpDate(""));
+    try testing.expectEqual(@as(?i64, null), parseHttpDate("Sun, 06 Zzz 1994 08:49:37 GMT"));
+}
+
+test "parseRetryAfter falls back to HTTP-date in the past -> 0" {
+    // A date well in the past must clamp to 0, never underflow u32.
+    const headers = [_]std.http.Header{.{ .name = "Retry-After", .value = "Sun, 06 Nov 1994 08:49:37 GMT" }};
+    try testing.expectEqual(@as(?u32, 0), parseRetryAfter(&headers));
+}
+
+test "parseRetryAfter integer form still wins over date path" {
+    const headers = [_]std.http.Header{.{ .name = "Retry-After", .value = "120" }};
+    try testing.expectEqual(@as(?u32, 120), parseRetryAfter(&headers));
 }
 
 test "401 -> auth.expired" {

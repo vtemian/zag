@@ -47,7 +47,6 @@ jobs:
         with:
           path: |
             .zig-cache
-            zig-cache
           key: ${{ runner.os }}-${{ matrix.target }}-zig-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-zig-
@@ -87,7 +86,6 @@ jobs:
         with:
           path: |
             .zig-cache
-            zig-cache
           key: ${{ runner.os }}-${{ matrix.target }}-zig-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-zig-

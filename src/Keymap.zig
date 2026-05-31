@@ -91,7 +91,7 @@ pub const KeySpec = struct {
     key: input.KeyEvent.Key,
     modifiers: input.KeyEvent.Modifiers = .{},
 
-    /// Two specs match iff both key and all modifier flags are equal.
+    /// Two specs match iff both key and every modifier flag are equal.
     pub fn eql(a: KeySpec, b: KeySpec) bool {
         if (std.meta.activeTag(a.key) != std.meta.activeTag(b.key)) return false;
         switch (a.key) {
@@ -99,9 +99,12 @@ pub const KeySpec = struct {
             .function => |n| if (n != b.key.function) return false,
             else => {},
         }
-        return a.modifiers.shift == b.modifiers.shift and
-            a.modifiers.alt == b.modifiers.alt and
-            a.modifiers.ctrl == b.modifiers.ctrl;
+        // Modifiers is a packed struct of six bools; a backing-integer
+        // compare is exhaustive across shift/alt/ctrl/super/hyper/meta.
+        // Comparing only shift/alt/ctrl let a KKP Super/Hyper/Meta press
+        // match a plain binding, since decodeKittyModifier sets all six.
+        const Bits = @typeInfo(input.KeyEvent.Modifiers).@"struct".backing_integer.?;
+        return @as(Bits, @bitCast(a.modifiers)) == @as(Bits, @bitCast(b.modifiers));
     }
 };
 
@@ -514,7 +517,7 @@ test "Registry re-register overwrites" {
     );
 }
 
-test "loadDefaults installs the nine built-in bindings" {
+test "loadDefaults installs the built-in bindings" {
     var r = Keymap.Registry.init(std.testing.allocator);
     defer r.deinit();
     try r.loadDefaults();
@@ -606,6 +609,28 @@ test "formatKeySpec round-trips through parseKeySpec for the common shapes" {
         const parsed = try parseKeySpec(got);
         try std.testing.expect(parsed.eql(.{ .key = c.ev.key, .modifiers = c.ev.modifiers }));
     }
+}
+
+test "KeySpec.eql distinguishes super/hyper/meta from a plain binding" {
+    // The Kitty Keyboard Protocol decoder sets super/hyper/meta on
+    // KKP terminals, so a plain-char binding must NOT match a press
+    // that carries any of those bits. Regression for Super+x firing
+    // a plain-x binding.
+    const plain_x: KeySpec = .{ .key = .{ .char = 'x' } };
+
+    const super_x: KeySpec = .{ .key = .{ .char = 'x' }, .modifiers = .{ .super = true } };
+    try std.testing.expect(!super_x.eql(plain_x));
+    try std.testing.expect(!plain_x.eql(super_x));
+
+    const hyper_x: KeySpec = .{ .key = .{ .char = 'x' }, .modifiers = .{ .hyper = true } };
+    try std.testing.expect(!hyper_x.eql(plain_x));
+
+    const meta_x: KeySpec = .{ .key = .{ .char = 'x' }, .modifiers = .{ .meta = true } };
+    try std.testing.expect(!meta_x.eql(plain_x));
+
+    // Positive case: two identical super-bit specs are equal.
+    const super_x2: KeySpec = .{ .key = .{ .char = 'x' }, .modifiers = .{ .super = true } };
+    try std.testing.expect(super_x.eql(super_x2));
 }
 
 test "Registry register returns a stable id; unregister removes by id" {

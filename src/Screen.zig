@@ -590,11 +590,27 @@ pub fn render(self: *Screen, file: std.Io.File) !void {
     // `cellsEqual` documents. Capacity is retained on both buffers so a
     // steady stream of the same handful of clusters reuses the same
     // backing allocation instead of malloc-ing every frame.
+    //
+    // `continuation` is reset in the same sweep. It is set only by
+    // writeCluster (the sole wide-glyph writer), which re-sets it every
+    // frame a leaf is redrawn, so zeroing it here makes the invariant hold
+    // by construction: a cell carries `continuation` only for the frame a
+    // wide write produced it. Without this, an in-place narrow fill that
+    // does not route through writeCluster (the status row) inherits a stale
+    // `continuation` bit from a vacated wide glyph, and the diff loop's
+    // `if (cur.continuation) skip` guard then drops the needed repaint,
+    // ghosting the right half of the old glyph.
     {
         var clear_span = trace.span("cluster_reset");
         defer clear_span.end();
-        for (self.current) |*cell| cell.cluster_id = 0;
-        for (self.previous) |*cell| cell.cluster_id = 0;
+        for (self.current) |*cell| {
+            cell.cluster_id = 0;
+            cell.continuation = false;
+        }
+        for (self.previous) |*cell| {
+            cell.cluster_id = 0;
+            cell.continuation = false;
+        }
         self.cluster_bytes.clearRetainingCapacity();
         self.cluster_index.clearRetainingCapacity();
     }
@@ -626,22 +642,20 @@ fn writeSome(file: std.Io.File, bytes: []const u8) WriteSomeError!usize {
 ///
 /// Continuation cells (second half of a wide char) are swallowed into
 /// the run - they inherit style from their primary and the terminal
-/// advances the cursor through them implicitly. A wide-char primary
-/// whose successor is not a continuation cell terminates the run so
-/// the next iteration re-syncs cursor position explicitly.
+/// advances the cursor through them implicitly. Wide-ness is read from
+/// the continuation bit on the successor cell rather than recomputed,
+/// since writeCluster (the sole grid writer) sets it for every wide write.
 fn findRunEnd(self: *const Screen, row: u16, start_col: u16, head: Cell) u16 {
     const row_base = @as(usize, row) * @as(usize, self.width);
     var c: u16 = start_col;
 
-    // Advance past the head cell. If head is wide and col+1 is a proper
-    // continuation, include it; otherwise stop before col+1 so the next
-    // outer iteration issues a fresh cursor move.
-    const head_width = width_mod.codepointWidth(head.codepoint);
+    // Advance past the head cell. A wide head is encoded by a continuation
+    // bit on the cell at col+1 (writeCluster is the sole grid writer and sets
+    // it for every w==2 write), so swallow that successor instead of
+    // re-deriving the width with codepointWidth on every frame.
     c += 1;
-    if (head_width == 2 and c < self.width and self.current[row_base + c].continuation) {
+    if (c < self.width and self.current[row_base + c].continuation) {
         c += 1;
-    } else if (head_width == 2) {
-        return c;
     }
 
     while (c < self.width) {
@@ -655,15 +669,10 @@ fn findRunEnd(self: *const Screen, row: u16, start_col: u16, head: Cell) u16 {
         if (!colorsEqual(head.fg, cell.fg)) break;
         if (!colorsEqual(head.bg, cell.bg)) break;
 
-        const w = width_mod.codepointWidth(cell.codepoint);
+        // A wide cell's continuation successor is consumed by the
+        // continuation branch on the next iteration, so a plain advance is
+        // correct for both single- and double-width cells.
         c += 1;
-        if (w == 2) {
-            if (c < self.width and self.current[row_base + c].continuation) {
-                c += 1;
-            } else {
-                break;
-            }
-        }
     }
     return c;
 }
@@ -898,6 +907,51 @@ test "render emits output for changed cells" {
     try std.testing.expect(std.mem.indexOf(u8, output, "H") != null);
     // Should contain bold SGR
     try std.testing.expect(std.mem.indexOf(u8, output, ";1") != null);
+}
+
+test "in-place fill over a vacated wide glyph repaints col1 (no continuation ghost)" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 4, 1);
+    defer screen.deinit();
+
+    // Frame 1: a wide glyph occupies col 0-1; writeCluster marks col 1 as a
+    // continuation cell.
+    screen.writeCluster(0, 0, "\u{4E2D}", 0x4E2D, 2, .{}, .default);
+    try std.testing.expect(screen.getCell(0, 1).continuation);
+    {
+        const pipe = try std.posix.pipe();
+        const write_end: std.fs.File = .{ .handle = pipe[1] };
+        const read_end: std.fs.File = .{ .handle = pipe[0] };
+        try screen.render(write_end);
+        write_end.close();
+        read_end.close();
+    }
+    // The continuation bit is frame-scoped: end-of-render must clear it on
+    // both grids so a later in-place fill cannot inherit a stale bit.
+    try std.testing.expect(!screen.current[1].continuation);
+    try std.testing.expect(!screen.previous[1].continuation);
+
+    // Frame 2: the wide glyph is gone. Mimic an in-place fill (drawStatusLine
+    // path: direct getCell writes, never writeCluster) putting distinct
+    // narrow chars at col 0 and col 1.
+    screen.getCell(0, 0).codepoint = 'A';
+    screen.getCell(0, 1).codepoint = 'B';
+
+    const pipe = try std.posix.pipe();
+    const write_end: std.fs.File = .{ .handle = pipe[1] };
+    const read_end: std.fs.File = .{ .handle = pipe[0] };
+    defer read_end.close();
+    try screen.render(write_end);
+    write_end.close();
+
+    var scratch: [8192]u8 = undefined;
+    const output = try readPipe(read_end, &scratch);
+
+    // Both cells must repaint. With a stale continuation bit on col 1, the
+    // diff would swallow it as a wide-glyph tail and never emit 'B',
+    // ghosting the old glyph's right half.
+    try std.testing.expect(std.mem.indexOf(u8, output, "A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "B") != null);
 }
 
 test "render copies current to previous" {

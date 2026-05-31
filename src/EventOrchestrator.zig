@@ -36,7 +36,6 @@ const NodeRegistry = @import("NodeRegistry.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const Keymap = @import("Keymap.zig");
-const width = @import("width.zig");
 const agent_events = @import("agent_events.zig");
 const Hooks = @import("Hooks.zig");
 const skills_mod = @import("skills.zig");
@@ -186,6 +185,66 @@ pub fn init(cfg: Config) !EventOrchestrator {
     errdefer self.window_manager.deinit();
     self.child_runner_registry = ChildRunnerRegistry.init(cfg.allocator);
     return self;
+}
+
+/// Heap-allocate the orchestrator and wire every back-reference that points
+/// into it. Returns a stable `*EventOrchestrator`, so interior addresses
+/// (`&self.window_manager`, the root pane's inline viewport) are valid the
+/// instant this returns. That lets the self-referential wiring live here,
+/// where `self` already has its final address, instead of a hand-ordered
+/// block in main that had to run after a by-value return landed and was
+/// guarded by "this address isn't stable yet" comments. Composition that is
+/// genuinely main's job (session restore, startup banner, tool registration,
+/// async runtime) stays in main and runs after this returns; the node
+/// registry every content-bearing `appendNode` needs is attached here.
+pub fn create(cfg: Config) !*EventOrchestrator {
+    const self = try cfg.allocator.create(EventOrchestrator);
+    errdefer cfg.allocator.destroy(self);
+    self.* = try init(cfg);
+    errdefer self.deinit();
+
+    // The compositor resolves per-pane diagnostics (e.g. the dropped-event
+    // counter) through the orchestrator.
+    cfg.compositor.orchestrator = self;
+
+    // Attach the node registry so Layout tracks node create/destroy and the
+    // WM-owned BufferRegistry reaches the root pane's conversation. Every
+    // content-bearing `appendNode` downstream of this assumes it has run.
+    try self.window_manager.attachLayoutRegistry();
+
+    // Rewire the layout's root leaf to the pane's inline viewport. The
+    // pre-construction `layout.setRoot` used a stack placeholder because this
+    // address did not exist yet; it does now.
+    cfg.layout.setRootViewport(&self.window_manager.root_pane.viewport);
+
+    // Lua layout/pane bindings call the window manager directly on the main
+    // thread; point the engine at the now-stable manager and buffer registry.
+    if (cfg.lua_engine) |engine| {
+        engine.window_manager = &self.window_manager;
+        engine.buffer_registry = &self.window_manager.buffer_registry;
+    }
+
+    // The root runner services `layout_request` round-trips against this WM
+    // and mirrors the root leaf's packed handle into the agent thread.
+    if (cfg.root_pane.runner) |runner| {
+        runner.window_manager = &self.window_manager;
+        if (self.window_manager.layout.root) |root_node| {
+            if (self.window_manager.handleForNode(root_node)) |handle| {
+                runner.pane_handle_packed = @bitCast(handle);
+            } else |err| {
+                log.warn("root leaf missing from registry: {}", .{err});
+            }
+        }
+    }
+
+    return self;
+}
+
+/// Tear down and free a `create`-allocated orchestrator.
+pub fn destroy(self: *EventOrchestrator) void {
+    const allocator = self.allocator;
+    self.deinit();
+    allocator.destroy(self);
 }
 
 /// Expose the shared wake-pipe write end for subsystems that need to signal
@@ -1048,9 +1107,11 @@ fn publishCursorAnchor(self: *EventOrchestrator, leaf_drafts: []const Compositor
     // Drafts can be missing for scratch panes; treat as empty draft so
     // the cursor still publishes at the prompt-glyph + space tail.
     var draft: []const u8 = "";
+    var draft_cursor: usize = 0;
     for (leaf_drafts) |entry| {
         if (entry.leaf == leaf) {
             draft = entry.draft;
+            draft_cursor = entry.draft_cursor;
             break;
         }
     }
@@ -1064,49 +1125,29 @@ fn publishCursorAnchor(self: *EventOrchestrator, leaf_drafts: []const Compositor
     const has_working_line = leaf.rect.height >= 5;
     const prompt_rows = if (has_working_line) reserve_prompt_rows - 1 else reserve_prompt_rows;
 
-    // `\u{203A} ` is the prompt glyph plus a trailing space, two
-    // visual cells.
+    // `\u{203A} ` is the prompt glyph plus a trailing space, two cells.
     const after_prompt: u16 = content_x +| 2;
     const right_edge: u16 = leaf.rect.x + leaf.rect.width - 1;
-    const available: u16 = if (right_edge > after_prompt + 1) right_edge - after_prompt - 1 else 0;
-
-    // Compute wrapped cursor position within the draft.
-    var cursor_row: u16 = 0;
-    var cursor_col = after_prompt;
-    if (available > 0 and draft.len > 0) {
-        const view = std.unicode.Utf8View.initUnchecked(draft);
-        var iter = view.iterator();
-        var i: usize = 0;
-        while (i < draft.len) {
-            const cluster = width.nextCluster(&iter) orelse break;
-            const w = cluster.width;
-            if (w == 0) {
-                if (cluster.base == '\n') {
-                    cursor_row += 1;
-                    cursor_col = after_prompt;
-                }
-                i += cluster.byte_len;
-                continue;
-            }
-            if (cursor_col + w > right_edge) {
-                cursor_row += 1;
-                cursor_col = after_prompt;
-            }
-            cursor_col += w;
-            i += cluster.byte_len;
-        }
+    // No prompt room: mirror drawPanePrompt's early return (no cursor).
+    if (after_prompt > right_edge) {
+        layout.cursor_anchor = null;
+        return;
     }
 
-    // Tail-visible rendering: if the draft overflows the prompt area,
-    // only the last `prompt_rows` are visible.
-    const total_rows = cursor_row + 1;
+    // Reuse the renderer's wrap math (Compositor) so the published anchor
+    // lands on the exact cell drawPanePrompt draws the cursor at, including
+    // the wrapped, tail-scrolled, and mid-draft-cursor cases. The inline
+    // duplicate this replaced ignored draft_cursor (always anchoring at the
+    // draft end) and could drift from the render.
+    const total_rows = Compositor.wrappedRowCountWithStart(after_prompt, right_edge, draft);
     const skip_rows = if (total_rows > prompt_rows) total_rows - prompt_rows else 0;
     const start_row = prompt_row -| @min(total_rows, prompt_rows) + 1;
-    const screen_row = start_row + cursor_row - skip_rows;
+    const cursor = Compositor.wrappedCursorPos(after_prompt, right_edge, draft, draft_cursor);
+    const visible_rel = if (cursor.row > skip_rows) cursor.row - skip_rows else 0;
 
     layout.cursor_anchor = .{
-        .x = cursor_col,
-        .y = screen_row,
+        .x = cursor.col,
+        .y = start_row + visible_rel,
         .width = 1,
         .height = 1,
     };

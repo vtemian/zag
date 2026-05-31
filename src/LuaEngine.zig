@@ -41,7 +41,8 @@ const http_stream_mod = @import("lua/primitives/http_stream.zig");
 const job_result_mod = @import("lua/job_result.zig");
 const hook_registry_mod = @import("lua/hook_registry.zig");
 const lua_json = @import("lua/lua_json.zig");
-const AsyncRuntime = @import("lua/AsyncRuntime.zig").AsyncRuntime;
+const lua_message = @import("lua/lua_message.zig");
+const IoBackend = @import("lua/IoBackend.zig").IoBackend;
 const embedded = @import("lua/embedded.zig");
 const provider_bindings = @import("lua/bindings/provider.zig");
 const prompt_bindings = @import("lua/bindings/prompt.zig");
@@ -167,7 +168,7 @@ pub const LuaEngine = struct {
     /// Worker pool + completion queue for blocking I/O primitives.
     /// Both have coupled lifetimes (pool writes to queue), so they're
     /// owned together. Null until `initAsync()` runs.
-    async_runtime: ?*AsyncRuntime = null,
+    async_runtime: ?*IoBackend = null,
     /// Optional back-pointer to the live window manager. Wired by
     /// `main.zig` once the orchestrator is in its final home; stays
     /// null in headless mode so Lua layout bindings raise a clean
@@ -820,19 +821,66 @@ pub const LuaEngine = struct {
     }
 
     /// Fetch the engine pointer stashed by `storeSelfPointer`. Must only be
-    /// called from a C-closure registered after `storeSelfPointer` has run;
-    /// a missing pointer is a programmer error and aborts via unreachable.
+    /// called from a C-closure registered after `storeSelfPointer` has run.
+    /// A missing pointer means the binding ran before the engine stored
+    /// itself; raise a Lua error so the misuse is catchable rather than a
+    /// process abort. `raiseErrorStr` is noreturn and longjmps out of the
+    /// C call frame, which is valid because every caller is a `zlua.wrap`'d
+    /// closure invoked under a protected Lua call.
     pub fn getEngineFromState(lua: *Lua) *LuaEngine {
         _ = lua.getField(zlua.registry_index, "_zag_engine");
-        const ptr = lua.toPointer(-1) catch unreachable;
+        const ptr = lua.toPointer(-1) catch {
+            lua.pop(1);
+            lua.raiseErrorStr("zag binding called before engine was initialized", .{});
+        };
         lua.pop(1);
         return @ptrCast(@alignCast(@constCast(ptr)));
     }
 
-    /// Find the Task owning `co`. Linear scan over the tasks map; tasks are
-    /// few in practice (tens). Candidate for an extraspace-based fast path
-    /// if it ever shows up in profiles.
+    /// Sentinel stored in a coroutine's extraspace when no Task owns it
+    /// yet. `lua.ref` never returns this value for a live registry slot, so
+    /// it can never collide with a real `thread_ref`.
+    const no_task_stash: usize = 0;
+
+    /// Stash `task.thread_ref` (the `self.tasks` key) in `co`'s own
+    /// per-thread extraspace so `taskForCoroutine` can recover the Task in
+    /// O(1) via a single map lookup. Each coroutine created by
+    /// `lua.newThread` carries its own pointer-sized extraspace block
+    /// immediately preceding its `lua_State`, so this write is local to
+    /// `co` and never aliases another thread's slot. We stash the integer
+    /// key rather than the `*Task` pointer so the read path never forms a
+    /// pointer from a possibly-garbage extraspace value.
+    fn stashTaskOnCoroutine(co: *Lua, task: *Task) void {
+        const space = co.getExtraSpace();
+        const slot: *usize = @ptrCast(@alignCast(space.ptr));
+        slot.* = refToStash(task.thread_ref);
+    }
+
+    fn refToStash(thread_ref: i32) usize {
+        return @as(usize, @as(u32, @bitCast(thread_ref)));
+    }
+
+    /// Find the Task owning `co`. The fast path reads a `thread_ref` stashed
+    /// in the coroutine's per-thread extraspace at spawn and looks it up in
+    /// `self.tasks`; a hit is trusted only when the recovered Task's `.co`
+    /// is `co`, so a stale or uninitialized block can never alias a live
+    /// Task. Lua does not zero the main state's extraspace, and `zag.spawn`
+    /// from `config.lua` passes that main state with no stashed Task, so the
+    /// `t.co == co` check is load-bearing. Because only an integer map key
+    /// is stashed (never a pointer), a garbage extraspace value can at worst
+    /// miss the map or hit an unrelated live Task whose `.co` rejects it;
+    /// the read path never dereferences a value-derived pointer. Falls back
+    /// to a linear scan when the fast path misses.
     pub fn taskForCoroutine(self: *LuaEngine, co: *Lua) ?*Task {
+        const space = co.getExtraSpace();
+        const slot: *const usize = @ptrCast(@alignCast(space.ptr));
+        const stashed = slot.*;
+        if (stashed != no_task_stash and stashed <= std.math.maxInt(u32)) {
+            const thread_ref: i32 = @bitCast(@as(u32, @intCast(stashed)));
+            if (self.tasks.get(thread_ref)) |t| {
+                if (t.co == co) return t;
+            }
+        }
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.*.co == co) return entry.value_ptr.*;
@@ -1422,6 +1470,22 @@ pub const LuaEngine = struct {
     /// don't step on each other.
     pub threadlocal var active_render_engine: ?*LuaEngine = null;
 
+    /// Build the `{tool, input, output, is_error}` context table the JIT
+    /// context and tool-transform handlers both consume, leaving it on the
+    /// stack top. Strings are copied into Lua memory by `pushString`, so the
+    /// borrowed slices need not outlive this call.
+    fn pushToolResultContext(lua: *Lua, tool: []const u8, tool_input: []const u8, output: []const u8, is_error: bool) void {
+        lua.newTable();
+        _ = lua.pushString(tool);
+        lua.setField(-2, "tool");
+        _ = lua.pushString(tool_input);
+        lua.setField(-2, "input");
+        _ = lua.pushString(output);
+        lua.setField(-2, "output");
+        lua.pushBoolean(is_error);
+        lua.setField(-2, "is_error");
+    }
+
     /// Run the JIT context handler for `req.tool_name` on the main thread.
     /// Builds a Lua-side context table, calls the registered function via
     /// `protectedCall`, and dupes the returned string into `req.allocator`
@@ -1446,18 +1510,8 @@ pub const LuaEngine = struct {
             return;
         }
 
-        // Build the context table the handler sees. Strings are copied
-        // into Lua-managed memory by `pushString`, so the borrowed
-        // `req.input/output` slices do not need to outlive this call.
-        lua.newTable();
-        _ = lua.pushString(req.tool_name);
-        lua.setField(-2, "tool");
-        _ = lua.pushString(req.input);
-        lua.setField(-2, "input");
-        _ = lua.pushString(req.output);
-        lua.setField(-2, "output");
-        lua.pushBoolean(req.is_error);
-        lua.setField(-2, "is_error");
+        // Build the context table the handler sees.
+        pushToolResultContext(lua, req.tool_name, req.input, req.output, req.is_error);
 
         lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
             const err_msg = lua.toString(-1) catch "<unprintable>";
@@ -1521,15 +1575,7 @@ pub const LuaEngine = struct {
         // Same context-table shape as the JIT context handler so a plugin
         // can swap between append-semantics and replace-semantics by
         // changing the registration entry point only.
-        lua.newTable();
-        _ = lua.pushString(req.tool_name);
-        lua.setField(-2, "tool");
-        _ = lua.pushString(req.input);
-        lua.setField(-2, "input");
-        _ = lua.pushString(req.output);
-        lua.setField(-2, "output");
-        lua.pushBoolean(req.is_error);
-        lua.setField(-2, "is_error");
+        pushToolResultContext(lua, req.tool_name, req.input, req.output, req.is_error);
 
         lua.protectedCall(.{ .args = 1, .results = 1 }) catch {
             const err_msg = lua.toString(-1) catch "<unprintable>";
@@ -1752,220 +1798,6 @@ pub const LuaEngine = struct {
         return self.loop_detect_handler;
     }
 
-    /// Push a Lua-side message snapshot onto the stack for the compact
-    /// strategy handler. The snapshot is a sequence (1..N) of
-    /// `{role = "user"|"assistant", content = "<concat text>"}` tables
-    /// where `content` is the concatenation of every `.text` block in
-    /// the original message. Non-text blocks (tool_use, tool_result,
-    /// thinking, redacted_thinking) are dropped from the snapshot.
-    /// Lossy by design: the strategy decides what stays and emits
-    /// replacement summary text rather than mutating block-shaped
-    /// history. Returns void; the table is left on top of the stack.
-    /// Push a full-fidelity message snapshot for the v2 compaction
-    /// hook. Each block becomes a Lua table with a `type` field
-    /// ("text", "tool_use", "tool_result", "thinking",
-    /// "redacted_thinking") plus the variant-specific data. Caller
-    /// pops nothing; the resulting array sits at stack top on return.
-    fn pushMessageSnapshot(lua: *Lua, messages: []const types.Message) !void {
-        lua.newTable();
-        for (messages, 0..) |msg, idx| {
-            lua.newTable();
-            const role: []const u8 = switch (msg.role) {
-                .user => "user",
-                .assistant => "assistant",
-            };
-            _ = lua.pushString(role);
-            lua.setField(-2, "role");
-
-            lua.newTable(); // content array
-            for (msg.content, 0..) |block, b_idx| {
-                lua.newTable();
-                switch (block) {
-                    .text => |t| {
-                        _ = lua.pushString("text");
-                        lua.setField(-2, "type");
-                        _ = lua.pushString(t.text);
-                        lua.setField(-2, "text");
-                    },
-                    .tool_use => |tu| {
-                        _ = lua.pushString("tool_use");
-                        lua.setField(-2, "type");
-                        _ = lua.pushString(tu.id);
-                        lua.setField(-2, "id");
-                        _ = lua.pushString(tu.name);
-                        lua.setField(-2, "name");
-                        _ = lua.pushString(tu.input_raw);
-                        lua.setField(-2, "input_raw");
-                    },
-                    .tool_result => |tr| {
-                        _ = lua.pushString("tool_result");
-                        lua.setField(-2, "type");
-                        _ = lua.pushString(tr.tool_use_id);
-                        lua.setField(-2, "tool_use_id");
-                        _ = lua.pushString(tr.content);
-                        lua.setField(-2, "content");
-                        lua.pushBoolean(tr.is_error);
-                        lua.setField(-2, "is_error");
-                    },
-                    .thinking => |t| {
-                        _ = lua.pushString("thinking");
-                        lua.setField(-2, "type");
-                        _ = lua.pushString(t.text);
-                        lua.setField(-2, "text");
-                        if (t.signature) |s| {
-                            _ = lua.pushString(s);
-                            lua.setField(-2, "signature");
-                        }
-                    },
-                    .redacted_thinking => |r| {
-                        _ = lua.pushString("redacted_thinking");
-                        lua.setField(-2, "type");
-                        _ = lua.pushString(r.data);
-                        lua.setField(-2, "data");
-                    },
-                }
-                lua.rawSetIndex(-2, @intCast(b_idx + 1));
-            }
-            lua.setField(-2, "content");
-
-            lua.rawSetIndex(-2, @intCast(idx + 1));
-        }
-    }
-
-    /// Decode a single full-fidelity message table off the top of the
-    /// stack into an owned `types.Message`. Counterpart to
-    /// `pushMessageSnapshot`. The expected shape is
-    /// `{role = ..., content = {{type = "text", text = "..."}, ...}}`.
-    /// On any structural error the function returns a specific error
-    /// and the caller's `errdefer` pops the entry.
-    fn decodeMessage(lua: *Lua, allocator: Allocator) !types.Message {
-        errdefer lua.pop(1);
-        if (lua.typeOf(-1) != .table) return error.CompactEntryNotTable;
-
-        _ = lua.getField(-1, "role");
-        defer lua.pop(1);
-        if (lua.typeOf(-1) != .string) return error.CompactEntryMissingRole;
-        const role_value = lua.toString(-1) catch return error.CompactEntryReadFailed;
-        const role: types.Role = if (std.mem.eql(u8, role_value, "user"))
-            .user
-        else if (std.mem.eql(u8, role_value, "assistant"))
-            .assistant
-        else
-            return error.CompactEntryUnknownRole;
-
-        _ = lua.getField(-2, "content");
-        defer lua.pop(1);
-
-        // Accept either an array of typed blocks (preferred, full
-        // fidelity) or a bare string for callers porting from v1.
-        if (lua.typeOf(-1) == .string) {
-            const raw = lua.toString(-1) catch return error.CompactEntryReadFailed;
-            const owned = try allocator.dupe(u8, raw);
-            errdefer allocator.free(owned);
-            const blocks = try allocator.alloc(types.ContentBlock, 1);
-            errdefer allocator.free(blocks);
-            blocks[0] = .{ .text = .{ .text = owned } };
-            return .{ .role = role, .content = blocks };
-        }
-        if (lua.typeOf(-1) != .table) return error.CompactEntryMissingContent;
-
-        const len = lua.rawLen(-1);
-        const blocks = try allocator.alloc(types.ContentBlock, len);
-        errdefer {
-            // Best-effort cleanup: only blocks we've already populated
-            // own heap memory. The slot tracker keeps the invariant.
-            for (blocks) |b| b.freeOwned(allocator);
-            allocator.free(blocks);
-        }
-        // Initialise every slot to a known-empty text block first so
-        // an error mid-loop still produces a valid free-able array.
-        for (blocks) |*b| b.* = .{ .text = .{ .text = "" } };
-
-        for (0..len) |i| {
-            _ = lua.rawGetIndex(-1, @intCast(i + 1));
-            defer lua.pop(1);
-            if (lua.typeOf(-1) != .table) return error.CompactEntryMissingContent;
-
-            _ = lua.getField(-1, "type");
-            const type_tag = if (lua.typeOf(-1) == .string)
-                lua.toString(-1) catch return error.CompactEntryReadFailed
-            else
-                return error.CompactEntryMissingContent;
-            lua.pop(1);
-
-            blocks[i] = try decodeBlock(lua, allocator, type_tag);
-        }
-        return .{ .role = role, .content = blocks };
-    }
-
-    /// Decode one typed content block by tag. The block table is at -1
-    /// on entry and remains at -1 on return (the caller pops it).
-    fn decodeBlock(lua: *Lua, allocator: Allocator, type_tag: []const u8) !types.ContentBlock {
-        if (std.mem.eql(u8, type_tag, "text")) {
-            _ = lua.getField(-1, "text");
-            defer lua.pop(1);
-            const raw = if (lua.typeOf(-1) == .string)
-                lua.toString(-1) catch ""
-            else
-                "";
-            return .{ .text = .{ .text = try allocator.dupe(u8, raw) } };
-        }
-        if (std.mem.eql(u8, type_tag, "tool_use")) {
-            const id = try luaFieldDup(lua, "id", allocator);
-            errdefer allocator.free(id);
-            const name = try luaFieldDup(lua, "name", allocator);
-            errdefer allocator.free(name);
-            const input_raw = try luaFieldDup(lua, "input_raw", allocator);
-            return .{ .tool_use = .{ .id = id, .name = name, .input_raw = input_raw } };
-        }
-        if (std.mem.eql(u8, type_tag, "tool_result")) {
-            const tu_id = try luaFieldDup(lua, "tool_use_id", allocator);
-            errdefer allocator.free(tu_id);
-            const content = try luaFieldDup(lua, "content", allocator);
-            errdefer allocator.free(content);
-            _ = lua.getField(-1, "is_error");
-            const is_err = lua.toBoolean(-1);
-            lua.pop(1);
-            return .{ .tool_result = .{ .tool_use_id = tu_id, .content = content, .is_error = is_err } };
-        }
-        if (std.mem.eql(u8, type_tag, "thinking")) {
-            const text = try luaFieldDup(lua, "text", allocator);
-            errdefer allocator.free(text);
-            _ = lua.getField(-1, "signature");
-            const sig_owned: ?[]const u8 = if (lua.typeOf(-1) == .string) blk: {
-                const raw = lua.toString(-1) catch "";
-                break :blk try allocator.dupe(u8, raw);
-            } else null;
-            lua.pop(1);
-            return .{ .thinking = .{
-                .text = text,
-                .signature = sig_owned,
-                .provider = .anthropic,
-                .id = null,
-            } };
-        }
-        if (std.mem.eql(u8, type_tag, "redacted_thinking")) {
-            const data = try luaFieldDup(lua, "data", allocator);
-            return .{ .redacted_thinking = .{ .data = data } };
-        }
-        return error.CompactEntryUnknownRole;
-    }
-
-    /// Convenience: read a string field on the table at stack top and
-    /// dupe it onto `allocator`. Errors when the field is missing or
-    /// not a string so callers get a clean error.* propagation.
-    fn luaFieldDup(lua: *Lua, name: []const u8, allocator: Allocator) ![]const u8 {
-        // getField needs a sentinel-terminated C string; the names we
-        // pass are short literals so a 32-byte buffer is enough.
-        var buf: [32]u8 = undefined;
-        const slot = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return error.CompactEntryReadFailed;
-        _ = lua.getField(-1, slot);
-        defer lua.pop(1);
-        if (lua.typeOf(-1) != .string) return error.CompactEntryMissingContent;
-        const raw = lua.toString(-1) catch return error.CompactEntryReadFailed;
-        return try allocator.dupe(u8, raw);
-    }
-
     /// Decode the strategy's top-of-stack return value (sitting on
     /// `co`'s stack at index -1) into a `CompactStrategyOutcome`. Used
     /// by `resumeTask`'s `.ok` arm when retiring a compact-strategy
@@ -2016,7 +1848,7 @@ pub const LuaEngine = struct {
         }
         for (0..len) |idx| {
             _ = co.rawGetIndex(-1, @intCast(idx + 1));
-            const msg = try decodeMessage(co, allocator);
+            const msg = try lua_message.decodeMessage(co, allocator);
             errdefer msg.deinit(allocator);
             try collected.append(allocator, msg);
             co.pop(1);
@@ -2081,7 +1913,7 @@ pub const LuaEngine = struct {
         lua.setField(-2, "tokens_used");
         lua.pushInteger(@intCast(req.tokens_max));
         lua.setField(-2, "tokens_max");
-        try pushMessageSnapshot(lua, req.messages);
+        try lua_message.pushMessageSnapshot(lua, req.messages);
         lua.setField(-2, "messages");
 
         if (self.async_runtime == null) {
@@ -2627,7 +2459,7 @@ pub const LuaEngine = struct {
         // Init-once cold path: latched at engine startup before any Lua code runs; double-init is a programmer bug, not a runtime condition.
         std.debug.assert(self.async_runtime == null);
 
-        const runtime = try AsyncRuntime.init(self.allocator, num_workers, capacity);
+        const runtime = try IoBackend.init(self.allocator, num_workers, capacity);
         errdefer runtime.deinit();
 
         const root = try async_scope.Scope.init(self.allocator, null);
@@ -2785,6 +2617,12 @@ pub const LuaEngine = struct {
             .started_at_ms = if (hook_payload != null) clock.milliTimestamp() else 0,
             .budget_ms = if (hook_payload != null) self.hook_dispatcher.hook_budget_ms else null,
         };
+
+        // Stash the Task in the coroutine's extraspace for O(1) lookup in
+        // taskForCoroutine. Written here so the slot is valid before the
+        // coroutine first resumes; the linear-scan fallback remains the
+        // ground truth, so a missed or stale stash is never fatal.
+        stashTaskOnCoroutine(co, task);
 
         try self.tasks.put(thread_ref, task);
         // From here on `task` is owned by `self.tasks`; any further cleanup
@@ -3141,6 +2979,72 @@ test "zag.sleep yields, worker sleeps, coroutine resumes with (true, nil)" {
     _ = eng.lua.getField(-1, "err_is_nil");
     try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
+}
+
+test "taskForCoroutine fast path matches the linear scan for a yielding coroutine" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString(
+        \\function test_lookup() zag.sleep(10) end
+    );
+    _ = try eng.lua.getGlobal("test_lookup");
+    _ = try eng.spawnCoroutine(0, null);
+
+    // The coroutine yielded inside zag.sleep, so exactly one task is parked
+    // in the map. Recover its coroutine via a manual scan, then assert the
+    // extraspace fast path resolves the identical *Task.
+    try std.testing.expectEqual(@as(u32, 1), eng.tasks.count());
+    var scanned: ?*LuaEngine.Task = null;
+    var it = eng.tasks.iterator();
+    while (it.next()) |entry| scanned = entry.value_ptr.*;
+    const expected = scanned.?;
+
+    const found = eng.taskForCoroutine(expected.co) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(expected, found);
+
+    // Drain to completion so the task retires and nothing leaks.
+    const deadline = std.time.milliTimestamp() + 500;
+    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+}
+
+test "taskForCoroutine returns null for the main state with no stashed task" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+
+    // The engine's main lua state is never any task's coroutine, and Lua
+    // does not zero its extraspace. The validation in taskForCoroutine must
+    // reject whatever garbage sits there rather than alias a live Task.
+    try std.testing.expect(eng.taskForCoroutine(eng.lua) == null);
+}
+
+test "getEngineFromState raises a catchable Lua error when the pointer is missing" {
+    // A bare Lua state with no `_zag_engine` registry entry stands in for a
+    // binding invoked before storeSelfPointer ran. getEngineFromState must
+    // surface a Lua error (caught here by protectedCall) instead of
+    // aborting the process via unreachable.
+    const lua = try Lua.init(std.testing.allocator);
+    defer lua.deinit();
+
+    const probe = struct {
+        fn call(state: *Lua) i32 {
+            _ = LuaEngine.getEngineFromState(state);
+            return 0;
+        }
+    };
+    lua.pushFunction(zlua.wrap(probe.call));
+    try std.testing.expectError(error.LuaRuntime, lua.protectedCall(.{ .args = 0, .results = 0 }));
 }
 
 test "zag.sleep returns (nil, 'cancelled') when scope cancelled mid-sleep" {
@@ -11471,7 +11375,7 @@ test "runDefaultSummarization detects prior summary and switches to UPDATE promp
     while (true) {
         const n = queue.drain(&buf);
         if (n == 0) break;
-        for (buf[0..n]) |ev| ev.freeOwned(alloc);
+        for (buf[0..n]) |ev| ev.freeOwned();
     }
 }
 
@@ -11539,10 +11443,10 @@ test "zag.llm.complete with stream=true emits compaction_summary_delta to attach
         for (buf[0..n]) |ev| {
             switch (ev) {
                 .compaction_summary_delta => |t| {
-                    if (std.mem.indexOf(u8, t, "STREAM ME") != null) found_delta = true;
-                    alloc.free(t);
+                    if (std.mem.indexOf(u8, t.bytes, "STREAM ME") != null) found_delta = true;
+                    t.free();
                 },
-                else => ev.freeOwned(alloc),
+                else => ev.freeOwned(),
             }
         }
     }

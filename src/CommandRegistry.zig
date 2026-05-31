@@ -45,14 +45,21 @@ pub fn deinit(self: *CommandRegistry) void {
 
 /// Register a zig-baked command. If the slash name is already taken,
 /// the old entry is replaced (the previous key is freed so storage
-/// does not leak). Built-in variants carry no allocator-owned state,
-/// so the displaced `Command` is discarded here.
+/// does not leak). Built-in variants carry no allocator-owned state, so a
+/// displaced `.built_in` needs no cleanup.
+///
+/// A displaced `.lua_callback`, by contrast, owns a Lua registry ref that
+/// only `registerLua`'s caller knows to unref. Built-ins always register
+/// before any Lua `zag.command{}` runs, so a built-in must never displace
+/// one; assert that ordering invariant rather than silently leaking the ref
+/// if it were ever broken.
 pub fn registerBuiltIn(
     self: *CommandRegistry,
     slash_name: []const u8,
     kind: BuiltIn,
 ) !void {
-    _ = try self.put(slash_name, .{ .built_in = kind });
+    const displaced = try self.put(slash_name, .{ .built_in = kind });
+    if (displaced) |prev| std.debug.assert(prev != .lua_callback);
 }
 
 /// Register a Lua-backed command. `ref` is a registry reference held

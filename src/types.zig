@@ -68,6 +68,11 @@ pub const ContentBlock = union(enum) {
     pub const RedactedThinking = struct {
         /// Provider-issued ciphertext; opaque to us, echoed back untouched.
         data: []const u8,
+        /// Which wire protocol produced this block. Cross-provider redacted
+        /// blocks carry ciphertext only the originating provider can
+        /// validate, so the Anthropic serializer drops anything not
+        /// tagged `.anthropic`.
+        provider: ThinkingProvider = .anthropic,
     };
 
     /// Which provider wire protocol produced a thinking block.

@@ -137,8 +137,16 @@ pub const Runner = struct {
         }
     }
 
-    pub fn executeWaitIdle(self: *Runner, idle_ms: u32) !void {
+    pub fn executeWaitIdle(self: *Runner, idle_ms: u32, default_timeout_ms: u32) !void {
+        // A child that emits a byte just shy of every `idle_ms` would re-arm
+        // the idle poll forever. The overall deadline caps that so a chatty or
+        // hung child surfaces as WaitIdleTimeout instead of wedging the run.
+        // Each poll waits the full `idle_ms`: idle detection means "quiet for
+        // idle_ms", so we must not clamp the window or a short final poll
+        // would report a false idle. The deadline only bounds total wall time.
+        const deadline_ms = std.time.milliTimestamp() + default_timeout_ms;
         while (true) {
+            if (std.time.milliTimestamp() >= deadline_ms) return error.WaitIdleTimeout;
             const status = try self.pumpOnce(@intCast(idle_ms));
             if (status == .exited) {
                 self.reapExitedChild();
@@ -206,7 +214,7 @@ pub const Runner = struct {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.alloc);
         try body.appendSlice(self.alloc, "zag-sim crash report\n====================\nexit_status: ");
-        try body.appendSlice(self.alloc, desc.text);
+        try body.appendSlice(self.alloc, desc.text());
         try body.appendSlice(self.alloc, "\nfinal_grid:\n");
         try body.appendSlice(self.alloc, grid_dump);
 
@@ -241,7 +249,13 @@ pub const Runner = struct {
         var tok = std.mem.tokenizeAny(u8, program, " \t");
         while (tok.next()) |word| {
             const z = try self.alloc.dupeZ(u8, word);
-            try argv_owned.append(self.alloc, z);
+            {
+                // errdefer only covers the gap before argv_owned takes
+                // ownership; once appended, the outer defer frees z, so this
+                // must not also free it (no double-free on a later error).
+                errdefer self.alloc.free(z);
+                try argv_owned.append(self.alloc, z);
+            }
             try argv.append(self.alloc, z.ptr);
         }
         if (argv.items.len == 0) return error.EmptySpawn;
@@ -266,33 +280,41 @@ pub const Runner = struct {
     }
 };
 
-const CrashDescription = struct { text: []const u8 };
+const CrashDescription = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn text(self: *const CrashDescription) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
 
 /// Render a `WaitPidResult.status` as a human-readable string, or return
-/// `null` when the exit doesn't qualify as a crash. Backed by the static
-/// `status_scratch` buffer, so the returned slice doesn't need freeing.
+/// `null` when the exit doesn't qualify as a crash. The description carries
+/// its own [64]u8 by value, so the returned struct is self-contained and
+/// safe to hold across further calls.
 fn describeStatus(status: u32, was_killed_by_harness: bool) ?CrashDescription {
+    var desc: CrashDescription = .{};
     if (posix.W.IFEXITED(status)) {
         const code = posix.W.EXITSTATUS(status);
         if (code == 0) return null;
-        // Buffer is module-static; we never free it.
-        return .{ .text = formatExit(code) };
+        const s = formatExit(code, &desc.buf);
+        desc.len = s.len;
+        return desc;
     }
     if (posix.W.IFSIGNALED(status)) {
         const sig = posix.W.TERMSIG(status);
         // Don't flag the SIGKILL we sent ourselves as a crash.
         if (was_killed_by_harness and sig == posix.SIG.KILL) return null;
-        return .{ .text = formatSignal(sig) };
+        const s = formatSignal(sig, &desc.buf);
+        desc.len = s.len;
+        return desc;
     }
     return null;
 }
 
-// Per-process scratch for the human-readable status text. Not thread-safe,
-// but Runner is single-threaded by construction.
-var status_scratch: [64]u8 = undefined;
-
-fn formatExit(code: u8) []const u8 {
-    return std.fmt.bufPrint(&status_scratch, "exit {d}", .{code}) catch "exit ?";
+fn formatExit(code: u8, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "exit {d}", .{code}) catch "exit ?";
 }
 
 /// Static lookup of POSIX signal numbers to their canonical names. Numbers
@@ -315,13 +337,13 @@ const signal_table = [_]struct { sig: u32, name: []const u8 }{
     .{ .sig = posix.SIG.USR2, .name = "SIGUSR2" },
 };
 
-fn formatSignal(sig: u32) []const u8 {
+fn formatSignal(sig: u32, buf: []u8) []const u8 {
     for (signal_table) |entry| {
         if (entry.sig == sig) {
-            return std.fmt.bufPrint(&status_scratch, "{s} ({d})", .{ entry.name, sig }) catch "signal ?";
+            return std.fmt.bufPrint(buf, "{s} ({d})", .{ entry.name, sig }) catch "signal ?";
         }
     }
-    return std.fmt.bufPrint(&status_scratch, "signal {d}", .{sig}) catch "signal ?";
+    return std.fmt.bufPrint(buf, "signal {d}", .{sig}) catch "signal ?";
 }
 
 test "executeWaitText finds echoed literal within timeout" {
@@ -350,7 +372,19 @@ test "executeWaitIdle completes when child quiet" {
     const argv = [_][*:0]const u8{ "/bin/cat", "-u" };
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
-    try r.executeWaitIdle(200); // cat with no input stays quiet
+    try r.executeWaitIdle(200, 2000); // cat with no input stays quiet
+}
+
+test "executeWaitIdle times out when child keeps emitting" {
+    var r = try Runner.init(std.testing.allocator);
+    defer r.deinit();
+    // Child prints a byte every ~20ms, well inside the 100ms idle window, so
+    // every poll sees data and re-arms. Only the overall 500ms deadline ends
+    // the wait. The wide margin keeps the test stable under scheduler jitter.
+    const argv = [_][*:0]const u8{ "/bin/sh", "-c", "while true; do printf x; sleep 0.02; done" };
+    const envp = [_][*:0]const u8{};
+    r.child = try Spawn.spawn(&argv, &envp, 80, 24);
+    try std.testing.expectError(error.WaitIdleTimeout, r.executeWaitIdle(100, 500));
 }
 
 test "executeSend writes to pty master" {
@@ -426,14 +460,16 @@ test "writeCrashReportIfBad writes crash.txt for non-zero exit" {
 }
 
 test "formatSignal decodes known signals to SIGNAME (n)" {
-    try std.testing.expectEqualStrings("SIGABRT (6)", formatSignal(posix.SIG.ABRT));
-    try std.testing.expectEqualStrings("SIGSEGV (11)", formatSignal(posix.SIG.SEGV));
-    try std.testing.expectEqualStrings("SIGTERM (15)", formatSignal(posix.SIG.TERM));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("SIGABRT (6)", formatSignal(posix.SIG.ABRT, &buf));
+    try std.testing.expectEqualStrings("SIGSEGV (11)", formatSignal(posix.SIG.SEGV, &buf));
+    try std.testing.expectEqualStrings("SIGTERM (15)", formatSignal(posix.SIG.TERM, &buf));
 }
 
 test "formatSignal falls back to numeric for unknown signals" {
     // 99 is outside the signal_table; verify we still produce a sensible string.
-    try std.testing.expectEqualStrings("signal 99", formatSignal(99));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("signal 99", formatSignal(99, &buf));
 }
 
 test "writeCrashReportIfBad records SIGABRT name when child aborts" {

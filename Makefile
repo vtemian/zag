@@ -81,4 +81,4 @@ checksums:
 .PHONY: clean
 clean:
 	$(ZIG) build --help >/dev/null 2>&1 && $(ZIG) build uninstall 2>/dev/null || true
-	rm -rf zig-out zig-cache .zig-cache $(DIST_DIR) $(ARTIFACT_DIR)
+	rm -rf zig-out .zig-cache $(DIST_DIR) $(ARTIFACT_DIR)

@@ -118,6 +118,26 @@ pub fn parseOptionalTimeout(raw: []const u8) !?u32 {
     return try parseDurationMs(trimmed);
 }
 
+/// Split a `wait_idle` arg into the required idle window and an optional
+/// trailing deadline override. `wait_idle 750ms` keeps the scenario-default
+/// deadline; `wait_idle 750ms 60s` waits for a 750ms-quiet window for up to
+/// 60s. The override exists for reasoning-model turns, which stream for far
+/// longer than the 10s default deadline and so never reach an idle window
+/// inside it; bumping the deadline per step beats inflating every wait
+/// globally. A trailing token that fails to parse as a duration is an error,
+/// not a silent fallback, so typos blow up loudly.
+pub const IdleAndDeadline = struct { idle_ms: u32, deadline_ms: ?u32 };
+
+pub fn parseIdleAndDeadline(raw: []const u8) !IdleAndDeadline {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (std.mem.indexOfAny(u8, trimmed, " \t")) |sp| {
+        const idle = trimmed[0..sp];
+        const rest = std.mem.trimLeft(u8, trimmed[sp..], " \t");
+        return .{ .idle_ms = try parseDurationMs(idle), .deadline_ms = try parseDurationMs(rest) };
+    }
+    return .{ .idle_ms = try parseDurationMs(trimmed), .deadline_ms = null };
+}
+
 test "parseSend literal + keysym" {
     var args: std.ArrayList(SendArg) = .empty;
     defer args.deinit(std.testing.allocator);
@@ -144,6 +164,20 @@ test "parseDurationMs all forms" {
     try std.testing.expectEqual(@as(u32, 300), try parseDurationMs("300ms"));
     try std.testing.expectEqual(@as(u32, 2000), try parseDurationMs("2s"));
     try std.testing.expectEqual(@as(u32, 500), try parseDurationMs("500"));
+}
+
+test "parseIdleAndDeadline bare and with deadline" {
+    const bare = try parseIdleAndDeadline("750ms");
+    try std.testing.expectEqual(@as(u32, 750), bare.idle_ms);
+    try std.testing.expect(bare.deadline_ms == null);
+
+    const with_deadline = try parseIdleAndDeadline("2s 60s");
+    try std.testing.expectEqual(@as(u32, 2000), with_deadline.idle_ms);
+    try std.testing.expectEqual(@as(u32, 60_000), with_deadline.deadline_ms.?);
+}
+
+test "parseIdleAndDeadline rejects a malformed deadline token" {
+    try std.testing.expectError(error.InvalidCharacter, parseIdleAndDeadline("2s 60secs"));
 }
 
 test "parsePatternAndTimeout regex bare and with timeout" {

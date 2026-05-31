@@ -63,6 +63,12 @@ pub const ProviderError = std.mem.Allocator.Error || CancelError || error{
     /// Refresh token was rejected by the IdP (invalid_grant family).
     /// The user needs to re-run `zag --login=<provider>`.
     LoginExpired,
+    /// A socket-level inter-byte read timeout fired (SO_RCVTIMEO/EAGAIN
+    /// recovered by `streaming.readChunk` / `http.zig`). Surfaced
+    /// verbatim rather than collapsed into `ApiError` so the agent
+    /// fallback can treat a stalled connection as retryable, distinct
+    /// from an opaque transport failure.
+    ReadTimeout,
 };
 
 /// Cooperative-cancellation error, composed into ProviderError via `||`.
@@ -80,24 +86,26 @@ pub const CancelError = error{
 /// returned as `ApiError`. Used at provider entry points so stdlib HTTP
 /// and JSON errors don't leak past the vtable.
 pub fn mapProviderError(err: anyerror) ProviderError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ApiError => error.ApiError,
-        error.InvalidUri => error.InvalidUri,
-        error.MalformedResponse => error.MalformedResponse,
-        error.MissingApiKey => error.MissingApiKey,
-        error.SseLineTooLong => error.SseLineTooLong,
-        error.SseEventDataTooLarge => error.SseEventDataTooLarge,
-        error.SseEventTypeTooLong => error.SseEventTypeTooLong,
-        error.Cancelled => error.Cancelled,
-        error.ProviderResponseFailed => error.ProviderResponseFailed,
-        error.NotLoggedIn => error.NotLoggedIn,
-        error.LoginExpired => error.LoginExpired,
-        else => blk: {
-            log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
-            break :blk error.ApiError;
-        },
-    };
+    // Identity-map every error already named in ProviderError; collapse
+    // anything else to ApiError. The passthrough is generated from the error
+    // set at comptime, so adding a ProviderError variant cannot be silently
+    // swallowed by a forgotten switch arm: a new member automatically passes
+    // through instead of being remapped to ApiError.
+    inline for (@typeInfo(ProviderError).error_set.?) |member| {
+        if (err == @field(ProviderError, member.name)) return @field(ProviderError, member.name);
+    }
+    log.err("provider error remapped to ApiError: {s}", .{@errorName(err)});
+    return error.ApiError;
+}
+
+/// Clamp a std.json i64 token count into the u32 usage field, flooring
+/// negatives and saturating overflow. Malformed providers occasionally
+/// report nonsense counts on an otherwise-200 body, and a raw `@intCast`
+/// would panic on a negative or out-of-range value; never panic on them.
+pub fn clampTokens(v: i64) u32 {
+    if (v <= 0) return 0;
+    if (v > std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(v);
 }
 
 /// Streaming event emitted by call_streaming for incremental response delivery.
@@ -1108,6 +1116,13 @@ test "mapProviderError passes LoginExpired through" {
     try std.testing.expectEqual(
         @as(ProviderError, error.LoginExpired),
         mapProviderError(error.LoginExpired),
+    );
+}
+
+test "mapProviderError passes ReadTimeout through" {
+    try std.testing.expectEqual(
+        @as(ProviderError, error.ReadTimeout),
+        mapProviderError(error.ReadTimeout),
     );
 }
 

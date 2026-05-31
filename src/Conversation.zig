@@ -21,6 +21,7 @@ const types = @import("types.zig");
 const ulid = @import("ulid.zig");
 const width = @import("width.zig");
 const Gutter = @import("Gutter.zig");
+const WireProjection = @import("WireProjection.zig");
 
 const Conversation = @This();
 
@@ -124,6 +125,13 @@ parent: ?*Conversation = null,
 /// `Session.Entry.subagent_path` for persisted events. Unused when
 /// `parent` is null.
 parent_subagent_id: u32 = 0,
+/// The `.subagent_link` node in `parent.tree` that renders this child's
+/// status line. Cached at spawn so `notifyChildChanged` can mark it dirty
+/// in O(1) per ancestor instead of rescanning `parent.tree.root_children`
+/// on every streamed token. The node is heap-allocated and only removed on
+/// spawn's failure path (which also destroys this child), so the pointer is
+/// stable for the child's whole lifetime. Null on the root.
+parent_link_node: ?*Node = null,
 /// Scratch slot used by `loadFromEntries` (and its `routeReplayEntry`
 /// recursion) to thread tool_call/tool_result pairing per Conversation
 /// during replay. Borrows a Node owned by `self.tree`; reset to null
@@ -438,7 +446,14 @@ fn collectVisibleLines(
 ) !void {
     if (collected.* >= max_lines) return;
 
-    const node_lines = renderer.lineCountForNode(node, registry);
+    // Logical line count for skip/window math. A warm cache entry holds
+    // exactly one StyledLine per logical line (== lineCountForNode, pinned
+    // by the nodeOwnMetrics test), so reuse its length and skip
+    // lineCountForNode, which for tool_call nodes reparses the tool-input
+    // JSON on every frame. The fetched entry is reused below to avoid a
+    // second hashmap lookup.
+    const cached_lines = cache.get(node);
+    const node_lines = if (cached_lines) |c| c.len else renderer.lineCountForNode(node, registry);
 
     // Gutter decoration context, fixed for this node across all its lines.
     // User-message rows are marked by the full-width `user_message_bar`
@@ -465,7 +480,7 @@ fn collectVisibleLines(
     if (skipped.* + node_lines <= skip) {
         skipped.* += node_lines;
     } else {
-        if (cache.get(node)) |cached| {
+        if (cached_lines) |cached| {
             const skip_from_node = if (skipped.* < skip) skip - skipped.* else 0;
             const available = if (skip_from_node < cached.len) cached.len - skip_from_node else 0;
             const take = @min(available, max_lines - collected.*);
@@ -591,6 +606,24 @@ fn lineSpansAsBytesGutter(line: Theme.StyledLine, gutter_cols: u16, alloc: Alloc
     return out;
 }
 
+/// Wrapped-row count for one rendered line including its one-time gutter
+/// prefix, without heap-allocating a parts array in the common case.
+/// Mirrors `lineSpansAsBytesGutter` + `width.wrappedRowCountMulti` exactly
+/// (the same gutter spacer slice, then each span's text, fed through the
+/// same wrap function so column state carries identically); falls back to
+/// the heap path for lines with more than 32 styled spans.
+fn wrappedRowCountWithGutter(line: Theme.StyledLine, gutter_cols: u16, content_width: u16, scratch_alloc: Allocator) !u32 {
+    var stack_parts: [33][]const u8 = undefined; // gutter + up to 32 spans
+    if (line.spans.len + 1 <= stack_parts.len) {
+        const cols = @min(gutter_cols, gutter_spacer.len);
+        stack_parts[0] = gutter_spacer[0..cols];
+        for (line.spans, 0..) |span, idx| stack_parts[idx + 1] = span.text;
+        return width.wrappedRowCountMulti(stack_parts[0 .. line.spans.len + 1], content_width);
+    }
+    const parts = try lineSpansAsBytesGutter(line, gutter_cols, scratch_alloc);
+    return width.wrappedRowCountMulti(parts, content_width);
+}
+
 /// Geometry of a single node's *own* render (excluding children) at
 /// `content_width`. Reads the memo; on miss, obtains the node's own
 /// StyledLines (cache hit, else a transient render into `scratch_alloc`
@@ -622,16 +655,14 @@ fn nodeOwnMetrics(
     var wrapped: u32 = 0;
     if (self.cache.get(node)) |cached| {
         for (cached) |line| {
-            const parts = try lineSpansAsBytesGutter(line, gutter, scratch_alloc);
-            wrapped += width.wrappedRowCountMulti(parts, content_width);
+            wrapped += try wrappedRowCountWithGutter(line, gutter, content_width, scratch_alloc);
         }
     } else {
         var scratch: std.ArrayList(Theme.StyledLine) = .empty;
         defer scratch.deinit(scratch_alloc);
         try self.renderer.render(node, &scratch, scratch_alloc, theme, &self.buffer_registry);
         for (scratch.items) |line| {
-            const parts = try lineSpansAsBytesGutter(line, gutter, scratch_alloc);
-            wrapped += width.wrappedRowCountMulti(parts, content_width);
+            wrapped += try wrappedRowCountWithGutter(line, gutter, content_width, scratch_alloc);
         }
     }
 
@@ -771,8 +802,7 @@ fn locateWindowStart(
         };
         var row_acc: u32 = 0;
         for (owned_lines, 0..) |line, idx| {
-            const parts = try lineSpansAsBytesGutter(line, gutter, scratch_alloc);
-            const rows = width.wrappedRowCountMulti(parts, content_width);
+            const rows = try wrappedRowCountWithGutter(line, gutter, content_width, scratch_alloc);
             if (into_node_rows < row_acc + rows) {
                 return .{
                     .skip = walk.cum_logical + idx,
@@ -1293,6 +1323,9 @@ pub fn spawnSubagent(self: *Conversation, name: []const u8, prompt: []const u8) 
     // single read site in NodeRenderer.subagentStatus.
     node.subagent_parent = @ptrCast(self);
 
+    // Cache the link node so per-token streaming invalidation is O(1).
+    child.parent_link_node = node;
+
     return child;
 }
 
@@ -1308,15 +1341,14 @@ pub fn spawnSubagent(self: *Conversation, name: []const u8, prompt: []const u8) 
 fn notifyChildChanged(self: *Conversation) void {
     var current: *Conversation = self;
     while (current.parent) |p| {
-        for (p.tree.root_children.items) |link_node| {
-            if (link_node.node_type == .subagent_link and
-                link_node.subagent_index == current.parent_subagent_id)
-            {
-                link_node.markDirty();
-                p.tree.dirty_nodes.push(link_node.id);
-                p.tree.generation +%= 1;
-                break;
-            }
+        // `parent_link_node` is the cached `.subagent_link` node in `p.tree`
+        // for `current`, set at spawn. Marking it directly is O(1) per
+        // ancestor; the old rescan of `p.tree.root_children` was O(parent
+        // top-level nodes) on every streamed token.
+        if (current.parent_link_node) |link_node| {
+            link_node.markDirty();
+            p.tree.dirty_nodes.push(link_node.id);
+            p.tree.generation +%= 1;
         }
         current = p;
     }
@@ -1461,311 +1493,31 @@ pub fn sessionSummaryInputs(self: *const Conversation) ?SessionSummaryInputs {
 
 // -- Wire-format projection --------------------------------------------------
 
-/// Walk the cursor's branch in-order and project the tree into a list of
-/// LLM wire-format messages. Allocations live in the supplied arena; the
-/// caller drops the arena at the end of the LLM call.
-///
-/// Status, error, and separator nodes are UI-only and not included in the
-/// projection. Synthetic tool_use ids ("synth_N") are minted in walk order
-/// so tool_result blocks can chain back to the most recent tool_call,
-/// matching the contract `ConversationHistory.rebuildMessages` enforced
-/// before Phase D.
-pub fn toWireMessages(
-    self: *const Conversation,
-    arena: Allocator,
-) !std.ArrayList(types.Message) {
-    var messages: std.ArrayList(types.Message) = .empty;
-    var assistant_blocks: std.ArrayList(types.ContentBlock) = .empty;
-    var tool_result_blocks: std.ArrayList(types.ContentBlock) = .empty;
-
-    var state: ProjectionState = .{
-        .arena = arena,
-        .messages = &messages,
-        .assistant_blocks = &assistant_blocks,
-        .tool_result_blocks = &tool_result_blocks,
-    };
-
-    for (self.tree.root_children.items) |node| {
-        try self.projectNode(&state, node);
-    }
-    try state.flushAssistant();
-    try state.flushToolResult();
-    return messages;
+/// Thin delegation seam: the projection logic lives in `WireProjection`,
+/// which walks this Conversation's tree (and its subagent children). Kept
+/// here so the external call sites that named `Conversation.toWireMessages`
+/// compile unchanged.
+pub fn toWireMessages(self: *const Conversation, arena: Allocator) !std.ArrayList(types.Message) {
+    return WireProjection.toWireMessages(self, arena);
 }
 
-const ProjectionState = struct {
-    arena: Allocator,
-    messages: *std.ArrayList(types.Message),
-    assistant_blocks: *std.ArrayList(types.ContentBlock),
-    tool_result_blocks: *std.ArrayList(types.ContentBlock),
-    /// Synthetic id counter used when no provider call_id is available
-    /// (Phase D parks tool_call metadata on `custom_tag` and does not
-    /// preserve the original id; matches `ConversationHistory.rebuildMessages`).
-    tool_id_counter: u32 = 0,
-    /// Most recently emitted synthetic tool_use id, awaiting a paired
-    /// tool_result. Cleared once consumed.
-    last_tool_use_id: ?[]const u8 = null,
-
-    fn flushAssistant(self: *ProjectionState) !void {
-        if (self.assistant_blocks.items.len == 0) return;
-        const owned = try self.assistant_blocks.toOwnedSlice(self.arena);
-        try self.messages.append(self.arena, .{ .role = .assistant, .content = owned });
-    }
-
-    fn flushToolResult(self: *ProjectionState) !void {
-        if (self.tool_result_blocks.items.len == 0) return;
-        const owned = try self.tool_result_blocks.toOwnedSlice(self.arena);
-        try self.messages.append(self.arena, .{ .role = .user, .content = owned });
-    }
-};
-
-fn projectNode(
-    self: *const Conversation,
-    state: *ProjectionState,
-    node: *const ConversationTree.Node,
-) !void {
-    switch (node.node_type) {
-        .user_message => {
-            try state.flushAssistant();
-            try state.flushToolResult();
-            const text = self.nodeText(node);
-            const content = try state.arena.alloc(types.ContentBlock, 1);
-            content[0] = .{ .text = .{ .text = try state.arena.dupe(u8, text) } };
-            try state.messages.append(state.arena, .{ .role = .user, .content = content });
-        },
-        .assistant_text => {
-            try state.flushToolResult();
-            const text = self.nodeText(node);
-            try state.assistant_blocks.append(state.arena, .{
-                .text = .{ .text = try state.arena.dupe(u8, text) },
-            });
-        },
-        .tool_call => {
-            try state.flushToolResult();
-            // Phase D parks the tool name on `custom_tag`; original input
-            // JSON is not preserved on the node, so the projection rebuilds
-            // a permissive `{}` payload (matching ConversationHistory.rebuildMessages).
-            const tool_name = node.custom_tag orelse "";
-            // Prefer the real provider id when the BufferSink (live) or
-            // JSONL replay populated it on the node. Falling back to
-            // synth_N is correct for legacy sessions that predate the
-            // typed `tool_use_id` field but is a real bug magnet on
-            // strict OpenAI-compatible providers (Kimi K2.6, Moonshot)
-            // because the next-turn request will mix synth-from-projection
-            // with real-from-live ids and the server rejects the pair.
-            const duped_id = if (node.tool_use_id) |id|
-                try state.arena.dupe(u8, id)
-            else blk: {
-                var scratch: [32]u8 = undefined;
-                const synthetic_id = try std.fmt.bufPrint(&scratch, "synth_{d}", .{state.tool_id_counter});
-                state.tool_id_counter += 1;
-                break :blk try state.arena.dupe(u8, synthetic_id);
-            };
-            const duped_name = try state.arena.dupe(u8, tool_name);
-            const duped_input = try state.arena.dupe(u8, "{}");
-            try state.assistant_blocks.append(state.arena, .{ .tool_use = .{
-                .id = duped_id,
-                .name = duped_name,
-                .input_raw = duped_input,
-            } });
-            // Drop any prior unconsumed id and remember the new one for
-            // the next tool_result. Mirrors rebuildMessages's "newest
-            // tool_call wins" pairing, which is the right shape today
-            // because tool_result nodes hang as children of their
-            // tool_call (live BufferSink path) or appear immediately
-            // after them (loadFromEntries path).
-            state.last_tool_use_id = duped_id;
-
-            // tool_result children of this tool_call land in the user
-            // message paired against the synth id we just minted.
-            var saw_result = false;
-            for (node.children.items) |child| {
-                if (child.node_type == .tool_result) {
-                    saw_result = true;
-                    try self.projectToolResult(state, child);
-                }
-            }
-            // Cancelled mid-execution: the tree carries the tool_call but
-            // no tool_result child. Strict OpenAI-compatible validators
-            // (Kimi, Moonshot, GPT itself) reject the next-turn request
-            // because every assistant tool_call must be answered. Synthesize
-            // a marker tool_result so the wire is well-formed and the model
-            // knows the call did not complete.
-            if (!saw_result) {
-                try state.flushAssistant();
-                state.last_tool_use_id = null;
-                try state.tool_result_blocks.append(state.arena, .{ .tool_result = .{
-                    .tool_use_id = duped_id,
-                    .content = try state.arena.dupe(u8, "[interrupted: tool did not complete]"),
-                    .is_error = true,
-                } });
-            }
-        },
-        .tool_result => {
-            // Top-level tool_result (no tool_call parent). Pair against
-            // whatever last_tool_use_id is live; if none is, fall back
-            // to "unknown" the way rebuildMessages did.
-            try self.projectToolResult(state, node);
-        },
-        .thinking => {
-            try state.flushToolResult();
-            const text = self.nodeText(node);
-            try state.assistant_blocks.append(state.arena, .{ .thinking = .{
-                .text = try state.arena.dupe(u8, text),
-                .signature = null,
-                .provider = .none,
-                .id = null,
-            } });
-        },
-        .thinking_redacted => {
-            try state.flushToolResult();
-            // The tree's redacted nodes carry no buffer (or an empty one);
-            // the encrypted blob doesn't survive the round-trip. Emit an
-            // empty payload so role alternation is preserved.
-            try state.assistant_blocks.append(state.arena, .{ .redacted_thinking = .{
-                .data = try state.arena.dupe(u8, ""),
-            } });
-        },
-        // UI-only and custom nodes are skipped.
-        .status, .err, .separator, .custom => {},
-        // A subagent_link projects as a `task` tool_use in the assistant
-        // turn, followed by the child's final summary as a tool_result
-        // in the next user turn. This keeps the LLM-visible wire format
-        // identical to today's task tool round-trip while the structural
-        // truth lives on the parent's tree as a link to the child
-        // Conversation rather than an inline collected blob.
-        .subagent_link => {
-            try state.flushToolResult();
-            if (node.subagent_index >= self.subagents.items.len) return;
-            const child = self.subagents.items[node.subagent_index];
-
-            const synth_id = try synthesizeSubagentId(state.arena, node.subagent_index);
-            const input_json = try buildSubagentTaskInput(state.arena, node, child);
-            const tool_name = try state.arena.dupe(u8, "task");
-            try state.assistant_blocks.append(state.arena, .{ .tool_use = .{
-                .id = synth_id,
-                .name = tool_name,
-                .input_raw = input_json,
-            } });
-            state.last_tool_use_id = synth_id;
-
-            // Synthesize the paired tool_result immediately so the LLM
-            // sees the round-trip as closed by the time it inspects the
-            // wire. Pair against the synth id we just minted.
-            try state.flushAssistant();
-            const summary = try childFinalSummary(state.arena, child);
-            const is_err = childErrored(child);
-            const paired_id = state.last_tool_use_id orelse synth_id;
-            state.last_tool_use_id = null;
-            try state.tool_result_blocks.append(state.arena, .{ .tool_result = .{
-                .tool_use_id = paired_id,
-                .content = summary,
-                .is_error = is_err,
-            } });
-        },
-    }
-}
-
-fn synthesizeSubagentId(arena: Allocator, index: u32) ![]const u8 {
-    return std.fmt.allocPrint(arena, "subagent_{d}", .{index});
-}
-
-fn buildSubagentTaskInput(
-    arena: Allocator,
-    node: *const ConversationTree.Node,
-    child: *const Conversation,
-) ![]const u8 {
-    _ = child;
-    const name = node.subagent_name orelse "unknown";
-    const prompt = childInitialPrompt(node);
-
-    var aw = std.Io.Writer.Allocating.init(arena);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll("{\"agent\":");
-    try types.writeJsonString(w, name);
-    try w.writeAll(",\"prompt\":");
-    try types.writeJsonString(w, prompt);
-    try w.writeAll("}");
-    return aw.toOwnedSlice();
-}
-
-/// Read the original prompt argument stashed on the link node at
-/// `spawnSubagent` time. Returns empty when missing (legacy JSONL
-/// replay leaves the field null because pre-stash sessions never
-/// captured it). Pre-stash callers that built the prompt by walking
-/// the child's first `user_message` saw the subagent system-prefix
-/// concatenated in front of the caller's text, doubling the prompt
-/// on replay.
-fn childInitialPrompt(node: *const ConversationTree.Node) []const u8 {
-    return node.subagent_prompt orelse "";
-}
-
-/// Concatenate all `.assistant_text` nodes in the child's tree into an
-/// arena-allocated slice (or return the tail `.err` node's text when
-/// the child errored). Used both by `toWireMessages` to project a
-/// subagent_link as a tool_result, and by the task tool to derive the
-/// summary returned to the parent's LLM and persisted as `task_end`.
+/// Delegation seam for the task tool: derive a child Conversation's final
+/// summary the same way `toWireMessages` projects a subagent_link.
 pub fn childFinalSummaryForTask(arena: Allocator, child: *const Conversation) ![]const u8 {
-    return childFinalSummary(arena, child);
+    return WireProjection.childFinalSummaryForTask(arena, child);
 }
 
-/// Whether the child Conversation's tail node is an `.err`. Used to
-/// flag the synthetic tool_result as `is_error` so the LLM sees the
-/// subagent failure on the wire.
+/// Delegation seam for the task tool: report whether a child Conversation
+/// errored, matching the projection's `is_error` flag.
 pub fn childErroredForTask(child: *const Conversation) bool {
-    return childErrored(child);
-}
-
-fn childFinalSummary(arena: Allocator, child: *const Conversation) ![]const u8 {
-    if (childErrored(child)) {
-        var last_err: ?*const ConversationTree.Node = null;
-        for (child.tree.root_children.items) |n| {
-            if (n.node_type == .err) last_err = n;
-        }
-        if (last_err) |n| {
-            return try arena.dupe(u8, child.nodeText(n));
-        }
-        return try arena.dupe(u8, "");
-    }
-
-    var buffer: std.ArrayList(u8) = .empty;
-    errdefer buffer.deinit(arena);
-    for (child.tree.root_children.items) |n| {
-        if (n.node_type != .assistant_text) continue;
-        try buffer.appendSlice(arena, child.nodeText(n));
-    }
-    return buffer.toOwnedSlice(arena);
-}
-
-fn childErrored(child: *const Conversation) bool {
-    if (child.tree.root_children.items.len == 0) return false;
-    const tail = child.tree.root_children.items[child.tree.root_children.items.len - 1];
-    return tail.node_type == .err;
-}
-
-fn projectToolResult(
-    self: *const Conversation,
-    state: *ProjectionState,
-    node: *const ConversationTree.Node,
-) !void {
-    try state.flushAssistant();
-    const use_id = if (state.last_tool_use_id) |id| blk: {
-        state.last_tool_use_id = null;
-        break :blk id;
-    } else try state.arena.dupe(u8, "unknown");
-    const text = self.nodeText(node);
-    try state.tool_result_blocks.append(state.arena, .{ .tool_result = .{
-        .tool_use_id = use_id,
-        .content = try state.arena.dupe(u8, text),
-        .is_error = false,
-    } });
+    return WireProjection.childErroredForTask(child);
 }
 
 /// Resolve a node's bytes through the buffer registry. Returns an empty
 /// slice if the node has no buffer (tool_call, redacted thinking) or if
-/// the handle is stale (shouldn't happen in practice).
-fn nodeText(self: *const Conversation, node: *const ConversationTree.Node) []const u8 {
+/// the handle is stale (shouldn't happen in practice). Public so
+/// `WireProjection` can read node text while walking the tree.
+pub fn nodeText(self: *const Conversation, node: *const ConversationTree.Node) []const u8 {
     const handle = node.buffer_id orelse return "";
     const tb = self.buffer_registry.asText(handle) catch return "";
     return tb.bytesView();
@@ -3030,6 +2782,38 @@ test "toWireMessages: tool_call/tool_result pairing emits assistant tool_use the
     try std.testing.expectEqual(@as(usize, 1), tool_msg.content.len);
     try std.testing.expectEqualStrings(synth_id, tool_msg.content[0].tool_result.tool_use_id);
     try std.testing.expectEqualStrings("ok", tool_msg.content[0].tool_result.content);
+}
+
+test "toWireMessages: tool_call projects node.tool_input_raw verbatim, not {}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "go");
+    const call = try cb.appendToolCallNode(null, "bash", "bash:0", "{\"command\":\"ls -la\"}");
+    _ = try cb.appendNode(call, .tool_result, "ok");
+    const messages = try cb.toWireMessages(arena.allocator());
+    var found: ?[]const u8 = null;
+    for (messages.items) |m| for (m.content) |b| if (b == .tool_use) {
+        found = b.tool_use.input_raw;
+    };
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("{\"command\":\"ls -la\"}", found.?);
+}
+
+test "toWireMessages: legacy tool_call without input falls back to {}" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cb = try Conversation.init(std.testing.allocator, 1, "test");
+    defer cb.deinit();
+    _ = try cb.appendNode(null, .user_message, "go");
+    _ = try cb.appendToolCallNode(null, "bash", "bash:0", null);
+    const messages = try cb.toWireMessages(arena.allocator());
+    var found: ?[]const u8 = null;
+    for (messages.items) |m| for (m.content) |b| if (b == .tool_use) {
+        found = b.tool_use.input_raw;
+    };
+    try std.testing.expectEqualStrings("{}", found.?);
 }
 
 test "toWireMessages: orphan tool_call gets synthetic cancelled tool_result" {

@@ -232,7 +232,7 @@ src/
   lua/
     mod.zig                  package facade for the Lua subsystem
     embedded.zig             embedded stdlib bundle (zag.* modules)
-    AsyncRuntime.zig         coroutine-aware task scheduler (main-thread pinned)
+    IoBackend.zig            worker pool + completion queue; workers run blocking primitives, main thread resumes coroutines
     Job.zig                  in-flight async job state
     job_result.zig           job result encoding for Lua return values
     LuaCompletionQueue.zig   completion handoff from worker pool to main thread
@@ -240,12 +240,14 @@ src/
     Scope.zig                lexical scope for plugin-owned resources
     hook_registry.zig        Lua-side hook registration surface
     lua_json.zig             Lua value to/from JSON
+    lua_message.zig          Lua table <-> types.Message marshalling (compaction hook)
     integration_test.zig     end-to-end Lua runtime tests
     spike_test.zig           targeted Lua runtime regression tests
     primitives/
       cmd.zig                zag.cmd subprocess primitive
       cmd_handle.zig         live subprocess handle (lines, kill, wait)
       fs.zig                 zag.fs filesystem primitives
+      llm.zig                zag.llm.complete primitive (provider call on a worker thread)
       http.zig               zag.http one-shot request primitive
       http_stream.zig        zag.http.stream chunked-body primitive
 

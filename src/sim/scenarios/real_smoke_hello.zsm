@@ -15,7 +15,11 @@ spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "say hi in three words" <Enter>
-wait_idle 20s
+# Wait for the reply to land and the turn to settle. The deadline must
+# clear a reasoning model's full think+answer time (well past the 10s
+# default), and the idle window only needs to be long enough to mean
+# "done", not the whole reply duration: small window, long deadline.
+wait_idle 2s 60s
 snapshot final
 send "/quit" <Enter>
 wait_exit

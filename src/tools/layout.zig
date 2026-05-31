@@ -189,9 +189,9 @@ fn execute_split(
                     .owned = false,
                 };
                 // A scratch pane carries inline text the main thread
-                // renders into a fresh ScratchBuffer. Missing `text`
-                // defaults to an empty pane; a non-string `text` is a
-                // client bug.
+                // renders into a fresh ScratchBuffer. Missing/empty `text`
+                // yields a single blank line (splitScalar always emits at
+                // least one element); a non-string `text` is a client bug.
                 if (std.mem.eql(u8, type_val.string, "scratch")) {
                     const text: []const u8 = if (obj.get("text")) |tv| switch (tv) {
                         .string => |s| s,

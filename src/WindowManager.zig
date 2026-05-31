@@ -35,7 +35,6 @@ const NodeRegistry = @import("NodeRegistry.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const agent_events = @import("agent_events.zig");
-const auth_wizard = @import("auth_wizard.zig");
 const skills_mod = @import("skills.zig");
 const types = @import("types.zig");
 const trace = @import("Metrics.zig");
@@ -1125,6 +1124,29 @@ fn formatErrorJson(alloc: Allocator, err: anyerror) ![]u8 {
     );
 }
 
+/// Mint a registry-owned scratch buffer pre-filled with `text` (split on
+/// `\n`) and return a borrowed surface for it, exactly like the `.handle`
+/// attach path. On ANY failure the just-created buffer is removed from the
+/// registry via `errdefer`, so a failed scratch split leaves no orphan.
+fn mintScratchSurface(self: *WindowManager, text: []const u8) !AttachedSurface {
+    const bh = try self.buffer_registry.createScratch("scratch");
+    errdefer self.buffer_registry.remove(bh) catch {};
+    switch (try self.buffer_registry.resolve(bh)) {
+        .scratch => |sbuf| {
+            var split_lines: std.ArrayList([]const u8) = .empty;
+            defer split_lines.deinit(self.layout.allocator);
+            var line_it = std.mem.splitScalar(u8, text, '\n');
+            while (line_it.next()) |line| try split_lines.append(self.layout.allocator, line);
+            try sbuf.setLines(split_lines.items);
+        },
+        else => return error.NotAScratchBuffer,
+    }
+    return .{
+        .buffer = try self.buffer_registry.asBuffer(bh),
+        .view = try self.buffer_registry.asView(bh),
+    };
+}
+
 /// Service a layout round-trip request from an agent thread: dispatch on
 /// the op, allocate the JSON response on `self.layout.allocator`, and
 /// signal `req.done` so the waiter unblocks. The caller owns the request
@@ -1190,35 +1212,12 @@ pub fn handleLayoutRequest(self: *WindowManager, req: *agent_events.LayoutReques
                             };
                         },
                         .scratch => |text| {
-                            // Mint a registry-owned scratch buffer, fill it
-                            // with the inline text, and attach it just like
-                            // the `.handle` path. The registry owns the
-                            // buffer's lifetime; pane teardown frees only the
-                            // PaneEntry, so closing the pane is leak-safe.
-                            const bh = self.buffer_registry.createScratch("scratch") catch
+                            // The registry owns the scratch buffer's lifetime;
+                            // pane teardown frees only the PaneEntry, so
+                            // closing the pane is leak-safe. mintScratchSurface
+                            // cleans up the buffer if the fill/attach fails.
+                            break :blk_attached self.mintScratchSurface(text) catch
                                 break :blk errorOutcome(alloc, "scratch_create_failed");
-                            switch (self.buffer_registry.resolve(bh) catch
-                                break :blk errorOutcome(alloc, "scratch_create_failed")) {
-                                .scratch => |sbuf| {
-                                    var split_lines: std.ArrayList([]const u8) = .empty;
-                                    defer split_lines.deinit(alloc);
-                                    var line_it = std.mem.splitScalar(u8, text, '\n');
-                                    while (line_it.next()) |line|
-                                        split_lines.append(alloc, line) catch
-                                            break :blk errorOutcome(alloc, "oom");
-                                    sbuf.setLines(split_lines.items) catch
-                                        break :blk errorOutcome(alloc, "scratch_fill_failed");
-                                },
-                                else => break :blk errorOutcome(alloc, "scratch_create_failed"),
-                            }
-                            const resolved_buffer = self.buffer_registry.asBuffer(bh) catch
-                                break :blk errorOutcome(alloc, "scratch_create_failed");
-                            const resolved_view = self.buffer_registry.asView(bh) catch
-                                break :blk errorOutcome(alloc, "scratch_create_failed");
-                            break :blk_attached .{
-                                .buffer = resolved_buffer,
-                                .view = resolved_view,
-                            };
                         },
                     }
                 };
@@ -1727,19 +1726,20 @@ pub fn openSessionPane(self: *WindowManager, id: []const u8) !Pane {
     self.next_buffer_id += 1;
     self.next_scratch_id += 1;
 
-    // Load the session AFTER the Conversation exists: loadEntries
-    // allocates an `Entry[]` we must free before returning regardless
-    // of success.
+    // Load the session AFTER the Conversation exists. The parsed Entry slice
+    // is transient: loadFromEntries copies every field into the conversation's
+    // own buffers, so nothing in the tree outlives it. Bump-allocate it in a
+    // scratch arena and drop the whole thing in one deinit rather than paying
+    // tens of thousands of individual alloc/free calls through the
+    // general-purpose allocator, which dominated large-session opens.
     const sh = try self.allocator.create(Session.SessionHandle);
     errdefer self.allocator.destroy(sh);
     sh.* = try mgr.loadSession(id);
     errdefer sh.close();
 
-    const entries = try Session.loadEntries(id, self.allocator);
-    defer {
-        for (entries) |entry| Session.freeEntry(entry, self.allocator);
-        self.allocator.free(entries);
-    }
+    var load_arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer load_arena.deinit();
+    const entries = try Session.loadEntries(id, load_arena.allocator());
     try cb.loadFromEntries(entries);
     cb.attachSession(sh);
 
@@ -1938,6 +1938,22 @@ pub fn attachSession(self: *WindowManager, pane: Pane) ?*Session.SessionHandle {
         return null;
     };
     conversation.attachSession(h);
+
+    // Announce the new session so an open sessions sidebar drops its cached
+    // list and shows the row. The `.created` change otherwise has no producer
+    // (rename/delete fire from the Lua bindings, status from AgentRunner); a
+    // missing or flaky engine just means the sidebar refreshes on its next
+    // event. Mirrors AgentRunner.announceSessionStatus's fire shape.
+    if (self.lua_engine) |engine| {
+        var payload: Hooks.HookPayload = .{ .session_list_changed = .{
+            .change = .created,
+            .session_id = h.meta.idSlice(),
+        } };
+        _ = engine.fireHook(&payload) catch |err| {
+            log.warn("SessionListChanged(.created) hook fire failed: {}", .{err});
+        };
+    }
+
     return h;
 }
 
@@ -2218,11 +2234,14 @@ pub fn restorePane(pane: Pane, handle: *Session.SessionHandle, allocator: Alloca
     const view = pane.conversation orelse return error.NotAnAgentPane;
 
     const session_id = handle.id[0..handle.id_len];
-    const entries = try Session.loadEntries(session_id, allocator);
-    defer {
-        for (entries) |entry| Session.freeEntry(entry, allocator);
-        allocator.free(entries);
-    }
+
+    // The parsed Entry slice is transient (loadFromEntries copies every field
+    // into the conversation's own buffers), so bump-allocate it in a scratch
+    // arena and free it all at once instead of per-entry through the
+    // general-purpose allocator. See openSessionPane for the rationale.
+    var load_arena = std.heap.ArenaAllocator.init(allocator);
+    defer load_arena.deinit();
+    const entries = try Session.loadEntries(session_id, load_arena.allocator());
 
     try view.loadFromEntries(entries);
     view.attachSession(handle);
@@ -2277,8 +2296,9 @@ pub fn handleCommand(self: *WindowManager, command: []const u8) CommandResult {
 ///      new one. `self.provider` keeps the same pointer (it addresses
 ///      main's owned slot), so every downstream reader sees the new
 ///      serializer, registry, and model id on the next read.
-///   4. Emit a status line plus a paste-me hint so the user can persist
-///      the pick by hand; autopersist is a deliberate non-goal.
+///   4. Emit a status line announcing the live swap. Persisting the pick as
+///      the default is the caller's decision (the /model picker calls
+///      `zag.persist_default_model`); this primitive never writes config.lua.
 pub fn swapProvider(
     self: *WindowManager,
     provider_name: []const u8,
@@ -2309,7 +2329,7 @@ fn swapProviderForRootFallback(
 }
 
 /// Swap the model for the pane identified by `handle`. All the
-/// cancel/drain/persistence/status logic lives here; `swapProvider`
+/// cancel/drain/status logic lives here; `swapProvider`
 /// is the focused-pane convenience wrapper.
 pub fn swapProviderForPane(
     self: *WindowManager,
@@ -2426,51 +2446,16 @@ fn swapProviderOnPanePtr(
         pane.provider = owned;
     }
 
-    // Step 4: try to persist the pick to config.lua. On any failure fall
-    // back to the paste-me hint so the user knows how to make the swap
-    // permanent by hand. auth_path lives next to config.lua on disk, so
-    // we derive one from the other; config_path is heap-allocated and
-    // owned by the caller.
-    const config_path = buildConfigPathFromAuth(self.allocator, self.provider.auth_path) catch null;
-    defer if (config_path) |p| self.allocator.free(p);
-
-    const persisted = if (config_path) |p| blk: {
-        auth_wizard.persistDefaultModel(self.allocator, p, model_string) catch |err| {
-            log.warn("persistDefaultModel failed: {}", .{err});
-            break :blk false;
-        };
-        break :blk true;
-    } else false;
-
-    if (persisted) {
-        self.appendStatusFmt(
-            "model swapped",
-            "model -> {s}\n  saved as default in {s}",
-            .{ model_string, config_path.? },
-        );
-    } else {
-        self.appendStatusFmt(
-            "model swapped",
-            "model -> {s}\n  Persist with zag.set_default_model(\"{s}\") in config.lua",
-            .{ model_string, model_string },
-        );
-    }
-}
-
-/// Derive the `config.lua` path that lives alongside `auth_path`. zag
-/// stores both under `~/.config/zag/`, so swapping the filename
-/// component is enough. Returns null when `auth_path` does not end in
-/// `auth.json` (e.g. test fixtures that point at a throwaway temp
-/// file), which signals the caller to skip persistence rather than
-/// write a bogus sibling. The returned slice is caller-owned.
-fn buildConfigPathFromAuth(
-    allocator: std.mem.Allocator,
-    auth_path: []const u8,
-) !?[]u8 {
-    const basename = "auth.json";
-    if (!std.mem.endsWith(u8, auth_path, basename)) return null;
-    const prefix = auth_path[0 .. auth_path.len - basename.len];
-    return try std.fmt.allocPrint(allocator, "{s}config.lua", .{prefix});
+    // Step 4: announce the live swap. Persisting the pick as the default is
+    // a separate decision the caller owns: the /model picker calls
+    // `zag.persist_default_model` after this returns. The window-system
+    // primitive deliberately does not write config.lua as a side effect of
+    // swapping a pane's model.
+    self.appendStatusFmt(
+        "model swapped",
+        "model -> {s}",
+        .{model_string},
+    );
 }
 
 /// Append a plain text line to the root buffer as a status node. Absorbs
@@ -5276,6 +5261,16 @@ test "restorePane rebuilds both tree and messages" {
 
     // Session handle was attached.
     try std.testing.expect(cb.session_handle != null);
+
+    // Content survives the scratch arena that backed the load. restorePane
+    // bump-allocates the Entry slice and frees it (arena deinit) before
+    // returning, so reading the text now would dangle if any node borrowed
+    // Entry bytes instead of copying them into the conversation's buffers.
+    var content_theme = @import("Theme.zig").defaultTheme();
+    const rr = try cb.readText(allocator, 100, &content_theme);
+    defer allocator.free(rr.text);
+    try std.testing.expect(std.mem.indexOf(u8, rr.text, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rr.text, "hello") != null);
 }
 
 // -- Provider swap test scaffolding ------------------------------------------
@@ -5388,7 +5383,7 @@ test "swapProvider rebuilds ProviderResult and updates model_id" {
     try std.testing.expectEqualStrings("provA/a1", f.wm.provider.model_id);
 }
 
-test "swapProvider persists the pick to config.lua" {
+test "swapProvider does not write config.lua (persistence is the caller's job)" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -5404,17 +5399,17 @@ test "swapProvider persists the pick to config.lua" {
     try buildPickerFixture(allocator, &f);
     defer f.deinit();
 
-    // Rewire the fixture's provider to point at a real tmp auth.json
-    // path so `buildConfigPathFromAuth` derives a sibling config.lua
-    // that we can inspect after the swap.
+    // Point the provider at a real tmp auth.json so the old persist path
+    // would have derived a sibling config.lua here.
     f.provider.deinit();
     f.provider = try llm.createProviderFromLuaConfig(&f.registry, "provA/a1", auth_path, allocator);
 
     try f.wm.swapProvider("provB", "b2");
 
-    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, allocator, .limited(1 << 16));
-    defer allocator.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
+    // The swap is a live, in-memory change only; it must NOT touch config.lua.
+    // Persisting the default is the /model picker's explicit decision via
+    // zag.persist_default_model, never a side effect of the window primitive.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, config_path, .{}));
 }
 
 test "providerFor falls back to shared default when override is null" {
@@ -8419,6 +8414,13 @@ test "splitFocusedWithSession attaches loaded session to a new pane" {
 
     const sh = session_conv.session_handle orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(session_id, sh.id[0..sh.id_len]);
+
+    // openSessionPane arena-loads the Entry slice and frees it before
+    // returning; the replayed content must have been copied into the pane's
+    // buffers, not left borrowing the freed arena. Reading it back proves so.
+    const rr = try session_conv.readText(allocator, 100, &theme);
+    defer allocator.free(rr.text);
+    try std.testing.expect(std.mem.indexOf(u8, rr.text, "hi from disk") != null);
 }
 
 test "splitFocusedWithSession rejects sessions when persistence is disabled" {

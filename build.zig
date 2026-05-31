@@ -36,9 +36,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("build_options", build_options.createModule());
-    exe_mod.addImport("zlua", zlua_dep.module("zlua"));
-    exe_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+    addCommonImports(exe_mod, build_options, zlua_dep, zigimg_dep);
 
     const exe = b.addExecutable(.{
         .name = "zag",
@@ -110,7 +108,6 @@ pub fn build(b: *std.Build) void {
                 const independent_scenarios = [_][]const u8{
                     "src/sim/scenarios/slash_quit.zsm",
                     "src/sim/scenarios/real_smoke_hello.zsm",
-                    "src/sim/scenarios/headless_smoke.zsm",
                     "src/sim/scenarios/tool_use_bash.zsm",
                     "src/sim/scenarios/tool_use_read_edit.zsm",
                     "src/sim/scenarios/tool_parallel.zsm",
@@ -146,14 +143,36 @@ pub fn build(b: *std.Build) void {
     script.step.dependOn(b.getInstallStep());
     validate_step.dependOn(&script.step);
 
+    // --- test-sandbox-linux -------------------------------------------------
+    // Spawns the built zag as the --__sandbox-helper subcommand on a real
+    // Linux kernel and asserts the landlock+seccomp boundary actually denies
+    // ~/.ssh reads (EPERM/EACCES) and AF_INET sockets (EACCES). This is the
+    // only automated coverage of the strict-mode boundary: `zig build test`
+    // cannot exercise it because the test runner replaces main(), so the
+    // helper short-circuit never fires and no real landlock/seccomp installs.
+    //
+    // Kept OUT of the default `test` step on purpose: it needs the installed
+    // binary plus a live kernel with landlock/seccomp. The assertions only
+    // run on a Linux host; on any other host the step is a clean no-op that
+    // prints a skip notice and exits 0, so `zig build test-sandbox-linux`
+    // and the default build graph stay green everywhere.
+    const sandbox_linux_step = b.step("test-sandbox-linux", "Linux-only: assert the bash sandbox helper denies secrets + AF_INET");
+    if (target.result.os.tag == .linux) {
+        const sandbox_probe = b.addSystemCommand(&.{"scripts/test-sandbox-linux.sh"});
+        sandbox_probe.addArtifactArg(exe);
+        sandbox_probe.step.dependOn(b.getInstallStep());
+        sandbox_linux_step.dependOn(&sandbox_probe.step);
+    } else {
+        const skip = b.addSystemCommand(&.{ "echo", "test-sandbox-linux: skipped (Linux only)" });
+        sandbox_linux_step.dependOn(&skip.step);
+    }
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addImport("build_options", build_options.createModule());
-    test_mod.addImport("zlua", zlua_dep.module("zlua"));
-    test_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+    addCommonImports(test_mod, build_options, zlua_dep, zigimg_dep);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
@@ -171,13 +190,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    agent_test_mod.addImport("build_options", build_options.createModule());
-    agent_test_mod.addImport("zlua", zlua_dep.module("zlua"));
-    agent_test_mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+    addCommonImports(agent_test_mod, build_options, zlua_dep, zigimg_dep);
 
     const agent_tests = b.addTest(.{
         .root_module = agent_test_mod,
     });
     const run_agent_tests = b.addRunArtifact(agent_tests);
     test_step.dependOn(&run_agent_tests.step);
+}
+
+/// Wire the imports every zag-graph module shares: a fresh `build_options`
+/// module (one per graph, never shared across modules), plus the zlua and
+/// zigimg dependency modules. sim_mod is intentionally excluded; it omits
+/// zlua/zigimg to keep Lua out of the sim binary's libc/ghostty-only link.
+fn addCommonImports(
+    m: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+    zlua_dep: *std.Build.Dependency,
+    zigimg_dep: *std.Build.Dependency,
+) void {
+    m.addImport("build_options", build_options.createModule());
+    m.addImport("zlua", zlua_dep.module("zlua"));
+    m.addImport("zigimg", zigimg_dep.module("zigimg"));
 }

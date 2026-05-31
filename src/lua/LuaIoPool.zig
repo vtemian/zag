@@ -115,9 +115,26 @@ pub const Pool = struct {
             } else {
                 executeJob(self.alloc, job);
             }
-            self.completions.push(job) catch {
-                _ = self.completions.dropped.fetchAdd(1, .monotonic);
-            };
+            // The finished job is the only handle that resumes the waiting
+            // coroutine, so dropping it would strand that coroutine forever.
+            // The main thread drains the completion queue continuously, so
+            // QueueFull is transient: retry exactly like the CmdHandle and
+            // HttpStream helper threads. Bail out of the retry if shutdown is
+            // requested though: during teardown the main thread stops draining,
+            // so a full ring would spin here forever and `deinit`'s join would
+            // deadlock. The coroutine cannot be resumed during teardown anyway,
+            // so abandoning the job is the same teardown leak as the ring jobs
+            // the completion queue's deinit already drops.
+            while (true) {
+                self.completions.push(job) catch |err| switch (err) {
+                    error.QueueFull => {
+                        if (self.shutdown.load(.acquire)) break;
+                        std.Thread.sleep(1 * std.time.ns_per_ms);
+                        continue;
+                    },
+                };
+                break;
+            }
         }
     }
 };
@@ -199,7 +216,11 @@ test "Pool.submit rejects after shutdown is signalled" {
     try testing.expectError(error.PoolShuttingDown, pool.submit(&job));
 }
 
-test "worker bumps completions.dropped when ring is full" {
+test "worker retries on a full ring so no job is ever dropped" {
+    // Capacity-1 ring forces backpressure: with three zero-ms jobs in flight
+    // the ring fills, so a worker that did not retry would strand a job and
+    // hang its coroutine. Drain via repeated pop() until all three arrive,
+    // proving the retry loop terminates and loses nothing under backpressure.
     const alloc = testing.allocator;
     const root = try Scope.init(alloc, null);
     defer root.deinit();
@@ -216,13 +237,17 @@ test "worker bumps completions.dropped when ring is full" {
     try pool.submit(&j2);
     try pool.submit(&j3);
 
-    // Wait long enough for workers to process all three.
-    clock.sleep(100 * std.time.ns_per_ms);
-
-    try testing.expect(completions.dropped.load(.monotonic) >= 2);
-
-    // Drain the one survivor so deinit doesn't leak test expectations.
-    _ = completions.pop();
+    var seen: usize = 0;
+    const deadline = clock.milliTimestamp() + 1000;
+    while (seen < 3 and clock.milliTimestamp() < deadline) {
+        if (completions.pop()) |got| {
+            try testing.expect(got == &j1 or got == &j2 or got == &j3);
+            seen += 1;
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
 }
 
 test "Pool init errdefer cleans up partial workers on spawn failure" {

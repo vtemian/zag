@@ -368,11 +368,14 @@ fn writeThinkingEcho(
 fn parseResponse(response_bytes: []const u8, reasoning: llm.Endpoint.ReasoningConfig, allocator: Allocator) !types.LlmResponse {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_bytes, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.MalformedResponse;
     const root = parsed.value.object;
 
-    const choices = (root.get("choices") orelse return error.MalformedResponse).array;
+    const choices_value = root.get("choices") orelse return error.MalformedResponse;
+    if (choices_value != .array) return error.MalformedResponse;
+    const choices = choices_value.array;
     if (choices.items.len == 0) return error.MalformedResponse;
-
+    if (choices.items[0] != .object) return error.MalformedResponse;
     const choice = choices.items[0].object;
 
     const stop_reason: types.StopReason = blk: {
@@ -388,17 +391,24 @@ fn parseResponse(response_bytes: []const u8, reasoning: llm.Endpoint.ReasoningCo
     var input_tokens: u32 = 0;
     var output_tokens: u32 = 0;
     var cache_read_tokens: u32 = 0;
-    if (root.get("usage")) |usage| {
-        if (usage.object.get("prompt_tokens")) |pt| input_tokens = @intCast(pt.integer);
-        if (usage.object.get("completion_tokens")) |ct| output_tokens = @intCast(ct.integer);
-        if (usage.object.get("prompt_tokens_details")) |d| if (d == .object) {
+    if (root.get("usage")) |usage| if (usage == .object) {
+        const usage_obj = usage.object;
+        if (usage_obj.get("prompt_tokens")) |pt| if (pt == .integer) {
+            input_tokens = llm.clampTokens(pt.integer);
+        };
+        if (usage_obj.get("completion_tokens")) |ct| if (ct == .integer) {
+            output_tokens = llm.clampTokens(ct.integer);
+        };
+        if (usage_obj.get("prompt_tokens_details")) |d| if (d == .object) {
             if (d.object.get("cached_tokens")) |v| if (v == .integer) {
-                cache_read_tokens = @intCast(v.integer);
+                cache_read_tokens = llm.clampTokens(v.integer);
             };
         };
-    }
+    };
 
-    const message = choice.get("message") orelse return error.MalformedResponse;
+    const message_value = choice.get("message") orelse return error.MalformedResponse;
+    if (message_value != .object) return error.MalformedResponse;
+    const message = message_value.object;
 
     var builder: llm.ResponseBuilder = .{};
     errdefer builder.deinit(allocator);
@@ -410,30 +420,40 @@ fn parseResponse(response_bytes: []const u8, reasoning: llm.Endpoint.ReasoningCo
     // model's intent (thinking precedes the visible response). Empty
     // response_fields => no scrape (historical behaviour).
     for (reasoning.response_fields) |field| {
-        const v = message.object.get(field) orelse continue;
+        const v = message.get(field) orelse continue;
         if (v != .string) continue;
         if (v.string.len == 0) continue;
         try builder.addThinking(v.string, null, .openai_chat, allocator);
         break;
     }
 
-    if (message.object.get("content")) |content| {
+    if (message.get("content")) |content| {
         if (content == .string) {
             try builder.addText(content.string, allocator);
         }
     }
 
-    if (message.object.get("tool_calls")) |tc| {
+    // Each tool_call whose shape is malformed is skipped rather than
+    // panicking; a partial tool list is better than a crashed turn.
+    if (message.get("tool_calls")) |tc| if (tc == .array) {
         for (tc.array.items) |tc_item| {
-            const func = tc_item.object.get("function").?.object;
+            if (tc_item != .object) continue;
+            const tc_obj = tc_item.object;
+            const func_value = tc_obj.get("function") orelse continue;
+            if (func_value != .object) continue;
+            const func = func_value.object;
+            const id_value = tc_obj.get("id") orelse continue;
+            const name_value = func.get("name") orelse continue;
+            const args_value = func.get("arguments") orelse continue;
+            if (id_value != .string or name_value != .string or args_value != .string) continue;
             try builder.addToolUse(
-                tc_item.object.get("id").?.string,
-                func.get("name").?.string,
-                func.get("arguments").?.string,
+                id_value.string,
+                name_value.string,
+                args_value.string,
                 allocator,
             );
         }
-    }
+    };
 
     return builder.finish(stop_reason, input_tokens, output_tokens, 0, cache_read_tokens, allocator);
 }
@@ -495,6 +515,9 @@ fn parseSseStream(
             continue;
         };
         defer parsed.deinit();
+        // A chunk whose JSON is not an object is malformed; skip it and keep
+        // the stream alive rather than panicking on the union access.
+        if (parsed.value != .object) continue;
         const obj = parsed.value.object;
 
         // Usage rides on the final chunk when stream_options.include_usage is set.
@@ -504,14 +527,14 @@ fn parseSseStream(
             if (usage == .object) {
                 const usage_obj = usage.object;
                 if (usage_obj.get("prompt_tokens")) |v| if (v == .integer) {
-                    input_tokens = @intCast(v.integer);
+                    input_tokens = llm.clampTokens(v.integer);
                 };
                 if (usage_obj.get("completion_tokens")) |v| if (v == .integer) {
-                    output_tokens = @intCast(v.integer);
+                    output_tokens = llm.clampTokens(v.integer);
                 };
                 if (usage_obj.get("prompt_tokens_details")) |d| if (d == .object) {
                     if (d.object.get("cached_tokens")) |v| if (v == .integer) {
-                        cache_read_tokens = @intCast(v.integer);
+                        cache_read_tokens = llm.clampTokens(v.integer);
                     };
                 };
             }
@@ -528,7 +551,9 @@ fn parseSseStream(
         }
 
         const choices = obj.get("choices") orelse continue;
+        if (choices != .array) continue;
         if (choices.array.items.len == 0) continue;
+        if (choices.array.items[0] != .object) continue;
         const choice = choices.array.items[0].object;
 
         // Check finish_reason
@@ -544,8 +569,9 @@ fn parseSseStream(
         }
 
         // Process delta
-        if (choice.get("delta")) |delta| {
-            if (delta.object.get("content")) |content| {
+        if (choice.get("delta")) |delta| if (delta == .object) {
+            const delta_obj = delta.object;
+            if (delta_obj.get("content")) |content| {
                 if (content == .string) {
                     try text_content.appendSlice(allocator, content.string);
                     callback.on_event(callback.ctx, .{ .text_delta = content.string });
@@ -556,7 +582,7 @@ fn parseSseStream(
             // names and accumulate the first non-empty match. Mirrors
             // the non-streaming scrape in parseResponse.
             for (reasoning.response_fields) |field| {
-                const v = delta.object.get(field) orelse continue;
+                const v = delta_obj.get(field) orelse continue;
                 if (v != .string) continue;
                 if (v.string.len == 0) continue;
                 try thinking_content.appendSlice(allocator, v.string);
@@ -567,9 +593,17 @@ fn parseSseStream(
                 break;
             }
 
-            if (delta.object.get("tool_calls")) |tc| {
+            if (delta_obj.get("tool_calls")) |tc| if (tc == .array) {
                 for (tc.array.items) |tc_item| {
-                    const index_raw = tc_item.object.get("index") orelse continue;
+                    if (tc_item != .object) continue;
+                    const tc_obj = tc_item.object;
+                    const index_raw = tc_obj.get("index") orelse continue;
+                    if (index_raw != .integer) continue;
+                    // Bound a malformed provider index so it cannot drive
+                    // unbounded growth of tool_calls; no real turn emits this
+                    // many parallel calls.
+                    const max_tool_call_index = 1024;
+                    if (index_raw.integer < 0 or index_raw.integer > max_tool_call_index) continue;
                     const index: usize = @intCast(index_raw.integer);
 
                     while (tool_calls.items.len <= index) {
@@ -590,13 +624,13 @@ fn parseSseStream(
                     // turn would fail server-side because the echoed
                     // tool_call_id no longer matches what the model knows.
                     // Set-once for id and name; arguments still accumulate.
-                    if (tc_item.object.get("id")) |id| {
+                    if (tc_obj.get("id")) |id| {
                         if (id == .string and tool_call.id.items.len == 0) {
                             try tool_call.id.appendSlice(allocator, id.string);
                         }
                     }
 
-                    if (tc_item.object.get("function")) |func| {
+                    if (tc_obj.get("function")) |func| if (func == .object) {
                         if (func.object.get("name")) |name| {
                             if (name == .string and tool_call.name.items.len == 0) {
                                 try tool_call.name.appendSlice(allocator, name.string);
@@ -608,10 +642,10 @@ fn parseSseStream(
                                 try tool_call.arguments.appendSlice(allocator, args.string);
                             }
                         }
-                    }
+                    };
                 }
-            }
-        }
+            };
+        };
     }
 
     // Assemble final LlmResponse

@@ -109,7 +109,11 @@ pub fn validate(
                     };
                     for (array_items) |item| {
                         if (!typeMatches(items_expected, item)) {
-                            return error.InvalidInput;
+                            // Same logical violation as a top-level type
+                            // mismatch (line above uses WrongFieldType); keep
+                            // the variant consistent regardless of nesting so
+                            // callers surface one error name for one cause.
+                            return error.WrongFieldType;
                         }
                     }
                 }
@@ -136,7 +140,10 @@ fn validateNestedObject(
             .string => |s| s,
             else => return error.MalformedSchema,
         };
-        if (!typeMatches(expected, value)) return error.InvalidInput;
+        // A nested field type mismatch is the same violation as a top-level
+        // one (validateObject uses WrongFieldType); keep the variant uniform
+        // across nesting depth.
+        if (!typeMatches(expected, value)) return error.WrongFieldType;
     }
 }
 
@@ -221,7 +228,7 @@ test "validate: nested object property with wrong type rejected" {
     ;
 
     const result = validate(allocator, schema, input);
-    try std.testing.expectError(error.InvalidInput, result);
+    try std.testing.expectError(error.WrongFieldType, result);
 }
 
 test "validate: array items type mismatch rejected" {
@@ -243,7 +250,7 @@ test "validate: array items type mismatch rejected" {
     ;
 
     const result = validate(allocator, schema, input);
-    try std.testing.expectError(error.InvalidInput, result);
+    try std.testing.expectError(error.WrongFieldType, result);
 }
 
 test "validate: nested validation passes on well-formed input" {

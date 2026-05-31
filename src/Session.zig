@@ -390,29 +390,27 @@ pub const SessionManager = struct {
         const cwd = std.Io.Dir.cwd();
 
         // Read meta
-        var meta = try readMetaFile(meta_path, self.allocator);
+        const meta = try readMetaFile(meta_path, self.allocator);
 
         // Recover from any crash that left the session half-written: truncate
-        // an incomplete trailing JSONL line, remove orphaned .tmp files, and
-        // reconcile meta.message_count against the real line count.
-        var sessions = cwd.openDir(io, sessions_dir, .{ .iterate = true }) catch |e| {
+        // an incomplete trailing JSONL line and remove orphaned .tmp files.
+        //
+        // meta.message_count is intentionally NOT reconciled against the real
+        // line count here (recovery is tail-only and never scans the body). It
+        // is append-maintained best-effort and may undercount after a crash or
+        // a session that ended on un-persisted streaming deltas; treat it as a
+        // display hint, not an authoritative count. Entry loading reads actual
+        // JSONL lines and never consults it.
+        var sessions = cwd.openDir(sessions_dir, .{ .iterate = true }) catch |e| {
             log.err("failed to open sessions dir for recovery: {}", .{e});
             return e;
         };
         defer sessions.close(io);
 
-        const report = recoverSessionFiles(sessions, id, self.allocator) catch |e| {
+        _ = recoverSessionFiles(sessions, id) catch |e| {
             log.err("session recovery failed: {}", .{e});
             return e;
         };
-
-        if (meta.message_count != report.actual_line_count) {
-            log.warn("session {s}: meta.message_count={d} but JSONL has {d} lines; trusting JSONL", .{
-                id, meta.message_count, report.actual_line_count,
-            });
-            meta.message_count = report.actual_line_count;
-            try writeMetaFile(meta_path, &meta);
-        }
 
         // Open JSONL for appending
         const jsonl_file = cwd.openFile(io, jsonl_path, .{ .mode = .write_only }) catch |e| {
@@ -733,6 +731,10 @@ pub const SessionHandle = struct {
     pub fn setStatus(self: *SessionHandle, status: SessionStatus) !void {
         self.append_mutex.lock();
         defer self.append_mutex.unlock();
+        // Skip the fsync+rename when the status is unchanged: status is
+        // re-announced at every turn boundary, and a no-op transition does
+        // not need a durability barrier.
+        if (self.meta.status == status) return;
         self.meta.status = status;
         try self.updateMeta();
     }
@@ -749,12 +751,21 @@ pub const SessionHandle = struct {
 
 /// Load all entries from a session's JSONL file.
 /// Caller must free the returned slice and each entry's allocated strings.
-pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
-    var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
-        return error.PathTooLong;
+/// Upper bound on the JSONL we will read into memory in one shot. Clears the
+/// largest observed session (~9 MiB) by ~14x while bounding the worst-case
+/// synchronous main-thread read of a corrupt or pathological file: the whole
+/// file is slurped before line-splitting, so an unbounded cap would let a
+/// runaway file freeze the UI loop. Replaces a former 10 MiB cap the largest
+/// real session was already at 90% of (the next big one would have failed
+/// with `error.FileTooBig`). A session legitimately approaching this size
+/// would need lazy/windowed loading, which is out of scope here.
+const max_session_bytes: usize = 128 * 1024 * 1024; // 128 MiB
 
-    const content = std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, allocator, .limited(10 * 1024 * 1024)) catch |e| {
+/// Read `path` (cwd-relative) and parse every JSONL line into an owned Entry
+/// slice. Shared body of `loadEntries` (cwd session) and `loadEntriesAt`
+/// (arbitrary project root); both differ only in how they spell the path.
+fn loadEntriesFromPath(allocator: Allocator, path: []const u8) ![]Entry {
+    const content = std.fs.cwd().readFileAlloc(allocator, path, max_session_bytes) catch |e| {
         log.err("failed to read session file: {}", .{e});
         return e;
     };
@@ -777,7 +788,7 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
             // torn trailing line before we get here, so a parse failure
             // mid-file is real corruption and we want it greppable.
             log.warn(
-                "loadEntries: skipping corrupt entry at byte {d} of {s}: {s}",
+                "session: skipping corrupt entry at byte {d} of {s}: {s}",
                 .{ line_start_offset, path, @errorName(err) },
             );
             continue;
@@ -792,6 +803,13 @@ pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
     }
 
     return entries.toOwnedSlice(allocator);
+}
+
+pub fn loadEntries(id: []const u8, allocator: Allocator) ![]Entry {
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{id}) catch
+        return error.PathTooLong;
+    return loadEntriesFromPath(allocator, path);
 }
 
 /// Fill in a synthetic ULID for any entry loaded from a pre-migration JSONL
@@ -1007,49 +1025,12 @@ pub fn loadEntriesAt(allocator: Allocator, project_path: []const u8, id: []const
         "{s}/{s}/{s}.jsonl",
         .{ project_path, sessions_dir, id },
     ) catch return error.PathTooLong;
-
-    const content = std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, allocator, .limited(10 * 1024 * 1024)) catch |e| {
-        log.err("failed to read session file: {}", .{e});
-        return e;
-    };
-    defer allocator.free(content);
-
-    var entries: std.ArrayList(Entry) = .empty;
-    errdefer {
-        for (entries.items) |entry| freeEntry(entry, allocator);
-        entries.deinit(allocator);
-    }
-
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
-    var line_index: usize = 0;
-    var line_start_offset: usize = 0;
-    while (line_iter.next()) |line| {
-        defer line_start_offset += line.len + 1;
-        if (line.len == 0) continue;
-        var entry = parseEntry(line, allocator) catch |err| {
-            log.warn(
-                "loadEntriesAt: skipping corrupt entry at byte {d} of {s}: {s}",
-                .{ line_start_offset, path, @errorName(err) },
-            );
-            continue;
-        };
-        const previous_id: ?ulid.Ulid = if (entries.items.len > 0)
-            entries.items[entries.items.len - 1].id
-        else
-            null;
-        backfillEntry(&entry, previous_id, line_index);
-        try entries.append(allocator, entry);
-        line_index += 1;
-    }
-
-    return entries.toOwnedSlice(allocator);
+    return loadEntriesFromPath(allocator, path);
 }
 
-/// Outcome of a session's crash-recovery pass. `actual_line_count` is the
-/// number of complete JSONL lines after truncation, used by `loadSession`
-/// to reconcile against `meta.message_count`.
+/// Outcome of a session's crash-recovery pass: how much of a torn trailing
+/// line was dropped and how many orphan `.tmp` files were removed.
 pub const RecoveryReport = struct {
-    actual_line_count: u32 = 0,
     truncated_bytes: usize = 0,
     orphaned_tmp_cleaned: usize = 0,
 };
@@ -1058,13 +1039,16 @@ pub const RecoveryReport = struct {
 /// last crash left behind:
 ///   1. Truncate an incomplete trailing JSONL line (no final `\n`).
 ///   2. Delete orphan `.tmp` files from a failed atomic meta rename.
-///   3. Report the real line count so the caller can fix `meta.message_count`.
 /// `dir` must be opened with `.iterate = true`.
-pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8, allocator: Allocator) !RecoveryReport {
-    const io = process_io.get();
+///
+/// Step 1 is tail-only on the common path: a file already ending in `\n` is
+/// line-aligned and is left untouched after a single end-byte read. Only a
+/// torn trailing line triggers a bounded backward scan to the last newline,
+/// so an uncrashed open never reads the whole (potentially multi-MiB) file.
+pub fn recoverSessionFiles(dir: std.fs.Dir, id: []const u8) !RecoveryReport {
     var report: RecoveryReport = .{};
 
-    // Step 1: truncate incomplete final JSONL line, count complete lines.
+    // Step 1: trim an incomplete final JSONL line, if any.
     var jsonl_name_buf: [64]u8 = undefined;
     const jsonl_name = std.fmt.bufPrint(&jsonl_name_buf, "{s}.jsonl", .{id}) catch
         return error.PathTooLong;
@@ -1073,26 +1057,17 @@ pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8, allocator: Allocator
         defer file.close(io);
         const end_pos = (try file.stat(io)).size;
         if (end_pos > 0) {
-            var read_buf: [4096]u8 = undefined;
-            var file_reader = file.reader(io, &read_buf);
-            const content = try file_reader.interface.allocRemaining(allocator, .limited(end_pos));
-            defer allocator.free(content);
-            const n = content.len;
-
-            var last_nl: ?usize = null;
-            for (content, 0..) |b, i| {
-                if (b == '\n') last_nl = i;
-            }
-            const truncate_to = if (last_nl) |idx| idx + 1 else 0;
-            if (truncate_to < n) {
-                report.truncated_bytes = n - truncate_to;
-                try file.setLength(io, truncate_to);
+            // A trailing newline means the file is line-aligned; nothing to do.
+            try file.seekTo(end_pos - 1);
+            var last_byte: [1]u8 = undefined;
+            const got = try file.readAll(&last_byte);
+            if (got == 1 and last_byte[0] != '\n') {
+                const truncate_to = try lastNewlinePos(file, end_pos);
+                report.truncated_bytes = @intCast(end_pos - truncate_to);
+                try file.setEndPos(truncate_to);
                 log.warn("session {s}: dropped {d} bytes of incomplete trailing JSONL line", .{
                     id, report.truncated_bytes,
                 });
-            }
-            for (content[0..truncate_to]) |b| {
-                if (b == '\n') report.actual_line_count += 1;
             }
         }
     } else |err| switch (err) {
@@ -1115,6 +1090,28 @@ pub fn recoverSessionFiles(dir: std.Io.Dir, id: []const u8, allocator: Allocator
     }
 
     return report;
+}
+
+/// Byte offset one past the last `\n` in `file`'s `[0, end_pos)` range, or 0
+/// when the range holds no newline. Reads backward in bounded chunks so
+/// trimming a torn trailing line costs a few small reads rather than a scan
+/// of the whole file.
+fn lastNewlinePos(file: std.fs.File, end_pos: u64) !u64 {
+    var buf: [64 * 1024]u8 = undefined;
+    var window_end = end_pos;
+    while (window_end > 0) {
+        const window_start = if (window_end > buf.len) window_end - buf.len else 0;
+        const len: usize = @intCast(window_end - window_start);
+        try file.seekTo(window_start);
+        const n = try file.readAll(buf[0..len]);
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (buf[i] == '\n') return window_start + @as(u64, i) + 1;
+        }
+        window_end = window_start;
+    }
+    return 0;
 }
 
 // -- Internal helpers --------------------------------------------------------
@@ -1224,110 +1221,256 @@ fn serializeEntryToBuf(entry: *Entry, buf: []u8) ![]const u8 {
 const writeJsonString = types.writeJsonString;
 
 /// Parse a single JSONL line into an Entry. Allocates string fields.
+/// Skip the remainder of a container whose opening `[`/`{` token the caller
+/// has already consumed. Used to tolerate a present-but-wrong-typed field
+/// whose value happens to be an array/object: we discard it and fall back to
+/// the field default, matching the DOM reader's `else => default` arms.
+fn skipRestOfContainer(scanner: *std.json.Scanner) !void {
+    var depth: usize = 1;
+    while (depth > 0) {
+        switch (try scanner.next()) {
+            .object_begin, .array_begin => depth += 1,
+            .object_end, .array_end => depth -= 1,
+            .end_of_document => return error.UnexpectedEndOfInput,
+            else => {},
+        }
+    }
+}
+
+/// Read the next JSON value as an owned, unescaped string, or null when the
+/// value is not a string (the non-string value is fully consumed). Mirrors
+/// the DOM reader's `.string => dupe, else => default` semantics: a present-
+/// but-wrong-typed field never fails the line.
+fn readStringField(scanner: *std.json.Scanner, allocator: Allocator) !?[]u8 {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .string => |s| return try allocator.dupe(u8, s),
+        .allocated_string => |s| return s,
+        .allocated_number => |s| {
+            allocator.free(s);
+            return null;
+        },
+        .number, .true, .false, .null => return null,
+        .array_begin, .object_begin => {
+            try skipRestOfContainer(scanner);
+            return null;
+        },
+        else => return error.UnexpectedToken,
+    }
+}
+
+/// Read the next JSON value as an i64, or `default` when it is not an integer.
+fn readIntField(scanner: *std.json.Scanner, allocator: Allocator, default: i64) !i64 {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .number => |s| return std.fmt.parseInt(i64, s, 10) catch default,
+        .allocated_number => |s| {
+            defer allocator.free(s);
+            return std.fmt.parseInt(i64, s, 10) catch default;
+        },
+        .allocated_string => |s| {
+            allocator.free(s);
+            return default;
+        },
+        .string, .true, .false, .null => return default,
+        .array_begin, .object_begin => {
+            try skipRestOfContainer(scanner);
+            return default;
+        },
+        else => return error.UnexpectedToken,
+    }
+}
+
+/// Read the next JSON value as a bool, or `default` when it is not a bool.
+fn readBoolField(scanner: *std.json.Scanner, allocator: Allocator, default: bool) !bool {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .true => return true,
+        .false => return false,
+        .allocated_string, .allocated_number => |s| {
+            allocator.free(s);
+            return default;
+        },
+        .string, .number, .null => return default,
+        .array_begin, .object_begin => {
+            try skipRestOfContainer(scanner);
+            return default;
+        },
+        else => return error.UnexpectedToken,
+    }
+}
+
+/// Read the next JSON value as a `[]u32` path, or null when it is not an
+/// array. Out-of-range or non-integer elements fail the line with
+/// `error.InvalidSubagentPath`, matching the DOM reader.
+fn readPathField(scanner: *std.json.Scanner, allocator: Allocator) !?[]const u32 {
+    switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .array_begin => {},
+        .allocated_string, .allocated_number => |s| {
+            allocator.free(s);
+            return null;
+        },
+        .string, .number, .true, .false, .null => return null,
+        .object_begin => {
+            try skipRestOfContainer(scanner);
+            return null;
+        },
+        else => return error.UnexpectedToken,
+    }
+
+    var list: std.ArrayList(u32) = .empty;
+    errdefer list.deinit(allocator);
+    while (true) {
+        switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+            .array_end => break,
+            .number => |s| {
+                const n = std.fmt.parseInt(i64, s, 10) catch return error.InvalidSubagentPath;
+                if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidSubagentPath;
+                try list.append(allocator, @intCast(n));
+            },
+            else => return error.InvalidSubagentPath,
+        }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Assign an owned string field, releasing any value a prior occurrence of
+/// the same key already stored. A well-formed JSONL line names each field
+/// once, but a duplicate key would otherwise overwrite (and leak) the first
+/// allocation; the old DOM reader was immune because `parsed.deinit` freed
+/// the whole document. `new_val` is taken verbatim (its ownership transfers
+/// to `slot`); call this only after the read that produced it succeeded so a
+/// failed read leaves `slot` for the function-level errdefer to release once.
+fn takeOwned(allocator: Allocator, slot: *[]const u8, new_val: ?[]u8) void {
+    if (slot.len > 0) allocator.free(slot.*);
+    slot.* = new_val orelse "";
+}
+
+/// Optional-field variant of `takeOwned`: null when the value was absent or
+/// not a string, freeing any prior allocation first.
+fn takeOwnedOpt(allocator: Allocator, slot: *?[]const u8, new_val: ?[]u8) void {
+    if (slot.*) |old| allocator.free(old);
+    slot.* = new_val;
+}
+
+/// Parse a single JSONL line into an Entry. Allocates string fields with
+/// `allocator`; the caller frees them via `freeEntry`. Streams the line with
+/// a `std.json.Scanner` rather than building a `std.json.Value` DOM, which
+/// skips the per-line object hashmap and value boxing that dominated bulk
+/// session loads. String unescaping and the lenient field semantics (a
+/// present-but-wrong-typed field falls back to its default rather than
+/// failing the line) match the prior DOM reader; see the round-trip,
+/// escape, wrong-type, and legacy-subagent tests below.
 fn parseEntry(line: []const u8, allocator: Allocator) !Entry {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
+    var scanner = std.json.Scanner.initCompleteInput(allocator, line);
+    defer scanner.deinit();
 
-    const entry_kind = if (obj.get("type")) |v| switch (v) {
-        .string => |s| s,
-        else => return error.InvalidEntryType,
-    } else return error.MissingType;
+    if (try scanner.next() != .object_begin) return error.NotAnObject;
 
-    const entry_type = EntryType.fromSlice(entry_kind) orelse return error.UnknownEntryType;
-
-    const content = if (obj.get("content")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => "",
-    } else "";
-
-    const tool_name = if (obj.get("tool_name")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => "",
-    } else "";
-
-    const tool_input = if (obj.get("tool_input")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => "",
-    } else "";
-
-    const is_error = if (obj.get("is_error")) |v| switch (v) {
-        .bool => |b| b,
-        else => false,
-    } else false;
-
-    const timestamp = if (obj.get("ts")) |v| switch (v) {
-        .integer => |i| i,
-        else => @as(i64, 0),
-    } else @as(i64, 0);
-
-    // Absent or unparseable `id` leaves the field as the zero sentinel so
-    // a later backfill pass (see Task 4 of the JSONL tree migration) can
-    // assign one deterministically without confusing it for a writer-set
-    // value. Same logic for `parent_id`, except the field stays null.
+    var entry_type: ?EntryType = null;
+    var content: []const u8 = "";
+    var tool_name: []const u8 = "";
+    var tool_input: []const u8 = "";
+    var is_error = false;
+    var timestamp: i64 = 0;
+    // Absent or unparseable `id` leaves the field as the zero sentinel so a
+    // later backfill pass can assign one deterministically without confusing
+    // it for a writer-set value. `parent_id` stays null on the same path.
     var id: ulid.Ulid = [_]u8{0} ** 26;
-    if (obj.get("id")) |v| switch (v) {
-        .string => |s| id = ulid.parse(s) catch [_]u8{0} ** 26,
-        else => {},
-    };
-
     var parent_id: ?ulid.Ulid = null;
-    if (obj.get("parent_id")) |v| switch (v) {
-        .string => |s| parent_id = ulid.parse(s) catch null,
-        else => {},
-    };
+    var signature: ?[]const u8 = null;
+    var thinking_provider: ?[]const u8 = null;
+    var encrypted_data: ?[]const u8 = null;
+    var tool_use_id: ?[]const u8 = null;
+    var subagent_path: ?[]const u32 = null;
+    var saw_subagent_path = false;
+    var legacy_subagent_id: ?u32 = null;
 
-    const signature = if (obj.get("signature")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+    // Any error after we start keeping owned fields must release them so a
+    // malformed line cannot leak. freeEntry is for fully-built entries; this
+    // mirrors it over the in-progress locals.
+    errdefer {
+        if (content.len > 0) allocator.free(content);
+        if (tool_name.len > 0) allocator.free(tool_name);
+        if (tool_input.len > 0) allocator.free(tool_input);
+        if (signature) |s| allocator.free(s);
+        if (thinking_provider) |s| allocator.free(s);
+        if (encrypted_data) |s| allocator.free(s);
+        if (tool_use_id) |s| allocator.free(s);
+        if (subagent_path) |p| allocator.free(p);
+    }
 
-    const thinking_provider = if (obj.get("thinking_provider")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+    while (true) {
+        const key_tok = try scanner.nextAlloc(allocator, .alloc_if_needed);
+        const key = switch (key_tok) {
+            .object_end => break,
+            .string => |s| s,
+            .allocated_string => |s| s,
+            else => return error.MalformedKey,
+        };
+        // Free an allocated (escaped) key once dispatch is done. Keys are
+        // ASCII in practice, so this is almost always the borrowed branch.
+        defer switch (key_tok) {
+            .allocated_string => |s| allocator.free(s),
+            else => {},
+        };
 
-    const encrypted_data = if (obj.get("encrypted_data")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+        if (std.mem.eql(u8, key, "type")) {
+            const s = (try readStringField(&scanner, allocator)) orelse return error.InvalidEntryType;
+            defer allocator.free(s);
+            entry_type = EntryType.fromSlice(s) orelse return error.UnknownEntryType;
+        } else if (std.mem.eql(u8, key, "content")) {
+            takeOwned(allocator, &content, try readStringField(&scanner, allocator));
+        } else if (std.mem.eql(u8, key, "tool_name")) {
+            takeOwned(allocator, &tool_name, try readStringField(&scanner, allocator));
+        } else if (std.mem.eql(u8, key, "tool_input")) {
+            takeOwned(allocator, &tool_input, try readStringField(&scanner, allocator));
+        } else if (std.mem.eql(u8, key, "is_error")) {
+            is_error = try readBoolField(&scanner, allocator, false);
+        } else if (std.mem.eql(u8, key, "ts")) {
+            timestamp = try readIntField(&scanner, allocator, 0);
+        } else if (std.mem.eql(u8, key, "id")) {
+            if (try readStringField(&scanner, allocator)) |s| {
+                defer allocator.free(s);
+                id = ulid.parse(s) catch [_]u8{0} ** 26;
+            }
+        } else if (std.mem.eql(u8, key, "parent_id")) {
+            if (try readStringField(&scanner, allocator)) |s| {
+                defer allocator.free(s);
+                parent_id = ulid.parse(s) catch null;
+            }
+        } else if (std.mem.eql(u8, key, "signature")) {
+            takeOwnedOpt(allocator, &signature, try readStringField(&scanner, allocator));
+        } else if (std.mem.eql(u8, key, "thinking_provider")) {
+            takeOwnedOpt(allocator, &thinking_provider, try readStringField(&scanner, allocator));
+        } else if (std.mem.eql(u8, key, "encrypted_data")) {
+            takeOwnedOpt(allocator, &encrypted_data, try readStringField(&scanner, allocator));
+        } else if (std.mem.eql(u8, key, "tool_use_id")) {
+            takeOwnedOpt(allocator, &tool_use_id, try readStringField(&scanner, allocator));
+        } else if (std.mem.eql(u8, key, "subagent_path")) {
+            saw_subagent_path = true;
+            const v = try readPathField(&scanner, allocator);
+            if (subagent_path) |old| allocator.free(old);
+            subagent_path = v;
+        } else if (std.mem.eql(u8, key, "subagent_id")) {
+            const n = try readIntField(&scanner, allocator, -1);
+            if (n >= 0 and n <= std.math.maxInt(u32)) legacy_subagent_id = @intCast(n);
+        } else {
+            try scanner.skipValue();
+        }
+    }
 
-    const tool_use_id = if (obj.get("tool_use_id")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
+    const et = entry_type orelse return error.MissingType;
 
     // Prefer the new array shape; fall back to the legacy single-int
-    // `subagent_id` field by treating it as a 1-element path.
-    var subagent_path: ?[]const u32 = null;
-    if (obj.get("subagent_path")) |v| switch (v) {
-        .array => |arr| {
-            const items = arr.items;
-            const buf = try allocator.alloc(u32, items.len);
-            errdefer allocator.free(buf);
-            for (items, 0..) |elem, i| switch (elem) {
-                .integer => |n| {
-                    if (n < 0 or n > std.math.maxInt(u32)) return error.InvalidSubagentPath;
-                    buf[i] = @intCast(n);
-                },
-                else => return error.InvalidSubagentPath,
-            };
+    // `subagent_id` only when no `subagent_path` field was present at all.
+    if (!saw_subagent_path) {
+        if (legacy_subagent_id) |sid| {
+            const buf = try allocator.alloc(u32, 1);
+            buf[0] = sid;
             subagent_path = buf;
-        },
-        else => {},
-    } else if (obj.get("subagent_id")) |v| switch (v) {
-        .integer => |i| {
-            if (i >= 0 and i <= std.math.maxInt(u32)) {
-                const buf = try allocator.alloc(u32, 1);
-                buf[0] = @intCast(i);
-                subagent_path = buf;
-            }
-        },
-        else => {},
-    };
+        }
+    }
 
     return Entry{
-        .entry_type = entry_type,
+        .entry_type = et,
         .content = content,
         .tool_name = tool_name,
         .tool_input = tool_input,
@@ -1524,6 +1667,79 @@ test "serializeEntry and parseEntry round-trip" {
     try std.testing.expectEqual(EntryType.user_message, parsed.entry_type);
     try std.testing.expectEqualStrings("hello world", parsed.content);
     try std.testing.expectEqual(@as(i64, 1234567890), parsed.timestamp);
+}
+
+test "parseEntry unescapes JSON string escapes in content" {
+    const allocator = std.testing.allocator;
+
+    // A raw JSONL line whose `content` carries the four escape shapes the
+    // serializer can emit (newline, quote, backslash) plus a \u codepoint.
+    // The reader must hand back the DECODED bytes, not the escaped source.
+    const line =
+        "{\"type\":\"assistant_text\",\"content\":\"line1\\nline2 \\\"q\\\" \\\\ \\u00e9\",\"ts\":7}";
+
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.assistant_text, parsed.entry_type);
+    try std.testing.expectEqualStrings("line1\nline2 \"q\" \\ \u{00e9}", parsed.content);
+    try std.testing.expectEqual(@as(i64, 7), parsed.timestamp);
+}
+
+test "parseEntry tolerates wrong-typed fields by falling back to defaults" {
+    const allocator = std.testing.allocator;
+
+    // Present-but-wrong-typed fields must not error the line; each falls back
+    // to its default (string -> "", bool -> false, int -> 0) so a single
+    // malformed field cannot drop an otherwise-loadable entry.
+    const line =
+        "{\"type\":\"info\",\"content\":123,\"is_error\":\"yes\",\"ts\":\"nope\",\"tool_name\":true}";
+
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.info, parsed.entry_type);
+    try std.testing.expectEqualStrings("", parsed.content);
+    try std.testing.expectEqualStrings("", parsed.tool_name);
+    try std.testing.expectEqual(false, parsed.is_error);
+    try std.testing.expectEqual(@as(i64, 0), parsed.timestamp);
+}
+
+test "parseEntry frees the prior value on a duplicate key (no leak, last wins)" {
+    const allocator = std.testing.allocator;
+
+    // A malformed-but-valid-JSON line repeating owning keys. The reader takes
+    // the last occurrence (matching the old DOM's use_last) and MUST free the
+    // earlier allocation: std.testing.allocator fails this test on a leak,
+    // which is exactly what the pre-fix overwrite-without-free path did.
+    const line =
+        "{\"type\":\"assistant_text\"," ++
+        "\"content\":\"first\",\"content\":\"second\"," ++
+        "\"signature\":\"sig1\",\"signature\":\"sig2\",\"ts\":3}";
+
+    const parsed = try parseEntry(line, allocator);
+    defer freeEntry(parsed, allocator);
+
+    try std.testing.expectEqual(EntryType.assistant_text, parsed.entry_type);
+    try std.testing.expectEqualStrings("second", parsed.content);
+    try std.testing.expect(parsed.signature != null);
+    try std.testing.expectEqualStrings("sig2", parsed.signature.?);
+}
+
+test "parseEntry rejects an invalid subagent_path element" {
+    const allocator = std.testing.allocator;
+
+    // Negative, u32-overflowing, and non-integer array elements each fail the
+    // line (matching the old DOM reader's InvalidSubagentPath). The partial
+    // path list built before the bad element must not leak.
+    const neg = "{\"type\":\"info\",\"subagent_path\":[0,-1],\"ts\":1}";
+    try std.testing.expectError(error.InvalidSubagentPath, parseEntry(neg, allocator));
+
+    const over = "{\"type\":\"info\",\"subagent_path\":[4294967296],\"ts\":1}";
+    try std.testing.expectError(error.InvalidSubagentPath, parseEntry(over, allocator));
+
+    const str = "{\"type\":\"info\",\"subagent_path\":[\"x\"],\"ts\":1}";
+    try std.testing.expectError(error.InvalidSubagentPath, parseEntry(str, allocator));
 }
 
 test "serializeEntry with tool fields" {
@@ -2454,9 +2670,8 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close(std.testing.io);
 
-    const report = try recoverSessionFiles(iter_dir, "abc", allocator);
+    const report = try recoverSessionFiles(iter_dir, "abc");
 
-    try std.testing.expectEqual(@as(u32, 2), report.actual_line_count);
     try std.testing.expectEqual(@as(usize, "{\"c\":".len), report.truncated_bytes);
 
     const after = try tmp.dir.readFileAlloc(std.testing.io, "abc.jsonl", allocator, .limited(1024));
@@ -2464,8 +2679,33 @@ test "recoverSessionFiles truncates an incomplete trailing JSONL line" {
     try std.testing.expectEqualStrings("{\"a\":1}\n{\"b\":2}\n", after);
 }
 
-test "recoverSessionFiles deletes orphan .tmp files for the session" {
+test "recoverSessionFiles trims a torn trailing line longer than the scan window" {
+    // A torn final line bigger than lastNewlinePos's 64 KiB chunk forces the
+    // backward scan to cross window boundaries before finding the last '\n'.
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const head = "{\"a\":1}\n";
+    const torn_len = 70 * 1024;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, head);
+    try body.appendNTimes(allocator, 'x', torn_len);
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = body.items });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc");
+    try std.testing.expectEqual(@as(usize, torn_len), report.truncated_bytes);
+
+    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(head, after);
+}
+
+test "recoverSessionFiles deletes orphan .tmp files for the session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2478,7 +2718,7 @@ test "recoverSessionFiles deletes orphan .tmp files for the session" {
     var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close(std.testing.io);
 
-    const report = try recoverSessionFiles(iter_dir, "abc", allocator);
+    const report = try recoverSessionFiles(iter_dir, "abc");
     try std.testing.expectEqual(@as(usize, 2), report.orphaned_tmp_cleaned);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "abc.meta.json.tmp", .{}));
@@ -2487,7 +2727,7 @@ test "recoverSessionFiles deletes orphan .tmp files for the session" {
     _ = try tmp.dir.statFile(std.testing.io, "other.meta.json.tmp", .{});
 }
 
-test "recoverSessionFiles reports line count for count reconciliation" {
+test "recoverSessionFiles leaves a clean newline-terminated file untouched" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2498,9 +2738,46 @@ test "recoverSessionFiles reports line count for count reconciliation" {
     var iter_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer iter_dir.close(std.testing.io);
 
-    const report = try recoverSessionFiles(iter_dir, "sess", allocator);
-    try std.testing.expectEqual(@as(u32, 4), report.actual_line_count);
+    const report = try recoverSessionFiles(iter_dir, "sess");
     try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
+
+    // The tail-only path must not rewrite a file that already ends in '\n'.
+    const after = try tmp.dir.readFileAlloc(allocator, "sess.jsonl", 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(jsonl_body, after);
+}
+
+test "recoverSessionFiles is a no-op on an empty session file" {
+    // end_pos == 0 short-circuits before any tail read or backward scan.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = "" });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc");
+    try std.testing.expectEqual(@as(usize, 0), report.truncated_bytes);
+}
+
+test "recoverSessionFiles truncates a lone unterminated line with no newline" {
+    // A file with zero '\n' is one torn line: lastNewlinePos exhausts its
+    // backward scan to offset 0, so the whole file is truncated away.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "{\"a\":1}"; // no trailing newline
+    try tmp.dir.writeFile(.{ .sub_path = "abc.jsonl", .data = body });
+
+    var iter_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    const report = try recoverSessionFiles(iter_dir, "abc");
+    try std.testing.expectEqual(@as(usize, body.len), report.truncated_bytes);
+
+    const after = try tmp.dir.readFileAlloc(allocator, "abc.jsonl", 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
 test "loader synthesizes ids for pre-migration entries" {
@@ -2835,6 +3112,50 @@ test "tool_call and tool_result round-trip tool_use_id and tool_input via loadEn
 
     // The cross-reference is the whole point: tool_result -> tool_call.
     try std.testing.expectEqualStrings(call_entry.tool_use_id.?, result_entry.tool_use_id.?);
+}
+
+test "loadEntries loads a session JSONL larger than the former 10 MiB cap" {
+    // A single entry whose content exceeds 10 MiB used to fail the entire
+    // load with error.FileTooBig (readFileAlloc's hard cap). The largest real
+    // session was already ~9 MiB, so the next big one would not have opened.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig_cwd);
+    try tmp.dir.setAsCwd();
+    defer restoreCwd(orig_cwd);
+
+    try std.fs.cwd().makePath(sessions_dir);
+
+    const big_len = 11 * 1024 * 1024;
+    const huge = try allocator.alloc(u8, big_len);
+    defer allocator.free(huge);
+    @memset(huge, 'x');
+
+    const session_id = "bigsession000000";
+    var path_buf: [256]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&path_buf, sessions_dir ++ "/{s}.jsonl", .{session_id});
+
+    // One JSONL line by hand; 'x' bytes need no escaping.
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    try line.appendSlice(allocator, "{\"type\":\"info\",\"content\":\"");
+    try line.appendSlice(allocator, huge);
+    try line.appendSlice(allocator, "\",\"ts\":1}\n");
+    try std.fs.cwd().writeFile(.{ .sub_path = jsonl_path, .data = line.items });
+
+    const loaded = try loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqual(EntryType.info, loaded[0].entry_type);
+    try std.testing.expectEqual(@as(usize, big_len), loaded[0].content.len);
 }
 
 test "backfillEntry mixes line index into seed to avoid same-ms collisions" {

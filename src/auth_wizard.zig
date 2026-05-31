@@ -380,6 +380,35 @@ pub fn persistDefaultModel(
     try atomicWrite(allocator, config_path, out.items);
 }
 
+/// Derive the `config.lua` path that lives alongside `auth_path`. zag stores
+/// both under `~/.config/zag/`, so swapping the filename component is enough.
+/// Returns null when `auth_path` does not end in `auth.json` (e.g. test
+/// fixtures pointing at a throwaway temp file), which signals the caller to
+/// skip persistence rather than write a bogus sibling. Slice is caller-owned.
+fn configPathFromAuth(allocator: std.mem.Allocator, auth_path: []const u8) !?[]u8 {
+    const basename = "auth.json";
+    if (!std.mem.endsWith(u8, auth_path, basename)) return null;
+    const prefix = auth_path[0 .. auth_path.len - basename.len];
+    return try std.fmt.allocPrint(allocator, "{s}config.lua", .{prefix});
+}
+
+/// Persist `model` as the default in the `config.lua` beside `auth_path`.
+/// Returns true when the write happened, false when no config path could be
+/// derived (a throwaway auth path, so persistence is skipped). This lets a
+/// Lua caller (the `/model` picker via `zag.persist_default_model`) own the
+/// persist decision, instead of a window-system primitive writing config.lua
+/// as a side effect of swapping a pane's model.
+pub fn persistDefaultModelForAuth(
+    allocator: std.mem.Allocator,
+    auth_path: []const u8,
+    model: []const u8,
+) !bool {
+    const config_path = (try configPathFromAuth(allocator, auth_path)) orelse return false;
+    defer allocator.free(config_path);
+    try persistDefaultModel(allocator, config_path, model);
+    return true;
+}
+
 fn stripExtraModelLines(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -2689,6 +2718,33 @@ test "promptModel returns recommended id on immediate Enter" {
     const result = try promptModel(&deps, &ep);
     defer if (result) |m| testing.allocator.free(m);
     try testing.expectEqualStrings("m2", result.?);
+}
+
+test "persistDefaultModelForAuth writes the default beside auth.json" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_abs);
+    const auth_path = try std.fs.path.join(gpa, &.{ dir_abs, "auth.json" });
+    defer gpa.free(auth_path);
+    const config_path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
+    defer gpa.free(config_path);
+
+    const wrote = try persistDefaultModelForAuth(gpa, auth_path, "provB/b2");
+    try std.testing.expect(wrote);
+
+    const body = try std.fs.cwd().readFileAlloc(gpa, config_path, 1 << 16);
+    defer gpa.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
+}
+
+test "persistDefaultModelForAuth skips a non-auth.json path" {
+    const gpa = std.testing.allocator;
+    // A throwaway path that does not end in auth.json yields no config
+    // sibling, so persistence is skipped rather than writing somewhere bogus.
+    const wrote = try persistDefaultModelForAuth(gpa, "/tmp/zag-test-not-auth.txt", "provB/b2");
+    try std.testing.expect(!wrote);
 }
 
 test "persistDefaultModel replaces existing line" {
