@@ -8,6 +8,7 @@ const std = @import("std");
 const posix = std.posix;
 const sync = @import("sync.zig");
 const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const Allocator = std.mem.Allocator;
 
 /// Borrowed handle, owned by this module while non-null.
@@ -71,6 +72,11 @@ pub fn initWithPath(path: []const u8) !void {
         else => |e| return posix.unexpectedErrno(e),
     }
     log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    // `handler` writes through `log_io`; without this a direct `initWithPath`
+    // (the test entry point) leaves it null and every message is silently
+    // dropped. `init` overrides with its explicit `io` after this returns;
+    // both resolve to the same process-wide io.
+    log_io = process_io.get();
 
     // Stash the path so callers can drop sibling artifacts next to the log.
     // `deinit` (called above) already cleared any previous owner. allocPrint
