@@ -214,8 +214,10 @@ fn layerLessThan(_: void, a: Layer, b: Layer) bool {
 /// of truth for the shape.
 pub const EnvSnapshot = struct {
     /// Absolute path of the process's current directory at snapshot time.
-    /// Owned.
-    cwd: []const u8,
+    /// Owned. Sentinel-terminated because `realPathFileAlloc` returns `[:0]u8`;
+    /// keeping the sentinel slice means `deinit` frees the full allocation
+    /// (freeing it as a plain `[]u8` would undercount by the null byte).
+    cwd: [:0]const u8,
     /// Absolute path of the surrounding git worktree. Equals `cwd` when
     /// no `.git` was found in the walk up the filesystem; the two slices
     /// share backing storage in that case, so call `deinit` only once.
@@ -238,9 +240,9 @@ pub const EnvSnapshot = struct {
     /// mirrors `cwd`; `is_git_repo` is false; `date_iso` uses the UTC
     /// `std.time.timestamp` result.
     pub fn capture(alloc: Allocator) !EnvSnapshot {
-        const cwd: []u8 = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", alloc) catch |err| blk: {
+        const cwd: [:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", alloc) catch |err| blk: {
             log.warn("env snapshot: getcwd failed: {}", .{err});
-            break :blk try alloc.dupe(u8, "");
+            break :blk try alloc.dupeZ(u8, "");
         };
         errdefer alloc.free(cwd);
 

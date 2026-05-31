@@ -33,11 +33,17 @@ pub fn execute(
 
     const io = process_io.get();
 
-    // Create parent directories if needed
+    // Create parent directories if needed. `createDirPath` returns error.NotDir
+    // when the final path component is an existing symlink to a directory (e.g.
+    // macOS /tmp -> private/tmp), so check whether the parent already exists
+    // first (`access` follows symlinks) and only create it when it is genuinely
+    // missing.
     if (std.fs.path.dirname(input.path)) |dir| {
-        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "error: cannot create directory '{s}': {s}", .{ dir, @errorName(err) }) catch return types.oomResult();
-            return .{ .content = msg, .is_error = true };
+        std.Io.Dir.cwd().access(io, dir, .{}) catch {
+            std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "error: cannot create directory '{s}': {s}", .{ dir, @errorName(err) }) catch return types.oomResult();
+                return .{ .content = msg, .is_error = true };
+            };
         };
     }
 

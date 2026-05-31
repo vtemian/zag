@@ -767,6 +767,26 @@ test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+var bash_test_env_map: ?std.process.Environ.Map = null;
+
+/// Seed `env_mod` from the real process environment so the strict-mode sandbox
+/// tests (which read HOME to build the secret-deny rules) pass regardless of
+/// test order. `env_mod`'s map is process-global but is only installed by a
+/// test that runs an `ensureTestEnv` helper (see env.zig); these bash tests can
+/// run before any other module seeds it. Test scaffolding only.
+fn ensureTestEnv() void {
+    if (bash_test_env_map != null) return;
+    var m: std.process.Environ.Map = .init(std.heap.page_allocator);
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const pair = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        m.put(pair[0..eq], pair[eq + 1 ..]) catch {};
+    }
+    bash_test_env_map = m;
+    env_mod.init(&bash_test_env_map.?);
+}
+
 test "execute denies reading ~/.ssh on macOS in strict mode" {
     // The agent tries to read the current user's ~/.ssh. If it works,
     // the sandbox failed. If the read is blocked, the output should
@@ -776,6 +796,7 @@ test "execute denies reading ~/.ssh on macOS in strict mode" {
     // test exercises the seatbelt path explicitly.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
+    ensureTestEnv();
     var strict: Config = .{ .permissive = false };
     bindConfig(&strict);
     defer bindConfig(null);
@@ -840,6 +861,7 @@ test "execute denies reading ~/.ssh on Linux in strict mode" {
         .unsupported => return error.SkipZigTest,
     }
 
+    ensureTestEnv();
     var strict: Config = .{ .permissive = false };
     bindConfig(&strict);
     defer bindConfig(null);
