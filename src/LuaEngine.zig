@@ -2487,11 +2487,21 @@ pub const LuaEngine = struct {
             rt.deinit();
             self.async_runtime = null;
         }
-        // tasks map: any leftover Tasks indicate a coroutine wasn't properly retired.
-        // Log a warning; strict assertion would abort release builds on buggy
-        // shutdown paths, which is worse than a noisy log line.
+        // Retire any coroutine still parked at shutdown -- the common case
+        // is a detached poller blocked in `zag.sleep`. Each parked task owns
+        // a Scope still linked under `root_scope`; `retireTask` unlinks and
+        // frees it. Without this, the `root_scope.deinit()` below asserts on
+        // the orphaned child (`children.len == 0`) and aborts the process.
+        // Drain by repeatedly retiring the first task, since retireTask
+        // removes from `self.tasks` and may resume joiners that retire more;
+        // a count ceiling guards against a pathological re-spawn loop.
         if (self.tasks.count() > 0) {
-            std.log.scoped(.lua).warn("deinitAsync: {d} tasks still alive", .{self.tasks.count()});
+            std.log.scoped(.lua).warn("deinitAsync: retiring {d} task(s) still alive", .{self.tasks.count()});
+        }
+        var guard: usize = 0;
+        while (self.tasks.count() > 0 and guard < 4096) : (guard += 1) {
+            var it = self.tasks.valueIterator();
+            self.retireTask(it.next().?.*);
         }
         self.tasks.deinit();
         if (self.root_scope) |s| {
