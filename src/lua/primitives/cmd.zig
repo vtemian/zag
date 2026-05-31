@@ -238,11 +238,12 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
 
     const term: std.process.Child.Term = if (truncated)
         .{ .signal = std.posix.SIG.KILL }
-    else child.wait(io) catch |err| {
-        job.err_tag = .io_error;
-        job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
-        return;
-    };
+    else
+        child.wait(io) catch |err| {
+            job.err_tag = .io_error;
+            job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
+            return;
+        };
 
     const code: i32 = switch (term) {
         .exited => |c| @as(i32, @intCast(c)),
