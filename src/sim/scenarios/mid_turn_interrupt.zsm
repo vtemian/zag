@@ -1,26 +1,40 @@
-# Mid-turn Ctrl+C cancel and recovery. We send a deliberately
-# long-running prompt, fire <C-c> while the model is still streaming,
-# then issue a different, trivial bash tool call. The second turn
-# proves the agent loop recovered: a regression in the cancel +
-# reminder-queue path would either leave the second prompt unsent or
-# trip up the streaming state machine.
+# Mid-turn Ctrl+C cancel and recovery. Send a long-running prompt, fire
+# <C-c> while the turn is in flight, then issue a fresh prompt. The second
+# turn proves the agent loop recovered: a regression in the cancel +
+# reminder-queue path would either leave the second prompt unsent or trip
+# up the streaming state machine.
 #
 # Ctrl+C is the real cancel hotkey in zag (see EventOrchestrator.zig).
 # Esc only enters normal mode in the modal keymap; it does NOT abort a
 # running agent.
+#
+# Robustness notes for reasoning models:
+#   * "turn in flight" is detected via the "* Working..." line zag renders
+#     while the agent runs. wait_idle can't see it (a reasoning model
+#     streams continuously, so there is never a quiet window).
+#   * Recovery is proven by turn LIFECYCLE (Working appears, then the grid
+#     settles), not by a token in the prompt: any token the prompt names
+#     also renders in the submitted user-message bubble, so wait_text on it
+#     would false-match the echo rather than the tool output.
+#   * The cancel is allowed to fully settle before the recovery prompt, so
+#     the recovery <Enter> isn't sent into the cancel teardown.
 
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "Write a 500-word essay about the history of pseudo-terminals on UNIX. Be thorough." <Enter>
-# wait_idle here is intentional: we want the model to START streaming
-# before we cancel. There is no deterministic signal for "streaming
-# has begun", so a small fixed wait is the honest choice.
-wait_idle 4s
+wait_text /Working/ 30s
 send <C-c>
-wait_idle 1s
+# Let the cancel fully settle (working line gone, grid quiet) before the
+# recovery prompt, so the <Enter> lands as a fresh submit rather than racing
+# the in-progress cancel teardown.
+wait_idle 2s 20s
 send "Forget that. Just run bash 'echo zag-recover-token-T7'." <Enter>
-wait_text /zag-recover-token-T7/ 45s
+# Recovery turn must START (proves the prompt submitted and the agent loop
+# is alive after the cancel) and then FINISH (a full post-cancel turn).
+wait_text /Working/ 30s
+wait_idle 2s 60s
 snapshot final
 send "/quit" <Enter>
-wait_exit
+# Teardown after a streaming session is slower than the 10s default.
+wait_exit 30s
