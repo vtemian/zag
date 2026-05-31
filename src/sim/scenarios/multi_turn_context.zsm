@@ -7,7 +7,10 @@ spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "Remember this token for the rest of our conversation: zag-ctx-token-PL9. Just acknowledge briefly." <Enter>
-wait_idle 30s
+# Let turn 1 fully settle before turn 2. Small idle window, long deadline
+# so a reasoning model's think+ack time (past the 10s default) doesn't
+# trip the wait before the grid quiets.
+wait_idle 2s 60s
 send "What was the token I asked you to remember? Reply with just the token, nothing else." <Enter>
 wait_text /zag-ctx-token-PL9/ 30s
 snapshot final
