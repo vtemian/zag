@@ -961,10 +961,16 @@ pub const LuaEngine = struct {
             co.xMove(engine.lua, nargs + 1);
         }
 
-        const thread_ref = engine.spawnCoroutine(nargs, parent) catch |err| {
-            var buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "zag.spawn failed: {s}", .{@errorName(err)}) catch "zag.spawn failed";
-            co.raiseErrorStr("%s", .{msg.ptr});
+        const thread_ref = engine.spawnCoroutine(nargs, parent) catch |err| switch (err) {
+            error.AsyncRuntimeNotReady => co.raiseErrorStr(
+                "zag.spawn: async runtime not ready (use it from a hook or tool, not at config top level)",
+                .{},
+            ),
+            else => {
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(&buf, "zag.spawn failed: {s}", .{@errorName(err)}) catch "zag.spawn failed";
+                co.raiseErrorStr("%s", .{msg.ptr});
+            },
         };
 
         // Push the TaskHandle userdata on `co`'s stack; that's where the
@@ -989,10 +995,16 @@ pub const LuaEngine = struct {
         if (co != engine.lua) {
             co.xMove(engine.lua, nargs + 1);
         }
-        _ = engine.spawnCoroutine(nargs, null) catch |err| {
-            var buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "zag.detach failed: {s}", .{@errorName(err)}) catch "zag.detach failed";
-            co.raiseErrorStr("%s", .{msg.ptr});
+        _ = engine.spawnCoroutine(nargs, null) catch |err| switch (err) {
+            error.AsyncRuntimeNotReady => co.raiseErrorStr(
+                "zag.detach: async runtime not ready (use it from a hook or tool, not at config top level)",
+                .{},
+            ),
+            else => {
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrintZ(&buf, "zag.detach failed: {s}", .{@errorName(err)}) catch "zag.detach failed";
+                co.raiseErrorStr("%s", .{msg.ptr});
+            },
         };
         return 0;
     }
@@ -2478,11 +2490,21 @@ pub const LuaEngine = struct {
             rt.deinit();
             self.async_runtime = null;
         }
-        // tasks map: any leftover Tasks indicate a coroutine wasn't properly retired.
-        // Log a warning; strict assertion would abort release builds on buggy
-        // shutdown paths, which is worse than a noisy log line.
+        // Retire any coroutine still parked at shutdown -- the common case
+        // is a detached poller blocked in `zag.sleep`. Each parked task owns
+        // a Scope still linked under `root_scope`; `retireTask` unlinks and
+        // frees it. Without this, the `root_scope.deinit()` below asserts on
+        // the orphaned child (`children.len == 0`) and aborts the process.
+        // Drain by repeatedly retiring the first task, since retireTask
+        // removes from `self.tasks` and may resume joiners that retire more;
+        // a count ceiling guards against a pathological re-spawn loop.
         if (self.tasks.count() > 0) {
-            std.log.scoped(.lua).warn("deinitAsync: {d} tasks still alive", .{self.tasks.count()});
+            std.log.scoped(.lua).warn("deinitAsync: retiring {d} task(s) still alive", .{self.tasks.count()});
+        }
+        var guard: usize = 0;
+        while (self.tasks.count() > 0 and guard < 4096) : (guard += 1) {
+            var it = self.tasks.valueIterator();
+            self.retireTask(it.next().?.*);
         }
         self.tasks.deinit();
         if (self.root_scope) |s| {
@@ -2588,8 +2610,14 @@ pub const LuaEngine = struct {
         hook_payload: ?*Hooks.HookPayload,
         compact_request: ?*agent_events.CompactRequest,
     ) !i32 {
-        // Init-once latch check: dwarfed by the `lua.newThread` + `Scope.init` allocations that follow on the same path, so no measurable hot-path cost.
-        std.debug.assert(self.async_runtime != null); // initAsync must have run
+        // The async runtime must be up before a coroutine can be scheduled.
+        // Internal callers (hooks, compaction) only run after `initAsync`,
+        // but the Lua-facing `zag.spawn`/`zag.detach` are reachable from
+        // config.lua, which `loadUserConfig` runs BEFORE `initAsync`. Surface
+        // that as a catchable error (the entry points raise a Lua error,
+        // absorbed by loadConfig's protectedCall) instead of asserting and
+        // aborting the whole process.
+        if (self.async_runtime == null) return error.AsyncRuntimeNotReady;
         std.debug.assert(hook_payload == null or compact_request == null); // mutually exclusive tags
 
         const parent = parent_scope orelse self.root_scope.?;

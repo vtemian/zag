@@ -379,10 +379,12 @@ test "executeWaitIdle completes when child quiet" {
 test "executeWaitIdle times out when child keeps emitting" {
     var r = try Runner.init(std.testing.allocator);
     defer r.deinit();
-    // Child prints a byte every ~20ms, well inside the 100ms idle window, so
-    // every poll sees data and re-arms. Only the overall 500ms deadline ends
-    // the wait. The wide margin keeps the test stable under scheduler jitter.
-    const argv = [_][*:0]const u8{ "/bin/sh", "-c", "while true; do printf x; sleep 0.02; done" };
+    // `yes` streams output continuously with no per-iteration fork, so every
+    // poll sees data and re-arms regardless of runner scheduling. Only the
+    // overall 500ms deadline ends the wait, surfacing WaitIdleTimeout. A
+    // sleep-loop emitter instead leaned on each `sleep` fork staying under the
+    // idle window, which a contended CI host can't guarantee.
+    const argv = [_][*:0]const u8{"/usr/bin/yes"};
     const envp = [_][*:0]const u8{};
     r.child = try Spawn.spawn(&argv, &envp, 80, 24);
     try std.testing.expectError(error.WaitIdleTimeout, r.executeWaitIdle(100, 500));

@@ -163,6 +163,36 @@ test "resumeFromJob drains completion queue and frees the job" {
     try testing.expectEqual(@as(usize, 0), remaining);
 }
 
+test "zag.detach without an async runtime errors instead of aborting" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // No initAsync, exactly like config.lua load (loadUserConfig runs
+    // before initAsync). Pre-fix `zag.detach`/`zag.spawn` here aborted the
+    // whole process via std.debug.assert; now it surfaces as a catchable
+    // Lua error with actionable text.
+    const res = engine.lua.doString("zag.detach(function() end)");
+    try testing.expectError(error.LuaRuntime, res);
+    const msg = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, msg, "async runtime not ready") != null);
+    engine.lua.setTop(0);
+}
+
+test "zag.spawn without an async runtime errors instead of aborting" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    const res = engine.lua.doString("zag.spawn(function() end)");
+    try testing.expectError(error.LuaRuntime, res);
+    const msg = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, msg, "async runtime not ready") != null);
+    engine.lua.setTop(0);
+}
+
 test "zag.sessions table is installed on the zag global" {
     const allocator = testing.allocator;
     var engine = try LuaEngine.init(allocator);
