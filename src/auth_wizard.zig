@@ -204,9 +204,13 @@ pub fn scaffoldConfigLua(
 
     const io = process_io.get();
     const parent = std.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
-    std.Io.Dir.cwd().createDirPath(io, parent) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
+    // access first (follows symlinks): skip createDirPath when the parent
+    // already exists, dodging 0.16's NotDir on a symlink-to-dir leaf.
+    std.Io.Dir.cwd().access(io, parent, .{}) catch {
+        std.Io.Dir.cwd().createDirPath(io, parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
     };
 
     const file = std.Io.Dir.createFileAbsolute(io, config_path, .{
@@ -460,11 +464,15 @@ fn atomicWrite(
 
     const io = process_io.get();
     const cwd = std.Io.Dir.cwd();
-    // Ensure parent exists (matches scaffoldConfigLua semantics).
+    // Ensure parent exists (matches scaffoldConfigLua semantics). access first
+    // (follows symlinks): skip createDirPath when the parent already exists,
+    // dodging 0.16's NotDir on a symlink-to-dir leaf.
     if (std.fs.path.dirname(path)) |parent| {
-        cwd.createDirPath(io, parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        cwd.access(io, parent, .{}) catch {
+            cwd.createDirPath(io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         };
     }
 

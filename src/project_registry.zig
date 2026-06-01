@@ -51,9 +51,15 @@ pub fn init(allocator: Allocator, config_dir: []const u8) !ProjectRegistry {
     const dir_owned = try allocator.dupe(u8, config_dir);
     errdefer allocator.free(dir_owned);
 
-    std.Io.Dir.cwd().createDirPath(process_io.get(), dir_owned) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
+    // access first (follows symlinks): 0.16's createDirPath returns error.NotDir
+    // when the existing leaf is a symlink-to-dir (e.g. a stow/chezmoi-managed
+    // ~/.config/zag), so skip it when the dir already exists.
+    const reg_io = process_io.get();
+    std.Io.Dir.cwd().access(reg_io, dir_owned, .{}) catch {
+        std.Io.Dir.cwd().createDirPath(reg_io, dir_owned) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
     };
 
     const file_path = try std.fs.path.join(allocator, &.{ dir_owned, "projects.json" });

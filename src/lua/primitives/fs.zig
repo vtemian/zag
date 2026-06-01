@@ -139,9 +139,15 @@ pub fn executeMkdir(alloc: Allocator, job: *Job) void {
 
     const io = process_io.get();
     if (spec.parents) {
-        std.Io.Dir.cwd().createDirPath(io, spec.path) catch |err| {
-            setFsErr(alloc, job, err);
-            return;
+        // mkdir -p is idempotent on an existing directory, but 0.16's
+        // createDirPath returns error.NotDir when the leaf already exists as a
+        // symlink-to-dir (e.g. macOS /tmp -> private/tmp). Check existence first
+        // (access follows symlinks) and only create when genuinely missing.
+        std.Io.Dir.cwd().access(io, spec.path, .{}) catch {
+            std.Io.Dir.cwd().createDirPath(io, spec.path) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
         };
     } else {
         std.Io.Dir.cwd().createDir(io, spec.path, .default_dir) catch |err| {

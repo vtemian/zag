@@ -302,9 +302,13 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
     const io = process_io.get();
     const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |parent| {
-        cwd.createDirPath(io, parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        // access first (follows symlinks): skip createDirPath when the parent
+        // already exists, dodging 0.16's NotDir on a symlink-to-dir leaf.
+        cwd.access(io, parent, .{}) catch {
+            cwd.createDirPath(io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         };
     }
 
@@ -410,9 +414,13 @@ pub fn upsertOAuth(alloc: Allocator, path: []const u8, name: []const u8, cred: O
     const io = process_io.get();
     const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |parent| {
-        cwd.createDirPath(io, parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        // access first (follows symlinks): skip createDirPath when the parent
+        // already exists, dodging 0.16's NotDir on a symlink-to-dir leaf.
+        cwd.access(io, parent, .{}) catch {
+            cwd.createDirPath(io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         };
     }
 
