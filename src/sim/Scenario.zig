@@ -3,6 +3,7 @@
 //! context for the artifacts layer (phase 4) to surface the failing step.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const Dsl = @import("Dsl.zig");
 const Args = @import("Args.zig");
 const Runner = @import("Runner.zig").Runner;
@@ -102,9 +103,9 @@ fn runSourceImpl(
     }
 
     for (steps, 0..) |step, idx| {
-        const t0 = std.time.milliTimestamp();
+        const t0 = clock.milliTimestamp();
         if (executeStep(&r, step, opts)) |_| {
-            const dur: i64 = std.time.milliTimestamp() - t0;
+            const dur: i64 = clock.milliTimestamp() - t0;
             // Comments aren't worth recording. They parse to verb=.comment
             // with no behaviour. Skip them to keep summary.json focused on
             // executable steps.
@@ -119,7 +120,7 @@ fn runSourceImpl(
                 ) catch {};
             }
         } else |e| {
-            const dur: i64 = std.time.milliTimestamp() - t0;
+            const dur: i64 = clock.milliTimestamp() - t0;
             const outcome = classify(e);
             summary.recordStep(
                 step.line_no,

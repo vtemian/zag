@@ -7,6 +7,7 @@
 //! and exposes a tiny path-builder so callers don't reimplement `{s}/{s}` joins.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 
 const Artifacts = @This();
 
@@ -28,7 +29,7 @@ start_ms: i64,
 /// signals the harness should not delete it on cleanup. When `override` is
 /// null, mint `$TMPDIR/zag-sim-<run_id>/` (fallback `/tmp`).
 pub fn create(alloc: std.mem.Allocator, override: ?[]const u8) !*Artifacts {
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = clock.milliTimestamp();
     const pid: i32 = @intCast(std.c.getpid());
     const run_id = try std.fmt.allocPrint(alloc, "{d}-{d}", .{ pid, start_ms });
     errdefer alloc.free(run_id);
@@ -299,7 +300,7 @@ test "copyNewestSession copies the freshest .jsonl by mtime" {
     try sessions.writeFile(.{ .sub_path = "mid.jsonl", .data = "{\"k\":\"mid\"}\n" });
     try sessions.writeFile(.{ .sub_path = "new.jsonl", .data = "{\"k\":\"new\"}\n" });
 
-    const now = std.time.nanoTimestamp();
+    const now = clock.nanoTimestamp();
     const sec: i128 = 1_000_000_000;
     var f_old = try sessions.openFile("old.jsonl", .{ .mode = .read_write });
     try f_old.updateTimes(now - 30 * sec, now - 30 * sec);

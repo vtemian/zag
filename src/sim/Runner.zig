@@ -9,6 +9,7 @@
 //! through the `Outcome` enum.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const posix = std.posix;
 const Spawn = @import("Spawn.zig");
 const Grid = @import("Grid.zig");
@@ -122,9 +123,9 @@ pub const Runner = struct {
         // operator hardcoding a global default.
         const parsed = try Args.parsePatternAndTimeout(raw);
         const timeout_ms = parsed.timeout_ms orelse default_timeout_ms;
-        const deadline_ms = std.time.milliTimestamp() + timeout_ms;
+        const deadline_ms = clock.milliTimestamp() + timeout_ms;
         while (true) {
-            const remaining = @max(@as(i64, 0), deadline_ms - std.time.milliTimestamp());
+            const remaining = @max(@as(i64, 0), deadline_ms - clock.milliTimestamp());
             const status = try self.pumpOnce(@intCast(@min(remaining, 250)));
             if (status == .exited) {
                 self.reapExitedChild();
@@ -133,7 +134,7 @@ pub const Runner = struct {
             const dump = try self.grid.plainText();
             defer self.alloc.free(dump);
             if (std.mem.indexOf(u8, dump, parsed.pattern) != null) return;
-            if (std.time.milliTimestamp() >= deadline_ms) return error.WaitTextTimeout;
+            if (clock.milliTimestamp() >= deadline_ms) return error.WaitTextTimeout;
         }
     }
 
@@ -144,9 +145,9 @@ pub const Runner = struct {
         // Each poll waits the full `idle_ms`: idle detection means "quiet for
         // idle_ms", so we must not clamp the window or a short final poll
         // would report a false idle. The deadline only bounds total wall time.
-        const deadline_ms = std.time.milliTimestamp() + default_timeout_ms;
+        const deadline_ms = clock.milliTimestamp() + default_timeout_ms;
         while (true) {
-            if (std.time.milliTimestamp() >= deadline_ms) return error.WaitIdleTimeout;
+            if (clock.milliTimestamp() >= deadline_ms) return error.WaitIdleTimeout;
             const status = try self.pumpOnce(@intCast(idle_ms));
             if (status == .exited) {
                 self.reapExitedChild();
@@ -178,9 +179,9 @@ pub const Runner = struct {
 
     pub fn executeWaitExit(self: *Runner, raw: []const u8, default_timeout_ms: u32) !void {
         const timeout_ms = (try Args.parseOptionalTimeout(raw)) orelse default_timeout_ms;
-        const deadline = std.time.milliTimestamp() + timeout_ms;
+        const deadline = clock.milliTimestamp() + timeout_ms;
         while (true) {
-            const remaining = @max(@as(i64, 0), deadline - std.time.milliTimestamp());
+            const remaining = @max(@as(i64, 0), deadline - clock.milliTimestamp());
             if (remaining == 0) return error.WaitExitTimeout;
             const pump_status = try self.pumpOnce(@intCast(@min(remaining, 250)));
             if (pump_status == .exited) {

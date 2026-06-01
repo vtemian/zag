@@ -47,16 +47,16 @@ pub fn parse(alloc: std.mem.Allocator, src: []const u8) ![]Step {
 
         if (std.mem.eql(u8, keyword, "set")) {
             // Two-word verb: require "set env <rest>".
-            const after_set = if (sep == trimmed.len) "" else std.mem.trimLeft(u8, trimmed[sep..], " \t");
+            const after_set = if (sep == trimmed.len) "" else std.mem.trimStart(u8, trimmed[sep..], " \t");
             const sep2 = std.mem.indexOfAny(u8, after_set, " \t") orelse after_set.len;
             const second = after_set[0..sep2];
             if (!std.mem.eql(u8, second, "env")) return error.UnknownVerb;
-            const rest = if (sep2 == after_set.len) "" else std.mem.trimLeft(u8, after_set[sep2..], " \t");
+            const rest = if (sep2 == after_set.len) "" else std.mem.trimStart(u8, after_set[sep2..], " \t");
             try out.append(alloc, .{ .verb = .set_env, .args = rest, .line_no = line_no });
             continue;
         }
 
-        const rest = if (sep == trimmed.len) "" else std.mem.trimLeft(u8, trimmed[sep..], " \t");
+        const rest = if (sep == trimmed.len) "" else std.mem.trimStart(u8, trimmed[sep..], " \t");
         const verb = verbFromKeyword(keyword) orelse return error.UnknownVerb;
         try out.append(alloc, .{ .verb = verb, .args = rest, .line_no = line_no });
     }
