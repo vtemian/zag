@@ -9,6 +9,7 @@
 //! cross-module dependency explicit.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const posix = std.posix;
 const Spawn = @import("Spawn.zig");
 const Grid = @import("Grid.zig");
@@ -30,8 +31,8 @@ test "cat round-trip: send SGR'd bytes, grid sees the plain text" {
 
     // Read with a 1s deadline.
     var buf: [256]u8 = undefined;
-    const deadline_ns = std.time.nanoTimestamp() + std.time.ns_per_s;
-    while (std.time.nanoTimestamp() < deadline_ns) {
+    const deadline_ns = clock.nanoTimestamp() + std.time.ns_per_s;
+    while (clock.nanoTimestamp() < deadline_ns) {
         var fds = [_]posix.pollfd{.{ .fd = sp.pty.master, .events = posix.POLL.IN, .revents = 0 }};
         _ = try posix.poll(&fds, 100);
         if ((fds[0].revents & posix.POLL.IN) == 0) continue;

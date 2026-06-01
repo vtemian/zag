@@ -6,6 +6,9 @@
 //! off to EventOrchestrator. Anything event-loop-shaped lives there.
 
 const std = @import("std");
+const sync = @import("sync.zig");
+const process_io = @import("process_io.zig");
+const wake_pipe = @import("wake_pipe.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const llm = @import("llm.zig");
@@ -44,6 +47,7 @@ const stdin_buffer_len: usize = 8256;
 const RegistryView = LuaEngine.RegistryView;
 
 const file_log = @import("file_log.zig");
+const env_mod = @import("env.zig");
 /// Floor log_level at .debug so the runtime gate in `file_log.handler`
 /// (driven by `ZAG_DEBUG` / `ZAG_LOG_LEVEL`) decides what actually gets
 /// written. Without this, `.debug` calls are stripped at compile time and
@@ -73,17 +77,24 @@ fn appendStatusLineFmt(
     try appendStatusLine(view, text);
 }
 
-/// Set a file descriptor to non-blocking mode.
-fn setNonBlocking(fd: posix.fd_t) !void {
-    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-    const nonblock_bit: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
-    _ = try posix.fcntl(fd, posix.F.SETFL, flags | nonblock_bit);
+/// Set a file descriptor to non-blocking mode. 0.16 removed
+/// `std.posix.fcntl`; the status-flag read/modify/write goes straight to
+/// libc `fcntl`, mirroring `wake_pipe.setFlag`.
+fn setNonBlocking(fd: posix.fd_t) error{Unexpected}!void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(usize, 0));
+    if (flags < 0) return error.Unexpected;
+    const nonblock_bit: u32 = @bitCast(std.c.O{ .NONBLOCK = true });
+    const new_flags: usize = @as(usize, @intCast(flags)) | nonblock_bit;
+    if (std.c.fcntl(fd, std.c.F.SETFL, new_flags) < 0) return error.Unexpected;
 }
 
 /// Post the welcome banner or a resume notice to the root buffer.
 fn postStartupBanner(view: *Conversation, resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "?";
+    const cwd: []const u8 = if (std.Io.Dir.cwd().realPath(process_io.get(), &cwd_buf)) |n|
+        cwd_buf[0..n]
+    else |_|
+        "?";
 
     if (resume_id == null) {
         try appendStatusLineFmt(view, "Welcome to zag",
@@ -109,7 +120,7 @@ fn postStartupBanner(view: *Conversation, resume_id: ?[]const u8, session_handle
 }
 
 /// Top-level entry: wires subsystems and hands control to EventOrchestrator.
-pub fn main() !void {
+pub fn main(start: std.process.Init) !void {
     // Sandbox helper short-circuit: when invoked as
     // `zag --__sandbox-helper <cwd> <home> -- /bin/sh -c <cmd>` by
     // tools/bash.zig, we install landlock and execve into the tail. This
@@ -131,38 +142,62 @@ pub fn main() !void {
         }
     }
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     trace.init();
 
     const allocator = trace.wrapAllocator(gpa.allocator());
 
-    file_log.init(allocator) catch |err| {
+    // One process-wide io shared across every thread Zag spawns (agent
+    // thread, Lua worker pool, cmd/http helpers). A multithread-safe
+    // `Threaded` instance is required because that sharing is concurrent;
+    // `init.io` (single-threaded) would disable concurrency.
+    var io_threaded = std.Io.Threaded.init(allocator, .{});
+    defer io_threaded.deinit();
+    const io = io_threaded.io();
+    // Install the process io for the sync primitives (sync.Mutex/Condition/
+    // ResetEvent) before any locking thread is spawned.
+    sync.setIo(io);
+    // Same io, exposed for the shallow fs helpers that have no io in scope.
+    process_io.init(io);
+
+    // Borrowed process environment (non-global in 0.16). Captured once in the
+    // env module so deep, io-free call sites can read it via `env.get` /
+    // `env.getOwned` instead of the removed `std.process.getEnvVarOwned`.
+    const env = start.environ_map;
+    env_mod.init(env);
+
+    file_log.init(allocator, io, env) catch |err| {
         // Best-effort: if the log file can't be opened, continue without
         // logging. Print once to stderr so the user knows.
         std.debug.print("zag: file logger disabled ({s})\n", .{@errorName(err)});
     };
     defer file_log.deinit();
-    file_log.configureFromEnv(allocator);
+    file_log.configureFromEnv(env);
 
     // Parse args first so `zag auth ...` subcommands bypass Lua + provider
     // init entirely. The TUI path picks up `.new_session` / `.resume_*`
     // below exactly as before. `--login=<provider>` is an older CLI shortcut
-    // that also exits before any TUI wiring.
-    const startup_mode = parseStartupArgs(allocator) catch .new_session;
+    // that also exits before any TUI wiring. Args are non-global in 0.16; the
+    // process arena owns the resolved slice.
+    const arena = start.arena.allocator();
+    const argv_z = start.minimal.args.toSlice(arena) catch &[_][:0]const u8{};
+    const argv = try arena.alloc([]const u8, argv_z.len);
+    for (argv_z, 0..) |a, i| argv[i] = a;
+    const startup_mode = parseStartupArgs(allocator, io, argv) catch .new_session;
     defer freeStartupMode(startup_mode, allocator);
 
     // Real stdin/stdout for the wizard. Sized >= auth_wizard.max_secret_len so
     // legitimate 8192-byte keys trigger the wizard's explicit length check
     // instead of surfacing as `error.StreamTooLong` from the reader.
-    const stdin_file = std.fs.File{ .handle = posix.STDIN_FILENO };
+    const stdin_file = std.Io.File.stdin();
     var stdin_buf: [stdin_buffer_len]u8 = undefined;
-    var stdin_reader = stdin_file.reader(&stdin_buf);
+    var stdin_reader = stdin_file.reader(io, &stdin_buf);
 
-    const stdout_file_wiz = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    const stdout_file_wiz = std.Io.File.stdout();
     var stdout_wiz_buf: [1024]u8 = undefined;
-    var stdout_wiz_writer = stdout_file_wiz.writer(&stdout_wiz_buf);
+    var stdout_wiz_writer = stdout_file_wiz.writer(io, &stdout_wiz_buf);
 
     // Dispatch auth subcommands *before* any subsystem comes up. These paths
     // exit the process; the TUI wiring below never runs.
@@ -184,7 +219,7 @@ pub fn main() !void {
             // OAuth signin flow. Exit with the process code the helper
             // returns so shell scripts can branch on success/failure.
             var stderr_buf: [1024]u8 = undefined;
-            var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+            var stderr_w = std.Io.File.stderr().writer(io, &stderr_buf);
             const code = cli_auth.runLoginCommand(allocator, prov, &stderr_w.interface) catch |err| {
                 stderr_w.interface.flush() catch {};
                 return err;
@@ -243,12 +278,12 @@ pub fn main() !void {
     // Wake pipe: non-blocking, close-on-exec. Agent threads and the SIGWINCH
     // handler write a byte to wake_write; the orchestrator polls wake_read to
     // break out of its poll() when there is real work to do.
-    const wake_fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const wake_fds = try wake_pipe.open();
     const wake_read = wake_fds[0];
     const wake_write = wake_fds[1];
     defer {
-        std.posix.close(wake_read);
-        std.posix.close(wake_write);
+        wake_pipe.close(wake_read);
+        wake_pipe.close(wake_write);
     }
     root_runner.wake_fd = wake_write;
     Terminal.setWakeFd(wake_write);
@@ -288,10 +323,10 @@ pub fn main() !void {
     else
         llm.createProviderFromEnv(registry_ptr, default_model, allocator) catch |err| {
             if (err == error.MissingCredential) {
-                const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+                const stderr_file = std.Io.File.stderr();
                 var scratch: [512]u8 = undefined;
                 const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
-                _ = stderr_file.write(message) catch {};
+                stderr_file.writeStreamingAll(io, message) catch {};
             }
             return err;
         };
@@ -367,7 +402,7 @@ pub fn main() !void {
     var compositor = Compositor.init(&screen, allocator, &theme);
     defer compositor.deinit();
 
-    const stdout_file = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    const stdout_file = std.Io.File.stdout();
 
     setNonBlocking(posix.STDIN_FILENO) catch |err| {
         log.warn("failed to set stdin non-blocking: {}", .{err});

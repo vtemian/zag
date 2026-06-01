@@ -15,6 +15,7 @@
 //! without leaving a dangling pointer in the registry.
 
 const std = @import("std");
+const sync = @import("sync.zig");
 const Allocator = std.mem.Allocator;
 const AgentRunner = @import("AgentRunner.zig");
 
@@ -30,10 +31,10 @@ const drain_runner_cap: usize = 32;
 /// stays alive until `done` is signalled.
 pub const Handle = struct {
     runner: *AgentRunner,
-    done: *std.Thread.ResetEvent,
+    done: *sync.ResetEvent,
 };
 
-mutex: std.Thread.Mutex = .{},
+mutex: sync.Mutex = .{},
 entries: std.ArrayList(Handle) = .empty,
 allocator: Allocator,
 
@@ -144,8 +145,8 @@ test "register then remove by pointer empties the registry" {
     // them, so undefined AgentRunner storage is fine here.
     var runner_a: AgentRunner = undefined;
     var runner_b: AgentRunner = undefined;
-    var done_a: std.Thread.ResetEvent = .{};
-    var done_b: std.Thread.ResetEvent = .{};
+    var done_a: sync.ResetEvent = .{};
+    var done_b: sync.ResetEvent = .{};
 
     try testing.expect(reg.isEmpty());
     try reg.register(.{ .runner = &runner_a, .done = &done_a });
@@ -198,9 +199,9 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
 
     // The child agent thread blocks until `gate` is set, so drainEvents stalls
     // in t.join() with no registry lock held under the new contract.
-    var gate: std.Thread.ResetEvent = .{};
+    var gate: sync.ResetEvent = .{};
     const Gated = struct {
-        fn run(g: *std.Thread.ResetEvent) void {
+        fn run(g: *sync.ResetEvent) void {
             g.wait();
         }
     };
@@ -210,13 +211,13 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     var registry = ChildRunnerRegistry.init(allocator);
     defer registry.deinit();
 
-    var child_done: std.Thread.ResetEvent = .{};
+    var child_done: sync.ResetEvent = .{};
     try registry.register(.{ .runner = &runner, .done = &child_done });
 
     // Drain thread: stalls inside drainEvents -> t.join() until the gate opens.
-    var drain_done: std.Thread.ResetEvent = .{};
+    var drain_done: sync.ResetEvent = .{};
     const Drainer = struct {
-        fn run(reg: *ChildRunnerRegistry, finished: *std.Thread.ResetEvent) void {
+        fn run(reg: *ChildRunnerRegistry, finished: *sync.ResetEvent) void {
             reg.drainAll();
             finished.set();
         }
@@ -228,10 +229,10 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     // code this would block until the join finished (i.e. until we open the
     // gate); here it must return without the gate ever being set.
     var other_runner: AgentRunner = undefined;
-    var other_done: std.Thread.ResetEvent = .{};
-    var registered: std.Thread.ResetEvent = .{};
+    var other_done: sync.ResetEvent = .{};
+    var registered: sync.ResetEvent = .{};
     const Registrar = struct {
-        fn run(reg: *ChildRunnerRegistry, r: *AgentRunner, d: *std.Thread.ResetEvent, ack: *std.Thread.ResetEvent) void {
+        fn run(reg: *ChildRunnerRegistry, r: *AgentRunner, d: *sync.ResetEvent, ack: *sync.ResetEvent) void {
             reg.register(.{ .runner = r, .done = d }) catch unreachable;
             ack.set();
         }

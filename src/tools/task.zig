@@ -18,6 +18,8 @@
 //!     Tracked at https://github.com/vtemian/zag/issues/5.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
+const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.task_tool);
 const types = @import("../types.zig");
@@ -155,7 +157,7 @@ fn runChild(
             task_start_id = sh.appendEntry(.{
                 .entry_type = .task_start,
                 .content = payload,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = clock.milliTimestamp(),
             }) catch |err| outer: {
                 log.warn("task_start persist failed: {}", .{err});
                 break :outer null;
@@ -267,7 +269,7 @@ fn runChild(
     // forced to null above in that case, so the fallback drain is Zig-only and
     // never touches the VM off the main thread.
     if (ctx.child_registry) |registry| {
-        var child_done: std.Thread.ResetEvent = .{};
+        var child_done: sync.ResetEvent = .{};
         try registry.register(.{ .runner = &child_runner, .done = &child_done });
         // No errdefer-remove needed: registration cannot fail after this
         // point, and the main thread always removes the entry on the child's
@@ -288,7 +290,7 @@ fn runChild(
             }
             const r = child_runner.drainEvents();
             if (r.finished) break;
-            if (!r.any_drained) std.Thread.sleep(5 * std.time.ns_per_ms);
+            if (!r.any_drained) clock.sleep(5 * std.time.ns_per_ms);
         }
     }
 
@@ -307,7 +309,7 @@ fn runChild(
         _ = sh.appendEntry(.{
             .entry_type = .task_end,
             .content = owned,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = clock.milliTimestamp(),
             .parent_id = task_start_id,
         }) catch |err| log.warn("task_end persist failed: {}", .{err});
     }
@@ -349,15 +351,15 @@ fn buildChildRegistry(
 /// empty audit row. The caller owns the returned slice and must free
 /// it with `allocator`.
 fn formatStartPayload(allocator: Allocator, agent_name: []const u8, prompt: []const u8) ![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    const w = list.writer(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
     try w.writeAll("{\"agent\":");
     try types.writeJsonString(w, agent_name);
     try w.writeAll(",\"prompt\":");
     try types.writeJsonString(w, prompt);
     try w.writeAll("}");
-    return list.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 fn formatUnknownAgent(
@@ -365,9 +367,9 @@ fn formatUnknownAgent(
     name: []const u8,
     subagents: *const @import("../subagents.zig").SubagentRegistry,
 ) ![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    const w = list.writer(allocator);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
     try w.print("error: unknown subagent '{s}'. Registered: ", .{name});
     if (subagents.entries.items.len == 0) {
         try w.writeAll("(none)");
@@ -377,7 +379,7 @@ fn formatUnknownAgent(
             try w.writeAll(entry.name);
         }
     }
-    return list.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// JSON schema and metadata sent to the LLM. The `agent` enum is built
@@ -535,9 +537,7 @@ test "task_start payload escapes JSON special characters in prompt" {
 }
 
 fn restoreCwdForTest(abs_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
-    defer dir.close();
-    dir.setAsCwd() catch {};
+    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
 }
 
 test "child_history pre-seeded with task_start_id chains child events under the delegation" {
@@ -553,9 +553,9 @@ test "child_history pre-seeded with task_start_id chains child events under the 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreCwdForTest(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);

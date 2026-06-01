@@ -337,32 +337,29 @@ test "ToolResultBlock defaults is_error to false" {
 
 test "writeJsonString escapes special characters" {
     var buf: [256]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const w = stream.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
-    try writeJsonString(w, "hello \"world\"\nline2\\end\ttab\r");
-    const result = stream.getWritten();
+    try writeJsonString(&w, "hello \"world\"\nline2\\end\ttab\r");
+    const result = w.buffered();
     try std.testing.expectEqualStrings("\"hello \\\"world\\\"\\nline2\\\\end\\ttab\\r\"", result);
 }
 
 test "writeJsonStringContents omits surrounding quotes" {
     var buf: [256]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const w = stream.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
-    try writeJsonStringContents(w, "no quotes");
-    const result = stream.getWritten();
+    try writeJsonStringContents(&w, "no quotes");
+    const result = w.buffered();
     try std.testing.expectEqualStrings("no quotes", result);
 }
 
 test "writeJsonString escapes control characters below 0x20" {
     var buf: [256]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const w = stream.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
     // 0x01 should become \u0001
-    try writeJsonString(w, &[_]u8{0x01});
-    const result = stream.getWritten();
+    try writeJsonString(&w, &[_]u8{0x01});
+    const result = w.buffered();
     try std.testing.expectEqualStrings("\"\\u0001\"", result);
 }
 

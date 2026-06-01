@@ -11,6 +11,8 @@
 //! wrapper arrive in later tasks.
 
 const std = @import("std");
+const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const llm = @import("llm.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
@@ -212,8 +214,10 @@ fn layerLessThan(_: void, a: Layer, b: Layer) bool {
 /// of truth for the shape.
 pub const EnvSnapshot = struct {
     /// Absolute path of the process's current directory at snapshot time.
-    /// Owned.
-    cwd: []const u8,
+    /// Owned. Sentinel-terminated because `realPathFileAlloc` returns `[:0]u8`;
+    /// keeping the sentinel slice means `deinit` frees the full allocation
+    /// (freeing it as a plain `[]u8` would undercount by the null byte).
+    cwd: [:0]const u8,
     /// Absolute path of the surrounding git worktree. Equals `cwd` when
     /// no `.git` was found in the walk up the filesystem; the two slices
     /// share backing storage in that case, so call `deinit` only once.
@@ -236,9 +240,9 @@ pub const EnvSnapshot = struct {
     /// mirrors `cwd`; `is_git_repo` is false; `date_iso` uses the UTC
     /// `std.time.timestamp` result.
     pub fn capture(alloc: Allocator) !EnvSnapshot {
-        const cwd = std.process.getCwdAlloc(alloc) catch |err| blk: {
+        const cwd: [:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", alloc) catch |err| blk: {
             log.warn("env snapshot: getcwd failed: {}", .{err});
-            break :blk try alloc.dupe(u8, "");
+            break :blk try alloc.dupeZ(u8, "");
         };
         errdefer alloc.free(cwd);
 
@@ -263,7 +267,7 @@ pub const EnvSnapshot = struct {
             }
         }
 
-        const date_iso = try formatIsoDate(alloc, std.time.timestamp());
+        const date_iso = try formatIsoDate(alloc, clock.timestamp());
         errdefer alloc.free(date_iso);
 
         return .{
@@ -305,9 +309,10 @@ fn findGitToplevel(alloc: Allocator, start: []const u8) !?[]const u8 {
 
         // Check `<slice>/.git` existence. Either a directory (normal
         // repo) or a regular file (linked worktree pointer) qualifies.
-        var dir = std.fs.openDirAbsolute(slice, .{}) catch return null;
-        defer dir.close();
-        if (dir.access(".git", .{})) |_| {
+        const io = process_io.get();
+        var dir = std.Io.Dir.openDirAbsolute(io, slice, .{}) catch return null;
+        defer dir.close(io);
+        if (dir.access(io, ".git", .{})) |_| {
             return try alloc.dupe(u8, slice);
         } else |_| {}
 
@@ -386,15 +391,15 @@ fn renderBuiltinSkillsCatalog(ctx: *const LayerContext, alloc: Allocator) anyerr
     const registry = ctx.skills orelse return null;
     if (registry.skills.items.len == 0) return null;
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
 
-    try registry.catalog(buf.writer(alloc));
+    try registry.catalog(&aw.writer);
 
     // `SkillRegistry.catalog` writes a trailing newline after the closing
     // tag; `Registry.render` joins layers with "\n\n", so trim the tail
     // to avoid stacking blank lines in the assembled prompt.
-    const written = buf.items;
+    const written = aw.writer.buffered();
     const trimmed_len = if (written.len > 0 and written[written.len - 1] == '\n') written.len - 1 else written.len;
     return try alloc.dupe(u8, written[0..trimmed_len]);
 }
@@ -881,7 +886,7 @@ test "findGitToplevel finds the repo root from a subdirectory" {
     // Discover the actual zag repo path from the process cwd so this
     // test works inside worktrees. getCwdAlloc may fail in odd
     // sandboxes; skip the check rather than erroring out.
-    const here = std.process.getCwdAlloc(alloc) catch return;
+    const here = std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", alloc) catch return;
     defer alloc.free(here);
 
     const found = try findGitToplevel(alloc, here);

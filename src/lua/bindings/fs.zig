@@ -9,6 +9,7 @@ const zlua = @import("zlua");
 const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const async_job = @import("../Job.zig");
+const process_io = @import("../../process_io.zig");
 
 /// Stage a `zag.fs.*` async entry: validate the coroutine, dup the
 /// path into a freshly-allocated arena, and return the arena + dup'd
@@ -205,7 +206,7 @@ fn zagFsStatFn(co: *Lua) i32 {
 /// return keeps callsites ergonomic (`if zag.fs.exists(p) then`).
 fn zagFsExistsFn(co: *Lua) i32 {
     const path = co.checkString(1);
-    std.fs.cwd().access(path, .{}) catch {
+    std.Io.Dir.cwd().access(process_io.get(), path, .{}) catch {
         co.pushBoolean(false);
         return 1;
     };
@@ -227,13 +228,16 @@ fn zagFsReadFileSyncFn(co: *Lua) i32 {
     const path = co.checkString(1);
     const engine = LuaEngine.getEngineFromState(co);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch {
+    const io = process_io.get();
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
         co.pushNil();
         return 1;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const bytes = file.readToEndAlloc(engine.allocator, max_bytes) catch {
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    const bytes = file_reader.interface.allocRemaining(engine.allocator, .limited(max_bytes)) catch {
         co.pushNil();
         return 1;
     };
@@ -250,17 +254,18 @@ fn zagFsReadFileSyncFn(co: *Lua) i32 {
 fn zagFsListDirSyncFn(co: *Lua) i32 {
     const path = co.checkString(1);
 
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch {
+    const io = process_io.get();
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch {
         co.pushNil();
         return 1;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     co.newTable();
     var it = dir.iterate();
     var idx: i32 = 0;
     while (true) {
-        const entry = it.next() catch {
+        const entry = it.next(io) catch {
             // Partial listings aren't useful; drop the table and
             // signal the caller to skip this directory.
             co.pop(1);

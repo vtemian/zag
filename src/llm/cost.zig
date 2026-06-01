@@ -3,6 +3,7 @@
 //! by the endpoint that serves them rather than a global table.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
 const registry_mod = @import("registry.zig");
 const Registry = registry_mod.Registry;
 const Endpoint = registry_mod.Endpoint;
@@ -11,7 +12,7 @@ const log = std.log.scoped(.cost);
 
 /// Guards lazy init and mutation of the unknown-model warned set. Cost
 /// estimation may be queried from agent threads, so the set needs a lock.
-var warned_mu: std.Thread.Mutex = .{};
+var warned_mu: sync.Mutex = .{};
 /// Lazily initialized on first `shouldWarnForModel` call. Lives for the
 /// lifetime of the process; entries are never freed individually.
 var warned: ?std.StringHashMap(void) = null;

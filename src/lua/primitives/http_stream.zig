@@ -20,6 +20,10 @@
 //! with an EOS/IO-error and the handle shuts down promptly.
 
 const std = @import("std");
+const test_net = @import("../../test_net.zig");
+const sync = @import("../../sync.zig");
+const clock = @import("../../clock.zig");
+const process_io = @import("../../process_io.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -89,8 +93,8 @@ pub const HttpStreamHandle = struct {
     helper: std.Thread,
 
     /// Internal command queue. Main enqueues; helper dequeues.
-    queue_mu: std.Thread.Mutex = .{},
-    queue_cv: std.Thread.Condition = .{},
+    queue_mu: sync.Mutex = .{},
+    queue_cv: sync.Condition = .{},
     queue: std.ArrayList(HelperCmd) = .empty,
     /// Set once `shutdownAndCleanup` has been called. Guards against
     /// double-free on a __gc that races an explicit `:close()`.
@@ -157,7 +161,7 @@ pub const HttpStreamHandle = struct {
             .completions = completions,
             .root_scope = root_scope,
             .arena = arena,
-            .client = .{ .allocator = alloc },
+            .client = .{ .allocator = alloc, .io = process_io.get() },
             .req = undefined,
             .body_reader = undefined,
             .status = 0,
@@ -204,15 +208,19 @@ pub const HttpStreamHandle = struct {
         self.helper = std.Thread.spawn(.{}, helperLoop, .{self}) catch {
             return error.IoError;
         };
-        self.helper.setName("zag.http_stream") catch |err| {
+        self.helper.setName(process_io.get(), "zag.http_stream") catch |err| {
             log.debug("http_stream helper setName failed: {s}", .{@errorName(err)});
         };
         return self;
     }
 
-    /// Map std.http errors to our `InitError` set. Kept close to the
-    /// call site so additions to std.http's error list show up as a
-    /// compile error here rather than being silently bucketed.
+    /// Map std.http (anyerror) into our `InitError` set. Because the input is
+    /// `anyerror` with a terminal `else`, a renamed/added std error is silently
+    /// bucketed into IoError rather than caught at compile time — so the
+    /// route/connect and DNS arms must be kept in sync with lib/std/Io/net.zig
+    /// by hand (verified against 0.16: the 0.15 names ConnectionTimedOut /
+    /// TemporaryNameServerFailure / HostLacksNetworkAddresses /
+    /// UnexpectedConnectFailure no longer exist).
     fn mapHttpErr(err: anyerror) InitError {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -226,16 +234,25 @@ pub const HttpStreamHandle = struct {
             error.HttpRedirectLocationMissing,
             error.HttpRedirectLocationOversize,
             => error.InvalidUri,
-            error.TlsInitializationFailed => error.TlsError,
+            error.TlsInitializationFailed,
+            error.CertificateBundleLoadFailure,
+            => error.TlsError,
+            error.Timeout,
             error.ConnectionRefused,
-            error.NetworkUnreachable,
-            error.ConnectionTimedOut,
             error.ConnectionResetByPeer,
-            error.TemporaryNameServerFailure,
-            error.NameServerFailure,
+            error.HostUnreachable,
+            error.NetworkUnreachable,
+            error.NetworkDown,
+            error.AddressUnavailable,
+            error.AddressFamilyUnsupported,
             error.UnknownHostName,
-            error.HostLacksNetworkAddresses,
-            error.UnexpectedConnectFailure,
+            error.NameServerFailure,
+            error.NoAddressReturned,
+            error.ResolvConfParseFailed,
+            error.InvalidDnsARecord,
+            error.InvalidDnsAAAARecord,
+            error.InvalidDnsCnameRecord,
+            error.DetectingNetworkConfigurationFailed,
             => error.ConnectFailed,
             else => error.IoError,
         };
@@ -441,7 +458,7 @@ pub const HttpStreamHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -467,7 +484,7 @@ pub const HttpStreamHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -495,8 +512,9 @@ pub const HttpStreamHandle = struct {
     fn shutdownSocket(self: *HttpStreamHandle) void {
         if (self.shutdown_done.swap(true, .acq_rel)) return;
         const conn = self.req.connection orelse return;
-        const stream = conn.stream_reader.getStream();
-        std.posix.shutdown(stream.handle, .both) catch |err| {
+        // 0.16 made getStream private; reach the Stream directly and use its
+        // io-aware shutdown rather than the removed std.posix.shutdown.
+        conn.stream_reader.stream.shutdown(process_io.get(), .both) catch |err| {
             log.debug("http_stream shutdown: {s}", .{@errorName(err)});
         };
     }
@@ -562,20 +580,20 @@ test "HttpStreamHandle close interrupts blocked helper read" {
     // and then holds the connection open without sending more bytes
     // for 10 seconds. The helper thread will read the first line
     // successfully, then block waiting for the next one.
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -588,14 +606,14 @@ test "HttpStreamHandle close interrupts blocked helper read" {
                 "Transfer-Encoding: chunked\r\n" ++
                 "\r\n" ++
                 "6\r\nline1\n\r\n";
-            conn.stream.writeAll(resp) catch return;
+            test_net.streamWriteAll(conn, resp) catch return;
 
             // Hold the connection open; the test's `:close()` will
             // cause shutdown on the client side, which shows up here
             // as a read of 0 bytes. Sleep is the simplest way to say
             // "don't send anything else". Capped well above the 1s
             // deadline the test enforces.
-            std.Thread.sleep(10 * std.time.ns_per_s);
+            clock.sleep(10 * std.time.ns_per_s);
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -617,31 +635,31 @@ test "HttpStreamHandle close interrupts blocked helper read" {
     // Wait for that first completion before racing :close(). Poll
     // rather than sleep blindly so the test isn't timing-fragile on
     // slow CI.
-    const poll_start = std.time.milliTimestamp();
+    const poll_start = clock.milliTimestamp();
     while (true) {
         if (completions.pop()) |j| {
             if (j.kind.http_stream_line_done.line) |l| alloc.free(l);
             alloc.destroy(j);
             break;
         }
-        if (std.time.milliTimestamp() - poll_start > 2000) return error.TestTimedOutBeforeFirstLine;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        if (clock.milliTimestamp() - poll_start > 2000) return error.TestTimedOutBeforeFirstLine;
+        clock.sleep(1 * std.time.ns_per_ms);
     }
 
     // Kick a SECOND read_line. This one will block because the
     // server hasn't sent another line. The helper is now in a
     // blocked recv() inside body_reader.stream.
     try handle.submit(.{ .read_line = .{ .thread_ref = 43 } });
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    clock.sleep(50 * std.time.ns_per_ms);
 
     // The actual measurement: close() + shutdownAndCleanup() must
     // return in well under 1s. Without the socket shutdown the
     // helper.join() call inside shutdownAndCleanup would wait for
     // the 10s server sleep to elapse.
-    const close_start = std.time.milliTimestamp();
+    const close_start = clock.milliTimestamp();
     handle.close();
     handle.shutdownAndCleanup();
-    const elapsed_ms = std.time.milliTimestamp() - close_start;
+    const elapsed_ms = clock.milliTimestamp() - close_start;
 
     try testing.expect(elapsed_ms < 1000);
 }

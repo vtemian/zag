@@ -88,7 +88,7 @@ pub fn parseLines(
 
 /// Check if a line is a code fence (starts with ``` possibly followed by a language tag).
 fn isCodeFence(line: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len < 3) return false;
     return trimmed[0] == '`' and trimmed[1] == '`' and trimmed[2] == '`';
 }
@@ -105,7 +105,7 @@ fn parseHeading(line: []const u8) ?[]const u8 {
 
 /// True if line is a horizontal rule: 3+ of the same char from {-, *, _}, with optional spaces.
 fn isHorizontalRule(line: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len < 3) return false;
     const ch = trimmed[0];
     if (ch != '-' and ch != '*' and ch != '_') return false;
@@ -117,7 +117,7 @@ fn isHorizontalRule(line: []const u8) bool {
 
 /// Return the item text after "- " or "* " (not "**"), or null.
 fn parseBulletList(line: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len < 2) return null;
     if (trimmed[0] == '-' and trimmed[1] == ' ') {
         const prefix_len = @as(usize, @intCast(line.len - trimmed.len)) + 2;
@@ -134,7 +134,7 @@ fn parseBulletList(line: []const u8) ?[]const u8 {
 
 /// Return the item text after "N. ", or null.
 fn parseNumberedList(line: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     var i: usize = 0;
     while (i < trimmed.len and trimmed[i] >= '0' and trimmed[i] <= '9') : (i += 1) {}
     if (i == 0) return null;

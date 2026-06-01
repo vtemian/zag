@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 
 const ReadInput = struct {
@@ -33,7 +34,7 @@ pub fn execute(
     const max_lines = input.max_lines orelse 2000;
 
     // Read the whole file into memory (up to 10MB)
-    const content = std.fs.cwd().readFileAlloc(allocator, input.path, types.max_file_bytes) catch |err| {
+    const content = std.Io.Dir.cwd().readFileAlloc(process_io.get(), input.path, allocator, .limited(types.max_file_bytes)) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: cannot read '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
@@ -96,11 +97,11 @@ test "read existing file" {
 
     // Write a temp file to read back
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(test_content);
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, test_content);
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\"}}", .{tmp_path});
     defer allocator.free(input);
@@ -147,11 +148,11 @@ test "read with max_lines truncation" {
     // 5 lines
     const test_content = "a\nb\nc\nd\ne\n";
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(test_content);
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, test_content);
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"max_lines\": 2}}", .{tmp_path});
     defer allocator.free(input);

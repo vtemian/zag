@@ -20,7 +20,10 @@
 //!    stable/volatile prompt.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const posix = std.posix;
+const wake_pipe = @import("wake_pipe.zig");
+const process_io = @import("process_io.zig");
 const prompt = @import("prompt.zig");
 const types = @import("types.zig");
 const Reminder = @import("Reminder.zig");
@@ -340,12 +343,12 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     var root_runner = AgentRunner.init(gpa, root_buffer_sink.sink(), &root_buffer);
     defer root_runner.deinit();
 
-    const wake_fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const wake_fds = try wake_pipe.open();
     const wake_read = wake_fds[0];
     const wake_write = wake_fds[1];
     defer {
-        posix.close(wake_read);
-        posix.close(wake_write);
+        wake_pipe.close(wake_read);
+        wake_pipe.close(wake_write);
     }
     root_runner.wake_fd = wake_write;
 
@@ -378,16 +381,17 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     var provider = llm.createProviderFromLuaConfig(registry_ptr, default_model, auth_path, gpa) catch |err| {
         // Headless can't run the interactive wizard, so a missing default
         // or credential just exits with a hint pointing at config.lua / auth.
-        const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+        const io = process_io.get();
+        const stderr_file = std.Io.File.stderr();
         switch (err) {
             error.NoDefaultModel => {
                 const msg = "zag: no default model configured. Set one in ~/.config/zag/config.lua via `zag.set_default_model(\"provider/model\")`.\n";
-                _ = stderr_file.write(msg) catch {};
+                stderr_file.writeStreamingAll(io, msg) catch {};
             },
             error.MissingCredential => {
                 var scratch: [512]u8 = undefined;
                 const message = cli_auth.formatMissingCredentialHint(&scratch, default_model.?, registry_ptr);
-                _ = stderr_file.write(message) catch {};
+                stderr_file.writeStreamingAll(io, message) catch {};
             },
             else => {},
         }
@@ -437,7 +441,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     const session_id: []const u8 = if (session_handle) |*sh|
         sh.id[0..sh.id_len]
     else
-        std.fmt.bufPrint(&synth_id_buf, "headless-{d}", .{std.time.milliTimestamp()}) catch "headless";
+        std.fmt.bufPrint(&synth_id_buf, "headless-{d}", .{clock.milliTimestamp()}) catch "headless";
 
     lua_engine.initAsync(4, 256) catch |err| {
         log.warn("lua async runtime init failed: {}", .{err});
@@ -467,7 +471,7 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
 fn runWithProvider(deps: HeadlessDeps) !void {
     const gpa = deps.gpa;
 
-    const instruction = try std.fs.cwd().readFileAlloc(gpa, deps.mode.instruction_file, 1 << 20);
+    const instruction = try std.Io.Dir.cwd().readFileAlloc(process_io.get(), deps.mode.instruction_file, gpa, .limited(1 << 20));
     defer gpa.free(instruction);
 
     // Reproduce the agent loop's prompt assembly so the captured trajectory's
@@ -506,7 +510,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     var capture = Trajectory.Capture.init(gpa);
     defer capture.deinit();
 
-    const started_at = std.time.milliTimestamp();
+    const started_at = clock.milliTimestamp();
     try capture.beginTurn(started_at);
 
     const spec = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id);
@@ -551,7 +555,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
 
         if (count == 0) {
             var wake_buf: [64]u8 = undefined;
-            _ = posix.read(deps.wake_read_fd, &wake_buf) catch {};
+            _ = wake_pipe.read(deps.wake_read_fd, &wake_buf) catch {};
             continue;
         }
 
@@ -729,12 +733,13 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     });
     defer Trajectory.freeTrajectory(traj, gpa);
 
-    const file = try std.fs.cwd().createFile(deps.mode.trajectory_out, .{ .truncate = true });
-    defer file.close();
-    var buffer: std.io.Writer.Allocating = .init(gpa);
+    const io = process_io.get();
+    const file = try std.Io.Dir.cwd().createFile(io, deps.mode.trajectory_out, .{ .truncate = true });
+    defer file.close(io);
+    var buffer: std.Io.Writer.Allocating = .init(gpa);
     defer buffer.deinit();
     try Trajectory.serialize(traj, gpa, &buffer.writer);
-    try file.writeAll(buffer.written());
+    try file.writeStreamingAll(io, buffer.writer.buffered());
 
     if (agent_err) |e| {
         log.err("headless agent error: {s}", .{e});

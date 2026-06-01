@@ -12,6 +12,9 @@
 //! against hostile or broken endpoints.
 
 const std = @import("std");
+const test_net = @import("../test_net.zig");
+const clock = @import("../clock.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 const error_detail = @import("error_detail.zig");
 const error_class = @import("error_class.zig");
@@ -74,6 +77,12 @@ pub const StreamingResponse = struct {
     /// does not. File upstream when you have a minute.
     body_done: bool = false,
 
+    /// Per-read body timeout in ms (0 = none), set from `opts.timeouts` in
+    /// `createWithOptions`. Enforced per chunk in `readChunk` by racing the
+    /// read against a deadline: 0.16 sockets are non-blocking within std.Io, so
+    /// SO_RCVTIMEO is inert (see socket_timeouts.streamWithTimeout).
+    read_ms: u32 = 0,
+
     /// Accumulates partial lines across network reads.
     pending_line: std.ArrayList(u8),
     /// Leftover bytes after a newline that belong to subsequent lines.
@@ -135,7 +144,7 @@ pub const StreamingResponse = struct {
         errdefer allocator.destroy(self);
 
         self.* = .{
-            .client = .{ .allocator = allocator },
+            .client = .{ .allocator = allocator, .io = process_io.get() },
             .req = undefined,
             .body_reader = undefined,
             .transfer_buf = undefined,
@@ -143,6 +152,7 @@ pub const StreamingResponse = struct {
             .remainder = .empty,
             .allocator = allocator,
             .body_done = false,
+            .read_ms = if (opts.timeouts) |to| to.read_ms else 0,
         };
         errdefer self.client.deinit();
 
@@ -194,28 +204,25 @@ pub const StreamingResponse = struct {
             return error.ApiError;
         };
 
-        // Receive response headers.
+        // Receive response headers, bounding the head read by self.read_ms so a
+        // provider that stalls before sending the head can't hang the turn (the
+        // body read is already bounded per-chunk; 0.16 has no OS read deadline
+        // on the non-blocking socket).
         var no_redirects: [0]u8 = .{};
-        var response = self.req.receiveHead(&no_redirects) catch |err| {
-            log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
-            return error.ApiError;
+        var response = socket_timeouts.receiveHeadWithTimeout(process_io.get(), &self.req, &no_redirects, self.read_ms) catch |err| switch (err) {
+            error.ReadTimeout => return error.ReadTimeout,
+            else => {
+                log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
+                return error.ApiError;
+            },
         };
 
-        // Socket-level read/write timeouts. Apply after `receiveHead` because
-        // that's the first point the underlying connection (and its socket
-        // fd) is reachable. The connect phase is left to the OS default
-        // (~75s on macOS, ~127s on Linux); Zig 0.15's std.http.Client does
-        // not surface the pre-handshake socket. SSE keep-alives every few
+        // Body read timeout is enforced per-chunk in `readChunk` via
+        // socket_timeouts.streamWithTimeout (self.read_ms), not by SO_RCVTIMEO:
+        // under 0.16 std.Io puts sockets in non-blocking mode and waits for
+        // readiness in its own poll() with no deadline, so SO_RCVTIMEO is inert.
+        // The connect phase is left to the OS default. SSE keep-alives every few
         // seconds satisfy the inter-byte read window in normal operation.
-        if (opts.timeouts) |to| {
-            if (self.req.connection) |conn| {
-                socket_timeouts.applySocketTimeouts(
-                    conn.stream_reader.getStream().handle,
-                    to.read_ms,
-                    to.write_ms,
-                );
-            }
-        }
 
         if (response.head.status != .ok) {
             const status: u16 = @intFromEnum(response.head.status);
@@ -503,28 +510,28 @@ pub const StreamingResponse = struct {
     /// without re-entering stdlib (which would panic on contentLengthStream;
     /// see the comment on body_done).
     ///
-    /// On `error.ReadFailed` the underlying socket error is recovered via
-    /// `connection.getReadError()`. `WouldBlock` (EAGAIN) means the
-    /// `SO_RCVTIMEO` set in `createWithOptions` fired; we surface it as
-    /// `error.ReadTimeout` so callers can distinguish a genuine timeout
-    /// from an opaque transport failure.
+    /// The read is bounded by `self.read_ms` (0 = none) via
+    /// socket_timeouts.streamWithTimeout: under 0.16 sockets are non-blocking
+    /// within std.Io, so the timeout is enforced by racing the read against a
+    /// deadline (not SO_RCVTIMEO). A deadline win surfaces `error.ReadTimeout`
+    /// so callers can distinguish a genuine timeout from a transport failure.
     fn readChunk(self: *StreamingResponse, chunk: []u8) !usize {
         if (self.body_done) return 0;
         var writer: std.Io.Writer = .fixed(chunk);
-        const n = self.body_reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+        const n = socket_timeouts.streamWithTimeout(
+            process_io.get(),
+            self.body_reader,
+            &writer,
+            .limited(chunk.len),
+            self.read_ms,
+        ) catch |err| switch (err) {
             error.EndOfStream => {
                 self.body_done = true;
                 return 0;
             },
+            error.ReadTimeout => return error.ReadTimeout,
             error.WriteFailed => unreachable, // fixed writer is sized to chunk.len
-            error.ReadFailed => {
-                if (self.req.connection) |conn| {
-                    if (conn.getReadError()) |inner| {
-                        if (inner == error.WouldBlock) return error.ReadTimeout;
-                    }
-                }
-                return error.ApiError;
-            },
+            error.ReadFailed => return error.ApiError,
         };
         return n;
     }
@@ -1055,12 +1062,16 @@ test "captureHeaders caps at MAX_RESPONSE_HEADERS" {
     // Build a HEAD with 100 trivial headers; capture should stop at 64.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "HTTP/1.1 200 OK\r\n");
-    var i: usize = 0;
-    while (i < 100) : (i += 1) {
-        try buf.writer(allocator).print("X-Hdr-{d}: v\r\n", .{i});
+    {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+        defer buf = aw.toArrayList();
+        try aw.writer.writeAll("HTTP/1.1 200 OK\r\n");
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            try aw.writer.print("X-Hdr-{d}: v\r\n", .{i});
+        }
+        try aw.writer.writeAll("\r\n");
     }
-    try buf.appendSlice(allocator, "\r\n");
 
     const head = try std.http.Client.Response.Head.parse(buf.items);
     const captured = try StreamingResponse.captureHeaders(allocator, &head);
@@ -1084,9 +1095,9 @@ test "freeHeaders is leak-clean on captured slice" {
 /// long enough that any read on the body side will hit `SO_RCVTIMEO`.
 /// Mirrors the `mockServeOnce` shape from `providers/chatgpt.zig` but
 /// stops short of writing a chunk so the client's body reader stalls.
-fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockTimeoutServer(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    var conn = srv.accept(std.testing.io) catch return;
+    defer conn.close(std.testing.io);
 
     const alloc = std.heap.page_allocator;
     var req: std.ArrayList(u8) = .empty;
@@ -1095,7 +1106,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
     var tmp: [4096]u8 = undefined;
     var headers_end: usize = 0;
     while (true) {
-        const n = conn.stream.read(&tmp) catch return;
+        const n = test_net.streamRead(conn, &tmp) catch return;
         if (n == 0) return;
         req.appendSlice(alloc, tmp[0..n]) catch return;
         if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
@@ -1118,7 +1129,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
     var body_remaining = if (content_length > body_have) content_length - body_have else 0;
     while (body_remaining > 0) {
         const want = @min(body_remaining, tmp.len);
-        const n = conn.stream.read(tmp[0..want]) catch return;
+        const n = test_net.streamRead(conn, tmp[0..want]) catch return;
         if (n == 0) break;
         body_remaining -= n;
     }
@@ -1129,8 +1140,8 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
         "Content-Type: text/event-stream\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
-    _ = conn.stream.writeAll(head_only) catch {};
-    std.Thread.sleep(sleep_ns);
+    _ = test_net.streamWriteAll(conn, head_only) catch {};
+    clock.sleep(sleep_ns);
 }
 
 test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-body" {
@@ -1142,22 +1153,21 @@ test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-bo
     // surfaces it as `error.ReadTimeout`.
     const allocator = std.testing.allocator;
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     // Sleep well past the 500 ms read timeout so the test fails clearly
     // when the timeout machinery is missing or wired wrong.
     const thr = try std.Thread.spawn(.{}, mockTimeoutServer, .{ &server, 3 * std.time.ns_per_s });
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const stream = try StreamingResponse.createWithOptions(.{
         .url = url,
         .body = "",
@@ -1169,7 +1179,7 @@ test "createWithOptions surfaces error.ReadTimeout when the server stalls mid-bo
     defer stream.destroy();
 
     const result = stream.readLine(null);
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
     try std.testing.expectError(error.ReadTimeout, result);
     // 500 ms timeout plus generous slack for connect/handshake. The
     // OS-default behaviour would push this well past 60 s.

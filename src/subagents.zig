@@ -142,7 +142,12 @@ pub const SubagentRegistry = struct {
     pub fn taskInputSchemaJson(self: *const SubagentRegistry, alloc: Allocator) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(alloc);
-        try self.writeTaskInputSchema(list.writer(alloc));
+        // 0.16 dropped the ArrayList writer adapter. Drive the list through an
+        // Allocating writer, then sync the grown buffer back into `list` so
+        // `toOwnedSlice` returns the bytes the writer produced.
+        var aw = std.Io.Writer.Allocating.fromArrayList(alloc, &list);
+        try self.writeTaskInputSchema(&aw.writer);
+        list = aw.toArrayList();
         return list.toOwnedSlice(alloc);
     }
 };
@@ -351,9 +356,9 @@ test "writeTaskInputSchema emits enum and per-entry description" {
     });
 
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.writeTaskInputSchema(fbs.writer());
-    const out = fbs.getWritten();
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.writeTaskInputSchema(&fbs);
+    const out = fbs.buffered();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
     defer parsed.deinit();
@@ -396,9 +401,9 @@ test "writeTaskInputSchema handles empty registry" {
     defer registry.deinit(alloc);
 
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.writeTaskInputSchema(fbs.writer());
-    const out = fbs.getWritten();
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.writeTaskInputSchema(&fbs);
+    const out = fbs.buffered();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
     defer parsed.deinit();

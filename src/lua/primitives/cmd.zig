@@ -8,6 +8,9 @@
 //! `job.err_tag` and returns.
 
 const std = @import("std");
+const clock = @import("../../clock.zig");
+const env_mod = @import("../../env.zig");
+const process_io = @import("../../process_io.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -19,6 +22,11 @@ const log = std.log.scoped(.lua_cmd);
 /// the agent-side bash tool for consistency. Latency the plugin author
 /// can rely on as "cancel propagates within one tick".
 const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
+
+/// Bytes of headroom requested per `MultiReader.fill`. Mirrors the default
+/// in `std.process.run`; the reader grows its buffer when this margin isn't
+/// available, so the exact value only tunes reallocation cadence.
+const fill_reserve_bytes: usize = 64;
 
 /// Aborter context for cmd_exec jobs. The aborter lives on the worker's
 /// stack for the duration of `executeExec`; scope.cancel can fire it at
@@ -49,49 +57,54 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
         return;
     }
 
-    var child = std.process.Child.init(spec.argv, alloc);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    if (spec.cwd) |c| child.cwd = c;
-    if (spec.stdin_bytes != null) child.stdin_behavior = .Pipe;
+    const io = process_io.get();
 
-    // Env handling. `merged_env` only exists in the `.extend` path; its
-    // lifetime must outlive `child.spawn` and the poll loop since
-    // `child.env_map` borrows its storage. A single defer at function
-    // scope handles cleanup on every return path.
-    var merged_env: ?std.process.EnvMap = null;
+    // Env handling. 0.16 routes the child environment through the spawn
+    // options' `environ_map`, not post-init `child.env_map`. `replace_env`
+    // points at the map the child should run with; for `.extend` it owns a
+    // merged copy whose storage must outlive the spawn syscall. A single
+    // defer at function scope frees the merged copy on every return path.
+    var merged_env: ?std.process.Environ.Map = null;
     defer if (merged_env) |*m| m.deinit();
+    var replace_env: ?*const std.process.Environ.Map = null;
 
     switch (spec.env_mode) {
         .inherit => {},
         .replace => {
-            if (spec.env_map) |*m| child.env_map = m;
+            if (spec.env_map) |*m| replace_env = m;
         },
         .extend => {
             if (spec.env_map) |extras| {
-                var sys_env = std.process.getEnvMap(alloc) catch |err| {
+                merged_env = env_mod.dupeMap(alloc) catch |err| {
                     job.err_tag = .io_error;
                     job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
                     return;
                 };
-                defer sys_env.deinit();
-
-                merged_env = std.process.EnvMap.init(alloc);
-                var it = sys_env.iterator();
-                while (it.next()) |e| merged_env.?.put(e.key_ptr.*, e.value_ptr.*) catch {};
                 var it2 = extras.iterator();
                 while (it2.next()) |e| merged_env.?.put(e.key_ptr.*, e.value_ptr.*) catch {};
 
-                child.env_map = &merged_env.?;
+                replace_env = &merged_env.?;
             }
         },
     }
 
-    child.spawn() catch |err| {
+    // 0.16 moved stdio routing, cwd, and env onto the spawn options;
+    // `std.process.Child` no longer has post-init `*_behavior` fields or a
+    // `spawn` method. stdin is a pipe only when we have bytes to feed.
+    var child = std.process.spawn(io, .{
+        .argv = spec.argv,
+        .cwd = if (spec.cwd) |c| .{ .path = c } else .inherit,
+        .environ_map = replace_env,
+        .stdin = if (spec.stdin_bytes != null) .pipe else .inherit,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
         job.err_tag = .spawn_failed;
         job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
         return;
     };
+    // `child.id` is null only after reap; it is always set right after spawn.
+    const child_pid = child.id.?;
 
     // Aborter wiring: ctx lives on this stack frame. Safe because
     // executeExec blocks until the child is reaped; before returning we
@@ -100,7 +113,7 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
     // of registered jobs but calls `job.abort()` which reads the live
     // aborter field, so clearing the field wins even against a stale
     // snapshot.
-    var abort_ctx = AbortCtx{ .pid = child.id };
+    var abort_ctx = AbortCtx{ .pid = child_pid };
     job.aborter = .{
         .ctx = @ptrCast(&abort_ctx),
         .abort_fn = AbortCtx.abortFn,
@@ -110,8 +123,8 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
         job.aborter = null;
         job.err_tag = .io_error;
         job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
-        std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
-        _ = child.wait() catch {};
+        std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+        _ = child.wait(io) catch {};
         return;
     };
     defer {
@@ -125,110 +138,126 @@ pub fn executeExec(alloc: Allocator, job: *Job) void {
     // Push stdin bytes (if any) and close the pipe so the child sees EOF.
     if (spec.stdin_bytes) |bytes| {
         if (child.stdin) |stdin| {
-            stdin.writeAll(bytes) catch |err| {
-                log.debug("stdin writeAll: {s}", .{@errorName(err)});
+            stdin.writeStreamingAll(io, bytes) catch |err| {
+                log.debug("stdin write: {s}", .{@errorName(err)});
             };
-            stdin.close();
+            stdin.close(io);
             child.stdin = null;
         }
     }
 
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = clock.milliTimestamp();
     const deadline_ms: i64 = if (spec.timeout_ms > 0)
         start_ms +| @as(i64, @intCast(spec.timeout_ms))
     else
         std.math.maxInt(i64);
 
-    var poller = std.Io.poll(alloc, enum { stdout, stderr }, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
-    });
-    defer poller.deinit();
+    // 0.16 removed `std.Io.poll`; the dual-pipe drain runs through an
+    // `Io.File.MultiReader`, which reads stdout and stderr concurrently on
+    // the process io. `fill(reserve, .{ .duration = 50ms })` blocks for one
+    // tick, then returns `error.Timeout` so we can re-check cancel/deadline,
+    // or `error.EndOfStream` once both pipes drain.
+    var mr_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(alloc, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    const tick: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromNanoseconds(@intCast(poll_interval_ns)),
+        .clock = .awake,
+    } };
 
     var truncated = false;
-    while (true) {
+    drain: while (true) {
         if (job.scope.isCancelled()) {
-            std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
-            _ = child.wait() catch {};
+            std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+            _ = child.wait(io) catch {};
             job.err_tag = .cancelled;
             return;
         }
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = clock.milliTimestamp();
         if (now_ms >= deadline_ms) {
-            std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
-            _ = child.wait() catch {};
+            std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+            _ = child.wait(io) catch {};
             job.err_tag = .timeout;
             return;
         }
 
-        // Poll for 50ms at a time, re-check deadline each iteration. If the
-        // deadline is less than 50ms away, the next iteration's
-        // `now_ms >= deadline_ms` branch handles it. Shrinking the poll
-        // timeout to the exact remainder buys nothing and, when
-        // `timeout_ms == 0` makes deadline_ms == maxInt(i64), the
-        // `(deadline_ms - now_ms) * ns_per_ms` multiplication overflows.
-        // Overshoot of up to 50ms past the deadline is fine for a
-        // best-effort process timeout.
-        const tick_ns: u64 = poll_interval_ns;
+        // Fill for one tick. A `Timeout` just means the tick elapsed with no
+        // new bytes, so loop to re-check cancel/deadline; `EndOfStream` means
+        // both pipes are done; anything else is a real read failure.
+        multi_reader.fill(fill_reserve_bytes, tick) catch |err| switch (err) {
+            error.Timeout => {},
+            error.EndOfStream => {
+                // Re-check cancel after the pipes EOF: the aborter's SIGKILL
+                // is what closed them, so falling through to the success path
+                // would misreport a cancelled run as exit code -9.
+                if (job.scope.isCancelled()) {
+                    _ = child.wait(io) catch {};
+                    job.err_tag = .cancelled;
+                    return;
+                }
+                break :drain;
+            },
+            else => {
+                std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+                _ = child.wait(io) catch {};
+                job.err_tag = .io_error;
+                job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
+                return;
+            },
+        };
 
-        const more = poller.pollTimeout(tick_ns) catch |err| {
-            std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
-            _ = child.wait() catch {};
+        if (spec.max_output_bytes > 0) {
+            if (stdout_reader.buffered().len > spec.max_output_bytes or
+                stderr_reader.buffered().len > spec.max_output_bytes)
+            {
+                truncated = true;
+                std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+                _ = child.wait(io) catch {};
+                break :drain;
+            }
+        }
+    }
+
+    // Surface any per-stream read error the MultiReader recorded (e.g. a pipe
+    // failure that didn't abort the whole fill). On the natural-exit path the
+    // child has already EOF'd; reap it for the exit code. On the truncate
+    // path we already killed and reaped above and synthesise the term.
+    if (!truncated) {
+        multi_reader.checkAnyError() catch |err| {
+            std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+            _ = child.wait(io) catch {};
+            job.err_tag = .io_error;
+            job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
+            return;
+        };
+    }
+
+    const term: std.process.Child.Term = if (truncated)
+        .{ .signal = std.posix.SIG.KILL }
+    else
+        child.wait(io) catch |err| {
             job.err_tag = .io_error;
             job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
             return;
         };
 
-        if (spec.max_output_bytes > 0) {
-            if (poller.reader(.stdout).bufferedLen() > spec.max_output_bytes or
-                poller.reader(.stderr).bufferedLen() > spec.max_output_bytes)
-            {
-                truncated = true;
-                std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
-                _ = child.wait() catch {};
-                break;
-            }
-        }
-
-        if (!more) {
-            // Re-check cancel AFTER pollTimeout returns: the aborter's SIGKILL
-            // is what caused the pipes to EOF, so falling through to the
-            // success path would misreport a cancelled run as exit code -9.
-            // The top-of-loop check can't catch this because pollTimeout
-            // returning !more skips straight to break.
-            if (job.scope.isCancelled()) {
-                _ = child.wait() catch {};
-                job.err_tag = .cancelled;
-                return;
-            }
-            break;
-        }
-    }
-
-    // The child is either naturally done (!more) or we killed it for
-    // truncation. Reap if still running; wait on natural-exit path.
-    const term = if (truncated) blk: {
-        // We already waited after kill in the truncate branch above.
-        break :blk std.process.Child.Term{ .Signal = @intCast(std.posix.SIG.KILL) };
-    } else child.wait() catch |err| {
-        job.err_tag = .io_error;
-        job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
-        return;
-    };
-
     const code: i32 = switch (term) {
-        .Exited => |c| @as(i32, @intCast(c)),
-        .Signal => |s| -@as(i32, @intCast(s)),
-        .Stopped, .Unknown => -1,
+        .exited => |c| @as(i32, @intCast(c)),
+        .signal => |s| -@as(i32, @intCast(@intFromEnum(s))),
+        .stopped, .unknown => -1,
     };
 
-    var stdout_slice = poller.toOwnedSlice(.stdout) catch {
+    var stdout_slice = multi_reader.toOwnedSlice(0) catch {
         job.err_tag = .io_error;
         job.err_detail = alloc.dupe(u8, "OutOfMemory") catch null;
         return;
     };
     errdefer alloc.free(stdout_slice);
-    var stderr_slice = poller.toOwnedSlice(.stderr) catch {
+    var stderr_slice = multi_reader.toOwnedSlice(1) catch {
         job.err_tag = .io_error;
         job.err_detail = alloc.dupe(u8, "OutOfMemory") catch null;
         return;
@@ -313,9 +342,9 @@ test "executeExec honors scope cancel" {
         .thread_ref = 0,
         .scope = root,
     };
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     executeExec(alloc, &job);
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     try testing.expect(job.err_tag != null);
     try testing.expect(job.err_tag.? == .cancelled);
@@ -372,17 +401,17 @@ test "executeExec cancels in-flight child via aborter" {
         }
     };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const thread = try std.Thread.spawn(.{}, worker.run, .{ alloc, &job });
 
     // Give the worker enough time to actually spawn /bin/sleep
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    clock.sleep(100 * std.time.ns_per_ms);
 
     // Cancel. Should invoke Job.aborter which SIGKILLs the child
     try root.cancel("test");
 
     thread.join();
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     try testing.expect(job.err_tag != null);
     try testing.expect(job.err_tag.? == .cancelled);

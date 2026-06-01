@@ -6,6 +6,9 @@
 //! counterpart lives in `streaming.zig`.
 
 const std = @import("std");
+const test_net = @import("../test_net.zig");
+const clock = @import("../clock.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 const Endpoint = @import("../llm.zig").Endpoint;
 const anthropic_provider = @import("../providers/anthropic.zig");
@@ -262,7 +265,7 @@ pub fn httpPostJsonRaw(
     allocator: Allocator,
     timeouts: ?registry.Endpoint.TimeoutConfig,
 ) !RawResponse {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = process_io.get() };
     defer client.deinit();
 
     const uri = std.Uri.parse(url) catch return error.InvalidUri;
@@ -307,30 +310,27 @@ pub fn httpPostJsonRaw(
         return error.ApiError;
     };
 
-    // Receive response headers.
+    // Receive response headers, bounding the head read so a provider that
+    // stalls before sending the head can't hang the turn (the body read below
+    // is already bounded; 0.16 has no OS read deadline on the non-blocking
+    // socket).
     var no_redirects: [0]u8 = .{};
-    var response = req.receiveHead(&no_redirects) catch |err| {
-        log.err("http: receiveHead failed: {s}", .{@errorName(err)});
-        return error.ApiError;
+    var response = socket_timeouts.receiveHeadWithTimeout(process_io.get(), &req, &no_redirects, if (timeouts) |to| to.read_ms else 0) catch |err| switch (err) {
+        error.ReadTimeout => return error.ReadTimeout,
+        else => {
+            log.err("http: receiveHead failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        },
     };
 
-    // Socket-level read/write timeouts. Apply after `receiveHead`
-    // because that's the first point the underlying connection (and its
-    // socket fd) is reachable. Connect phase remains OS-default.
-    if (timeouts) |to| {
-        if (req.connection) |conn| {
-            socket_timeouts.applySocketTimeouts(
-                conn.stream_reader.getStream().handle,
-                to.read_ms,
-                to.write_ms,
-            );
-        }
-    }
-
-    // Read the body. EAGAIN (`error.WouldBlock`) recovered through
-    // `connection.getReadError()` after the wrapper `error.ReadFailed`
-    // surfaces as `error.ReadTimeout` so callers can distinguish a
-    // genuine timeout from an opaque transport failure.
+    // Read the body, bounding each read by the endpoint's read timeout.
+    // Under 0.16, sockets are non-blocking within std.Io, so the timeout is
+    // enforced by racing each `reader.stream` against a deadline (see
+    // socket_timeouts.streamWithTimeout), not by SO_RCVTIMEO. A deadline win
+    // cancels the in-flight read and surfaces `error.ReadTimeout` so callers
+    // can distinguish a genuine timeout from an opaque transport failure.
+    const io = process_io.get();
+    const read_ms: u32 = if (timeouts) |to| to.read_ms else 0;
     var transfer_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
@@ -340,17 +340,11 @@ pub fn httpPostJsonRaw(
     while (true) {
         var chunk: [4096]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&chunk);
-        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+        const n = socket_timeouts.streamWithTimeout(io, reader, &writer, .limited(chunk.len), read_ms) catch |err| switch (err) {
             error.EndOfStream => break,
+            error.ReadTimeout => return error.ReadTimeout,
             error.WriteFailed => unreachable, // fixed writer is sized to chunk.len
-            error.ReadFailed => {
-                if (req.connection) |conn| {
-                    if (conn.getReadError()) |inner| {
-                        if (inner == error.WouldBlock) return error.ReadTimeout;
-                    }
-                }
-                return error.ApiError;
-            },
+            error.ReadFailed => return error.ApiError,
         };
         if (n == 0) break;
         try out.appendSlice(allocator, chunk[0..n]);
@@ -404,7 +398,7 @@ test "buildHeaders creates correct auth for bearer endpoint" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(path);
@@ -441,7 +435,7 @@ test "buildHeaders creates correct auth for x_api_key endpoint" {
     // resolve succeeds against a real on-disk file.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(path);
@@ -735,12 +729,12 @@ test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id f
     // sourced from `zag.provider{}` reaches buildHeaders correctly.
     const allocator = std.testing.allocator;
 
-    const access = try buildFreshAccessToken(allocator, std.time.timestamp() + 3600);
+    const access = try buildFreshAccessToken(allocator, clock.timestamp() + 3600);
     defer allocator.free(access);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(path);
@@ -807,18 +801,21 @@ test "buildHeaders on a Lua-declared .oauth endpoint emits Bearer + account id f
 /// headers (chunked transfer, no chunk yet) and sleeps long enough that
 /// any read on the body side hits `SO_RCVTIMEO`. Mirrors
 /// `mockTimeoutServer` in `streaming.zig`.
-fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockTimeoutServer(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    const io = std.testing.io;
+    var stream = srv.accept(io) catch return;
+    defer stream.close(io);
 
     const alloc = std.heap.page_allocator;
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(alloc);
 
+    var read_scratch: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_scratch);
     var tmp: [4096]u8 = undefined;
     var headers_end: usize = 0;
     while (true) {
-        const n = conn.stream.read(&tmp) catch return;
+        const n = sr.interface.readSliceShort(&tmp) catch return;
         if (n == 0) return;
         req.appendSlice(alloc, tmp[0..n]) catch return;
         if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
@@ -841,7 +838,7 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
     var body_remaining = if (content_length > body_have) content_length - body_have else 0;
     while (body_remaining > 0) {
         const want = @min(body_remaining, tmp.len);
-        const n = conn.stream.read(tmp[0..want]) catch return;
+        const n = sr.interface.readSliceShort(tmp[0..want]) catch return;
         if (n == 0) break;
         body_remaining -= n;
     }
@@ -853,8 +850,11 @@ fn mockTimeoutServer(srv: *std.net.Server, sleep_ns: u64) void {
         "Content-Type: application/json\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
-    _ = conn.stream.writeAll(head_only) catch {};
-    std.Thread.sleep(sleep_ns);
+    var write_scratch: [256]u8 = undefined;
+    var sw = stream.writer(io, &write_scratch);
+    sw.interface.writeAll(head_only) catch {};
+    sw.interface.flush() catch {};
+    clock.sleep(sleep_ns);
 }
 
 test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body" {
@@ -866,20 +866,19 @@ test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body
     // `error.ReadTimeout`.
     const allocator = std.testing.allocator;
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     const thr = try std.Thread.spawn(.{}, mockTimeoutServer, .{ &server, 3 * std.time.ns_per_s });
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const result = httpPostJsonRaw(
         url,
         "{}",
@@ -887,10 +886,69 @@ test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body
         allocator,
         .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 },
     );
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
     try std.testing.expectError(error.ReadTimeout, result);
     // 500 ms timeout plus generous slack for connect/handshake. The
     // OS-default behaviour would push this well past 60 s.
+    try std.testing.expect(elapsed < 1500);
+}
+
+// Like mockTimeoutServer but never writes the response head: drains the
+// request so the client's send completes, then stalls. This exercises the
+// HEAD-read race (receiveHeadWithTimeout) rather than the body-read race.
+fn mockHeadStallServer(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    const io = std.testing.io;
+    var stream = srv.accept(io) catch return;
+    defer stream.close(io);
+
+    const alloc = std.heap.page_allocator;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+    var read_scratch: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_scratch);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = sr.interface.readSliceShort(&tmp) catch break;
+        if (n == 0) break;
+        req.appendSlice(alloc, tmp[0..n]) catch break;
+        if (std.mem.indexOf(u8, req.items, "\r\n\r\n") != null) break;
+    }
+    // No response head is ever written; the client must time out in receiveHead.
+    clock.sleep(sleep_ns);
+}
+
+test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls before the response head" {
+    // The HEAD-read race (receiveHeadWithTimeout): the server accepts the
+    // connection and drains the request, then never sends the response head.
+    // Without the head-read deadline the client would block in receiveHead until
+    // the OS default (~75s macOS / ~127s Linux); with read_ms=500 it surfaces
+    // error.ReadTimeout. This covers the distinct failure mode the receiveHead
+    // bound was added for (the body-stall test above can only trip
+    // streamWithTimeout, since that mock writes the full head first).
+    const allocator = std.testing.allocator;
+
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
+
+    const thr = try std.Thread.spawn(.{}, mockHeadStallServer, .{ &server, 3 * std.time.ns_per_s });
+    defer {
+        server.deinit(std.testing.io);
+        thr.join();
+    }
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const start = clock.milliTimestamp();
+    const result = httpPostJsonRaw(
+        url,
+        "{}",
+        &.{},
+        allocator,
+        .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 },
+    );
+    const elapsed = clock.milliTimestamp() - start;
+    try std.testing.expectError(error.ReadTimeout, result);
     try std.testing.expect(elapsed < 1500);
 }
 

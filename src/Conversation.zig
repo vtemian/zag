@@ -5,6 +5,7 @@
 //! Nodes are rendered to display lines via an internal NodeRenderer.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("Buffer.zig");
 const View = @import("View.zig");
@@ -1217,8 +1218,8 @@ fn applyRefinedName(self: *Conversation, name: []const u8, prompt: []const u8) !
             if (link_node.node_type != .subagent_link) continue;
             if (link_node.subagent_index != self.parent_subagent_id) continue;
 
-            const should_set_prompt = (prompt.len > 0) and
-                ((link_node.subagent_prompt orelse "").len == 0);
+            const existing_prompt: []const u8 = link_node.subagent_prompt orelse "";
+            const should_set_prompt = (prompt.len > 0) and (existing_prompt.len == 0);
 
             // Dupe both first so a prompt-allocation failure leaves
             // the link node untouched (no half-applied refinement).
@@ -1446,7 +1447,7 @@ pub fn persistUserMessage(self: *Conversation, text: []const u8) void {
     self.persistEvent(.{
         .entry_type = .user_message,
         .content = text,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = clock.milliTimestamp(),
     });
 }
 
@@ -2218,9 +2219,7 @@ test "loadFromEntries reloads tool_call nodes collapsed" {
 // swallowed because a failed restore inside `defer` can't be reported
 // and the tmpDir cleanup still wins.
 fn restoreTestCwd(abs_path: []const u8) void {
-    var dir = std.fs.openDirAbsolute(abs_path, .{}) catch return;
-    defer dir.close();
-    dir.setAsCwd() catch {};
+    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
 }
 
 test "child Conversation persistEvent stamps subagent_path and routes through parent" {
@@ -2229,9 +2228,9 @@ test "child Conversation persistEvent stamps subagent_path and routes through pa
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);
@@ -2271,9 +2270,9 @@ test "loadFromEntries reconstructs subagents from tagged entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);
@@ -2345,9 +2344,9 @@ test "depth-2 subagent_path round-trips through persist + load" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);
@@ -3261,9 +3260,9 @@ test "loadFromEntries refines (unknown) when task_start arrives after child even
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
     defer restoreTestCwd(orig_cwd);
 
     var mgr = try Session.SessionManager.init(allocator);

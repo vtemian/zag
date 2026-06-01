@@ -196,7 +196,7 @@ fn serializeRequest(
     thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
 
@@ -451,7 +451,7 @@ pub fn parseResponse(response_bytes: []const u8, allocator: Allocator) !types.Ll
             if (id_value != .string or name_value != .string) continue;
 
             // Serialize the input object back to JSON string
-            var input_out: std.io.Writer.Allocating = .init(allocator);
+            var input_out: std.Io.Writer.Allocating = .init(allocator);
             try std.json.Stringify.value(input_value, .{}, &input_out.writer);
             const input_raw = try input_out.toOwnedSlice();
             defer allocator.free(input_raw);
@@ -1992,7 +1992,7 @@ test "anthropic writeMessage serializes tool_use content block" {
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2023,7 +2023,7 @@ test "anthropic writeMessage serializes tool_result with is_error" {
 
     const msg = types.Message{ .role = .user, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2050,7 +2050,7 @@ test "anthropic writeMessage serializes thinking block on thinking-capable model
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2084,7 +2084,7 @@ test "anthropic writeMessage emits empty signature when thinking has none" {
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2118,7 +2118,7 @@ test "anthropic writeMessage drops thinking blocks tagged with foreign provider"
     content[1] = .{ .text = .{ .text = "actual answer" } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
 
     // Use a model identifier that supports extended thinking (so
     // emit_thinking is true). Otherwise the no-extended-thinking branch
@@ -2148,7 +2148,7 @@ test "anthropic writeMessage serializes redacted_thinking block" {
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-opus-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2177,7 +2177,7 @@ test "anthropic writeMessage strips thinking blocks on pre-thinking Claude" {
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-3-5-sonnet-20241022", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2205,7 +2205,7 @@ test "anthropic writeMessage escapes thinking text with special characters" {
 
     const msg = types.Message{ .role = .assistant, .content = content };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2256,7 +2256,7 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buf)];
     const log_full = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     defer file_log.deinit();
@@ -2307,7 +2307,7 @@ test "anthropic SSE event:error invokes telemetry.onStreamError" {
     const expected = (try file_log.artifactPath(allocator, ".turn-4.stream-error.json")) orelse
         return error.NoLogPath;
     defer allocator.free(expected);
-    const stat = try std.fs.cwd().statFile(expected);
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, expected, .{});
     try std.testing.expect(stat.size > 0);
 
     // error_detail got populated for the agent error formatter. The UI
@@ -2368,7 +2368,7 @@ test "anthropic writeMessage escapes tu.id, tu.name, and tr.tool_use_id" {
     } };
 
     const msg = types.Message{ .role = .assistant, .content = content };
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-sonnet-4-5", msg, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2423,7 +2423,7 @@ test "anthropic writeMessage drops foreign-provider thinking after JSONL replay"
 
     // Now serialize through anthropic.zig with a thinking-supporting
     // Claude model. The .openai_chat block must NOT survive.
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeMessage("claude-sonnet-4-5", message, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);

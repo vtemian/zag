@@ -71,9 +71,10 @@ pub fn pushJsonAsTable(lua: *Lua, raw_json: []const u8, allocator: Allocator) !v
 /// Serialize the Lua value at `index` (must be a table) to a JSON string.
 /// Caller owns the returned slice (allocator.free).
 pub fn luaTableToJson(lua: *Lua, index: i32, allocator: Allocator) ![]const u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try luaValueToJson(lua, index, buf.writer(allocator));
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    try luaValueToJson(lua, index, &aw.writer);
+    var buf = aw.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 

@@ -4,6 +4,7 @@
 //! implement, plus the model string parser and provider factory.
 
 const std = @import("std");
+const env_mod = @import("env.zig");
 const types = @import("types.zig");
 const auth = @import("auth.zig");
 const Allocator = std.mem.Allocator;
@@ -453,7 +454,7 @@ pub const ProviderResult = struct {
 /// `$HOME/.config/zag/auth.json`, falling back to `./.config/zag/auth.json`
 /// when `$HOME` is unset. Returns a slice of `buf`; no heap allocation.
 fn defaultAuthPath(buf: []u8) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse ".";
+    const home = env_mod.get("HOME") orelse ".";
     return std.fmt.bufPrint(buf, "{s}/.config/zag/auth.json", .{home});
 }
 
@@ -959,7 +960,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{
@@ -967,7 +968,7 @@ test "createProviderFromLuaConfig reads model from engine and key from auth.json
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -987,7 +988,7 @@ test "createProviderFromLuaConfig surfaces NoDefaultModel when default_model uns
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{
@@ -995,7 +996,7 @@ test "createProviderFromLuaConfig surfaces NoDefaultModel when default_model uns
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1013,7 +1014,7 @@ test "createProviderFromLuaConfig returns MissingCredential when provider not in
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{
@@ -1021,7 +1022,7 @@ test "createProviderFromLuaConfig returns MissingCredential when provider not in
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1041,7 +1042,7 @@ test "createProviderFromLuaConfig skips auth lookup for .auth = .none endpoints"
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1061,7 +1062,7 @@ test "createProviderFromLuaConfig returns UnknownProvider for unsupported provid
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);
@@ -1083,7 +1084,7 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
         \\{
@@ -1091,7 +1092,7 @@ test "createProviderFromLuaConfig returns MissingCredential for oauth provider w
         \\}
         ,
     });
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_path, "auth.json" });
     defer allocator.free(auth_path);

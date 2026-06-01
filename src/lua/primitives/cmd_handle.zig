@@ -21,6 +21,9 @@
 //! consuming a fixed share of the worker pool.
 
 const std = @import("std");
+const sync = @import("../../sync.zig");
+const clock = @import("../../clock.zig");
+const process_io = @import("../../process_io.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -91,16 +94,20 @@ pub const CmdHandle = struct {
     arena: *std.heap.ArenaAllocator,
     /// Long-lived Child. Owned by the helper thread once spawned.
     child: std.process.Child,
+    /// PID recorded at spawn. 0.16 nulls `child.id` once the process is
+    /// reaped, but `:pid()` is documented to keep returning the recorded
+    /// value after reap, so it reads this stable copy instead.
+    pid: std.process.Child.Id = undefined,
     /// Stable storage for the EnvMap when the caller wires env/env_extra.
     /// Child.env_map holds a pointer into this field (not into the
     /// caller's stack frame), so the address must outlive the child.
-    env_map_storage: ?std.process.EnvMap = null,
+    env_map_storage: ?std.process.Environ.Map = null,
     /// Helper thread running `helperLoop`.
     helper: std.Thread,
 
     /// Internal command queue. Main enqueues; helper dequeues.
-    queue_mu: std.Thread.Mutex = .{},
-    queue_cv: std.Thread.Condition = .{},
+    queue_mu: sync.Mutex = .{},
+    queue_cv: sync.Condition = .{},
     queue: std.ArrayList(HelperCmd) = .empty,
     /// Set once `shutdownAndCleanup` has been called. Guards against
     /// double-free on a second __gc (Lua may, in pathological shutdown
@@ -142,7 +149,7 @@ pub const CmdHandle = struct {
     pub const SpawnOpts = struct {
         cwd: ?[]const u8 = null,
         env_mode: job_mod.CmdExecEnvMode = .inherit,
-        env_map: ?std.process.EnvMap = null,
+        env_map: ?std.process.Environ.Map = null,
         /// When true, stdout is a pipe and `:lines()` reads from it.
         /// When false (default), stdout is routed to `/dev/null` and
         /// `:lines()` surfaces `io_error: stdout not captured`. Keeping
@@ -178,6 +185,7 @@ pub const CmdHandle = struct {
         argv: []const []const u8,
         opts: SpawnOpts,
     ) !*CmdHandle {
+        const io = process_io.get();
         const self = try alloc.create(CmdHandle);
         errdefer alloc.destroy(self);
 
@@ -186,50 +194,51 @@ pub const CmdHandle = struct {
             .completions = completions,
             .root_scope = root_scope,
             .arena = arena,
-            .child = std.process.Child.init(argv, alloc),
+            .child = undefined,
             .helper = undefined,
             .max_line_bytes = opts.max_line_bytes,
         };
-        // Route stdio to /dev/null by default. `.Close` would hand
-        // EBADF to any child that writes a startup banner (see
-        // /bin/echo, which exits non-zero when stdout is closed);
-        // `.Inherit` would spam the host process's terminal during
-        // tests. `capture_stdout` in `opts` opts into `.Pipe` for
-        // `:lines()`; `:write` in 6.4c will add `capture_stdin`.
-        // stderr is always `.Ignore` until `:stderr_lines()` exists;
-        // the Lua binding rejects `capture_stderr = true` at spawn
-        // rather than silently letting a chatty child stall on a full
-        // stderr pipe the helper never drains.
-        self.child.stdin_behavior = if (opts.capture_stdin) .Pipe else .Ignore;
-        self.child.stdout_behavior = if (opts.capture_stdout) .Pipe else .Ignore;
-        self.child.stderr_behavior = .Ignore;
-        if (opts.cwd) |c| self.child.cwd = c;
 
+        // 0.16 moved stdio routing, cwd, and env onto the spawn options;
+        // `std.process.Child` no longer has post-init `*_behavior` fields or
+        // a `spawn` method. Move the EnvMap into stable handle storage first
+        // so `environ_map` can borrow it for the spawn syscall and beyond.
         switch (opts.env_mode) {
             .inherit => {},
             .replace, .extend => if (opts.env_map) |m| {
-                // Move the EnvMap into stable handle storage; child.env_map
-                // is a borrow that must survive past Child.spawn(), so it
-                // cannot point into the caller's stack frame. Caller has
-                // already merged parent env for .extend.
+                // Caller has already merged parent env for .extend.
                 self.env_map_storage = m;
-                self.child.env_map = &self.env_map_storage.?;
             },
         }
 
-        try self.child.spawn();
+        // Route stdio to /dev/null by default. `.close` would hand EBADF to
+        // any child that writes a startup banner (see /bin/echo, which exits
+        // non-zero when stdout is closed); `.inherit` would spam the host
+        // process's terminal during tests. `capture_stdout` opts into a pipe
+        // for `:lines()`; `capture_stdin` into one for `:write()`. stderr is
+        // always `.ignore` until `:stderr_lines()` exists; the Lua binding
+        // rejects `capture_stderr = true` at spawn rather than silently
+        // letting a chatty child stall on a full stderr pipe.
+        self.child = std.process.spawn(io, .{
+            .argv = argv,
+            .cwd = if (opts.cwd) |c| .{ .path = c } else .inherit,
+            .environ_map = if (self.env_map_storage) |*m| m else null,
+            .stdin = if (opts.capture_stdin) .pipe else .ignore,
+            .stdout = if (opts.capture_stdout) .pipe else .ignore,
+            .stderr = .ignore,
+        }) catch |err| return err;
+        self.pid = self.child.id.?;
         errdefer {
             // Spawn succeeded but we failed below; kill-and-reap so we
             // don't strand a child.
-            std.posix.kill(self.child.id, std.posix.SIG.KILL) catch {};
-            _ = self.child.wait() catch {};
+            self.child.kill(io);
         }
 
         self.helper = try std.Thread.spawn(.{}, helperLoop, .{self});
         // Name the helper for nicer debugger/`ps -M` output. setName
         // can fail on some OSes (permissions, unsupported); ignore
         // and log at debug; the helper still works unnamed.
-        self.helper.setName("zag.cmd_handle") catch |err| {
+        self.helper.setName(io, "zag.cmd_handle") catch |err| {
             log.debug("cmd_handle helper setName failed: {s}", .{@errorName(err)});
         };
         return self;
@@ -272,7 +281,9 @@ pub const CmdHandle = struct {
     /// and we skip the kill entirely.
     fn runKill(self: *CmdHandle, signo: u8) void {
         if (self.state.load(.acquire) == .exited) return;
-        std.posix.kill(self.child.id, signo) catch |err| {
+        // `child.id` becomes null once `wait`/`kill` has reaped the process.
+        const pid = self.child.id orelse return;
+        std.posix.kill(pid, signalNumToSig(signo)) catch |err| {
             log.debug("cmd:kill helper kill failed: {s}", .{@errorName(err)});
         };
     }
@@ -305,15 +316,21 @@ pub const CmdHandle = struct {
         }
 
         // Pull bytes until a newline lands in the buffer or the pipe
-        // drains. `std.fs.File.read` blocks; that's fine because the
-        // helper thread exists precisely to absorb that block.
+        // drains. `readStreaming` blocks; that's fine because the helper
+        // thread exists precisely to absorb that block. 0.16 signals EOF
+        // with `error.EndOfStream` rather than a 0-length read, so fold
+        // that back into the existing n==0 drain path.
+        const io = process_io.get();
         while (true) {
             var chunk: [4096]u8 = undefined;
-            const n = stdout.read(&chunk) catch |err| {
-                log.warn("read_line: stdout read failed: {s}", .{@errorName(err)});
-                self.stdout_eof = true;
-                self.postReadLineDone(thread_ref, null);
-                return;
+            const n = stdout.readStreaming(io, &.{&chunk}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => {
+                    log.warn("read_line: stdout read failed: {s}", .{@errorName(err)});
+                    self.stdout_eof = true;
+                    self.postReadLineDone(thread_ref, null);
+                    return;
+                },
             };
             if (n == 0) {
                 self.stdout_eof = true;
@@ -398,7 +415,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -426,7 +443,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -450,7 +467,7 @@ pub const CmdHandle = struct {
             return;
         };
 
-        stdin.writeAll(data) catch |err| {
+        stdin.writeStreamingAll(process_io.get(), data) catch |err| {
             self.postWriteDoneErr(thread_ref, @errorName(err));
             return;
         };
@@ -465,7 +482,7 @@ pub const CmdHandle = struct {
     /// so the coroutine resumes rather than hanging.
     fn runCloseStdin(self: *CmdHandle, thread_ref: i32) void {
         if (self.child.stdin) |stdin| {
-            stdin.close();
+            stdin.close(process_io.get());
             self.child.stdin = null;
         }
         self.postCloseStdinDone(thread_ref);
@@ -489,7 +506,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -516,7 +533,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -541,7 +558,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -557,7 +574,7 @@ pub const CmdHandle = struct {
     /// time __gc runs the completion queue itself may be torn down).
     fn runWait(self: *CmdHandle, thread_ref: i32) void {
         if (self.state.load(.acquire) != .exited) {
-            const term = self.child.wait() catch |err| {
+            const term = self.child.wait(process_io.get()) catch |err| {
                 log.warn("child.wait failed: {s}", .{@errorName(err)});
                 self.exit_code = -1;
                 self.state.store(.exited, .release);
@@ -566,9 +583,9 @@ pub const CmdHandle = struct {
             };
 
             self.exit_code = switch (term) {
-                .Exited => |c| @as(i32, @intCast(c)),
-                .Signal => |s| -@as(i32, @intCast(s)),
-                .Stopped, .Unknown => -1,
+                .exited => |c| @as(i32, @intCast(c)),
+                .signal => |s| -@as(i32, @intCast(@intFromEnum(s))),
+                .stopped, .unknown => -1,
             };
             self.state.store(.exited, .release);
         }
@@ -609,7 +626,7 @@ pub const CmdHandle = struct {
         while (true) {
             self.completions.push(job) catch |err| switch (err) {
                 error.QueueFull => {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    clock.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
             };
@@ -633,7 +650,7 @@ pub const CmdHandle = struct {
         // deliver the kill; otherwise we also enqueue the wait.
         const s = self.state.load(.acquire);
         if (s != .exited) {
-            self.submit(.{ .kill = .{ .signo = std.posix.SIG.KILL } }) catch {};
+            self.submit(.{ .kill = .{ .signo = @intFromEnum(std.posix.SIG.KILL) } }) catch {};
             if (s == .running) {
                 self.submit(.{ .wait = .{ .thread_ref = 0 } }) catch {};
             }
@@ -641,7 +658,7 @@ pub const CmdHandle = struct {
             // been SIGKILLed. If this ever hangs, the process is
             // uninterruptible (D state) and we have a bigger problem.
             while (self.state.load(.acquire) != .exited) {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
         }
 
@@ -684,31 +701,41 @@ pub const CmdHandle = struct {
 
 /// Parse a signal name string into a POSIX signal number. Accepts the
 /// common ones; anything else is rejected by the Lua binding.
+/// Maps a signal name to its numeric value. 0.16's `std.posix.SIG` is an
+/// enum (`c.SIG__enum_NNNN`) rather than an integer constant, so the values
+/// are unwrapped to `u8` here for storage on the worker queue; the syscall
+/// re-wraps them via `@enumFromInt` (see `signalNumToSig`).
 pub fn signalNameToNum(name: []const u8) ?u8 {
-    if (std.mem.eql(u8, name, "TERM")) return std.posix.SIG.TERM;
-    if (std.mem.eql(u8, name, "KILL")) return std.posix.SIG.KILL;
-    if (std.mem.eql(u8, name, "INT")) return std.posix.SIG.INT;
-    if (std.mem.eql(u8, name, "HUP")) return std.posix.SIG.HUP;
-    if (std.mem.eql(u8, name, "QUIT")) return std.posix.SIG.QUIT;
-    if (std.mem.eql(u8, name, "USR1")) return std.posix.SIG.USR1;
-    if (std.mem.eql(u8, name, "USR2")) return std.posix.SIG.USR2;
-    if (std.mem.eql(u8, name, "STOP")) return std.posix.SIG.STOP;
-    if (std.mem.eql(u8, name, "CONT")) return std.posix.SIG.CONT;
+    if (std.mem.eql(u8, name, "TERM")) return @intFromEnum(std.posix.SIG.TERM);
+    if (std.mem.eql(u8, name, "KILL")) return @intFromEnum(std.posix.SIG.KILL);
+    if (std.mem.eql(u8, name, "INT")) return @intFromEnum(std.posix.SIG.INT);
+    if (std.mem.eql(u8, name, "HUP")) return @intFromEnum(std.posix.SIG.HUP);
+    if (std.mem.eql(u8, name, "QUIT")) return @intFromEnum(std.posix.SIG.QUIT);
+    if (std.mem.eql(u8, name, "USR1")) return @intFromEnum(std.posix.SIG.USR1);
+    if (std.mem.eql(u8, name, "USR2")) return @intFromEnum(std.posix.SIG.USR2);
+    if (std.mem.eql(u8, name, "STOP")) return @intFromEnum(std.posix.SIG.STOP);
+    if (std.mem.eql(u8, name, "CONT")) return @intFromEnum(std.posix.SIG.CONT);
     return null;
+}
+
+/// Re-wrap a stored signal number into the `std.posix.SIG` enum that
+/// `std.posix.kill`/`raise` now require.
+pub fn signalNumToSig(signo: u8) std.posix.SIG {
+    return @enumFromInt(signo);
 }
 
 const testing = std.testing;
 
 test "signalNameToNum maps the common signals" {
-    try testing.expectEqual(@as(?u8, std.posix.SIG.TERM), signalNameToNum("TERM"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.KILL), signalNameToNum("KILL"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.INT), signalNameToNum("INT"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.HUP), signalNameToNum("HUP"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.QUIT), signalNameToNum("QUIT"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.USR1), signalNameToNum("USR1"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.USR2), signalNameToNum("USR2"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.STOP), signalNameToNum("STOP"));
-    try testing.expectEqual(@as(?u8, std.posix.SIG.CONT), signalNameToNum("CONT"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.TERM)), signalNameToNum("TERM"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.KILL)), signalNameToNum("KILL"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.INT)), signalNameToNum("INT"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.HUP)), signalNameToNum("HUP"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.QUIT)), signalNameToNum("QUIT"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.USR1)), signalNameToNum("USR1"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.USR2)), signalNameToNum("USR2"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.STOP)), signalNameToNum("STOP"));
+    try testing.expectEqual(@as(?u8, @intFromEnum(std.posix.SIG.CONT)), signalNameToNum("CONT"));
     try testing.expect(signalNameToNum("BOGUS") == null);
 }
 

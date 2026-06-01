@@ -97,12 +97,12 @@ pub fn parsePatternAndTimeout(raw: []const u8) !PatternAndTimeout {
         if (std.mem.lastIndexOfScalar(u8, raw, '/')) |close| {
             if (close > 0) {
                 pattern = raw[1..close];
-                rest = std.mem.trimLeft(u8, raw[close + 1 ..], " \t");
+                rest = std.mem.trimStart(u8, raw[close + 1 ..], " \t");
             }
         }
     } else if (std.mem.indexOfAny(u8, raw, " \t")) |sp| {
         pattern = raw[0..sp];
-        rest = std.mem.trimLeft(u8, raw[sp..], " \t");
+        rest = std.mem.trimStart(u8, raw[sp..], " \t");
     }
     const timeout_ms: ?u32 = if (rest.len == 0) null else try parseDurationMs(rest);
     return .{ .pattern = pattern, .timeout_ms = timeout_ms };
@@ -132,7 +132,7 @@ pub fn parseIdleAndDeadline(raw: []const u8) !IdleAndDeadline {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (std.mem.indexOfAny(u8, trimmed, " \t")) |sp| {
         const idle = trimmed[0..sp];
-        const rest = std.mem.trimLeft(u8, trimmed[sp..], " \t");
+        const rest = std.mem.trimStart(u8, trimmed[sp..], " \t");
         return .{ .idle_ms = try parseDurationMs(idle), .deadline_ms = try parseDurationMs(rest) };
     }
     return .{ .idle_ms = try parseDurationMs(trimmed), .deadline_ms = null };

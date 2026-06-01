@@ -12,6 +12,8 @@
 //! (see Conversation.draft).
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
+const clock = @import("clock.zig");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -76,7 +78,7 @@ screen: *Screen,
 /// and forwarded to each runner on submit for worker-side hook dispatch.
 lua_engine: ?*LuaEngine,
 /// Where to write the rendered screen.
-stdout_file: std.fs.File,
+stdout_file: std.Io.File,
 /// Read end of the wake pipe. The orchestrator polls this alongside stdin so
 /// agent-thread event pushes and SIGWINCH can interrupt its wait without a
 /// busy-wait sleep.
@@ -141,7 +143,7 @@ pub const Config = struct {
     /// hand in a fallback registry seeded with the same built-ins.
     command_registry: *CommandRegistry,
     /// Where to write the rendered screen.
-    stdout_file: std.fs.File,
+    stdout_file: std.Io.File,
     /// Read end of the wake pipe; polled alongside stdin so agent events
     /// and SIGWINCH can interrupt poll() without a busy-wait.
     wake_read_fd: posix.fd_t,
@@ -306,7 +308,7 @@ pub fn run(self: *EventOrchestrator) !void {
 fn drainWakePipe(fd: posix.fd_t) void {
     var buf: [64]u8 = undefined;
     while (true) {
-        _ = posix.read(fd, &buf) catch return;
+        _ = wake_pipe.read(fd, &buf) catch return;
     }
 }
 
@@ -412,7 +414,7 @@ fn tick(
     // ticks at 4 Hz even when events are silent or filtered. When
     // nothing is running, fall back to the parser's escape-timeout (or
     // -1 = block forever) so idle CPU stays at zero.
-    const parser_timeout = parser.pollTimeoutMs(std.time.milliTimestamp());
+    const parser_timeout = parser.pollTimeoutMs(clock.milliTimestamp());
     const heartbeat_ms: ?i32 = if (self.anyAgentRunning()) 250 else null;
     const poll_timeout = pollTimeoutWithHeartbeat(parser_timeout, heartbeat_ms);
     _ = posix.poll(&fds, poll_timeout) catch {};
@@ -433,7 +435,7 @@ fn tick(
     }
 
     // Poll for input (outside frame span, so wait doesn't count)
-    const maybe_event = parser.pollOnce(posix.STDIN_FILENO, std.time.milliTimestamp());
+    const maybe_event = parser.pollOnce(posix.STDIN_FILENO, clock.milliTimestamp());
 
     // Resize: merge SIGWINCH and in-band CSI sources so handleResize
     // is called at most once per tick.
@@ -536,7 +538,7 @@ fn tick(
     // Read focused-runner state once, before the dirty check, so the
     // same elapsed_ms feeds both the heartbeat decision and the
     // composite call below. These calls are cheap (one optional deref
-    // + one std.time.milliTimestamp at most) so paying for them on the
+    // + one clock.milliTimestamp at most) so paying for them on the
     // skipped-frame path is negligible.
     const focused = self.window_manager.getFocusedPane();
     const agent_running = if (focused.runner) |r| r.isAgentRunning() else false;
@@ -672,7 +674,7 @@ fn sweepFloatsForAutoClose(self: *EventOrchestrator) void {
     const layout = self.window_manager.layout;
     if (layout.floats.items.len == 0) return;
 
-    const now = std.time.milliTimestamp();
+    const now = clock.milliTimestamp();
 
     // Real layouts hold ≤ 10 floats; a fixed-size stack scratch is
     // plenty. The cap matches the orchestrator's other per-frame
@@ -1315,7 +1317,7 @@ fn drainChildrenToCompletion(self: *EventOrchestrator) void {
         // Yield so a parent agent thread woken by a child's `done` can return
         // from runChild and let its (cancelled) loop push `.done` before the
         // next pass, instead of busy-spinning on a not-yet-finished parent.
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
 }
 
@@ -1331,27 +1333,27 @@ test {
 }
 
 test "drainWakePipe consumes all pending bytes" {
-    const fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     // Write more than the 64-byte internal scratch so drainWakePipe must loop.
     const payload = [_]u8{1} ** 128;
-    try std.testing.expectEqual(@as(usize, 128), try posix.write(fds[1], &payload));
+    try std.testing.expectEqual(@as(usize, 128), try wake_pipe.write(fds[1], &payload));
 
     drainWakePipe(fds[0]);
 
     // A subsequent non-blocking read must now return WouldBlock, proving the
-    // pipe is empty. EAGAIN maps to error.WouldBlock on Zig 0.15.
+    // pipe is empty. wake_pipe.read maps a raw EAGAIN to error.WouldBlock.
     var scratch: [8]u8 = undefined;
-    const residual = posix.read(fds[0], &scratch);
+    const residual = wake_pipe.read(fds[0], &scratch);
     try std.testing.expectError(error.WouldBlock, residual);
 }
 
 test "drainWakePipe on empty pipe returns without blocking" {
-    const fds = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     // Pipe is empty; the function must bail on the first WouldBlock rather
     // than hang. If this test ever times out, drainWakePipe is blocking.
@@ -1844,7 +1846,7 @@ test "sweepFloatsForAutoClose closes a float whose time has elapsed" {
 
     // Backdate created_at_ms to well outside the timeout so the next
     // sweep observes the float as expired without sleeping the test.
-    f.layout.findFloat(handle).?.created_at_ms = std.time.milliTimestamp() - 1000;
+    f.layout.findFloat(handle).?.created_at_ms = clock.milliTimestamp() - 1000;
 
     var orch: EventOrchestrator = undefined;
     orch.window_manager = f.wm.*;

@@ -13,6 +13,8 @@
 //! session persistence stays inline, independent of the sink.
 
 const std = @import("std");
+const sync = @import("sync.zig");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.agent_runner);
 const Conversation = @import("Conversation.zig");
@@ -294,7 +296,7 @@ pub fn submit(
     self.queue_active = true;
     self.lua_engine = deps.lua_engine;
     self.cancel_flag.store(false, .release);
-    self.turn_started_ms = std.time.milliTimestamp();
+    self.turn_started_ms = clock.milliTimestamp();
     self.output_tokens.store(0, .release);
 
     // Populate the TaskContext the agent thread publishes into the
@@ -532,7 +534,7 @@ pub fn shutdownAll(runners: []const *AgentRunner) void {
 /// Milliseconds since the current turn's agent thread spawned, or 0 when idle.
 pub fn elapsedMs(self: *const AgentRunner) u64 {
     const start = self.turn_started_ms orelse return 0;
-    const now = std.time.milliTimestamp();
+    const now = clock.milliTimestamp();
     return if (now > start) @intCast(now - start) else 0;
 }
 
@@ -965,7 +967,7 @@ pub fn drainEvents(self: *AgentRunner) DrainResult {
 /// per-arm `defer allocator.free(...)` lifetime; the headless loop
 /// owns the bytes for the duration of its switch arm.
 pub fn persistAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) void {
-    const ts = std.time.milliTimestamp();
+    const ts = clock.milliTimestamp();
     switch (event) {
         .text_delta => |text| {
             self.conversation.persistEvent(.{
@@ -1301,7 +1303,7 @@ test "elapsedMs and outputTokens reflect per-turn state" {
     try std.testing.expectEqual(@as(u32, 0), runner.outputTokens());
 
     // A turn that started in the past reports a positive elapsed time.
-    runner.turn_started_ms = std.time.milliTimestamp() - 50;
+    runner.turn_started_ms = clock.milliTimestamp() - 50;
     try std.testing.expect(runner.elapsedMs() >= 50);
 
     // Output-token counter reads back what the streaming path stored.
@@ -2216,13 +2218,13 @@ test "ChildRunnerRegistry.drainAll finishes a child, signals done, removes entry
     var registry = ChildRunnerRegistry.init(allocator);
     defer registry.deinit();
 
-    var child_done: std.Thread.ResetEvent = .{};
+    var child_done: sync.ResetEvent = .{};
     try registry.register(.{ .runner = &runner, .done = &child_done });
 
     // Worker thread parks on `done`, exactly as runChild would. It must wake
     // only after the test thread's drainAll() finishes the child.
     const Waiter = struct {
-        fn run(done: *std.Thread.ResetEvent, woke: *std.atomic.Value(bool)) void {
+        fn run(done: *sync.ResetEvent, woke: *std.atomic.Value(bool)) void {
             done.wait();
             woke.store(true, .release);
         }
@@ -2416,14 +2418,10 @@ test "handleAgentEvent .done keeps a failed turn's status, does not settle to id
     // cwd at a temp dir and restore it afterwards.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    defer {
-        var d = std.fs.openDirAbsolute(orig_cwd, .{}) catch unreachable;
-        defer d.close();
-        d.setAsCwd() catch {};
-    }
-    try tmp.dir.setAsCwd();
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
 
     var mgr = try Session.SessionManager.init(allocator);
     var handle = try mgr.createSession("test-model");

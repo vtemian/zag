@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const process_io = @import("../../process_io.zig");
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
 
@@ -38,7 +39,7 @@ fn setFsErr(alloc: Allocator, job: *Job, err: anyerror) void {
     job.err_detail = alloc.dupe(u8, @errorName(err)) catch null;
 }
 
-fn kindFromStd(k: std.fs.File.Kind) job_mod.FsKind {
+fn kindFromStd(k: std.Io.File.Kind) job_mod.FsKind {
     return switch (k) {
         .file => .file,
         .directory => .dir,
@@ -57,50 +58,16 @@ pub fn executeRead(alloc: Allocator, job: *Job) void {
         return;
     }
 
-    const file = std.fs.cwd().openFile(spec.path, .{}) catch |err| {
-        setFsErr(alloc, job, err);
-        return;
-    };
-    defer file.close();
-
-    const st = file.stat() catch |err| {
-        setFsErr(alloc, job, err);
-        return;
-    };
-
-    const bytes = alloc.alloc(u8, st.size) catch {
-        job.err_tag = .io_error;
-        job.err_detail = alloc.dupe(u8, "OOM") catch null;
-        return;
-    };
-
-    // `stat()` and `readAll()` aren't atomic: a concurrent writer may
-    // truncate the file between the two calls, leaving the tail of
-    // `bytes` uninitialized. Capture the actual count and resize so we
-    // never surface uninitialized memory to Lua.
-    const n = file.readAll(bytes) catch |err| {
-        alloc.free(bytes);
+    // 0.16 removed `File.readAll`; `Dir.readFileAlloc` opens, reads to EOF,
+    // and right-sizes the buffer in one call, which also sidesteps the old
+    // stat/read truncation race the manual loop had to guard against. No
+    // size cap here mirrors the previous behaviour (it sized to st.size).
+    const bytes = std.Io.Dir.cwd().readFileAlloc(process_io.get(), spec.path, alloc, .unlimited) catch |err| {
         setFsErr(alloc, job, err);
         return;
     };
 
-    job.result = .{ .fs_read = .{ .bytes = shrinkOrZeroPad(alloc, bytes, n) } };
-}
-
-/// Handle the `stat`/`readAll` race: if a concurrent writer truncated
-/// the file after we sized the buffer, return a correctly-sized copy.
-/// On OOM (vanishingly unlikely for a shrink) we zero the tail and
-/// hand back the oversized allocation so Lua never sees uninitialised
-/// memory. Caller owns the returned slice via `alloc`.
-fn shrinkOrZeroPad(alloc: Allocator, bytes: []u8, n: usize) []const u8 {
-    if (n >= bytes.len) return bytes;
-    if (alloc.dupe(u8, bytes[0..n])) |actual| {
-        alloc.free(bytes);
-        return actual;
-    } else |_| {
-        @memset(bytes[n..], 0);
-        return bytes;
-    }
+    job.result = .{ .fs_read = .{ .bytes = bytes } };
 }
 
 /// Write-or-append. Overwrite mode truncates; append mode opens-or-
@@ -114,30 +81,51 @@ pub fn executeWrite(alloc: Allocator, job: *Job) void {
         return;
     }
 
-    const file = switch (spec.mode) {
-        .overwrite => std.fs.cwd().createFile(spec.path, .{ .truncate = true }) catch |err| {
-            setFsErr(alloc, job, err);
-            return;
-        },
-        .append => blk: {
-            const f = std.fs.cwd().createFile(spec.path, .{ .truncate = false }) catch |err| {
-                setFsErr(alloc, job, err);
-                return;
-            };
-            f.seekFromEnd(0) catch |err| {
-                f.close();
-                setFsErr(alloc, job, err);
-                return;
-            };
-            break :blk f;
-        },
-    };
-    defer file.close();
+    const io = process_io.get();
 
-    file.writeAll(spec.content) catch |err| {
-        setFsErr(alloc, job, err);
-        return;
-    };
+    switch (spec.mode) {
+        .overwrite => {
+            const file = std.Io.Dir.cwd().createFile(io, spec.path, .{ .truncate = true }) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
+            defer file.close(io);
+            file.writeStreamingAll(io, spec.content) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
+        },
+        .append => {
+            // 0.16 removed `File.seekFromEnd`; open without truncating, stat
+            // the current size, and drive a positional writer seeked to the
+            // end so the content lands after the existing bytes.
+            const file = std.Io.Dir.cwd().createFile(io, spec.path, .{ .truncate = false }) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
+            defer file.close(io);
+
+            const st = file.stat(io) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
+
+            var write_buf: [4096]u8 = undefined;
+            var fw = file.writer(io, &write_buf);
+            fw.seekTo(st.size) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
+            fw.interface.writeAll(spec.content) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
+            fw.interface.flush() catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
+        },
+    }
     job.result = .empty;
 }
 
@@ -149,13 +137,20 @@ pub fn executeMkdir(alloc: Allocator, job: *Job) void {
         return;
     }
 
+    const io = process_io.get();
     if (spec.parents) {
-        std.fs.cwd().makePath(spec.path) catch |err| {
-            setFsErr(alloc, job, err);
-            return;
+        // mkdir -p is idempotent on an existing directory, but 0.16's
+        // createDirPath returns error.NotDir when the leaf already exists as a
+        // symlink-to-dir (e.g. macOS /tmp -> private/tmp). Check existence first
+        // (access follows symlinks) and only create when genuinely missing.
+        std.Io.Dir.cwd().access(io, spec.path, .{}) catch {
+            std.Io.Dir.cwd().createDirPath(io, spec.path) catch |err| {
+                setFsErr(alloc, job, err);
+                return;
+            };
         };
     } else {
-        std.fs.cwd().makeDir(spec.path) catch |err| {
+        std.Io.Dir.cwd().createDir(io, spec.path, .default_dir) catch |err| {
             setFsErr(alloc, job, err);
             return;
         };
@@ -175,15 +170,16 @@ pub fn executeRemove(alloc: Allocator, job: *Job) void {
         return;
     }
 
+    const io = process_io.get();
     if (spec.recursive) {
-        std.fs.cwd().deleteTree(spec.path) catch |err| {
+        std.Io.Dir.cwd().deleteTree(io, spec.path) catch |err| {
             setFsErr(alloc, job, err);
             return;
         };
     } else {
-        std.fs.cwd().deleteFile(spec.path) catch |file_err| {
+        std.Io.Dir.cwd().deleteFile(io, spec.path) catch |file_err| {
             if (file_err == error.IsDir) {
-                std.fs.cwd().deleteDir(spec.path) catch |dir_err| {
+                std.Io.Dir.cwd().deleteDir(io, spec.path) catch |dir_err| {
                     setFsErr(alloc, job, dir_err);
                     return;
                 };
@@ -207,11 +203,12 @@ pub fn executeList(alloc: Allocator, job: *Job) void {
         return;
     }
 
-    var dir = std.fs.cwd().openDir(spec.path, .{ .iterate = true }) catch |err| {
+    const io = process_io.get();
+    var dir = std.Io.Dir.cwd().openDir(io, spec.path, .{ .iterate = true }) catch |err| {
         setFsErr(alloc, job, err);
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var entries: std.ArrayList(job_mod.FsEntry) = .empty;
     // If we bail out before handing the slice to the Job, free every
@@ -224,7 +221,7 @@ pub fn executeList(alloc: Allocator, job: *Job) void {
 
     var it = dir.iterate();
     while (true) {
-        const entry_opt = it.next() catch |err| {
+        const entry_opt = it.next(io) catch |err| {
             setFsErr(alloc, job, err);
             return;
         };
@@ -265,16 +262,19 @@ pub fn executeStat(alloc: Allocator, job: *Job) void {
         return;
     }
 
-    const st = std.fs.cwd().statFile(spec.path) catch |err| {
+    const st = std.Io.Dir.cwd().statFile(process_io.get(), spec.path, .{}) catch |err| {
         setFsErr(alloc, job, err);
         return;
     };
 
+    // 0.16's `Stat` carries `mtime` as an `Io.Timestamp` (i96 nanoseconds)
+    // and replaces the raw `mode` field with a `Permissions` value; unwrap
+    // both into the millisecond/u32 shapes the Lua result still exposes.
     job.result = .{ .fs_stat = .{
         .kind = kindFromStd(st.kind),
         .size = st.size,
-        .mtime_ms = @intCast(@divTrunc(st.mtime, std.time.ns_per_ms)),
-        .mode = @intCast(st.mode),
+        .mtime_ms = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_ms)),
+        .mode = @intCast(st.permissions.toMode()),
     } };
 }
 
@@ -285,7 +285,7 @@ const Scope = @import("../Scope.zig").Scope;
 
 fn makeTmpAbs(tmp: *std.testing.TmpDir, sub: []const u8, out: []u8) ![]u8 {
     var realbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &realbuf);
+    const base = realbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &realbuf)];
     return try std.fmt.bufPrint(out, "{s}/{s}", .{ base, sub });
 }
 
@@ -296,7 +296,7 @@ test "executeRead returns file bytes" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "hello.txt", .data = "hi there" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hello.txt", .data = "hi there" });
 
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try makeTmpAbs(&tmp, "hello.txt", &pbuf);
@@ -336,7 +336,7 @@ test "executeStat reports kind and size" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "s.dat", .data = "0123456789" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "s.dat", .data = "0123456789" });
 
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try makeTmpAbs(&tmp, "s.dat", &pbuf);

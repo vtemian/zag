@@ -11,6 +11,9 @@
 //! endpoints (e.g. local Ollama) skip credential capture entirely.
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
+const process_io = @import("process_io.zig");
+const env_mod = @import("env.zig");
 
 const log = std.log.scoped(.auth_wizard);
 
@@ -45,7 +48,7 @@ pub const Paths = struct {
 /// `$HOME`. Mirrors `LuaEngine.loadUserConfig`'s lookup so the wizard agrees
 /// with the engine on file locations. Propagates any HOME read error.
 pub fn buildPaths(allocator: std.mem.Allocator) !Paths {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try env_mod.getOwned(allocator, "HOME");
     defer allocator.free(home);
 
     const auth_path = try std.fmt.allocPrint(allocator, "{s}/.config/zag/auth.json", .{home});
@@ -59,7 +62,7 @@ pub fn buildPaths(allocator: std.mem.Allocator) !Paths {
 /// so we don't crash under `env -i`; the login flow surfaces a clearer
 /// error downstream when it tries to persist.
 pub fn buildAuthPath(allocator: std.mem.Allocator) ![]u8 {
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+    const home_dir = env_mod.getOwned(allocator, "HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => blk: {
             log.warn("HOME unset; falling back to \".\" for auth.json path", .{});
             break :blk try allocator.dupe(u8, ".");
@@ -199,26 +202,31 @@ pub fn scaffoldConfigLua(
 ) !void {
     const picked = registry.find(provider_name) orelse return error.UnknownProvider;
 
+    const io = process_io.get();
     const parent = std.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
-    std.fs.cwd().makePath(parent) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
+    // access first (follows symlinks): skip createDirPath when the parent
+    // already exists, dodging 0.16's NotDir on a symlink-to-dir leaf.
+    std.Io.Dir.cwd().access(io, parent, .{}) catch {
+        std.Io.Dir.cwd().createDirPath(io, parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
     };
 
-    const file = std.fs.createFileAbsolute(config_path, .{
+    const file = std.Io.Dir.createFileAbsolute(io, config_path, .{
         .exclusive = true,
-        .mode = 0o644,
+        .permissions = .fromMode(0o644),
     }) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
     const body = try renderConfigLua(allocator, picked, chosen_model);
     defer allocator.free(body);
 
     var scratch: [512]u8 = undefined;
-    var w = file.writer(&scratch);
+    var w = file.writer(io, &scratch);
     try w.interface.writeAll(body);
     try w.interface.flush();
 }
@@ -266,20 +274,31 @@ fn renderConfigLua(
         \\
     );
 
-    try body.writer(allocator).print("require(\"zag.providers.{s}\")\n", .{picked.name});
+    {
+        const line = try std.fmt.allocPrint(allocator, "require(\"zag.providers.{s}\")\n", .{picked.name});
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
+    }
 
     try body.appendSlice(allocator, "\n-- Uncomment to enable additional providers:\n");
     for (embedded.entries) |entry| {
         if (!std.mem.startsWith(u8, entry.name, "zag.providers.")) continue;
         const short = stripProviderPrefix(entry.name);
         if (std.mem.eql(u8, short, picked.name)) continue;
-        try body.writer(allocator).print("-- require(\"zag.providers.{s}\")\n", .{short});
+        const line = try std.fmt.allocPrint(allocator, "-- require(\"zag.providers.{s}\")\n", .{short});
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
     }
 
-    try body.writer(allocator).print(
-        "\nzag.set_default_model(\"{s}/{s}\")\n",
-        .{ picked.name, chosen_model orelse picked.default_model },
-    );
+    {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "\nzag.set_default_model(\"{s}/{s}\")\n",
+            .{ picked.name, chosen_model orelse picked.default_model },
+        );
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
+    }
 
     return body.toOwnedSlice(allocator);
 }
@@ -302,7 +321,7 @@ pub fn persistDefaultModel(
         return error.InvalidModelId;
     }
 
-    const existing = std.fs.cwd().readFileAlloc(allocator, config_path, 1 << 20) catch |err| switch (err) {
+    const existing = std.Io.Dir.cwd().readFileAlloc(process_io.get(), config_path, allocator, .limited(1 << 20)) catch |err| switch (err) {
         error.FileNotFound => &[_]u8{},
         else => return err,
     };
@@ -329,10 +348,13 @@ pub fn persistDefaultModel(
 
     if (last_active_line_start) |start| {
         try out.appendSlice(allocator, existing[0..start]);
-        try out.writer(allocator).print(
+        const line = try std.fmt.allocPrint(
+            allocator,
             "zag.set_default_model(\"{s}\")",
             .{new_model_id},
         );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
         try out.appendSlice(allocator, existing[last_active_line_end.?..]);
 
         // Strip any OTHER active lines that survived the naive copy so
@@ -350,10 +372,13 @@ pub fn persistDefaultModel(
         if (existing.len > 0 and existing[existing.len - 1] != '\n') {
             try out.append(allocator, '\n');
         }
-        try out.writer(allocator).print(
+        const line = try std.fmt.allocPrint(
+            allocator,
             "zag.set_default_model(\"{s}\")\n",
             .{new_model_id},
         );
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
     }
 
     try atomicWrite(allocator, config_path, out.items);
@@ -437,20 +462,29 @@ fn atomicWrite(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    // Ensure parent exists (matches scaffoldConfigLua semantics).
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
+    // Ensure parent exists (matches scaffoldConfigLua semantics). access first
+    // (follows symlinks): skip createDirPath when the parent already exists,
+    // dodging 0.16's NotDir on a symlink-to-dir leaf.
     if (std.fs.path.dirname(path)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        cwd.access(io, parent, .{}) catch {
+            cwd.createDirPath(io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         };
     }
 
-    var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(body);
-    try file.sync();
+    var file = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+    defer file.close(io);
+    var scratch: [512]u8 = undefined;
+    var w = file.writer(io, &scratch);
+    try w.interface.writeAll(body);
+    try w.interface.flush();
+    try file.sync(io);
 
-    try std.fs.cwd().rename(tmp_path, path);
+    try cwd.rename(tmp_path, cwd, path, io);
 }
 
 /// Cap on how many times `promptChoice` re-asks before giving up. Five is
@@ -686,7 +720,7 @@ pub fn promptPicker(
 
     var buf: [1]u8 = undefined;
     while (true) {
-        const n = std.posix.read(fd, &buf) catch |err| {
+        const n = wake_pipe.read(fd, &buf) catch |err| {
             try deps.stdout.writeByte('\n');
             try deps.stdout.flush();
             return err;
@@ -1065,7 +1099,7 @@ pub fn runWizard(deps: WizardDeps) !WizardResult {
 
     var scaffolded = false;
     if (deps.scaffold_config and deps.forced_provider == null) {
-        const exists = if (std.fs.accessAbsolute(deps.config_path, .{})) |_|
+        const exists = if (std.Io.Dir.accessAbsolute(process_io.get(), deps.config_path, .{})) |_|
             true
         else |err| switch (err) {
             error.FileNotFound => false,
@@ -1165,14 +1199,14 @@ pub fn removeAuth(deps: WizardDeps, provider_name: []const u8) !void {
 /// Print an actionable "no credentials, switch to a TTY" hint for `provider_name`
 /// to `stderr` and exit with status 1. Used by `runFirstRunWizard` from both
 /// the up-front non-TTY guard and the `error.NonInteractiveFirstRun` retry path.
-fn exitNoCredentialsForProvider(stderr: std.fs.File, provider_name: []const u8) noreturn {
+fn exitNoCredentialsForProvider(stderr: std.Io.File, provider_name: []const u8) noreturn {
     var scratch: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(
         &scratch,
         "zag: no credentials configured for provider '{s}'; run `zag auth login {s}` from an interactive terminal.\n",
         .{ provider_name, provider_name },
     ) catch "zag: no credentials configured; run `zag auth login <provider>` from an interactive terminal.\n";
-    _ = stderr.write(msg) catch {};
+    stderr.writeStreamingAll(process_io.get(), msg) catch {};
     std.process.exit(1);
 }
 
@@ -1190,15 +1224,16 @@ pub fn runFirstRunWizard(
 ) !llm.ProviderResult {
     const default_model: ?[]const u8 = if (lua_engine) |eng| eng.default_model else null;
 
-    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
-    const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+    const io = process_io.get();
+    const stderr = std.Io.File.stderr();
+    const is_tty = (std.Io.File{ .handle = std.posix.STDIN_FILENO, .flags = .{ .nonblocking = false } }).isTty(io) catch false;
 
     if (!is_tty) {
         if (default_model) |model_id| {
             const spec = llm.parseModelString(model_id);
             exitNoCredentialsForProvider(stderr, spec.provider_name);
         }
-        _ = stderr.write("zag: no config.lua found and stdin is not a TTY; create ~/.config/zag/config.lua with at least one `require(\"zag.providers.*\")` and a `zag.set_default_model(...)` call.\n") catch {};
+        stderr.writeStreamingAll(io, "zag: no config.lua found and stdin is not a TTY; create ~/.config/zag/config.lua with at least one `require(\"zag.providers.*\")` and a `zag.set_default_model(...)` call.\n") catch {};
         std.process.exit(1);
     }
 
@@ -1211,7 +1246,7 @@ pub fn runFirstRunWizard(
     // Scaffold config.lua only when it's truly absent; a user with a pinned
     // default_model should keep their file untouched.
     const scaffold = blk: {
-        std.fs.accessAbsolute(paths.config_path, .{}) catch |err| switch (err) {
+        std.Io.Dir.accessAbsolute(process_io.get(), paths.config_path, .{}) catch |err| switch (err) {
             error.FileNotFound => break :blk true,
             else => break :blk false,
         };
@@ -1248,7 +1283,7 @@ pub fn runFirstRunWizard(
                 const spec = llm.parseModelString(model_id);
                 exitNoCredentialsForProvider(stderr, spec.provider_name);
             }
-            _ = stderr.write("zag: first-run setup needs an interactive terminal.\n") catch {};
+            stderr.writeStreamingAll(io, "zag: first-run setup needs an interactive terminal.\n") catch {};
             std.process.exit(1);
         }
         return err;
@@ -1275,7 +1310,7 @@ pub fn runFirstRunWizard(
                 // config.lua's default_model points at a different one. After
                 // a successful scaffold, new_default is non-null by construction.
                 const new_model = new_default orelse {
-                    _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
+                    stderr.writeStreamingAll(io, "zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
                     std.process.exit(1);
                 };
                 const new_spec = llm.parseModelString(new_model);
@@ -1285,11 +1320,11 @@ pub fn runFirstRunWizard(
                     "zag: config.lua sets default model to '{s}', but no credential is configured for provider '{s}'. Edit ~/.config/zag/config.lua to use the provider you just added ('{s}').\n",
                     .{ new_model, new_spec.provider_name, result.provider_name },
                 ) catch "zag: default model provider mismatch; edit ~/.config/zag/config.lua.\n";
-                _ = stderr.write(msg) catch {};
+                stderr.writeStreamingAll(io, msg) catch {};
                 std.process.exit(1);
             },
             error.NoDefaultModel => {
-                _ = stderr.write("zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
+                stderr.writeStreamingAll(io, "zag: wizard finished without setting a default model; this is a zag bug, please report.\n") catch {};
                 std.process.exit(1);
             },
             else => return err,
@@ -1759,14 +1794,14 @@ test "scaffoldConfigLua writes expected contents for openai" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "openai", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     // Picked provider loads via an active `require(...)` line.
@@ -1788,14 +1823,14 @@ test "scaffoldConfigLua writes expected contents for anthropic" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     try testing.expect(std.mem.indexOf(u8, actual, "require(\"zag.providers.anthropic\")\n") != null);
@@ -1809,14 +1844,14 @@ test "scaffoldConfigLua does not duplicate the picked provider in the commented 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "anthropic", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     // The picked provider must appear exactly once as the active require; it
@@ -1838,7 +1873,7 @@ test "scaffoldConfigLua lists every other stdlib provider in the commented block
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1848,7 +1883,7 @@ test "scaffoldConfigLua lists every other stdlib provider in the commented block
     // custom Lua-declared providers aren't required to match.
     try scaffoldConfigLua(testing.allocator, &registry, path, "ollama", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
 
     for (embedded.entries) |entry| {
@@ -1871,16 +1906,16 @@ test "scaffoldConfigLua is a no-op when file exists" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
-    try tmp.dir.writeFile(.{ .sub_path = "config.lua", .data = "-- user content" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.lua", .data = "-- user content" });
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "openai", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("-- user content", actual);
 }
@@ -1891,14 +1926,14 @@ test "scaffoldConfigLua creates parent directories" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "nested", "config.lua" });
     defer testing.allocator.free(path);
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "groq", null);
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
     try testing.expect(std.mem.indexOf(u8, actual, "require(\"zag.providers.groq\")") != null);
     try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"groq/llama-3.3-70b-versatile\")") != null);
@@ -1910,7 +1945,7 @@ test "scaffoldConfigLua rejects unknown provider" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
@@ -1927,14 +1962,14 @@ test "scaffoldConfigLua writes chosen_model when provided" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "config.lua" });
     defer testing.allocator.free(path);
 
     try scaffoldConfigLua(testing.allocator, &registry, path, "openai-oauth", "gpt-5.5");
 
-    const actual = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 16);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(actual);
     try testing.expect(std.mem.indexOf(u8, actual, "zag.set_default_model(\"openai-oauth/gpt-5.5\")") != null);
     // The endpoint's default_model must not leak through when the caller
@@ -1946,9 +1981,9 @@ test "scaffoldConfigLua writes chosen_model when provided" {
 /// `tmpDir`. Returned slices are owned by `testing.allocator` and must be
 /// freed by the caller.
 fn wizardPaths(
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
 ) !struct { auth_path: []u8, config_path: []u8 } {
-    const dir_path = try dir.realpathAlloc(testing.allocator, ".");
+    const dir_path = try dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir_path);
     const auth_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "auth.json" });
     errdefer testing.allocator.free(auth_path);
@@ -2002,15 +2037,15 @@ test "runWizard happy path writes auth.json and scaffolds config.lua" {
     try testing.expect(result.scaffolded_config);
 
     // auth.json: 0o600, openai key present.
-    const auth_stat = try std.fs.cwd().statFile(paths.auth_path);
-    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(auth_stat.mode & 0o777)));
+    const auth_stat = try std.Io.Dir.cwd().statFile(std.testing.io, paths.auth_path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(auth_stat.permissions.toMode() & 0o777)));
 
     var loaded = try auth.loadAuthFile(testing.allocator, paths.auth_path);
     defer loaded.deinit();
     try testing.expectEqualStrings("sk-abc-123", (try loaded.getApiKey("openai")).?);
 
     // config.lua: scaffolded with the openai template and the picked model.
-    const config_body = try std.fs.cwd().readFileAlloc(testing.allocator, paths.config_path, 1 << 16);
+    const config_body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, paths.config_path, testing.allocator, .limited(1 << 16));
     defer testing.allocator.free(config_body);
     try testing.expect(std.mem.indexOf(u8, config_body, "require(\"zag.providers.openai\")") != null);
     try testing.expect(std.mem.indexOf(u8, config_body, "zag.set_default_model(\"openai/gpt-4o-mini\")") != null);
@@ -2058,7 +2093,7 @@ test "runWizard with forced_provider skips the choice prompt" {
     try testing.expectEqualStrings("sk-ant-key", (try loaded.getApiKey("anthropic")).?);
 
     // config.lua must NOT exist: forced mode is credential-only.
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.config_path));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, paths.config_path, .{}));
 }
 
 test "runWizard on forced_provider prints paste-me model hint, does not scaffold" {
@@ -2102,7 +2137,7 @@ test "runWizard on forced_provider prints paste-me model hint, does not scaffold
     // config.lua must NOT exist on disk: the hint is print-only.
     try testing.expectError(
         error.FileNotFound,
-        std.fs.accessAbsolute(paths.config_path, .{}),
+        std.Io.Dir.accessAbsolute(std.testing.io, paths.config_path, .{}),
     );
 }
 
@@ -2543,7 +2578,7 @@ test "dispatchProviderCredential skips credential capture for .none endpoints" {
     try dispatchProviderCredential(&deps, picked);
 
     // auth.json must not exist: `.none` writes nothing.
-    try testing.expectError(error.FileNotFound, std.fs.cwd().statFile(paths.auth_path));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, paths.auth_path, .{}));
 
     const rendered = stdout_writer.written();
     try testing.expect(std.mem.indexOf(u8, rendered, "requires no credential") != null);
@@ -2697,7 +2732,7 @@ test "persistDefaultModelForAuth writes the default beside auth.json" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const auth_path = try std.fs.path.join(gpa, &.{ dir_abs, "auth.json" });
     defer gpa.free(auth_path);
@@ -2707,7 +2742,7 @@ test "persistDefaultModelForAuth writes the default beside auth.json" {
     const wrote = try persistDefaultModelForAuth(gpa, auth_path, "provB/b2");
     try std.testing.expect(wrote);
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, config_path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"provB/b2\")") != null);
 }
@@ -2724,12 +2759,12 @@ test "persistDefaultModel replaces existing line" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data =
         \\require("zag.providers.anthropic")
@@ -2740,7 +2775,7 @@ test "persistDefaultModel replaces existing line" {
 
     try persistDefaultModel(gpa, path, "openai-oauth/gpt-5.2");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"openai-oauth/gpt-5.2\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "anthropic/claude-sonnet-4-20250514") == null);
@@ -2750,19 +2785,19 @@ test "persistDefaultModel appends when no line exists" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data = "require(\"zag.providers.anthropic\")\n",
     });
 
     try persistDefaultModel(gpa, path, "anthropic/claude-opus-4-20250514");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"anthropic/claude-opus-4-20250514\")") != null);
 }
@@ -2771,12 +2806,12 @@ test "persistDefaultModel ignores commented-out lines" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data =
         \\-- zag.set_default_model("old/one")
@@ -2788,7 +2823,7 @@ test "persistDefaultModel ignores commented-out lines" {
 
     try persistDefaultModel(gpa, path, "openai/gpt-4o");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "-- zag.set_default_model(\"old/one\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "zag.set_default_model(\"openai/gpt-4o\")") != null);
@@ -2799,12 +2834,12 @@ test "persistDefaultModel collapses multiple active lines to one" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
     defer gpa.free(dir_abs);
     const path = try std.fs.path.join(gpa, &.{ dir_abs, "config.lua" });
     defer gpa.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.lua",
         .data =
         \\zag.set_default_model("a/one")
@@ -2816,7 +2851,7 @@ test "persistDefaultModel collapses multiple active lines to one" {
 
     try persistDefaultModel(gpa, path, "a/final");
 
-    const body = try std.fs.cwd().readFileAlloc(gpa, path, 1 << 16);
+    const body = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16));
     defer gpa.free(body);
     const count = std.mem.count(u8, body, "zag.set_default_model(");
     try std.testing.expectEqual(@as(usize, 1), count);

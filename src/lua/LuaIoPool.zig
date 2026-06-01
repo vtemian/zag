@@ -10,6 +10,8 @@
 //! the agent loop.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
+const clock = @import("../clock.zig");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
 const Scope = @import("Scope.zig").Scope;
@@ -18,8 +20,8 @@ const CompletionQueue = @import("LuaCompletionQueue.zig").Queue;
 pub const Pool = struct {
     alloc: Allocator,
     workers: []std.Thread,
-    queue_mu: std.Thread.Mutex = .{},
-    queue_cv: std.Thread.Condition = .{},
+    queue_mu: sync.Mutex = .{},
+    queue_cv: sync.Condition = .{},
     // Simple FIFO linked list of pending jobs; workers pop from head.
     pending_head: ?*JobNode = null,
     pending_tail: ?*JobNode = null,
@@ -127,7 +129,7 @@ pub const Pool = struct {
                 self.completions.push(job) catch |err| switch (err) {
                     error.QueueFull => {
                         if (self.shutdown.load(.acquire)) break;
-                        std.Thread.sleep(1 * std.time.ns_per_ms);
+                        clock.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },
                 };
@@ -143,13 +145,13 @@ pub const Pool = struct {
 fn executeJob(alloc: Allocator, job: *Job) void {
     switch (job.kind) {
         .sleep => |s| {
-            const deadline = std.time.milliTimestamp() + @as(i64, @intCast(s.ms));
-            while (std.time.milliTimestamp() < deadline) {
+            const deadline = clock.milliTimestamp() + @as(i64, @intCast(s.ms));
+            while (clock.milliTimestamp() < deadline) {
                 if (job.scope.isCancelled()) {
                     job.err_tag = .cancelled;
                     return;
                 }
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                clock.sleep(10 * std.time.ns_per_ms);
             }
             job.result = .empty;
         },
@@ -236,13 +238,13 @@ test "worker retries on a full ring so no job is ever dropped" {
     try pool.submit(&j3);
 
     var seen: usize = 0;
-    const deadline = std.time.milliTimestamp() + 1000;
-    while (seen < 3 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 1000;
+    while (seen < 3 and clock.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expect(got == &j1 or got == &j2 or got == &j3);
             seen += 1;
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try testing.expectEqual(@as(usize, 3), seen);
@@ -285,8 +287,8 @@ test "Pool submit routes job to worker and posts to completion queue" {
     try pool.submit(&job);
 
     // Poll the completion queue for up to 1s
-    const deadline = std.time.milliTimestamp() + 1000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 1000;
+    while (clock.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expectEqual(&job, got);
             try testing.expect(got.err_tag == null);
@@ -294,7 +296,7 @@ test "Pool submit routes job to worker and posts to completion queue" {
             try testing.expect(got.result.? == .empty);
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
     return error.JobNeverCompleted;
 }
@@ -316,21 +318,21 @@ test "Pool executes sleep job" {
         .scope = root,
     };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     try pool.submit(&job);
 
     const deadline = start + 500;
-    while (std.time.milliTimestamp() < deadline) {
+    while (clock.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expectEqual(&job, got);
             try testing.expect(got.err_tag == null);
             try testing.expect(got.result != null);
             try testing.expect(got.result.? == .empty);
-            const elapsed = std.time.milliTimestamp() - start;
+            const elapsed = clock.milliTimestamp() - start;
             try testing.expect(elapsed >= 20);
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
     return error.SleepJobNeverCompleted;
 }
@@ -356,20 +358,20 @@ test "Pool sleep honors cancellation before dispatch" {
         .scope = root,
     };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     try pool.submit(&job);
 
     const deadline = start + 500;
-    while (std.time.milliTimestamp() < deadline) {
+    while (clock.milliTimestamp() < deadline) {
         if (completions.pop()) |got| {
             try testing.expect(got.err_tag != null);
             try testing.expect(got.err_tag.? == .cancelled);
             try testing.expect(got.result == null);
-            const elapsed = std.time.milliTimestamp() - start;
+            const elapsed = clock.milliTimestamp() - start;
             try testing.expect(elapsed < 100);
             return;
         }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        clock.sleep(1 * std.time.ns_per_ms);
     }
     return error.CancelledJobNeverCompleted;
 }

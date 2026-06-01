@@ -234,15 +234,15 @@ fn buildSubagentTaskInput(
     const name = node.subagent_name orelse "unknown";
     const prompt = childInitialPrompt(node);
 
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(arena);
-    const w = list.writer(arena);
+    var aw = std.Io.Writer.Allocating.init(arena);
+    errdefer aw.deinit();
+    const w = &aw.writer;
     try w.writeAll("{\"agent\":");
     try types.writeJsonString(w, name);
     try w.writeAll(",\"prompt\":");
     try types.writeJsonString(w, prompt);
     try w.writeAll("}");
-    return list.toOwnedSlice(arena);
+    return aw.toOwnedSlice();
 }
 
 /// Read the original prompt argument stashed on the link node at

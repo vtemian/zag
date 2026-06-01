@@ -16,6 +16,7 @@
 //! construction; this module does not provide it.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 
 pub const Ulid = [26]u8;
 
@@ -43,7 +44,7 @@ pub const ParseError = error{InvalidUlid};
 
 /// Generate a ULID using the current wall-clock time.
 pub fn generate(rng: std.Random) Ulid {
-    const now_ms: u64 = @intCast(std.time.milliTimestamp());
+    const now_ms: u64 = @intCast(clock.milliTimestamp());
     return generateAt(now_ms, rng);
 }
 

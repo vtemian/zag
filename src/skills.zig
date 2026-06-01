@@ -28,6 +28,8 @@
 //! backing array.
 
 const std = @import("std");
+const env_mod = @import("env.zig");
+const process_io = @import("process_io.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const frontmatter = @import("frontmatter.zig");
@@ -115,7 +117,7 @@ pub const SkillRegistry = struct {
     /// simply emit an empty `<available_skills>` block in that case.
     /// Caller owns the returned registry and must call `deinit(alloc)`.
     pub fn discoverFromDefaults(alloc: Allocator) SkillRegistry {
-        const home = std.process.getEnvVarOwned(alloc, "HOME") catch |err| switch (err) {
+        const home = env_mod.getOwned(alloc, "HOME") catch |err| switch (err) {
             error.EnvironmentVariableNotFound => alloc.dupe(u8, ".") catch return .{},
             else => {
                 log.warn("HOME unreadable, skills discovery skipped: {}", .{err});
@@ -127,7 +129,7 @@ pub const SkillRegistry = struct {
         const config_home = std.fmt.allocPrint(alloc, "{s}/.config/zag", .{home}) catch return .{};
         defer alloc.free(config_home);
 
-        const project_root = std.fs.cwd().realpathAlloc(alloc, ".") catch null;
+        const project_root = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", alloc) catch null;
         defer if (project_root) |p| alloc.free(p);
 
         return discover(alloc, config_home, project_root) catch |err| blk: {
@@ -167,7 +169,8 @@ fn walkRoot(
     const root_abs = try std.fs.path.join(alloc, &.{ root, subpath });
     defer alloc.free(root_abs);
 
-    var dir = std.fs.openDirAbsolute(root_abs, .{ .iterate = true }) catch |err| switch (err) {
+    const io = process_io.get();
+    var dir = std.Io.Dir.openDirAbsolute(io, root_abs, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return,
         error.AccessDenied => {
             log.warn("permission denied walking skills root: {s}", .{root_abs});
@@ -178,10 +181,10 @@ fn walkRoot(
             return;
         },
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next() catch |err| {
+    while (iter.next(io) catch |err| {
         log.warn("iterating {s} failed: {}", .{ root_abs, err });
         return;
     }) |entry| {
@@ -189,7 +192,7 @@ fn walkRoot(
 
         const md_relative = try std.fs.path.join(alloc, &.{ entry.name, "SKILL.md" });
         defer alloc.free(md_relative);
-        dir.access(md_relative, .{}) catch continue;
+        dir.access(io, md_relative, .{}) catch continue;
 
         const md_path = try std.fs.path.join(alloc, &.{ root_abs, entry.name, "SKILL.md" });
         // Ownership transfers into the Skill on successful append; free
@@ -214,7 +217,7 @@ fn loadSkill(
     registry: *SkillRegistry,
     md_path: []const u8,
 ) LoadError!void {
-    const src = std.fs.cwd().readFileAlloc(alloc, md_path, 1 * 1024 * 1024) catch |err| {
+    const src = std.Io.Dir.cwd().readFileAlloc(process_io.get(), md_path, alloc, .limited(1 * 1024 * 1024)) catch |err| {
         log.warn("reading {s} failed: {}", .{ md_path, err });
         return error.Skipped;
     };
@@ -343,14 +346,14 @@ fn writeXmlEscaped(writer: anytype, raw: []const u8) !void {
 // --- Tests ---
 
 fn writeSkillFile(
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     subdir: []const u8,
     frontmatter_body: []const u8,
 ) !void {
-    try dir.makePath(subdir);
-    var skill_dir = try dir.openDir(subdir, .{});
-    defer skill_dir.close();
-    try skill_dir.writeFile(.{ .sub_path = "SKILL.md", .data = frontmatter_body });
+    try dir.createDirPath(std.testing.io, subdir);
+    var skill_dir = try dir.openDir(std.testing.io, subdir, .{});
+    defer skill_dir.close(std.testing.io);
+    try skill_dir.writeFile(std.testing.io, .{ .sub_path = "SKILL.md", .data = frontmatter_body });
 }
 
 test "discover finds skills across project and user roots" {
@@ -372,9 +375,9 @@ test "discover finds skills across project and user roots" {
         "---\nname: skill-b\ndescription: Second skill.\n---\nBody.\n",
     );
 
-    const project_root = try project_tmp.dir.realpathAlloc(alloc, ".");
+    const project_root = try project_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(project_root);
-    const home_root = try home_tmp.dir.realpathAlloc(alloc, ".");
+    const home_root = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(home_root);
 
     var registry = try SkillRegistry.discover(alloc, home_root, project_root);
@@ -416,9 +419,9 @@ test "project shadows user on name collision" {
         "---\nname: same\ndescription: User version.\n---\n",
     );
 
-    const project_root = try project_tmp.dir.realpathAlloc(alloc, ".");
+    const project_root = try project_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(project_root);
-    const home_root = try home_tmp.dir.realpathAlloc(alloc, ".");
+    const home_root = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(home_root);
 
     var registry = try SkillRegistry.discover(alloc, home_root, project_root);
@@ -446,7 +449,7 @@ test "invalid names are rejected" {
         "---\nname: Bad_Name\ndescription: Should be rejected.\n---\n",
     );
 
-    const home_root = try home_tmp.dir.realpathAlloc(alloc, ".");
+    const home_root = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(home_root);
 
     var registry = try SkillRegistry.discover(alloc, home_root, null);
@@ -467,9 +470,9 @@ test "catalog emits well-formed XML with escaping" {
     try registry.skills.append(alloc, .{ .name = name, .description = desc, .path = path });
 
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.catalog(fbs.writer());
-    const out = fbs.getWritten();
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.catalog(&fbs);
+    const out = fbs.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "<available_skills>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "</available_skills>") != null);
@@ -507,9 +510,9 @@ test "catalog is empty when no skills" {
     defer registry.deinit(alloc);
 
     var buf: [64]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try registry.catalog(fbs.writer());
-    try testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+    var fbs = std.Io.Writer.fixed(&buf);
+    try registry.catalog(&fbs);
+    try testing.expectEqual(@as(usize, 0), fbs.buffered().len);
 }
 
 test "warnAboutIgnoredAllowedToolsOnce skips when no skill declares allowed-tools" {

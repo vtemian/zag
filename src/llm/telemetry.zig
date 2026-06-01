@@ -19,6 +19,8 @@
 //! allocated and freed on `deinit`.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
+const process_io = @import("../process_io.zig");
 
 const Allocator = std.mem.Allocator;
 const error_class = @import("error_class.zig");
@@ -103,7 +105,7 @@ pub const Telemetry = struct {
             .session_id = opts.session_id,
             .turn = opts.turn,
             .model = opts.model,
-            .started_ns = std.time.nanoTimestamp(),
+            .started_ns = clock.nanoTimestamp(),
         };
         return self;
     }
@@ -124,7 +126,7 @@ pub const Telemetry = struct {
     /// for tests and for callers that want the structured form without
     /// going through std.log. Caller frees with `self.allocator`.
     pub fn formatTimeline(self: *Telemetry) ![]u8 {
-        const elapsed_ns = std.time.nanoTimestamp() - self.started_ns;
+        const elapsed_ns = clock.nanoTimestamp() - self.started_ns;
         const elapsed_ms: i64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
         const error_kind = self.error_kind orelse "-";
         return std.fmt.allocPrint(
@@ -210,7 +212,7 @@ pub const Telemetry = struct {
         const path = (try file_log.artifactPath(self.allocator, suffix)) orelse return;
         defer self.allocator.free(path);
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         const w = &out.writer;
 
@@ -222,7 +224,7 @@ pub const Telemetry = struct {
         try writeJsonOrString(w, request_body);
         try w.writeByte('}');
 
-        try writeFile(path, out.written());
+        try writeFile(path, out.writer.buffered());
     }
 
     fn dumpResponseArtifact(
@@ -239,7 +241,7 @@ pub const Telemetry = struct {
 
         const capped = response_body[0..@min(response_body.len, MAX_RESP_BYTES)];
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         const w = &out.writer;
 
@@ -251,7 +253,7 @@ pub const Telemetry = struct {
         try writeStringField(w, "classified_as", staticTagName(class), false);
         try w.writeByte('}');
 
-        try writeFile(path, out.written());
+        try writeFile(path, out.writer.buffered());
     }
 
     fn dumpStreamErrorArtifact(
@@ -269,7 +271,7 @@ pub const Telemetry = struct {
         const path = (try file_log.artifactPath(self.allocator, suffix)) orelse return;
         defer self.allocator.free(path);
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         const w = &out.writer;
 
@@ -280,7 +282,7 @@ pub const Telemetry = struct {
         try writeJsonOrString(w, envelope_json);
         try w.writeByte('}');
 
-        try writeFile(path, out.written());
+        try writeFile(path, out.writer.buffered());
     }
 };
 
@@ -340,9 +342,10 @@ fn writeJsonOrString(w: anytype, body: []const u8) !void {
 }
 
 fn writeFile(path: []const u8, bytes: []const u8) !void {
-    var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer f.close();
-    try f.writeAll(bytes);
+    const io = process_io.get();
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, bytes);
 }
 
 // -- Tests --------------------------------------------------------------
@@ -353,7 +356,7 @@ const testing = std.testing;
 /// land there. Returns the directory absolute path; caller defers
 /// cleanup of `tmp` and `file_log.deinit()`.
 fn setupTmpLog(tmp: *std.testing.TmpDir, path_buf: []u8, full_buf: []u8) ![]const u8 {
-    const tmp_abs = try tmp.dir.realpath(".", path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", path_buf)];
     const log_full = try std.fmt.bufPrint(full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     return tmp_abs;
@@ -362,7 +365,7 @@ fn setupTmpLog(tmp: *std.testing.TmpDir, path_buf: []u8, full_buf: []u8) ![]cons
 fn readArtifact(tmp_abs: []const u8, suffix: []const u8) ![]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const full = try std.fmt.bufPrint(&path_buf, "{s}/instance{s}", .{ tmp_abs, suffix });
-    return std.fs.cwd().readFileAlloc(testing.allocator, full, 4 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, full, testing.allocator, .limited(4 * 1024 * 1024));
 }
 
 test "Telemetry deinit emits timeline log line" {
@@ -584,13 +587,13 @@ test "Telemetry artifactPath sees Telemetry's writes" {
     const expected_req = (try file_log.artifactPath(testing.allocator, ".turn-2.req.json")) orelse
         return error.NoLogPath;
     defer testing.allocator.free(expected_req);
-    const stat_req = try std.fs.cwd().statFile(expected_req);
+    const stat_req = try std.Io.Dir.cwd().statFile(std.testing.io, expected_req, .{});
     try testing.expect(stat_req.size > 0);
 
     const expected_resp = (try file_log.artifactPath(testing.allocator, ".turn-2.resp.json")) orelse
         return error.NoLogPath;
     defer testing.allocator.free(expected_resp);
-    const stat_resp = try std.fs.cwd().statFile(expected_resp);
+    const stat_resp = try std.Io.Dir.cwd().statFile(std.testing.io, expected_resp, .{});
     try testing.expect(stat_resp.size > 0);
 }
 

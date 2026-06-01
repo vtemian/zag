@@ -12,6 +12,7 @@
 //! new tree/geometry logic there and any new lifecycle logic here.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -1033,7 +1034,7 @@ pub fn resizeById(
 ///
 /// Caller owns the returned bytes.
 pub fn describe(self: *WindowManager, alloc: Allocator) ![]u8 {
-    var aw: std.io.Writer.Allocating = .init(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     var jw: std.json.Stringify = .{ .writer = &aw.writer };
 
@@ -1297,7 +1298,7 @@ pub fn readPaneById(
     const result = try conv_buf.readText(alloc, max_lines, self.compositor.theme);
     defer alloc.free(result.text);
 
-    var aw: std.io.Writer.Allocating = .init(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     var jw: std.json.Stringify = .{ .writer = &aw.writer };
 
@@ -2384,7 +2385,7 @@ fn swapProviderOnPanePtr(
             while (runner.isAgentRunning()) : (waited_ms += 1) {
                 if (waited_ms >= timeout_ms) return error.SwapTimeout;
                 _ = runner.drainEvents();
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
         }
         runner.shutdown();
@@ -5078,7 +5079,7 @@ test "layout_split tool mounts scratch buffer by handle end-to-end" {
             while (true) {
                 const n = self.queue.drain(&slot);
                 if (n == 0) {
-                    std.Thread.sleep(std.time.ns_per_ms);
+                    clock.sleep(std.time.ns_per_ms);
                     continue;
                 }
                 switch (slot[0]) {
@@ -5202,9 +5203,9 @@ test "restorePane rebuilds both tree and messages" {
     // deterministic id, write a small JSONL file ourselves, and build a
     // SessionHandle struct pointing at it. Writing the file directly (rather
     // than via SessionHandle.appendEntry in a loop) sidesteps a known
-    // quirk of std.fs.File positional writers: each freshly-created writer
+    // quirk of std.Io.File positional writers: each freshly-created writer
     // starts at pos 0, so a single writer loop is the reliable pattern.
-    std.fs.cwd().makePath(".zag/sessions") catch {};
+    std.Io.Dir.cwd().createDirPath(std.testing.io, ".zag/sessions") catch {};
 
     const session_id = "restore_test_0123456789abcdef01";
 
@@ -5212,14 +5213,14 @@ test "restorePane rebuilds both tree and messages" {
     const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
 
     defer {
-        std.fs.cwd().deleteFile(jsonl_path) catch {};
+        std.Io.Dir.cwd().deleteFile(std.testing.io, jsonl_path) catch {};
     }
 
     // Write two entries using a single writer so positional offsets advance.
-    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, jsonl_path, .{ .truncate = true });
     {
         var write_scratch: [512]u8 = undefined;
-        var fw = file.writer(&write_scratch);
+        var fw = file.writer(std.testing.io, &write_scratch);
         try fw.interface.writeAll("{\"type\":\"user_message\",\"content\":\"hi\",\"ts\":0}\n");
         try fw.interface.writeAll("{\"type\":\"assistant_text\",\"content\":\"hello\",\"ts\":1}\n");
         try fw.interface.flush();
@@ -5387,7 +5388,7 @@ test "swapProvider does not write config.lua (persistence is the caller's job)" 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -5408,7 +5409,7 @@ test "swapProvider does not write config.lua (persistence is the caller's job)" 
     // The swap is a live, in-memory change only; it must NOT touch config.lua.
     // Persisting the default is the /model picker's explicit decision via
     // zag.persist_default_model, never a side effect of the window primitive.
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(config_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, config_path, .{}));
 }
 
 test "providerFor falls back to shared default when override is null" {
@@ -5940,12 +5941,12 @@ test "zag.pane.session_id returns the bound session id for a conversation pane" 
     // The PickerFixture's root_pane is conversation-backed but
     // session-less. Attach a real SessionHandle pointing at a temp
     // JSONL file so the binding has something to read.
-    std.fs.cwd().makePath(".zag/sessions") catch {};
+    std.Io.Dir.cwd().createDirPath(std.testing.io, ".zag/sessions") catch {};
     const session_id = "panebind_test_0123456789abcdef0";
     var jsonl_path_buf: [256]u8 = undefined;
     const jsonl_path = try std.fmt.bufPrint(&jsonl_path_buf, ".zag/sessions/{s}.jsonl", .{session_id});
-    defer std.fs.cwd().deleteFile(jsonl_path) catch {};
-    const file = try std.fs.cwd().createFile(jsonl_path, .{ .truncate = true });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, jsonl_path) catch {};
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, jsonl_path, .{ .truncate = true });
     var handle = Session.SessionHandle{
         .id_len = @intCast(session_id.len),
         .file = file,
@@ -8290,7 +8291,7 @@ test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-k
     defer allocator.free(open_script);
     try f.engine.lua.doString(open_script);
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         // Cycle through printable ASCII so each keystroke produces a
@@ -8333,16 +8334,10 @@ test "splitFocusedWithSession attaches loaded session to a new pane" {
     // here cannot collide with the host project's `.zag/sessions`.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const orig_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(orig_cwd);
-    try tmp.dir.setAsCwd();
-    defer {
-        if (std.fs.openDirAbsolute(orig_cwd, .{})) |d_const| {
-            var d = d_const;
-            d.setAsCwd() catch {};
-            d.close();
-        } else |_| {}
-    }
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
 
     var mgr_opt: ?Session.SessionManager = try Session.SessionManager.init(allocator);
     var seed_handle = try mgr_opt.?.createSession("test-model");

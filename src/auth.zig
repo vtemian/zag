@@ -23,6 +23,9 @@
 //! silently dropping the entry.
 
 const std = @import("std");
+const test_net = @import("test_net.zig");
+const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const Allocator = std.mem.Allocator;
 
 const oauth = @import("oauth.zig");
@@ -200,11 +203,13 @@ pub fn checkFileMode(mode: std.posix.mode_t) bool {
 /// Load the auth file at `path`. A missing file returns an empty `AuthFile`
 /// (first-run UX). Any other IO or parse failure surfaces as an error.
 pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
     // Stat first so we can warn on wrong mode without failing the load.
     // Windows has no POSIX mode bits, so skip the check there.
     if (@import("builtin").os.tag != .windows) {
-        if (std.fs.cwd().statFile(path)) |stat| {
-            const mode: std.posix.mode_t = @intCast(stat.mode & 0o7777);
+        if (cwd.statFile(io, path, .{})) |stat| {
+            const mode: std.posix.mode_t = @intCast(stat.permissions.toMode() & 0o7777);
             if (!checkFileMode(mode)) {
                 log.warn("auth file at '{s}' has mode 0o{o} (expected 0o600); credentials may be readable by other users", .{ path, mode });
             }
@@ -217,7 +222,7 @@ pub fn loadAuthFile(alloc: Allocator, path: []const u8) !AuthFile {
         }
     }
 
-    const bytes = std.fs.cwd().readFileAlloc(alloc, path, max_auth_bytes) catch |err| switch (err) {
+    const bytes = cwd.readFileAlloc(io, path, alloc, .limited(max_auth_bytes)) catch |err| switch (err) {
         error.FileNotFound => return AuthFile.init(alloc),
         else => return err,
     };
@@ -294,10 +299,16 @@ fn stringField(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
 /// (mirroring `Session.zig`) so a mid-write crash can never leave a
 /// partially-written `auth.json`.
 pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        // access first (follows symlinks): skip createDirPath when the parent
+        // already exists, dodging 0.16's NotDir on a symlink-to-dir leaf.
+        cwd.access(io, parent, .{}) catch {
+            cwd.createDirPath(io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         };
     }
 
@@ -305,31 +316,29 @@ pub fn saveAuthFile(path: []const u8, file: AuthFile) !void {
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch
         return error.PathTooLong;
 
-    const cwd = std.fs.cwd();
-
     // Belt-and-suspenders: a stale <path>.tmp from a prior crash would
     // otherwise inherit its old mode bits via O_CREAT|O_TRUNC. Unlinking
     // first guarantees a fresh 0o600 file. Combined with the rename-to-path
     // below, every save re-asserts 0o600 even when auth.json pre-exists with
     // laxer permissions (addressing the same concern as the POSIX fchmod
     // approach from wip/chatgpt-oauth 65a25e4).
-    cwd.deleteFile(tmp_path) catch |err| switch (err) {
+    cwd.deleteFile(io, tmp_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 
     {
-        const tmp_file = try cwd.createFile(tmp_path, .{ .mode = 0o600, .truncate = true });
-        defer tmp_file.close();
+        const tmp_file = try cwd.createFile(io, tmp_path, .{ .permissions = .fromMode(0o600), .truncate = true });
+        defer tmp_file.close(io);
 
         var scratch: [512]u8 = undefined;
-        var w = tmp_file.writer(&scratch);
+        var w = tmp_file.writer(io, &scratch);
         try writeAuthJson(&w.interface, file);
         try w.interface.flush();
-        try tmp_file.sync();
+        try tmp_file.sync(io);
     }
 
-    try cwd.rename(tmp_path, path);
+    try cwd.rename(tmp_path, cwd, path, io);
 }
 
 /// Emit `file` as a JSON object keyed by provider name. Order is the hash
@@ -402,21 +411,27 @@ pub fn upsertOAuth(alloc: Allocator, path: []const u8, name: []const u8, cred: O
     const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{path});
     defer alloc.free(lock_path);
 
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
+        // access first (follows symlinks): skip createDirPath when the parent
+        // already exists, dodging 0.16's NotDir on a symlink-to-dir leaf.
+        cwd.access(io, parent, .{}) catch {
+            cwd.createDirPath(io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         };
     }
 
-    const lock_file = try std.fs.cwd().createFile(lock_path, .{
+    const lock_file = try cwd.createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
-        .mode = 0o600,
+        .permissions = .fromMode(0o600),
     });
-    defer lock_file.close();
-    try lock_file.lock(.exclusive);
-    defer lock_file.unlock();
+    defer lock_file.close(io);
+    try lock_file.lock(io, .exclusive);
+    defer lock_file.unlock(io);
 
     var file = loadAuthFile(alloc, path) catch |err| switch (err) {
         error.FileNotFound => AuthFile.init(alloc),
@@ -476,7 +491,7 @@ pub const ResolveOptions = struct {
 };
 
 fn defaultNow() i64 {
-    return std.time.timestamp();
+    return clock.timestamp();
 }
 
 /// Unified credential entry point. Loads `auth.json`, looks up
@@ -617,7 +632,7 @@ test "checkFileMode flags world- or group-accessible bits" {
 test "loadAuthFile returns empty map when file missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(path);
     const missing = try std.fs.path.join(std.testing.allocator, &.{ path, "auth.json" });
     defer std.testing.allocator.free(missing);
@@ -630,7 +645,7 @@ test "loadAuthFile returns empty map when file missing" {
 test "saveAuthFile writes mode 0600" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -640,14 +655,14 @@ test "saveAuthFile writes mode 0600" {
     try file.setApiKey("openai", "sk-test");
     try saveAuthFile(path, file);
 
-    const stat = try std.fs.cwd().statFile(path);
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -655,9 +670,9 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     // Pre-create the file with a world-readable mode, as if the user chmod'd
     // it or restored from a tarball that stripped the original 0o600.
     {
-        const pre = try std.fs.cwd().createFile(path, .{ .mode = 0o644, .truncate = true });
-        defer pre.close();
-        try std.posix.fchmod(pre.handle, 0o644);
+        const pre = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
+        defer pre.close(std.testing.io);
+        _ = std.c.fchmod(pre.handle, 0o644);
     }
 
     var file = AuthFile.init(std.testing.allocator);
@@ -665,14 +680,14 @@ test "saveAuthFile re-applies 0o600 when overwriting a file with loose mode" {
     try file.setApiKey("openai", "sk-test");
     try saveAuthFile(path, file);
 
-    const stat = try std.fs.cwd().statFile(path);
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "round-trip preserves api_key entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -701,12 +716,12 @@ test "saveAuthFile is atomic under simulated crash" {
     // auth.json with the new contents only.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json.tmp",
         .data = "garbage-from-a-prior-crash",
     });
@@ -723,14 +738,14 @@ test "saveAuthFile is atomic under simulated crash" {
 
     try std.testing.expectError(
         error.FileNotFound,
-        tmp.dir.statFile("auth.json.tmp"),
+        tmp.dir.statFile(std.testing.io, "auth.json.tmp", .{}),
     );
 }
 
 test "saveAuthFile preserves 0o600 after atomic rename" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -740,14 +755,14 @@ test "saveAuthFile preserves 0o600 after atomic rename" {
     try file.setApiKey("openai", "sk-mode");
     try saveAuthFile(path, file);
 
-    const stat = try std.fs.cwd().statFile(path);
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
 test "removeEntry deletes existing and is a no-op for missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -776,7 +791,7 @@ test "removeEntry deletes existing and is a no-op for missing" {
 test "loadAuthFile round-trips an oauth entry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -807,7 +822,7 @@ test "loadAuthFile round-trips an oauth entry" {
 test "loadAuthFile preserves api_key entries alongside oauth entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -838,7 +853,7 @@ test "loadAuthFile preserves api_key entries alongside oauth entries" {
 test "upsertOAuth replaces an existing oauth entry without clobbering api_key entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -876,7 +891,7 @@ test "upsertOAuth replaces an existing oauth entry without clobbering api_key en
 test "upsertOAuth serializes concurrent callers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -964,7 +979,7 @@ fn idTokenWithAccount(alloc: Allocator, account_id: []const u8) ![]const u8 {
 test "resolveCredential returns api_key verbatim" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -985,7 +1000,7 @@ test "resolveCredential returns api_key verbatim" {
 test "resolveCredential returns error.NotLoggedIn when entry missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1000,7 +1015,7 @@ test "resolveCredential returns error.NotLoggedIn when entry missing" {
 test "resolveCredential returns current oauth tokens when well before expiry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1044,10 +1059,10 @@ test "resolveCredential returns current oauth tokens when well before expiry" {
 }
 
 test "resolveCredential refreshes when within 5 minutes of expiry" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Mock IdP returns a fresh id_token whose account claim is acc-new, a
     // new access_token whose exp is well in the future, and a rotated
@@ -1074,12 +1089,12 @@ test "resolveCredential refreshes when within 5 minutes of expiry" {
     defer std.testing.allocator.free(response);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, resp: []const u8) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server, resp: []const u8) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamRead(conn, &buf) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, response });
@@ -1090,7 +1105,7 @@ test "resolveCredential refreshes when within 5 minutes of expiry" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1143,10 +1158,10 @@ test "resolveCredential refreshes when within 5 minutes of expiry" {
 }
 
 test "resolveCredential refreshes when access token already expired" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const frozen_now: i64 = 1_700_000_000;
     const new_access = try accessTokenWithExp(std.testing.allocator, frozen_now + 3600);
@@ -1168,12 +1183,12 @@ test "resolveCredential refreshes when access token already expired" {
     defer std.testing.allocator.free(response);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, resp: []const u8) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server, resp: []const u8) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamRead(conn, &buf) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, response });
@@ -1184,7 +1199,7 @@ test "resolveCredential refreshes when access token already expired" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);
@@ -1230,22 +1245,22 @@ test "resolveCredential refreshes when access token already expired" {
 }
 
 test "resolveCredential maps LoginExpired from refresh endpoint" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
-            _ = conn.stream.read(&buf) catch {};
+            _ = test_net.streamRead(conn, &buf) catch {};
             const resp =
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: 69\r\nConnection: close\r\n\r\n" ++
                 "{\"error\":\"invalid_grant\",\"error_description\":\"refresh token expired\"}";
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -1256,7 +1271,7 @@ test "resolveCredential maps LoginExpired from refresh endpoint" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(path);

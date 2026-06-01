@@ -10,13 +10,15 @@
 //! the job itself; the main thread drains continuously so full is brief.
 
 const std = @import("std");
+const wake_pipe = @import("../wake_pipe.zig");
+const sync = @import("../sync.zig");
 const Allocator = std.mem.Allocator;
 const Job = @import("Job.zig").Job;
 const Scope = @import("Scope.zig").Scope;
 
 pub const Queue = struct {
     alloc: Allocator,
-    mu: std.Thread.Mutex = .{},
+    mu: sync.Mutex = .{},
     ring: []*Job,
     head: usize = 0,
     tail: usize = 0,
@@ -43,10 +45,12 @@ pub const Queue = struct {
         self.tail = (self.tail + 1) % self.ring.len;
         self.len += 1;
         if (self.wake_fd >= 0) {
-            _ = std.posix.write(self.wake_fd, &[_]u8{1}) catch |err| switch (err) {
-                error.WouldBlock, error.BrokenPipe => {},
-                else => {},
-            };
+            // 0.16 removed std.posix.write; the self-pipe wake is a single
+            // byte to a non-blocking fd whose errors (EAGAIN, EPIPE) are all
+            // benign here, so write via the raw libc syscall and ignore the
+            // result, matching the wake write in Terminal.zig.
+            const byte: [1]u8 = .{1};
+            _ = std.c.write(self.wake_fd, &byte, 1);
         }
     }
 
@@ -116,16 +120,16 @@ test "Queue.push writes one byte to wake_fd" {
     var q = try Queue.init(alloc, 4);
     defer q.deinit();
 
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     q.wake_fd = fds[1];
     var j = stubJob(root);
     try q.push(&j);
 
     var buf: [4]u8 = undefined;
-    const n = try std.posix.read(fds[0], &buf);
+    const n = try wake_pipe.read(fds[0], &buf);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(@as(u8, 1), buf[0]);
 }

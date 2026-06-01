@@ -48,8 +48,11 @@
 //! agent can interrupt long-running commands.
 
 const std = @import("std");
+const env_mod = @import("../env.zig");
+const clock = @import("../clock.zig");
 const builtin = @import("builtin");
 const types = @import("../types.zig");
+const process_io = @import("../process_io.zig");
 const landlock = @import("../sandbox/landlock_linux.zig");
 const Allocator = std.mem.Allocator;
 
@@ -111,14 +114,17 @@ pub fn execute(
     const sandbox: ?SandboxArgv = sandbox_blk: {
         if (permissive) break :sandbox_blk null;
 
-        const home = std.posix.getenv("HOME") orelse home_blk: {
+        const home = env_mod.get("HOME") orelse home_blk: {
             log.warn("HOME unset; sandbox secret-deny rules will be rooted at '/' (no per-user secrets denied)", .{});
             break :home_blk "/";
         };
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch |err| cwd_blk: {
-            log.warn("realpath('.') failed ({s}); sandbox cwd write-scope will be rooted at '/', expect EPERM on writes", .{@errorName(err)});
-            break :cwd_blk "/";
+        const cwd: []const u8 = cwd_blk: {
+            const n = std.Io.Dir.cwd().realPath(process_io.get(), &cwd_buf) catch |err| {
+                log.warn("realpath('.') failed ({s}); sandbox cwd write-scope will be rooted at '/', expect EPERM on writes", .{@errorName(err)});
+                break :cwd_blk "/";
+            };
+            break :cwd_blk cwd_buf[0..n];
         };
 
         const built: ?SandboxArgv = switch (builtin.os.tag) {
@@ -136,28 +142,32 @@ pub fn execute(
     };
     defer if (sandbox) |sb| freeSandboxArgv(allocator, sb);
 
-    var child = if (sandbox) |sb|
-        std.process.Child.init(sb.argv, allocator)
-    else
-        std.process.Child.init(&.{ "/bin/sh", "-c", input.command }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    // Run the child as its own process-group leader so cancellation can
-    // SIGKILL the entire group. In strict mode the direct child is the
-    // sandbox wrapper (sandbox-exec on macOS) which fork/execs /bin/sh;
-    // signalling only the wrapper would leave the shell grandchild alive.
-    child.pgid = 0;
-
-    child.spawn() catch |err| {
+    const io = process_io.get();
+    // 0.16 moved stdio routing onto the spawn options; `std.process.Child` no
+    // longer has post-init `*_behavior` fields or a `spawn` method. Run the
+    // child as its own process-group leader (pgid=0) so cancellation can SIGKILL
+    // the entire group: in strict mode the direct child is the sandbox wrapper
+    // (sandbox-exec on macOS) which fork/execs /bin/sh; signalling only the
+    // wrapper would leave the shell grandchild alive.
+    var child = std.process.spawn(io, .{
+        .argv = if (sandbox) |sb| sb.argv else &.{ "/bin/sh", "-c", input.command },
+        .stdin = .inherit,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    }) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: failed to spawn shell: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
+    // `child.id` is null only after reap; capture the live pid for the
+    // cancellation SIGKILL below.
+    const child_pid = child.id.?;
 
-    const outcome = collectWithCancel(&child, allocator, cancel) catch |err| {
-        // Kill the whole group (negative pid) so the sandboxed grandchild
-        // dies too; child.kill() would only signal the wrapper.
-        std.posix.kill(-child.id, std.posix.SIG.KILL) catch |kill_err| log.debug("bash cleanup group kill: {s}", .{@errorName(kill_err)});
-        if (child.wait()) |_| {} else |wait_err| log.debug("bash cleanup wait: {s}", .{@errorName(wait_err)});
+    const outcome = collectWithCancel(&child, io, allocator, cancel) catch |err| {
+        // Kill the whole group (negative pid) so the sandboxed grandchild dies
+        // too; child.kill() would only signal the wrapper.
+        std.posix.kill(-child_pid, std.posix.SIG.KILL) catch |kill_err| log.debug("bash cleanup group kill: {s}", .{@errorName(kill_err)});
+        _ = child.wait(io) catch |wait_err| log.debug("bash cleanup wait: {s}", .{@errorName(wait_err)});
         const msg = std.fmt.allocPrint(allocator, "error: command failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
@@ -170,18 +180,18 @@ pub fn execute(
         // trapped TERM, and cancellation must be unignorable and reach every
         // descendant. Without the group target, a sandboxed grandchild would
         // outlive the cancel.
-        std.posix.kill(-child.id, std.posix.SIG.KILL) catch |err| log.debug("bash cancel group kill: {s}", .{@errorName(err)});
-        _ = child.wait() catch |err| log.debug("bash cancel wait: {s}", .{@errorName(err)});
+        std.posix.kill(-child_pid, std.posix.SIG.KILL) catch |err| log.debug("bash cancel group kill: {s}", .{@errorName(err)});
+        _ = child.wait(io) catch |err| log.debug("bash cancel wait: {s}", .{@errorName(err)});
         return .{ .content = "error: cancelled", .is_error = true, .owned = false };
     }
 
-    const term = child.wait() catch |err| {
+    const term = child.wait(io) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "error: command wait failed: {s}", .{@errorName(err)}) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
 
     const exit_code: u32 = switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
 
@@ -216,9 +226,12 @@ const Outcome = struct {
 
 /// Read child stdout/stderr while periodically checking `cancel`.
 ///
-/// Uses `std.Io.poll` with a 50ms timeout so the loop wakes up even if the
-/// child produces no output, giving cancellation a bounded latency.
-/// Returns when both pipes hit EOF (child closed them) or `cancel` fires.
+/// 0.16 removed `std.Io.poll`; the dual-pipe drain runs through an
+/// `Io.File.MultiReader`. `fill(reserve, .{ .duration = 50ms })` blocks one
+/// tick then returns `error.Timeout` so the loop wakes even when the child
+/// produces no output, giving cancellation a bounded latency. The fill stops
+/// on `error.EndOfStream` once both pipes close (child exited) or when
+/// `cancel` fires.
 ///
 /// When either stream's buffered output crosses `max_output_bytes`, the first
 /// `max_output_bytes` are captured into a heap-owned snapshot, the truncated
@@ -226,14 +239,21 @@ const Outcome = struct {
 /// keeps draining without blocking on a full pipe.
 fn collectWithCancel(
     child: *std.process.Child,
+    io: std.Io,
     allocator: Allocator,
     cancel: ?*std.atomic.Value(bool),
 ) !Outcome {
-    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
-    });
-    defer poller.deinit();
+    var mr_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    const tick: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromNanoseconds(@intCast(poll_interval_ns)),
+        .clock = .awake,
+    } };
 
     // Snapshots of the first `max_output_bytes` for each stream, taken at the
     // moment the cap is first crossed. Null until that happens.
@@ -243,21 +263,23 @@ fn collectWithCancel(
     errdefer if (stderr_snapshot) |s| allocator.free(s);
 
     var cancelled = false;
-    while (true) {
+    drain: while (true) {
         if (cancel) |flag| {
             if (flag.load(.acquire)) {
                 cancelled = true;
-                break;
+                break :drain;
             }
         }
-        const more = try poller.pollTimeout(poll_interval_ns);
-        if (!more) break;
-        // pollTimeout returns true both when data arrived and when it simply
-        // timed out, so re-check cancel on the next iteration rather than
-        // doing bounds work here.
-        try captureAndDrainOverflow(poller.reader(.stdout), allocator, &stdout_snapshot);
-        try captureAndDrainOverflow(poller.reader(.stderr), allocator, &stderr_snapshot);
+        multi_reader.fill(64, tick) catch |err| switch (err) {
+            error.Timeout => continue :drain,
+            error.EndOfStream => break :drain,
+            else => return err,
+        };
+        try captureAndDrainOverflow(stdout_reader, allocator, &stdout_snapshot);
+        try captureAndDrainOverflow(stderr_reader, allocator, &stderr_snapshot);
     }
+
+    if (!cancelled) try multi_reader.checkAnyError();
 
     const stdout_truncated = stdout_snapshot != null;
     const stderr_truncated = stderr_snapshot != null;
@@ -265,12 +287,12 @@ fn collectWithCancel(
     const stdout = if (stdout_snapshot) |s| blk: {
         stdout_snapshot = null;
         break :blk s;
-    } else try poller.toOwnedSlice(.stdout);
+    } else try multi_reader.toOwnedSlice(0);
     errdefer allocator.free(stdout);
     const stderr = if (stderr_snapshot) |s| blk: {
         stderr_snapshot = null;
         break :blk s;
-    } else try poller.toOwnedSlice(.stderr);
+    } else try multi_reader.toOwnedSlice(1);
 
     return .{
         .stdout = stdout,
@@ -362,7 +384,7 @@ fn buildLinuxArgv(
     command: []const u8,
 ) !SandboxArgv {
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = try std.fs.selfExePath(&self_buf);
+    const self_path = self_buf[0..try std.process.executablePath(process_io.get(), &self_buf)];
 
     const self_owned = try allocator.dupe(u8, self_path);
     errdefer allocator.free(self_owned);
@@ -425,8 +447,12 @@ fn escapeSeatbeltLiteral(allocator: Allocator, path: []const u8) ![]u8 {
 /// matters: deny rules placed AFTER an allow rule for an overlapping
 /// subpath override the allow.
 fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    // 0.16 dropped the ArrayList writer adapter; build the profile through an
+    // Allocating writer, which owns the growing buffer and hands back an owned
+    // slice at the end. A mid-build failure frees the buffer via errdefer.
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
     // Escape the interpolated paths once so a literal `"` or `\` in HOME or
     // cwd cannot break out of the s-expression string and corrupt the whole
@@ -436,13 +462,13 @@ fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![
     const cwd_esc = try escapeSeatbeltLiteral(allocator, inputs.cwd);
     defer allocator.free(cwd_esc);
 
-    try buf.appendSlice(allocator, "(version 1)\n");
-    try buf.appendSlice(allocator, "(deny default)\n");
-    try buf.appendSlice(allocator, "(allow process-fork)\n");
-    try buf.appendSlice(allocator, "(allow process-exec)\n");
-    try buf.appendSlice(allocator, "(allow signal (target self))\n");
-    try buf.appendSlice(allocator, "(allow sysctl-read)\n");
-    try buf.appendSlice(allocator, "(allow file-read-metadata)\n");
+    try w.writeAll("(version 1)\n");
+    try w.writeAll("(deny default)\n");
+    try w.writeAll("(allow process-fork)\n");
+    try w.writeAll("(allow process-exec)\n");
+    try w.writeAll("(allow signal (target self))\n");
+    try w.writeAll("(allow sysctl-read)\n");
+    try w.writeAll("(allow file-read-metadata)\n");
 
     // Read: broad allow on /, then deny secrets explicitly. The broad
     // allow is necessary because /bin/sh's dyld needs to read
@@ -450,32 +476,32 @@ fn buildSeatbeltProfile(allocator: std.mem.Allocator, inputs: SeatbeltInputs) ![
     // and other paths an enumerated allow-list cannot reasonably cover.
     // Secrets are denied below; seatbelt evaluates rules top-to-bottom
     // and later rules override earlier ones.
-    try buf.appendSlice(allocator, "(allow file-read* (subpath \"/\"))\n");
+    try w.writeAll("(allow file-read* (subpath \"/\"))\n");
 
     // Deny secrets (ordered AFTER the broad allow so they override).
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{home_esc});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{home_esc});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{home_esc});
-    try buf.writer(allocator).print("(deny file-read* (literal \"{s}/.netrc\"))\n", .{home_esc});
-    try buf.writer(allocator).print("(deny file-read* (subpath \"{s}/.config\"))\n", .{home_esc});
-    try buf.appendSlice(allocator, "(deny file-read* (subpath \"/Library/Keychains\"))\n");
-    try buf.appendSlice(allocator, "(deny file-read* (subpath \"/private/etc/master.passwd\"))\n");
+    try w.print("(deny file-read* (subpath \"{s}/.ssh\"))\n", .{home_esc});
+    try w.print("(deny file-read* (subpath \"{s}/.aws\"))\n", .{home_esc});
+    try w.print("(deny file-read* (subpath \"{s}/.gnupg\"))\n", .{home_esc});
+    try w.print("(deny file-read* (literal \"{s}/.netrc\"))\n", .{home_esc});
+    try w.print("(deny file-read* (subpath \"{s}/.config\"))\n", .{home_esc});
+    try w.writeAll("(deny file-read* (subpath \"/Library/Keychains\"))\n");
+    try w.writeAll("(deny file-read* (subpath \"/private/etc/master.passwd\"))\n");
 
     // Write: cwd, /tmp, plus the standard /dev sinks as literals.
-    try buf.writer(allocator).print("(allow file-write* (subpath \"{s}\"))\n", .{cwd_esc});
-    try buf.appendSlice(allocator, "(allow file-write* (subpath \"/tmp\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (subpath \"/private/tmp\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/null\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/stdout\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/stderr\"))\n");
-    try buf.appendSlice(allocator, "(allow file-write* (literal \"/dev/tty\"))\n");
+    try w.print("(allow file-write* (subpath \"{s}\"))\n", .{cwd_esc});
+    try w.writeAll("(allow file-write* (subpath \"/tmp\"))\n");
+    try w.writeAll("(allow file-write* (subpath \"/private/tmp\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/null\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/stdout\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/stderr\"))\n");
+    try w.writeAll("(allow file-write* (literal \"/dev/tty\"))\n");
 
     // Network: loopback only. sandbox-exec accepts only `*` or `localhost`
     // as the host literal in (remote ip ...); numeric IPs make the entire
     // profile parse-fail, so we keep just the symbolic localhost rule.
-    try buf.appendSlice(allocator, "(allow network-outbound (remote ip \"localhost:*\"))\n");
+    try w.writeAll("(allow network-outbound (remote ip \"localhost:*\"))\n");
 
-    return buf.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 test {
@@ -537,10 +563,10 @@ test "bash kills child on cancel" {
 
     // Give the child time to start before signalling cancel, so the test
     // exercises the cancellation path rather than a pre-poll early-out.
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    clock.sleep(200 * std.time.ns_per_ms);
     cancel.store(true, .release);
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     thread.join();
     const elapsed_ns = timer.read();
 
@@ -583,10 +609,10 @@ test "bash group-kills sandboxed grandchild on cancel" {
     var result: ?types.ToolResult = null;
     var thread = try std.Thread.spawn(.{}, Runner.run, .{ &cancel, &result, allocator });
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    clock.sleep(200 * std.time.ns_per_ms);
     cancel.store(true, .release);
 
-    var timer = try std.time.Timer.start();
+    var timer = try clock.Timer.start();
     thread.join();
     const elapsed_ns = timer.read();
 
@@ -724,21 +750,32 @@ test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" 
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    const home = std.posix.getenv("HOME") orelse "/";
+    const home = env_mod.get("HOME") orelse "/";
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/";
+    const io = std.testing.io;
+    const cwd: []const u8 = if (std.Io.Dir.cwd().realPath(io, &cwd_buf)) |n| cwd_buf[0..n] else |_| "/";
     const profile = try buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home });
     defer allocator.free(profile);
 
-    var child = std.process.Child.init(
-        &.{ "/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", "exit 0" },
-        allocator,
-    );
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    const term = try child.wait();
-    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", "exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const term = try child.wait(io);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+var bash_test_env_map: ?std.process.Environ.Map = null;
+
+/// Seed `env_mod` from the real process environment so the strict-mode sandbox
+/// tests (which read HOME to build the secret-deny rules) pass regardless of
+/// test order: `env_mod`'s map is process-global but only installed by a test
+/// that seeds it, and these bash tests can run before any other module does.
+/// Test scaffolding only.
+fn ensureTestEnv() void {
+    _ = env_mod.seedFromEnvironForTest(&bash_test_env_map);
 }
 
 test "execute denies reading ~/.ssh on macOS in strict mode" {
@@ -750,6 +787,7 @@ test "execute denies reading ~/.ssh on macOS in strict mode" {
     // test exercises the seatbelt path explicitly.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
 
+    ensureTestEnv();
     var strict: Config = .{ .permissive = false };
     bindConfig(&strict);
     defer bindConfig(null);
@@ -814,6 +852,7 @@ test "execute denies reading ~/.ssh on Linux in strict mode" {
         .unsupported => return error.SkipZigTest,
     }
 
+    ensureTestEnv();
     var strict: Config = .{ .permissive = false };
     bindConfig(&strict);
     defer bindConfig(null);

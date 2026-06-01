@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const process_io = @import("../process_io.zig");
 const Allocator = std.mem.Allocator;
 
 const WriteInput = struct {
@@ -30,11 +31,19 @@ pub fn execute(
     defer parsed.deinit();
     const input = parsed.value;
 
-    // Create parent directories if needed
+    const io = process_io.get();
+
+    // Create parent directories if needed. `createDirPath` returns error.NotDir
+    // when the final path component is an existing symlink to a directory (e.g.
+    // macOS /tmp -> private/tmp), so check whether the parent already exists
+    // first (`access` follows symlinks) and only create it when it is genuinely
+    // missing.
     if (std.fs.path.dirname(input.path)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "error: cannot create directory '{s}': {s}", .{ dir, @errorName(err) }) catch return types.oomResult();
-            return .{ .content = msg, .is_error = true };
+        std.Io.Dir.cwd().access(io, dir, .{}) catch {
+            std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "error: cannot create directory '{s}': {s}", .{ dir, @errorName(err) }) catch return types.oomResult();
+                return .{ .content = msg, .is_error = true };
+            };
         };
     }
 
@@ -45,27 +54,27 @@ pub fn execute(
     defer allocator.free(tmp_path);
 
     {
-        const file = std.fs.cwd().createFile(tmp_path, .{ .truncate = true }) catch |err| {
+        const file = std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true }) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "error: cannot create '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
-        defer file.close();
+        defer file.close(io);
 
-        file.writeAll(input.content) catch |err| {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+        file.writeStreamingAll(io, input.content) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             const msg = std.fmt.allocPrint(allocator, "error: writing to '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
 
-        file.sync() catch |err| {
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+        file.sync(io) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             const msg = std.fmt.allocPrint(allocator, "error: syncing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
             return .{ .content = msg, .is_error = true };
         };
     }
 
-    std.fs.cwd().rename(tmp_path, input.path) catch |err| {
-        std.fs.cwd().deleteFile(tmp_path) catch {};
+    std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), input.path, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         const msg = std.fmt.allocPrint(allocator, "error: finalizing '{s}': {s}", .{ input.path, @errorName(err) }) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
@@ -115,7 +124,7 @@ test "write a new file" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "/tmp/zag-test-write-new.txt";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"hello world\\n\"}}", .{tmp_path});
     defer allocator.free(input);
@@ -127,7 +136,7 @@ test "write a new file" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote") != null);
 
     // Verify file was actually written
-    const written = try std.fs.cwd().readFileAlloc(allocator, tmp_path, 1024);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tmp_path, allocator, .limited(1024));
     defer allocator.free(written);
     try std.testing.expectEqualStrings("hello world\n", written);
 }
@@ -136,7 +145,7 @@ test "write counts lines correctly" {
     const allocator = std.testing.allocator;
 
     const tmp_path = "/tmp/zag-test-write-lines.txt";
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, tmp_path) catch {};
 
     // 3 newlines => 4 lines (trailing partial line counts)
     const input = try std.fmt.allocPrint(allocator, "{{\"path\": \"{s}\", \"content\": \"a\\nb\\nc\\n\"}}", .{tmp_path});
@@ -163,16 +172,16 @@ test "write returns detailed error result for invalid JSON input" {
 test "write leaves original file intact when destination is a directory" {
     const allocator = std.testing.allocator;
     const tmp_dir = "/tmp/zag-test-write-atomic-victim";
-    std.fs.cwd().makePath(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(std.testing.io, tmp_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
 
     // Pre-populate the destination so we can verify it survives a failed write.
     const original_path = try std.fmt.allocPrint(allocator, "{s}/file.txt", .{tmp_dir});
     defer allocator.free(original_path);
     {
-        const f = try std.fs.cwd().createFile(original_path, .{});
-        defer f.close();
-        try f.writeAll("ORIGINAL");
+        const f = try std.Io.Dir.cwd().createFile(std.testing.io, original_path, .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, "ORIGINAL");
     }
 
     // Try to write to a path that's actually a directory (will fail mid-flow).
@@ -188,7 +197,7 @@ test "write leaves original file intact when destination is a directory" {
     try std.testing.expect(result.is_error);
 
     // The original sibling file must be unchanged.
-    const verify = try std.fs.cwd().readFileAlloc(allocator, original_path, 1024);
+    const verify = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, original_path, allocator, .limited(1024));
     defer allocator.free(verify);
     try std.testing.expectEqualStrings("ORIGINAL", verify);
 }

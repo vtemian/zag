@@ -17,6 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const process_io = @import("process_io.zig");
 const log = std.log.scoped(.instruction);
 
 /// Hard cap on instruction file size. Prevents accidental ingestion of huge
@@ -60,7 +61,7 @@ pub fn systemPaths(home: []const u8, alloc: Allocator) ![]const []const u8 {
     for (candidates) |segments| {
         const path = try std.fs.path.join(alloc, segments);
         errdefer alloc.free(path);
-        std.fs.accessAbsolute(path, .{}) catch {
+        std.Io.Dir.accessAbsolute(process_io.get(), path, .{}) catch {
             alloc.free(path);
             continue;
         };
@@ -124,11 +125,12 @@ fn trimTrailingSep(path: []const u8) []const u8 {
 }
 
 fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?Found {
+    const io = process_io.get();
     for (names) |name| {
         const path = try std.fs.path.join(alloc, &.{ dir_abs, name });
         errdefer alloc.free(path);
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.IsDir, error.NotDir => {
                 alloc.free(path);
                 continue;
@@ -143,9 +145,9 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
                 return err;
             },
         };
-        defer file.close();
+        defer file.close(io);
 
-        const stat = file.stat() catch |err| {
+        const stat = file.stat(io) catch |err| {
             log.warn("stat {s} failed: {}", .{ path, err });
             alloc.free(path);
             continue;
@@ -159,7 +161,9 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
             continue;
         }
 
-        const content = file.readToEndAlloc(alloc, MAX_BYTES) catch |err| switch (err) {
+        var read_buf: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buf);
+        const content = file_reader.interface.allocRemaining(alloc, .limited(MAX_BYTES)) catch |err| switch (err) {
             error.OutOfMemory => {
                 alloc.free(path);
                 return err;
@@ -178,16 +182,16 @@ fn probeDir(dir_abs: []const u8, names: []const []const u8, alloc: Allocator) !?
 
 // --- tests ---
 
-fn writeFile(dir: std.fs.Dir, name: []const u8, body: []const u8) !void {
-    var f = try dir.createFile(name, .{});
-    defer f.close();
-    try f.writeAll(body);
+fn writeFile(dir: std.Io.Dir, name: []const u8, body: []const u8) !void {
+    var f = try dir.createFile(std.testing.io, name, .{});
+    defer f.close(std.testing.io);
+    try f.writeStreamingAll(std.testing.io, body);
 }
 
 test "systemPaths returns only existing paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(home);
 
     // Neither file exists yet.
@@ -198,8 +202,8 @@ test "systemPaths returns only existing paths" {
     }
 
     // Create only ~/.claude/CLAUDE.md.
-    try tmp.dir.makePath(".claude");
-    try writeFile(try tmp.dir.openDir(".claude", .{}), "CLAUDE.md", "global claude");
+    try tmp.dir.createDirPath(std.testing.io, ".claude");
+    try writeFile(try tmp.dir.openDir(std.testing.io, ".claude", .{}), "CLAUDE.md", "global claude");
     {
         const paths = try systemPaths(home, testing.allocator);
         defer freeSystemPaths(paths, testing.allocator);
@@ -208,8 +212,8 @@ test "systemPaths returns only existing paths" {
     }
 
     // Add ~/.config/zag/AGENTS.md too; both should appear in declared order.
-    try tmp.dir.makePath(".config/zag");
-    try writeFile(try tmp.dir.openDir(".config/zag", .{}), "AGENTS.md", "global zag");
+    try tmp.dir.createDirPath(std.testing.io, ".config/zag");
+    try writeFile(try tmp.dir.openDir(std.testing.io, ".config/zag", .{}), "AGENTS.md", "global zag");
     {
         const paths = try systemPaths(home, testing.allocator);
         defer freeSystemPaths(paths, testing.allocator);
@@ -222,7 +226,7 @@ test "systemPaths returns only existing paths" {
 test "findUp returns null when nothing is present" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     const result = try findUp(root, root, testing.allocator);
@@ -233,7 +237,7 @@ test "findUp finds AGENTS.md in cwd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "AGENTS.md", "hello agents");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     const result = (try findUp(root, root, testing.allocator)).?;
@@ -248,7 +252,7 @@ test "findUp prefers AGENTS.md over CLAUDE.md in same dir" {
     try writeFile(tmp.dir, "CLAUDE.md", "claude wins");
     try writeFile(tmp.dir, "AGENTS.md", "agents wins");
     try writeFile(tmp.dir, "CONTEXT.md", "context wins");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     const result = (try findUp(root, root, testing.allocator)).?;
@@ -262,7 +266,7 @@ test "findUp falls back to CLAUDE.md when AGENTS.md absent" {
     defer tmp.cleanup();
     try writeFile(tmp.dir, "CLAUDE.md", "claude only");
     try writeFile(tmp.dir, "CONTEXT.md", "context fallback");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     const result = (try findUp(root, root, testing.allocator)).?;
@@ -275,7 +279,7 @@ test "findUp falls back to CONTEXT.md when AGENTS.md and CLAUDE.md absent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "CONTEXT.md", "context only");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     const result = (try findUp(root, root, testing.allocator)).?;
@@ -288,8 +292,8 @@ test "findUp walks up from nested cwd to ancestor with AGENTS.md" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "AGENTS.md", "ancestor wins");
-    try tmp.dir.makePath("a/b/c");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "a/b/c");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
     const cwd = try std.fs.path.join(testing.allocator, &.{ root, "a", "b", "c" });
     defer testing.allocator.free(cwd);
@@ -304,9 +308,9 @@ test "findUp first-hit: nested AGENTS.md beats ancestor AGENTS.md" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "AGENTS.md", "ancestor");
-    try tmp.dir.makePath("nested");
-    try writeFile(try tmp.dir.openDir("nested", .{}), "AGENTS.md", "nested");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    try writeFile(try tmp.dir.openDir(std.testing.io, "nested", .{}), "AGENTS.md", "nested");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
     const cwd = try std.fs.path.join(testing.allocator, &.{ root, "nested" });
     defer testing.allocator.free(cwd);
@@ -321,8 +325,8 @@ test "findUp stops at worktree boundary" {
     defer tmp.cleanup();
     // AGENTS.md sits at tmp root, but worktree is "inner".
     try writeFile(tmp.dir, "AGENTS.md", "outside worktree");
-    try tmp.dir.makePath("inner/sub");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "inner/sub");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
     const worktree = try std.fs.path.join(testing.allocator, &.{ root, "inner" });
     defer testing.allocator.free(worktree);
@@ -340,17 +344,17 @@ test "findUp skips files larger than MAX_BYTES" {
     // Write an oversized AGENTS.md plus a small CLAUDE.md fallback. The walk
     // should treat AGENTS.md as if absent and surface CLAUDE.md instead.
     {
-        var f = try tmp.dir.createFile("AGENTS.md", .{});
-        defer f.close();
+        var f = try tmp.dir.createFile(std.testing.io, "AGENTS.md", .{});
+        defer f.close(std.testing.io);
         const chunk = [_]u8{'x'} ** 4096;
         var written: usize = 0;
         while (written < MAX_BYTES + 1) : (written += chunk.len) {
-            try f.writeAll(&chunk);
+            try f.writeStreamingAll(std.testing.io, &chunk);
         }
     }
     try writeFile(tmp.dir, "CLAUDE.md", "fallback");
 
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     const result = (try findUp(root, root, testing.allocator)).?;
@@ -370,7 +374,7 @@ test "findUpWith honours caller-supplied basenames" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "MARK.md", "marker body");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     // The default FILE_NAMES list misses MARK.md, so the standard
@@ -389,7 +393,7 @@ test "findUpWith returns null for empty names list" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(tmp.dir, "AGENTS.md", "ignored");
-    const root = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
     const empty: []const []const u8 = &.{};

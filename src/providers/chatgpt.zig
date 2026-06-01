@@ -13,6 +13,8 @@
 //! Reference: codex-rs/codex-api/src/common.rs:159-180 (ResponsesApiRequest).
 
 const std = @import("std");
+const test_net = @import("../test_net.zig");
+const clock = @import("../clock.zig");
 const types = @import("../types.zig");
 const llm = @import("../llm.zig");
 const Harness = @import("../Harness.zig");
@@ -228,7 +230,7 @@ fn serializeRequest(
     reasoning: llm.Endpoint.ReasoningConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
 
@@ -924,7 +926,7 @@ fn flattenResponseError(allocator: Allocator, raw_data: []const u8) !?[]u8 {
     // Re-serialize the inner error object so the classifier sees a flat
     // `{"error":{...}}`. The double-pass cost is fine: response.failed is
     // strictly off the hot path.
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.writeAll("{\"error\":");
     try std.json.Stringify.value(err_value, .{}, &out.writer);
@@ -1972,9 +1974,9 @@ const canned_text_sse =
 /// that are already in flight but the connection is still mid-write.
 /// Draining until `\r\n\r\n` (end of request headers) plus any
 /// `Content-Length` body bytes is the robust shape.
-fn mockServeOnce(srv: *std.net.Server, response: []const u8) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockServeOnce(srv: *std.Io.net.Server, response: []const u8) void {
+    var conn = srv.accept(std.testing.io) catch return;
+    defer conn.close(std.testing.io);
 
     const alloc = std.heap.page_allocator;
     var req: std.ArrayList(u8) = .empty;
@@ -1984,7 +1986,7 @@ fn mockServeOnce(srv: *std.net.Server, response: []const u8) void {
     // 1. Read until we see the end-of-headers sentinel.
     var headers_end: usize = 0;
     while (true) {
-        const n = conn.stream.read(&tmp) catch return;
+        const n = test_net.streamRead(conn, &tmp) catch return;
         if (n == 0) return; // client hung up before finishing request
         req.appendSlice(alloc, tmp[0..n]) catch return;
         if (std.mem.indexOf(u8, req.items, "\r\n\r\n")) |idx| {
@@ -2009,13 +2011,13 @@ fn mockServeOnce(srv: *std.net.Server, response: []const u8) void {
     var body_remaining = if (content_length > body_have) content_length - body_have else 0;
     while (body_remaining > 0) {
         const want = @min(body_remaining, tmp.len);
-        const n = conn.stream.read(tmp[0..want]) catch return;
+        const n = test_net.streamRead(conn, tmp[0..want]) catch return;
         if (n == 0) break;
         body_remaining -= n;
     }
 
     // 3. Now it's safe to write the canned response.
-    _ = conn.stream.writeAll(response) catch {};
+    _ = test_net.streamWriteAll(conn, response) catch {};
 }
 
 // Chunked transfer encoding: Zig 0.15's http.Client has a bug in
@@ -2060,9 +2062,8 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     const allocator = std.testing.allocator;
 
     // 1. Spin up a localhost SSE server with a canned response.
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     const http_response = try buildMockResponse(allocator, canned_text_sse);
     defer allocator.free(http_response);
@@ -2072,7 +2073,7 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     // even if the client never connected (e.g. callStreaming errored early).
     // Otherwise the test deadlocks on a failing happy path.
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 
@@ -2081,12 +2082,12 @@ test "ChatgptSerializer.callStreaming drives SSE stream and returns LlmResponse"
     // Use wall-clock time rather than a frozen constant: buildHeaders uses
     // ResolveOptions{} defaults (std.time.timestamp), so a hardcoded past
     // exp would trigger a refresh against the mock URL and fail.
-    const access = try testAccessTokenWithExp(allocator, std.time.timestamp() + 3600);
+    const access = try testAccessTokenWithExp(allocator, clock.timestamp() + 3600);
     defer allocator.free(access);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -2195,12 +2196,12 @@ test "createProviderFromLuaConfig wires openai-oauth through ChatgptSerializer" 
     // Use wall-clock time rather than a frozen constant: buildHeaders uses
     // ResolveOptions{} defaults (std.time.timestamp), so a hardcoded past
     // exp would trigger a refresh against the mock URL and fail.
-    const access = try testAccessTokenWithExp(allocator, std.time.timestamp() + 3600);
+    const access = try testAccessTokenWithExp(allocator, clock.timestamp() + 3600);
     defer allocator.free(access);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -2243,7 +2244,7 @@ test "createProviderFromLuaConfig fails fast when oauth provider has no credenti
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(allocator, &.{ dir_abs, "auth.json" });
     defer allocator.free(auth_path);
@@ -2414,7 +2415,7 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buf)];
     const log_full = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     defer file_log.deinit();
@@ -2455,7 +2456,7 @@ test "chatgpt SSE: response.failed invokes telemetry.onStreamError with .chatgpt
         return error.NoLogPath;
     defer allocator.free(expected);
 
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, expected, 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, expected, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
@@ -2473,7 +2474,7 @@ test "chatgpt SSE: response.incomplete invokes telemetry.onStreamError with .cha
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_abs = try tmp.dir.realpath(".", &path_buf);
+    const tmp_abs = path_buf[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buf)];
     const log_full = try std.fmt.bufPrint(&full_buf, "{s}/instance.log", .{tmp_abs});
     try file_log.initWithPath(log_full);
     defer file_log.deinit();
@@ -2503,7 +2504,7 @@ test "chatgpt SSE: response.incomplete invokes telemetry.onStreamError with .cha
         return error.NoLogPath;
     defer allocator.free(expected);
 
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, expected, 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, expected, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
@@ -2541,7 +2542,7 @@ test "chatgpt writeFunctionCallItem escapes tu.id and tu.name" {
         .input_raw = "{}",
     };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeFunctionCallItem(tu, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);
@@ -2562,7 +2563,7 @@ test "chatgpt writeFunctionCallOutputItem escapes tr.tool_use_id" {
         .is_error = false,
     };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     try writeFunctionCallOutputItem(tr, &out.writer);
     const json = try out.toOwnedSlice();
     defer allocator.free(json);

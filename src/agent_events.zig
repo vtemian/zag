@@ -8,6 +8,9 @@
 //! thread-spawning code.
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
+const sync = @import("sync.zig");
+const clock = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 const Hooks = @import("Hooks.zig");
 const prompt = @import("prompt.zig");
@@ -318,11 +321,11 @@ pub const AgentEvent = union(enum) {
 /// there is no caller left to react to `error.EventDropped`.
 pub const EventQueue = struct {
     /// Guards concurrent access to buffer / head / tail / len.
-    mutex: std.Thread.Mutex = .{},
+    mutex: sync.Mutex = .{},
     /// Signalled after `drain` frees slots so a producer waiting in
     /// `pushWithBackpressure` wakes as soon as capacity reopens rather than
     /// after a fixed polling interval. Waited on under `mutex`.
-    drained: std.Thread.Condition = .{},
+    drained: sync.Condition = .{},
     /// Ring storage for queued events. Length equals the queue's capacity.
     buffer: []AgentEvent,
     /// Index of the next event to be drained.
@@ -393,17 +396,20 @@ pub const EventQueue = struct {
         self.buffer[self.tail] = event;
         self.tail = (self.tail + 1) % self.buffer.len;
         self.len += 1;
-        // Snapshot the wake fd under the lock, then perform the syscall
-        // after unlocking so a slow pipe write doesn't serialize other
-        // producers behind the ring mutex.
+        // Snapshot the wake fd under the lock, then perform the syscall after
+        // unlocking so a slow pipe write doesn't serialize other producers
+        // behind the ring mutex. 0.16 removed std.posix.write; the self-pipe
+        // wake is a single byte to a non-blocking fd whose errors (EAGAIN when a
+        // wake is already pending, EPIPE when the reader closed during shutdown)
+        // are all benign here, so write via the raw libc syscall and ignore the
+        // result, matching the wake writes in Terminal.zig and
+        // LuaCompletionQueue.zig. The authoritative event delivery has already
+        // succeeded.
         const wake = self.wake_fd;
         self.mutex.unlock();
-        // Signal the wake pipe if one is configured. WouldBlock (pipe full,
-        // wake already pending) and BrokenPipe (reader closed during
-        // shutdown) are expected; other errors are swallowed because the
-        // authoritative event delivery has already succeeded.
         if (wake) |fd| {
-            _ = std.posix.write(fd, &[_]u8{1}) catch {};
+            const byte: [1]u8 = .{1};
+            _ = std.c.write(fd, &byte, 1);
         }
     }
 
@@ -461,9 +467,9 @@ pub const EventQueue = struct {
                 return error.EventDropped;
             }
             const remaining_ns = deadline_ns - elapsed_ns;
-            const wait_start = std.time.nanoTimestamp();
+            const wait_start = clock.nanoTimestamp();
             self.drained.timedWait(&self.mutex, remaining_ns) catch {};
-            const wait_end = std.time.nanoTimestamp();
+            const wait_end = clock.nanoTimestamp();
             const delta: u64 = @intCast(@max(0, wait_end - wait_start));
             elapsed_ns += delta;
         }
@@ -473,10 +479,13 @@ pub const EventQueue = struct {
         self.buffer[self.tail] = event;
         self.tail = (self.tail + 1) % self.buffer.len;
         self.len += 1;
+        // Wake after unlocking (see push); std.posix.write is gone in 0.16, so
+        // this raw async-signal-safe libc write replaces it.
         const wake = self.wake_fd;
         self.mutex.unlock();
         if (wake) |fd| {
-            _ = std.posix.write(fd, &[_]u8{1}) catch {};
+            const byte: [1]u8 = .{1};
+            _ = std.c.write(fd, &byte, 1);
         }
     }
 
@@ -561,7 +570,7 @@ pub const LayoutRequest = struct {
     /// this to false and leave `result_json` null.
     result_owned: bool = true,
     /// Signalled by the main thread when the response fields are set.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
 
     /// Construct a request with the given op. All response fields start
     /// empty; the main thread fills them before `done.set()`.
@@ -592,7 +601,7 @@ pub const PromptAssemblyRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when either `result` or
     /// `error_name` has been filled in.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Populated on success. Null when `error_name` is set.
     result: ?prompt.AssembledPrompt = null,
     /// Populated on failure with `@errorName` of whatever went wrong
@@ -642,7 +651,7 @@ pub const JitContextRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil) has been finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
     /// the call errored. Owned by the waiter.
@@ -708,7 +717,7 @@ pub const ToolTransformRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil) has been finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
     /// the call errored. Owned by the waiter.
@@ -768,7 +777,7 @@ pub const ToolGateRequest = struct {
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil / no handler) has been
     /// finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
     /// the call errored. Owned by the waiter; release via
@@ -851,7 +860,7 @@ pub const LoopDetectRequest = struct {
     /// Signalled by the main thread when either `result`, `error_name`,
     /// or neither (handler returned nil / no handler) has been
     /// finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Handler return value, decoded into a `LoopAction`. The
     /// `reminder` arm's text is duped into `allocator`. Null when the
     /// handler returned nil, when no handler was registered, or when
@@ -948,7 +957,7 @@ pub const CompactRequest = struct {
     allocator: Allocator,
     /// Signalled by the main thread when `outcome` (or `error_name`)
     /// has been finalized.
-    done: std.Thread.ResetEvent = .{},
+    done: sync.ResetEvent = .{},
     /// Default to "use default" so a missing handler / nil return /
     /// dispatch-side error all flow into the Zig fallback chain.
     outcome: CompactStrategyOutcome = .use_default,
@@ -1114,15 +1123,15 @@ test "push writes to wake_fd when set" {
     var queue = try EventQueue.initBounded(alloc, 16);
     defer queue.deinit();
 
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const fds = try wake_pipe.open();
+    defer wake_pipe.close(fds[0]);
+    defer wake_pipe.close(fds[1]);
 
     queue.wake_fd = fds[1];
     try queue.push(.{ .text_delta = try OwnedPayload.dupe(alloc, "hi") });
 
     var buf: [16]u8 = undefined;
-    const n = try std.posix.read(fds[0], &buf);
+    const n = try wake_pipe.read(fds[0], &buf);
     try std.testing.expectEqual(@as(usize, 1), n);
 
     var drain_buf: [4]AgentEvent = undefined;
@@ -1204,7 +1213,7 @@ test "close drops a backpressured push immediately instead of waiting out the bu
 
 const BackpressureDrainer = struct {
     queue: *EventQueue,
-    go: std.Thread.ResetEvent,
+    go: sync.ResetEvent,
     drained_n: std.atomic.Value(usize),
 
     fn run(self: *BackpressureDrainer) void {

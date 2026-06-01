@@ -801,7 +801,7 @@ test "Step source enum round-trips to strings" {
 }
 
 test "serialize minimal trajectory matches golden shape" {
-    var out: std.io.Writer.Allocating = .init(std.testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     const steps = [_]Step{
         .{ .step_id = 1, .source = .system, .message = "You are zag." },
@@ -841,7 +841,7 @@ test "tool_calls arguments serialize as object not string" {
         .agent = .{ .name = "zag", .version = "0.1.0" },
         .steps = &steps,
     };
-    var out: std.io.Writer.Allocating = .init(std.testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try serialize(traj, std.testing.allocator, &out.writer);
     // Must appear as {"cmd":"ls"}, not "{\"cmd\":\"ls\"}"
@@ -962,7 +962,7 @@ test "serialize emits reasoning_content when populated" {
     });
     defer freeTrajectory(traj, std.testing.allocator);
 
-    var out: std.io.Writer.Allocating = .init(std.testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try serialize(traj, std.testing.allocator, &out.writer);
     const body = out.written();
@@ -990,7 +990,7 @@ test "writeToolCall handles malformed arguments_json without crashing" {
         .arguments_json = "{\"path\":src/main.zig\"}", // missing quote before src
     };
 
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
     try writeToolCall(&out.writer, allocator, call);

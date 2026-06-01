@@ -6,6 +6,7 @@
 //! it into place so half-written summaries never appear on disk.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const Artifacts = @import("Artifacts.zig");
 const Runner = @import("Runner.zig");
 
@@ -79,7 +80,7 @@ pub fn recordStep(
 /// Atomic write: serialize → write to `summary.json.tmp` → fsync → rename
 /// to `summary.json`. Caller invokes once at scenario end.
 pub fn flush(self: *Summary) !void {
-    const flush_ms = std.time.milliTimestamp();
+    const flush_ms = clock.milliTimestamp();
     const duration_ms: i64 = flush_ms - self.artifacts.start_ms;
 
     const bytes = try self.serialize(duration_ms);

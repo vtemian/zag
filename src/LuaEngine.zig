@@ -4,6 +4,9 @@
 //! so that plugins can define tools in Lua that appear alongside the built-in Zig tools.
 
 const std = @import("std");
+const test_net = @import("test_net.zig");
+const env_mod = @import("env.zig");
+const clock = @import("clock.zig");
 const zlua = @import("zlua");
 const build_options = @import("build_options");
 const types = @import("types.zig");
@@ -460,7 +463,7 @@ pub const LuaEngine = struct {
     /// searcher that covers `~/.config/zag/lua/*.lua` is installed once in
     /// `init`, so `require()` works here without any additional setup.
     pub fn loadUserConfig(self: *LuaEngine) void {
-        const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
+        const home = env_mod.getOwned(self.allocator, "HOME") catch return;
         defer self.allocator.free(home);
 
         // Load config.lua (collects zag.tool() calls)
@@ -1962,7 +1965,7 @@ pub const LuaEngine = struct {
             } else {
                 // No completion available yet. 1ms idle matches fireHook's
                 // drain cadence (src/lua/hook_registry.zig:215).
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
         }
     }
@@ -2233,7 +2236,7 @@ pub const LuaEngine = struct {
     fn sinkEnforceBudget(ctx: *anyopaque, budget_ms: i64) void {
         const self: *LuaEngine = @ptrCast(@alignCast(ctx));
         if (budget_ms <= 0) return;
-        const now = std.time.milliTimestamp();
+        const now = clock.milliTimestamp();
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
             const task = entry.value_ptr.*;
@@ -2391,7 +2394,7 @@ pub const LuaEngine = struct {
         // user_searcher closure treats an empty dir as "no user overrides".
         var user_dir_owned: ?[]u8 = null;
         defer if (user_dir_owned) |d| allocator.free(d);
-        if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+        if (env_mod.getOwned(allocator, "HOME")) |home| {
             defer allocator.free(home);
             user_dir_owned = try std.fmt.allocPrint(allocator, "{s}/.config/zag/lua", .{home});
         } else |_| {
@@ -2639,7 +2642,7 @@ pub const LuaEngine = struct {
             .scope = scope,
             .hook_payload = hook_payload,
             .compact_request = compact_request,
-            .started_at_ms = if (hook_payload != null) std.time.milliTimestamp() else 0,
+            .started_at_ms = if (hook_payload != null) clock.milliTimestamp() else 0,
             .budget_ms = if (hook_payload != null) self.hook_dispatcher.hook_budget_ms else null,
         };
 
@@ -2984,12 +2987,12 @@ test "zag.sleep yields, worker sleeps, coroutine resumes with (true, nil)" {
     // Drive the drain-and-resume loop by hand: no orchestrator running in
     // tests, so we poll the completion queue and feed each job through
     // resumeFromJob until the coroutine retires (or the deadline trips).
-    const deadline = std.time.milliTimestamp() + 500;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 500;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -3032,12 +3035,12 @@ test "taskForCoroutine fast path matches the linear scan for a yielding coroutin
     try std.testing.expectEqual(expected, found);
 
     // Drain to completion so the task retires and nothing leaks.
-    const deadline = std.time.milliTimestamp() + 500;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 500;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -3095,12 +3098,12 @@ test "zag.sleep returns (nil, 'cancelled') when scope cancelled mid-sleep" {
     try task.scope.cancel("test");
 
     // Drive drain loop until task retires.
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -3331,11 +3334,11 @@ test "loadConfig loads a Lua file and collects tools" {
         \\})
     ;
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(config_content);
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, config_content);
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     try engine.loadConfig(tmp_path);
     try std.testing.expectEqual(@as(usize, 1), engine.tools.items.len);
@@ -3359,12 +3362,12 @@ test "loadConfig reports syntax error gracefully instead of crashing" {
 
     const tmp_path = "/tmp/zag_test_config_syntax_error.lua";
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
         // Unclosed table literal: classic syntax error.
-        try file.writeAll("local x = { 1, 2,\n");
+        try file.writeStreamingAll(std.testing.io, "local x = { 1, 2,\n");
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     try std.testing.expectError(error.LuaSyntax, engine.loadConfig(tmp_path));
 }
@@ -3376,11 +3379,11 @@ test "loadConfig reports runtime error gracefully" {
 
     const tmp_path = "/tmp/zag_test_config_runtime_error.lua";
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
-        try file.writeAll("error('user aborted config')\n");
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "error('user aborted config')\n");
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     try std.testing.expectError(error.LuaRuntime, engine.loadConfig(tmp_path));
 }
@@ -3547,11 +3550,11 @@ test "end-to-end: config file to registry execution" {
         \\})
     ;
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(config_content);
+        const file = try std.Io.Dir.createFileAbsolute(std.testing.io, tmp_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, config_content);
     }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, tmp_path) catch {};
 
     // Load config
     try engine.loadConfig(tmp_path);
@@ -3572,7 +3575,7 @@ test "end-to-end: config file to registry execution" {
         fn pump(q: *agent_events.EventQueue, eng: *LuaEngine, stop_flag: *std.atomic.Value(bool)) void {
             while (!stop_flag.load(.acquire)) {
                 AgentRunner.dispatchHookRequests(q, eng, null);
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                clock.sleep(1 * std.time.ns_per_ms);
             }
             // Final drain so any late pushes by the test thread are serviced.
             AgentRunner.dispatchHookRequests(q, eng, null);
@@ -5138,12 +5141,12 @@ test "zag.spawn returns handle and :done() flips after sleep completes" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5178,12 +5181,12 @@ test "zag.detach spawns a fire-and-forget coroutine" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5216,12 +5219,12 @@ test "task:join yields until target completes, returns (true, nil)" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5254,12 +5257,12 @@ test "task:join returns (nil, 'cancelled') when target is cancelled" {
     _ = try eng.lua.getGlobal("outer");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5303,12 +5306,12 @@ test "zag.all collects results in input order" {
     _ = try eng.lua.getGlobal("test_all");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5355,12 +5358,12 @@ test "zag.race returns fastest value and reports winning index" {
     _ = try eng.lua.getGlobal("test_race");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5398,12 +5401,12 @@ test "zag.timeout returns err='timeout' when fn overshoots deadline" {
     _ = try eng.lua.getGlobal("test_timeout");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5438,12 +5441,12 @@ test "zag.timeout passes through value when fn beats deadline" {
     _ = try eng.lua.getGlobal("test_timeout_win");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5477,12 +5480,12 @@ test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
     _ = try eng.lua.getGlobal("test_cmd");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5519,12 +5522,12 @@ test "zag.cmd stdin piped to /bin/cat echoes back" {
     _ = try eng.lua.getGlobal("test_cat");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5557,12 +5560,12 @@ test "zag.cmd env_extra sets env var visible to child" {
     _ = try eng.lua.getGlobal("test_env");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5593,16 +5596,16 @@ test "zag.cmd timeout_ms kills long-running process" {
     _ = try eng.lua.getGlobal("test_timeout");
     _ = try eng.spawnCoroutine(0, null);
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const deadline = start + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
 
     _ = try eng.lua.getGlobal("_to_r_is_nil");
@@ -5635,12 +5638,12 @@ test "zag.cmd.spawn + kill + wait returns signal-coded exit" {
     _ = try eng.lua.getGlobal("test_spawn_kill");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5676,12 +5679,12 @@ test "zag.cmd.spawn of short-lived process: wait returns code 0" {
     _ = try eng.lua.getGlobal("test_spawn_quick");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5714,12 +5717,12 @@ test "zag.cmd.spawn :wait after child exited returns code" {
     );
     _ = try eng.lua.getGlobal("test_post_exit");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5750,12 +5753,12 @@ test "zag.cmd.spawn GC without :wait reaps child cleanly" {
     );
     _ = try eng.lua.getGlobal("test_gc_no_wait");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5787,12 +5790,12 @@ test "zag.cmd.spawn :lines yields lines then nil at EOF" {
     );
     _ = try eng.lua.getGlobal("test_lines");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5833,12 +5836,12 @@ test "zag.cmd.spawn :lines errors when stdout not captured" {
     _ = try eng.lua.getGlobal("test_no_capture");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 2000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
 
@@ -5883,12 +5886,12 @@ test "zag.cmd.spawn :write feeds stdin, :close_stdin causes cat to exit" {
     _ = try eng.lua.getGlobal("test_write");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5941,12 +5944,12 @@ test "zag.cmd.kill on a spawned child exits it with the signal" {
     _ = try eng.lua.getGlobal("test_kill");
     _ = try eng.spawnCoroutine(0, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -5980,19 +5983,19 @@ test "zag.http.get fetches from a local test server" {
 
     // Canned HTTP/1.1 server: kernel picks the port, thread serves one
     // request then exits. Same pattern as primitives/http.zig's test.
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6004,7 +6007,7 @@ test "zag.http.get fetches from a local test server" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "hello from lua";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -6029,12 +6032,12 @@ test "zag.http.get fetches from a local test server" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6069,10 +6072,10 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Capture the received request bytes so the test can assert which
     // headers the client sent. Shared by-pointer with the server
@@ -6084,13 +6087,13 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
     var captured = Captured{};
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, cap: *Captured) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server, cap: *Captured) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var total: usize = 0;
             while (total < cap.request_bytes.len) {
-                const n = conn.stream.read(cap.request_bytes[total..]) catch break;
+                const n = test_net.streamRead(conn, cap.request_bytes[total..]) catch break;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, cap.request_bytes[0..total], "\r\n\r\n") != null) break;
@@ -6104,7 +6107,7 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "ok";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, &captured });
@@ -6123,12 +6126,12 @@ test "zag.http.get does not send Accept-Encoding (avoids gzip corruption)" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6148,24 +6151,24 @@ test "zag.http.post sends body and parses response" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Echo server: read the request (crude but OK for small bodies
     // under a single MSS), grab everything after `\r\n\r\n`, send it
     // back as the response body. No Content-Length on the request
     // side means we also accept chunked-less small payloads.
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [8192]u8 = undefined;
             var total: usize = 0;
             // Headers first
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6183,7 +6186,7 @@ test "zag.http.post sends body and parses response" {
 
             // Keep reading until we have the full body.
             while ((total - header_end) < content_length and total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
             }
@@ -6191,7 +6194,7 @@ test "zag.http.post sends body and parses response" {
             const body = buf[header_end..total];
             var resp_buf: [8192]u8 = undefined;
             const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -6218,12 +6221,12 @@ test "zag.http.post sends body and parses response" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6254,19 +6257,19 @@ test "zag.http.stream yields response lines then nil at EOF" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    var server_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try server_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6278,7 +6281,7 @@ test "zag.http.stream yields response lines then nil at EOF" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "line1\nline2\nline3\n";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -6306,9 +6309,9 @@ test "zag.http.stream yields response lines then nil at EOF" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
-        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else std.Thread.sleep(1 * std.time.ns_per_ms);
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else clock.sleep(1 * std.time.ns_per_ms);
     }
 
     _ = try eng.lua.getGlobal("_stream_count");
@@ -6339,19 +6342,19 @@ test "zag.http.stream flushes trailing partial line on EOS" {
     try eng.initAsync(2, 16);
     defer eng.deinitAsync();
 
-    var server_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try server_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -6364,7 +6367,7 @@ test "zag.http.stream flushes trailing partial line on EOS" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "a\nb\nc";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -6392,9 +6395,9 @@ test "zag.http.stream flushes trailing partial line on EOS" {
     _ = eng.lua.pushString(url);
     _ = try eng.spawnCoroutine(1, null);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
-        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else std.Thread.sleep(1 * std.time.ns_per_ms);
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else clock.sleep(1 * std.time.ns_per_ms);
     }
 
     _ = try eng.lua.getGlobal("_partial_count");
@@ -6440,12 +6443,12 @@ test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
     );
     _ = try eng.lua.getGlobal("test_partial_cmd");
     _ = try eng.spawnCoroutine(0, null);
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6473,12 +6476,12 @@ test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
 /// pattern, so pull it out to keep the test bodies focused on their
 /// assertions.
 fn driveDrainLoop(eng: *LuaEngine, timeout_ms: i64) !void {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
-    while (eng.tasks.count() > 0 and std.time.milliTimestamp() < deadline) {
+    const deadline = clock.milliTimestamp() + timeout_ms;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
         if (eng.async_runtime.?.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            clock.sleep(1 * std.time.ns_per_ms);
         }
     }
     try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
@@ -6493,9 +6496,9 @@ test "zag.fs.read returns file bytes" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "r.txt", .data = "hello-from-disk" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "r.txt", .data = "hello-from-disk" });
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/r.txt", .{base});
 
@@ -6558,7 +6561,7 @@ test "zag.fs.write + read roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/w.txt", .{base});
 
@@ -6599,9 +6602,9 @@ test "zag.fs.append extends an existing file" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "first" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "first" });
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/a.txt", .{base});
 
@@ -6638,7 +6641,7 @@ test "zag.fs.mkdir creates directories, parents=true handles nesting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var flat_buf: [std.fs.max_path_bytes]u8 = undefined;
     const flat_path = try std.fmt.bufPrint(&flat_buf, "{s}/flat", .{base});
     var deep_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6669,8 +6672,8 @@ test "zag.fs.mkdir creates directories, parents=true handles nesting" {
     eng.lua.pop(1);
 
     // Verify both directories actually exist on disk.
-    try tmp.dir.access("flat", .{});
-    try tmp.dir.access("nested/inner/leaf", .{});
+    try tmp.dir.access(std.testing.io, "flat", .{});
+    try tmp.dir.access(std.testing.io, "nested/inner/leaf", .{});
 }
 
 test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
@@ -6682,12 +6685,12 @@ test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "trash.txt", .data = "x" });
-    try tmp.dir.makePath("tree/inner");
-    try tmp.dir.writeFile(.{ .sub_path = "tree/inner/child.txt", .data = "y" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trash.txt", .data = "x" });
+    try tmp.dir.createDirPath(std.testing.io, "tree/inner");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tree/inner/child.txt", .data = "y" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var f_buf: [std.fs.max_path_bytes]u8 = undefined;
     const file_path = try std.fmt.bufPrint(&f_buf, "{s}/trash.txt", .{base});
     var t_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6718,8 +6721,8 @@ test "zag.fs.remove deletes a file; recursive=true deletes a tree" {
     eng.lua.pop(1);
 
     // Nothing should remain at those paths.
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("trash.txt", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("tree", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "trash.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "tree", .{}));
 }
 
 test "zag.fs.list returns directory entries" {
@@ -6731,12 +6734,12 @@ test "zag.fs.list returns directory entries" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "one.txt", .data = "1" });
-    try tmp.dir.writeFile(.{ .sub_path = "two.txt", .data = "2" });
-    try tmp.dir.makeDir("sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "one.txt", .data = "1" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "two.txt", .data = "2" });
+    try tmp.dir.createDir(std.testing.io, "sub", .default_dir);
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     _ = eng.lua.pushString(base);
     eng.lua.setGlobal("_ls_path");
 
@@ -6785,10 +6788,10 @@ test "zag.fs.stat returns kind, size, mtime_ms, mode" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "s.dat", .data = "0123456789ab" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "s.dat", .data = "0123456789ab" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/s.dat", .{base});
 
@@ -6839,10 +6842,10 @@ test "zag.fs.exists returns true for present file, false for missing" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "e.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "e.txt", .data = "" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     var yes_buf: [std.fs.max_path_bytes]u8 = undefined;
     const yes_path = try std.fmt.bufPrint(&yes_buf, "{s}/e.txt", .{base});
     var no_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6953,9 +6956,9 @@ test "hook budget cancels a runaway coroutine" {
         .args_rewrite = null,
     } };
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     _ = try eng.fireHook(&payload);
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     // Budget is 30ms; enforcement + worker abort round-trip should
     // finish well under 5 seconds (and nowhere near 10s).
@@ -7187,14 +7190,14 @@ test "user dir file shadows embedded stdlib entry" {
     // Build a temp dir with zag/providers/anthropic.lua returning a sentinel.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("zag/providers");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "zag/providers");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "zag/providers/anthropic.lua",
         .data = "return 'from-user-dir'",
     });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
 
     // Redirect _ZAG_LOADER.user_dir to the temp dir. The searcher closure
     // reads ctx.user_dir on every call, so this takes effect immediately.
@@ -7221,7 +7224,7 @@ test "require falls through to embedded when user dir file missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_tmp_user_dir");
     try engine.lua.doString("_ZAG_LOADER.user_dir = _tmp_user_dir");
@@ -8603,7 +8606,7 @@ test "zag.context.find_up returns nil when no instruction file is present" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     _ = engine.lua.pushString(root);
     engine.lua.setGlobal("_root");
@@ -8627,9 +8630,9 @@ test "zag.context.find_up surfaces AGENTS.md content from cwd" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "project guidance" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "project guidance" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     _ = engine.lua.pushString(root);
     engine.lua.setGlobal("_root");
@@ -8660,10 +8663,10 @@ test "zag.context.find_up accepts a single string and walks up" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "ancestor body" });
-    try tmp.dir.makePath("nested/leaf");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "ancestor body" });
+    try tmp.dir.createDirPath(std.testing.io, "nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
     defer std.testing.allocator.free(leaf);
 
@@ -8690,7 +8693,7 @@ test "zag.layers.agents_md renders nothing when no instruction file exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.layers.agents_md')");
 
@@ -8714,9 +8717,9 @@ test "zag.layers.agents_md emits AGENTS.md content wrapped in <instructions>" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.layers.agents_md')");
 
@@ -8770,10 +8773,10 @@ test "agents_md integration: eager-loaded layer pulls parent AGENTS.md into asse
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Prefer TDD." });
-    try tmp.dir.makePath("nested/leaf");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Prefer TDD." });
+    try tmp.dir.createDirPath(std.testing.io, "nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
     defer std.testing.allocator.free(leaf);
 
@@ -8822,9 +8825,9 @@ test "agents_md integration: assembled prompt omits instructions block when no f
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("nested/leaf");
+    try tmp.dir.createDirPath(std.testing.io, "nested/leaf");
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
     const leaf = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "leaf" });
     defer std.testing.allocator.free(leaf);
 
@@ -8884,11 +8887,11 @@ test "zag.fs.read_file_sync and list_dir_sync" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "hello-sync" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.md", .data = "# header\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "hello-sync" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.md", .data = "# header\n" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath(".", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
 
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_base");
@@ -8942,8 +8945,8 @@ test "zag.subagents.filesystem loads agents from tmpdir" {
         \\---
         \\You are a reviewer. Read the diff and return findings.
     ;
-    try tmp.dir.makePath("agents");
-    try tmp.dir.writeFile(.{ .sub_path = "agents/reviewer.md", .data = reviewer_md });
+    try tmp.dir.createDirPath(std.testing.io, "agents");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/reviewer.md", .data = reviewer_md });
 
     const scout_md =
         \\---
@@ -8952,13 +8955,13 @@ test "zag.subagents.filesystem loads agents from tmpdir" {
         \\---
         \\You are a scout.
     ;
-    try tmp.dir.writeFile(.{ .sub_path = "agents/scout.md", .data = scout_md });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/scout.md", .data = scout_md });
 
     // A sibling file without the right extension must be ignored.
-    try tmp.dir.writeFile(.{ .sub_path = "agents/README", .data = "ignore me" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/README", .data = "ignore me" });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath("agents", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
 
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_agents_dir");
@@ -8998,20 +9001,20 @@ test "zag.subagents.filesystem skips malformed files with a warning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("agents");
+    try tmp.dir.createDirPath(std.testing.io, "agents");
     // Missing `name` field; must be skipped.
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agents/broken.md",
         .data = "---\ndescription: no name\n---\nbody\n",
     });
     // Valid; must be loaded even though a sibling was malformed.
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agents/good.md",
         .data = "---\nname: good\ndescription: ok\n---\nhi\n",
     });
 
     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmp.dir.realpath("agents", &rbuf);
+    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
 
     _ = engine.lua.pushString(base);
     engine.lua.setGlobal("_agents_dir");
@@ -10156,10 +10159,10 @@ test "zag.jit.agents_md attaches AGENTS.md from the read file's parent" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
-    try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD always." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "code.go", .data = "package main" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10184,9 +10187,9 @@ test "zag.jit.agents_md returns nil when no instruction file exists" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "code.go", .data = "package main" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "code.go", .data = "package main" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10207,11 +10210,11 @@ test "zag.jit.agents_md dedups within a turn" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD." });
-    try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.go", .data = "package a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.go", .data = "package b" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10245,11 +10248,11 @@ test "zag.jit.agents_md re-attaches across turn boundaries" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Use TDD." });
-    try tmp.dir.writeFile(.{ .sub_path = "a.go", .data = "package a" });
-    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Use TDD." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.go", .data = "package a" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.go", .data = "package b" });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10290,9 +10293,9 @@ test "zag.jit.agents_md skips when ctx.is_error is true" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "Should be skipped." });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "Should be skipped." });
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &pbuf);
+    const root = pbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &pbuf)];
 
     try engine.lua.doString("require('zag.jit.agents_md')");
 
@@ -10331,9 +10334,13 @@ test "zag.transforms.rg_trim trims grep output past 200 lines" {
     // marker so the agent sees the early hits but not the long tail.
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 300) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 300) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10366,9 +10373,13 @@ test "zag.transforms.rg_trim leaves short grep output untouched" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 100) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 100) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10395,9 +10406,13 @@ test "zag.transforms.rg_trim passes through error output" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 300) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 300) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10422,9 +10437,13 @@ test "zag.transforms.bash_trim trims bash output past 500 lines" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 700) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 700) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(
@@ -10455,9 +10474,13 @@ test "zag.transforms.bash_trim leaves short bash output untouched" {
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
-    var i: usize = 1;
-    while (i <= 100) : (i += 1) {
-        try output.writer(alloc).print("line {d}\n", .{i});
+    {
+        var aw_output = std.Io.Writer.Allocating.fromArrayList(alloc, &output);
+        defer output = aw_output.toArrayList();
+        var i: usize = 1;
+        while (i <= 100) : (i += 1) {
+            try aw_output.writer.print("line {d}\n", .{i});
+        }
     }
 
     var req = agent_events.ToolTransformRequest.init(

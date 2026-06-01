@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const posix = std.posix;
+const process_io = @import("process_io.zig");
+const env_mod = @import("env.zig");
 
 const log = std.log.scoped(.terminal);
 
@@ -147,7 +149,7 @@ pub fn init() !Terminal {
 /// is to set `COLORTERM=truecolor` or `COLORTERM=24bit`. Anything else -
 /// including an empty value - means "fall back to 256-color palette".
 pub fn detectTrueColor() bool {
-    const val = posix.getenv("COLORTERM") orelse return false;
+    const val = env_mod.get("COLORTERM") orelse return false;
     return trueColorFromValue(val);
 }
 
@@ -228,11 +230,11 @@ pub fn checkResize(self: *Terminal) ?Size {
 // -- Private helpers ---------------------------------------------------------
 
 fn writeEscapeSequence(seq: []const u8) !void {
-    const stdout = std.fs.File{ .handle = posix.STDOUT_FILENO };
+    const stdout = std.Io.File.stdout();
     // 256 bytes: longest escape sequence we emit is ~30 bytes (mouse tracking
     // enable/disable pair). 256 gives generous headroom without touching the heap.
     var buf: [256]u8 = undefined;
-    var w = stdout.writer(&buf);
+    var w = stdout.writer(process_io.get(), &buf);
     try w.interface.writeAll(seq);
     try w.interface.flush();
 }
@@ -246,7 +248,7 @@ fn installSigwinchHandler() void {
     posix.sigaction(posix.SIG.WINCH, &act, null);
 }
 
-fn handleSigwinch(sig: i32, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+fn handleSigwinch(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
     _ = sig;
     _ = info;
     _ = ctx;
@@ -276,7 +278,6 @@ test "getSize returns non-zero dimensions" {
     // runners may not provide. We allow IoctlFailed gracefully.
     const size = getSize() catch |err| switch (err) {
         error.IoctlFailed, error.InvalidSize => return,
-        else => return err,
     };
     try std.testing.expect(size.rows > 0);
     try std.testing.expect(size.cols > 0);
@@ -326,7 +327,7 @@ test "detectTrueColor honours COLORTERM env var" {
     // in Zig 0.15 (no std.posix.setenv). Assert it agrees with the current
     // $COLORTERM: if set to truecolor/24bit the fn returns true, otherwise
     // false. Either way this exercises the env-read path.
-    const expected = if (posix.getenv("COLORTERM")) |v| trueColorFromValue(v) else false;
+    const expected = if (env_mod.get("COLORTERM")) |v| trueColorFromValue(v) else false;
     try std.testing.expectEqual(expected, detectTrueColor());
 }
 

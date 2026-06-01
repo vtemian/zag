@@ -9,6 +9,7 @@
 //! All styling reads from the Theme.
 
 const std = @import("std");
+const wake_pipe = @import("wake_pipe.zig");
 const Allocator = std.mem.Allocator;
 const Screen = @import("Screen.zig");
 const Layout = @import("Layout.zig");
@@ -1423,17 +1424,17 @@ test "multi-line bash command emits no raw control bytes" {
 
     compositor.composite(&layout, &[_]Compositor.LeafDraft{}, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
 
-    const pipe = try std.posix.pipe();
-    const write_end: std.fs.File = .{ .handle = pipe[1] };
-    const read_end: std.fs.File = .{ .handle = pipe[0] };
-    defer read_end.close();
+    const pipe = try wake_pipe.openBlocking();
+    const write_end: std.Io.File = .{ .handle = pipe[1], .flags = .{ .nonblocking = false } };
+    const read_end: std.Io.File = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } };
+    defer read_end.close(std.testing.io);
     try screen.render(write_end);
-    write_end.close();
+    write_end.close(std.testing.io);
 
     var scratch: [16384]u8 = undefined;
     var total: usize = 0;
     while (total < scratch.len) {
-        const n = std.posix.read(read_end.handle, scratch[total..]) catch break;
+        const n = wake_pipe.read(read_end.handle, scratch[total..]) catch break;
         if (n == 0) break;
         total += n;
     }

@@ -3,18 +3,19 @@
     .version = "0.1.0",
     .dependencies = .{
         .zlua = .{
-            .url = "https://github.com/natecraddock/ziglua/archive/refs/tags/0.6.0.tar.gz",
-            .hash = "zlua-0.1.0-hGRpCww-BQCx3cX6zbKWfTgOx6B7Peo4P17RK2hm7-xV",
+            .url = "git+https://github.com/natecraddock/ziglua.git#22cad3abc50bca7c73145e07ed2835926e2dda44",
+            .hash = "zlua-0.1.0-hGRpC5dqBQCm1fzCu23-RM5xE9_6JSnUitX9HFi9jSYA",
         },
         .zigimg = .{
-            .url = "git+https://github.com/zigimg/zigimg.git?ref=zigimg_zig_0.15.1#362cdd6bce109f7bc674be134cddd378f52da5d4",
-            .hash = "zigimg-0.1.0-8_eo2jNrFQD4mu3EAUkfQRmCkyfprdIXc8JQ6uyxhjSQ",
+            .url = "git+https://github.com/zigimg/zigimg.git?ref=zigimg_zig_0.16.0#d695acd97c02e57bb151e8f659d1280f5cd6ca70",
+            .hash = "zigimg-0.1.0-8_eo2oyaFwBZwJpmqPkCfVXWBrHcqbYwmrp1I6bTD3lI",
         },
-        .ghostty = .{
-            .url = "https://github.com/ghostty-org/ghostty/archive/48ccec182a932c2ec04c344d45a5fc553861cb13.tar.gz",
-            .hash = "ghostty-1.3.2-dev-5UdBCyWADgWdIlucJPVt0dKs8jFWT_fA4mu7dk_GUIr0",
-            .lazy = true,
-        },
+        // ghostty (libghostty-vt) is dropped on the 0.16 branch: it is 0.15-only
+        // (its build.zig asserts required Zig v0.15.2) and is consumed solely by
+        // the -Dsim-gated zag-sim. The 0.16 build runner still evaluates a lazy
+        // dep's build.zig at graph-config time, so even gated it breaks the core
+        // build. Re-add (with sim re-enabled) once ghostty supports 0.16
+        // (ghostty PR 12726).
     },
     .fingerprint = 0x9179a895b492806,
     .paths = .{

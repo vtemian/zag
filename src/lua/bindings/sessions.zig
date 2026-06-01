@@ -42,6 +42,8 @@
 //!     both are deferred to v2.
 
 const std = @import("std");
+const env_mod = @import("../../env.zig");
+const process_io = @import("../../process_io.zig");
 const zlua = @import("zlua");
 const Lua = zlua.Lua;
 
@@ -79,7 +81,7 @@ fn fireSessionListChanged(
 /// Resolve `$HOME/.config/zag` the same way `Session.recordCwdInRegistry`
 /// does. Returns an owned slice; caller frees with `allocator.free`.
 fn resolveConfigDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try env_mod.getOwned(allocator, "HOME");
     defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, ".config", "zag" });
 }
@@ -155,7 +157,7 @@ fn collectRows(allocator: std.mem.Allocator) !Collection {
 
     // Fold in the current cwd in case the registry was unreachable or
     // had not yet been updated when the sidebar first opened.
-    if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_real| {
+    if (std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", allocator)) |cwd_real| {
         defer allocator.free(cwd_real);
         try appendProjectRows(allocator, &rows, &project_paths, cwd_real);
     } else |err| {
@@ -273,7 +275,7 @@ fn verifyProjectRegistered(allocator: std.mem.Allocator, project_path: []const u
     // cwd realpath wins fast: the sidebar's most common case is renaming
     // a session in the current project, and that almost always matches
     // here without touching the registry file at all.
-    if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_real| {
+    if (std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", allocator)) |cwd_real| {
         defer allocator.free(cwd_real);
         if (std.mem.eql(u8, cwd_real, project_path)) return;
     } else |_| {}
@@ -532,6 +534,12 @@ fn zagSessionsOpenFn(lua: *Lua) i32 {
     const id = lua.toString(1) catch {
         lua.raiseErrorStr("zag.sessions.open: id must be a string", .{});
     };
+    // Validate the id here rather than relying on `splitFocusedWithSession`
+    // surfacing `error.InvalidSessionId`: 0.16's stricter inferred-error-set
+    // resolution does not expose that deeply-nested error to this call site.
+    if (!Session.isValidSessionId(id)) {
+        lua.raiseErrorStr("zag.sessions.open: invalid session id", .{});
+    }
 
     // When the caller hands us a project_path (the sidebar does, every
     // row carries one) we verify it matches the cwd realpath. Sessions
@@ -544,7 +552,7 @@ fn zagSessionsOpenFn(lua: *Lua) i32 {
         const project = lua.toString(2) catch {
             lua.raiseErrorStr("zag.sessions.open: project_path must be a string", .{});
         };
-        const cwd_real = std.fs.cwd().realpathAlloc(engine.allocator, ".") catch |err| {
+        const cwd_real = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", engine.allocator) catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&buf, "zag.sessions.open: cwd realpath: {s}", .{@errorName(err)}) catch
                 "zag.sessions.open: cwd realpath failed";
@@ -557,7 +565,6 @@ fn zagSessionsOpenFn(lua: *Lua) i32 {
     }
 
     _ = wm.splitFocusedWithSession(id) catch |err| switch (err) {
-        error.InvalidSessionId => lua.raiseErrorStr("zag.sessions.open: invalid session id", .{}),
         error.SessionManagerUnavailable => lua.raiseErrorStr("zag.sessions.open: persistence disabled", .{}),
         else => {
             var buf: [128]u8 = undefined;

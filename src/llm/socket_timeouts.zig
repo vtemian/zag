@@ -1,53 +1,140 @@
-//! Socket-level read/write timeout helper, shared between the streaming
-//! and non-streaming HTTP paths.
+//! Per-read timeout for the HTTP body, shared between the streaming
+//! (`llm/streaming.zig`) and non-streaming (`llm/http.zig`) paths.
 //!
-//! Both `llm/http.zig` (non-streaming) and `llm/streaming.zig` (SSE) need
-//! to apply `SO_RCVTIMEO` / `SO_SNDTIMEO` on the underlying TCP socket
-//! after the request handshake completes (i.e. after `req.receiveHead`
-//! is the first point where `req.connection` is non-null and the socket
-//! fd is reachable). Centralizing the setsockopt logic here avoids two
-//! near-identical copies and keeps the platform-specific `timeval`
-//! conversion in one place.
+//! Zig 0.15 bounded a stalled provider read with `SO_RCVTIMEO` on the raw
+//! socket. Zig 0.16's `std.Io.Threaded` puts sockets in non-blocking mode and
+//! waits for readiness in its own `poll()` with no deadline, so `SO_RCVTIMEO`
+//! is inert: a wedged provider would block a body read forever. Instead we run
+//! each `reader.stream(...)` as a concurrent task raced against a deadline via
+//! `std.Io.Select`; on deadline the in-flight read is cancelled (`std.Io`
+//! interrupts the blocked recv via SIG.IO) and we surface `error.ReadTimeout`.
 //!
 //! Design notes:
 //!   - This module imports only `std`. It deliberately does NOT import
-//!     `registry.zig` to keep the dependency graph one-directional
-//!     (`registry` <- `socket_timeouts` would invert what `streaming.zig`
-//!     and `http.zig` already pull in).
-//!   - `read_ms == 0` (or `write_ms == 0`) leaves the OS default in
-//!     place, matching the documented "no timeout" semantics on
-//!     `Endpoint.TimeoutConfig`.
-//!   - A `setsockopt` failure is logged and ignored. A missing platform
-//!     feature (or a socket closed between `receiveHead` and now) must
-//!     not abort the request; the worst case is the OS-default timeout
-//!     still applies, which is the pre-fix behavior.
+//!     `registry.zig` to keep the dependency graph one-directional.
+//!   - `read_ms == 0` means "no timeout": a plain blocking `reader.stream`
+//!     with no task spawned, matching `Endpoint.TimeoutConfig` semantics.
+//!   - The timeout is per-read (per chunk), matching the old per-`recv`
+//!     `SO_RCVTIMEO` semantic: a body that streams steadily never trips it; a
+//!     read that idles past `read_ms` does.
 
 const std = @import("std");
 
-const log = std.log.scoped(.socket_timeouts);
+/// `error.ReadTimeout` is returned when the per-read deadline fires before the
+/// underlying `reader.stream` produces data; the in-flight read is cancelled.
+pub const StreamTimeoutError = std.Io.Reader.StreamError || error{ReadTimeout};
 
-/// Apply read/write socket timeouts. Best-effort: a setsockopt failure
-/// is logged and ignored. `read_ms == 0` and `write_ms == 0` leave the
-/// OS default in place.
-pub fn applySocketTimeouts(handle: std.posix.socket_t, read_ms: u32, write_ms: u32) void {
-    if (read_ms > 0) {
-        const tv = std.posix.timeval{
-            .sec = @intCast(read_ms / 1000),
-            .usec = @intCast((read_ms % 1000) * 1000),
-        };
-        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch |err| {
-            log.warn("failed to set SO_RCVTIMEO: {s}", .{@errorName(err)});
-        };
-    }
-    if (write_ms > 0) {
-        const tv = std.posix.timeval{
-            .sec = @intCast(write_ms / 1000),
-            .usec = @intCast((write_ms % 1000) * 1000),
-        };
-        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch |err| {
-            log.warn("failed to set SO_SNDTIMEO: {s}", .{@errorName(err)});
-        };
-    }
+const Race = union(enum) {
+    read: std.Io.Reader.StreamError!usize,
+    timer: void,
+};
+
+fn streamOnce(
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    limit: std.Io.Limit,
+) std.Io.Reader.StreamError!usize {
+    return reader.stream(writer, limit);
+}
+
+fn deadlineTask(io: std.Io, ns: u64) void {
+    io.sleep(.fromNanoseconds(@intCast(ns)), .awake) catch {};
+}
+
+/// Run one `reader.stream(writer, limit)` bounded by `read_ms` milliseconds
+/// (0 = unbounded). On deadline, the in-flight read is cancelled and
+/// `error.ReadTimeout` is returned; otherwise the stream result (including
+/// `error.EndOfStream`) is propagated unchanged.
+///
+/// `io.concurrent` reuses a pooled worker, so the per-chunk cost is a small
+/// `Future` allocation and a worker handoff, negligible against network
+/// round-trip latency. The result union carries only a byte count, never an
+/// owned resource, so `Select.cancelDiscard` cleans up the loser without a
+/// leak. If concurrency is unavailable (`error.ConcurrencyUnavailable`, e.g. a
+/// single-threaded build) we fall back to a plain blocking read.
+pub fn streamWithTimeout(
+    io: std.Io,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    limit: std.Io.Limit,
+    read_ms: u32,
+) StreamTimeoutError!usize {
+    if (read_ms == 0) return reader.stream(writer, limit);
+
+    var buffer: [2]Race = undefined;
+    var sel = std.Io.Select(Race).init(io, &buffer);
+    sel.concurrent(.read, streamOnce, .{ reader, writer, limit }) catch {
+        // No concurrency available: block rather than fail the request.
+        return reader.stream(writer, limit);
+    };
+    sel.async(.timer, deadlineTask, .{ io, @as(u64, read_ms) * std.time.ns_per_ms });
+
+    const winner = sel.await() catch {
+        sel.cancelDiscard();
+        return error.ReadTimeout;
+    };
+    sel.cancelDiscard();
+    return switch (winner) {
+        .timer => error.ReadTimeout,
+        .read => |r| r,
+    };
+}
+
+/// `error.ReadTimeout` for a stalled response-head read. Same shape as the
+/// per-read body timeout above, applied to `Request.receiveHead`.
+pub const ReceiveHeadTimeoutError = std.http.Client.Request.ReceiveHeadError || error{ReadTimeout};
+
+const HeadRace = union(enum) {
+    head: std.http.Client.Request.ReceiveHeadError!std.http.Client.Response,
+    timer: void,
+};
+
+fn receiveHeadOnce(
+    req: *std.http.Client.Request,
+    redirect_buffer: []u8,
+) std.http.Client.Request.ReceiveHeadError!std.http.Client.Response {
+    return req.receiveHead(redirect_buffer);
+}
+
+/// Run `req.receiveHead(redirect_buffer)` bounded by `read_ms` milliseconds
+/// (0 = unbounded). A wedged provider that accepts the connection but never
+/// (fully) sends the response head would otherwise hang `receiveHead` forever:
+/// 0.16 sockets are non-blocking inside `std.Io`, so there is no OS read
+/// deadline on the head read, only on the body (which `streamWithTimeout`
+/// already bounds). On deadline the in-flight head read is cancelled and
+/// `error.ReadTimeout` is returned.
+///
+/// Cancellation safety mirrors `streamWithTimeout`: only the worker touches
+/// `req` while the race runs (the caller is parked in `await`), so on a timeout
+/// the cancelled read leaves `req` partially-read and the caller's
+/// `req.deinit()` reclaims it; on a head win the worker has already returned by
+/// the time `await` does, so the returned `Response`'s borrows into the
+/// (caller-frame-stable) `req` are safe to use on the calling thread.
+pub fn receiveHeadWithTimeout(
+    io: std.Io,
+    req: *std.http.Client.Request,
+    redirect_buffer: []u8,
+    read_ms: u32,
+) ReceiveHeadTimeoutError!std.http.Client.Response {
+    if (read_ms == 0) return req.receiveHead(redirect_buffer);
+
+    var buffer: [2]HeadRace = undefined;
+    var sel = std.Io.Select(HeadRace).init(io, &buffer);
+    sel.concurrent(.head, receiveHeadOnce, .{ req, redirect_buffer }) catch {
+        // No concurrency available: block rather than fail the request.
+        return req.receiveHead(redirect_buffer);
+    };
+    sel.async(.timer, deadlineTask, .{ io, @as(u64, read_ms) * std.time.ns_per_ms });
+
+    const winner = sel.await() catch {
+        sel.cancelDiscard();
+        return error.ReadTimeout;
+    };
+    sel.cancelDiscard();
+    return switch (winner) {
+        .timer => error.ReadTimeout,
+        .head => |r| r,
+    };
 }
 
 test {

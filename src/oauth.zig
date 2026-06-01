@@ -5,6 +5,9 @@
 //! --login=<provider> or from src/auth.zig during credential refresh.
 
 const std = @import("std");
+const test_net = @import("test_net.zig");
+const clock = @import("clock.zig");
+const process_io = @import("process_io.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
@@ -28,7 +31,7 @@ pub const PkceCodes = struct {
 
 pub fn generatePkce(alloc: Allocator) !PkceCodes {
     var raw: [64]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    clock.randomBytes(&raw);
 
     const enc = std.base64.url_safe_no_pad.Encoder;
 
@@ -87,7 +90,7 @@ test "generatePkce produces distinct verifiers across calls" {
 
 pub fn generateState(alloc: Allocator) ![]const u8 {
     var raw: [32]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    clock.randomBytes(&raw);
 
     const enc = std.base64.url_safe_no_pad.Encoder;
     const buf = try alloc.alloc(u8, enc.calcSize(raw.len));
@@ -126,7 +129,7 @@ pub const AuthorizeParams = struct {
 };
 
 pub fn buildAuthorizeUrl(alloc: Allocator, p: AuthorizeParams) ![]const u8 {
-    var aw: std.io.Writer.Allocating = .init(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
     errdefer aw.deinit();
 
     try aw.writer.writeAll(p.issuer);
@@ -144,7 +147,7 @@ pub fn buildAuthorizeUrl(alloc: Allocator, p: AuthorizeParams) ![]const u8 {
     return aw.toOwnedSlice();
 }
 
-fn writeParam(w: *std.io.Writer, key: []const u8, value: []const u8) !void {
+fn writeParam(w: *std.Io.Writer, key: []const u8, value: []const u8) !void {
     try w.writeAll("&");
     try std.Uri.Component.formatEscaped(.{ .raw = key }, w);
     try w.writeAll("=");
@@ -554,7 +557,7 @@ fn oauthPostRaw(
     extra_headers: []const std.http.Header,
     timeouts: Endpoint.TimeoutConfig,
 ) !RawPostResponse {
-    var client = std.http.Client{ .allocator = alloc };
+    var client = std.http.Client{ .allocator = alloc, .io = process_io.get() };
     defer client.deinit();
 
     const uri = std.Uri.parse(url) catch return error.InvalidUri;
@@ -592,21 +595,20 @@ fn oauthPostRaw(
     };
 
     var no_redirects: [0]u8 = .{};
-    var response = req.receiveHead(&no_redirects) catch |err| {
-        log.warn("oauth: receiveHead failed: {s}", .{@errorName(err)});
-        return error.ApiError;
+    var response = socket_timeouts.receiveHeadWithTimeout(process_io.get(), &req, &no_redirects, timeouts.read_ms) catch |err| switch (err) {
+        error.ReadTimeout => return error.ReadTimeout,
+        else => {
+            log.warn("oauth: receiveHead failed: {s}", .{@errorName(err)});
+            return error.ApiError;
+        },
     };
 
-    // First point the socket fd is reachable; cap read/write so a stalled
-    // IdP fails fast instead of wedging the turn.
-    if (req.connection) |conn| {
-        socket_timeouts.applySocketTimeouts(
-            conn.stream_reader.getStream().handle,
-            timeouts.read_ms,
-            timeouts.write_ms,
-        );
-    }
-
+    // Bound the read so a wedged IdP fails fast instead of hanging the turn on
+    // the OS-default socket timeout. 0.16 makes the http reader non-blocking,
+    // so the bound is enforced by racing the read against a deadline
+    // (socket_timeouts.streamWithTimeout), not by SO_RCVTIMEO. (write_ms is no
+    // longer separately enforced: the send completes before receiveHead.)
+    const io = process_io.get();
     var transfer_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
@@ -616,17 +618,11 @@ fn oauthPostRaw(
     while (true) {
         var chunk: [4096]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&chunk);
-        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
+        const n = socket_timeouts.streamWithTimeout(io, reader, &writer, .limited(chunk.len), timeouts.read_ms) catch |err| switch (err) {
             error.EndOfStream => break,
+            error.ReadTimeout => return error.ReadTimeout,
             error.WriteFailed => unreachable, // fixed writer sized to chunk.len
-            error.ReadFailed => {
-                if (req.connection) |conn| {
-                    if (conn.getReadError()) |inner| {
-                        if (inner == error.WouldBlock) return error.ReadTimeout;
-                    }
-                }
-                return error.ApiError;
-            },
+            error.ReadFailed => return error.ApiError,
         };
         if (n == 0) break;
         try out.appendSlice(alloc, chunk[0..n]);
@@ -640,7 +636,7 @@ fn oauthPostRaw(
 
 pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     // Build form body.
-    var body_aw: std.io.Writer.Allocating = .init(alloc);
+    var body_aw: std.Io.Writer.Allocating = .init(alloc);
     defer body_aw.deinit();
     const body_w = &body_aw.writer;
 
@@ -671,7 +667,7 @@ pub fn exchangeCode(alloc: Allocator, p: ExchangeParams) !TokenResponse {
     return parseTokenResponse(alloc, raw.body, .exchange);
 }
 
-fn writeFormField(w: *std.io.Writer, key: []const u8, val: []const u8, first: bool) !void {
+fn writeFormField(w: *std.Io.Writer, key: []const u8, val: []const u8, first: bool) !void {
     if (!first) try w.writeByte('&');
     try std.Uri.Component.formatEscaped(.{ .raw = key }, w);
     try w.writeByte('=');
@@ -720,24 +716,24 @@ fn pickString(alloc: Allocator, obj: std.json.ObjectMap, key: []const u8, requir
 }
 
 test "exchangeCode POSTs form-urlencoded and parses tokens" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const Captured = struct { bytes: [8192]u8 = undefined, len: usize = 0 };
     var captured = Captured{};
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, cap: *Captured) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
-            cap.len = conn.stream.read(&cap.bytes) catch 0;
+        fn run(srv: *std.Io.net.Server, cap: *Captured) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+            cap.len = test_net.streamRead(conn, &cap.bytes) catch 0;
             const resp =
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: 59\r\nConnection: close\r\n\r\n" ++
                 "{\"id_token\":\"idt\",\"access_token\":\"at\",\"refresh_token\":\"rt\"}";
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, &captured });
@@ -770,22 +766,22 @@ test "exchangeCode POSTs form-urlencoded and parses tokens" {
 }
 
 test "exchangeCode returns error.TokenExchangeFailed on non-2xx" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var b: [4096]u8 = undefined;
-            _ = conn.stream.read(&b) catch {};
+            _ = test_net.streamRead(conn, &b) catch {};
             const resp =
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: 65\r\nConnection: close\r\n\r\n" ++
                 "{\"error\":\"invalid_grant\",\"error_description\":\"auth code expired\"}";
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -916,24 +912,24 @@ test "extractErrorCode returns null when code exceeds out buffer" {
 }
 
 test "refreshAccessToken POSTs JSON and parses tokens" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const Captured = struct { bytes: [8192]u8 = undefined, len: usize = 0 };
     var captured = Captured{};
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server, cap: *Captured) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
-            cap.len = conn.stream.read(&cap.bytes) catch 0;
+        fn run(srv: *std.Io.net.Server, cap: *Captured) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+            cap.len = test_net.streamRead(conn, &cap.bytes) catch 0;
             const resp =
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: 70\r\nConnection: close\r\n\r\n" ++
                 "{\"id_token\":\"NEW_ID\",\"access_token\":\"NEW_AT\",\"refresh_token\":\"NEW_RT\"}";
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{ &server, &captured });
@@ -961,22 +957,22 @@ test "refreshAccessToken POSTs JSON and parses tokens" {
 }
 
 test "refreshAccessToken tolerates omitted fields (empty strings)" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var b: [4096]u8 = undefined;
-            _ = conn.stream.read(&b) catch {};
+            _ = test_net.streamRead(conn, &b) catch {};
             const resp =
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: 26\r\nConnection: close\r\n\r\n" ++
                 "{\"access_token\":\"ONLY_AT\"}";
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -998,22 +994,22 @@ test "refreshAccessToken tolerates omitted fields (empty strings)" {
 }
 
 test "refreshAccessToken maps invalid_grant to error.LoginExpired" {
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
             var b: [4096]u8 = undefined;
-            _ = conn.stream.read(&b) catch {};
+            _ = test_net.streamRead(conn, &b) catch {};
             const resp =
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n" ++
                 "Content-Length: 69\r\nConnection: close\r\n\r\n" ++
                 "{\"error\":\"invalid_grant\",\"error_description\":\"refresh token expired\"}";
-            _ = conn.stream.writeAll(resp) catch {};
+            _ = test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -1033,23 +1029,31 @@ test "refreshAccessToken maps invalid_grant to error.LoginExpired" {
 /// only the response head (chunked transfer, no chunk) and sleeps. Any read
 /// on the body side blocks until `SO_RCVTIMEO` fires. Mirrors
 /// `mockTimeoutServer` in `llm/http.zig`.
-fn mockStallingIdp(srv: *std.net.Server, sleep_ns: u64) void {
-    const conn = srv.accept() catch return;
-    defer conn.stream.close();
+fn mockStallingIdp(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    const io = std.testing.io;
+    var stream = srv.accept(io) catch return;
+    defer stream.close(io);
 
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = conn.stream.read(&buf) catch return;
+    var read_scratch: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_scratch);
+    var req: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (total < req.len) {
+        const n = sr.interface.readSliceShort(req[total..]) catch return;
         if (n == 0) return;
-        if (std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") != null) break;
+        total += n;
+        if (std.mem.indexOf(u8, req[0..total], "\r\n\r\n") != null) break;
     }
 
     const head_only = "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: application/json\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
         "Connection: close\r\n\r\n";
-    _ = conn.stream.writeAll(head_only) catch {};
-    std.Thread.sleep(sleep_ns);
+    var write_scratch: [256]u8 = undefined;
+    var sw = stream.writer(io, &write_scratch);
+    sw.interface.writeAll(head_only) catch {};
+    sw.interface.flush() catch {};
+    clock.sleep(sleep_ns);
 }
 
 test "oauthPostRaw surfaces error.ReadTimeout when the IdP stalls mid-body" {
@@ -1059,24 +1063,23 @@ test "oauthPostRaw surfaces error.ReadTimeout when the IdP stalls mid-body" {
     // read timeout the body read fails fast with EAGAIN, recovered as
     // error.ReadTimeout. A short timeout is threaded in directly so the
     // test stays sub-second rather than waiting the 30s production budget.
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
 
     const thr = try std.Thread.spawn(.{}, mockStallingIdp, .{ &server, 3 * std.time.ns_per_s });
     defer {
-        server.deinit();
+        server.deinit(std.testing.io);
         thr.join();
     }
 
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/oauth/token", .{port});
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     const result = oauthPostRaw(std.testing.allocator, url, "{}", &.{
         .{ .name = "Content-Type", .value = "application/json" },
     }, .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 });
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = clock.milliTimestamp() - start;
 
     try std.testing.expectError(error.ReadTimeout, result);
     // 500 ms timeout plus slack for connect/handshake; OS-default behaviour
@@ -1157,11 +1160,13 @@ pub fn runLoginFlowWithCodes(
     pkce: PkceCodes,
     state: []const u8,
 ) !void {
-    // 1) Bind the callback listener.
-    const addr = try std.net.Address.parseIp("127.0.0.1", opts.redirect_port);
-    var listener = try addr.listen(.{ .reuse_address = true });
-    defer listener.deinit();
-    const bound_port = listener.listen_address.getPort();
+    // 1) Bind the callback listener. 0.16 moved sockets under std.Io.net,
+    // so the listen/accept/read path all take the process io explicitly.
+    const io = process_io.get();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", opts.redirect_port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const bound_port = listener.socket.address.getPort();
 
     const redirect_uri = try std.fmt.allocPrint(
         alloc,
@@ -1188,7 +1193,7 @@ pub fn runLoginFlowWithCodes(
     // 3) Launch the browser unless tests opted out.
     if (!opts.skip_browser) {
         var stdout_buf: [1024]u8 = undefined;
-        var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
         stdout_w.interface.print(
             "Opening your browser to sign in. If it doesn't open, paste:\n  {s}\n\n",
             .{auth_url},
@@ -1200,14 +1205,14 @@ pub fn runLoginFlowWithCodes(
     }
 
     // 4) Accept exactly one inbound connection.
-    const conn = try listener.accept();
-    defer conn.stream.close();
+    const stream = try listener.accept(io);
+    defer stream.close(io);
 
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [8 * 1024]u8 = undefined;
-    var net_reader = conn.stream.reader(&read_buf);
-    var net_writer = conn.stream.writer(&write_buf);
-    var server = std.http.Server.init(net_reader.interface(), &net_writer.interface);
+    var net_reader = stream.reader(io, &read_buf);
+    var net_writer = stream.writer(io, &write_buf);
+    var server = std.http.Server.init(&net_reader.interface, &net_writer.interface);
     var request = try server.receiveHead();
 
     // 5) Parse /auth/callback?code=...&state=...
@@ -1267,7 +1272,7 @@ pub fn runLoginFlowWithCodes(
     defer alloc.free(account_id);
 
     // 9) Persist into auth.json.
-    const last_refresh = try formatIsoUtc(alloc, std.time.timestamp());
+    const last_refresh = try formatIsoUtc(alloc, clock.timestamp());
     defer alloc.free(last_refresh);
     auth.upsertOAuth(alloc, opts.auth_path, opts.provider_name, .{
         .id_token = tokens.id_token,
@@ -1297,17 +1302,20 @@ pub fn runLoginFlowWithCodes(
 }
 
 fn launchBrowser(alloc: Allocator, url: []const u8) !void {
+    _ = alloc;
     const argv: []const []const u8 = switch (builtin.os.tag) {
         .macos => &.{ "open", url },
         .linux => &.{ "xdg-open", url },
         else => return error.UnsupportedPlatform,
     };
-    var child = std.process.Child.init(argv, alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    _ = child.wait() catch {};
+    const io = process_io.get();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    _ = child.wait(io) catch {};
 }
 
 /// Look up `key` in a form-encoded query string. Returns a freshly allocated
@@ -1403,39 +1411,39 @@ test "percentDecode handles %XX escapes and `+` as space" {
 
 /// A tiny issuer that answers one POST /oauth/token with the canned JSON.
 const MockIssuer = struct {
-    server: std.net.Server,
+    server: std.Io.net.Server,
     port: u16,
     thread: std.Thread = undefined,
 
     fn start() !MockIssuer {
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        const server = try addr.listen(.{ .reuse_address = true });
-        return .{ .server = server, .port = server.listen_address.getPort() };
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const server = try addr.listen(std.testing.io, .{ .reuse_address = true });
+        return .{ .server = server, .port = test_net.boundPort(&server) };
     }
 
     fn deinit(self: *MockIssuer) void {
-        self.server.deinit();
+        self.server.deinit(std.testing.io);
     }
 
-    fn run(srv: *std.net.Server) void {
-        const conn = srv.accept() catch return;
-        defer conn.stream.close();
+    fn run(srv: *std.Io.net.Server) void {
+        var conn = srv.accept(std.testing.io) catch return;
+        defer conn.close(std.testing.io);
         var buf: [8192]u8 = undefined;
-        _ = conn.stream.read(&buf) catch {};
+        _ = test_net.streamRead(conn, &buf) catch {};
         const resp =
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
             "Content-Length: 203\r\nConnection: close\r\n\r\n" ++
             // id_token payload: {"https://api.openai.com/auth":{"chatgpt_account_id":"acc-123"}}
             // Encoded with a trailing `.sig` stub to look like a real JWT.
             "{\"id_token\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjLTEyMyJ9fQ.sig\",\"access_token\":\"at\",\"refresh_token\":\"rt\"}";
-        _ = conn.stream.writeAll(resp) catch {};
+        _ = test_net.streamWriteAll(conn, resp) catch {};
     }
 };
 
 test "runLoginFlowWithCodes exchanges code, persists auth.json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(auth_path);
@@ -1451,10 +1459,9 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
     defer issuer_thread.join();
 
     // Pick a free port for the callback server so we know what to dial.
-    const probe_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var probe = try probe_addr.listen(.{ .reuse_address = true });
-    const callback_port = probe.listen_address.getPort();
-    probe.deinit();
+    var probe = try test_net.listenLoopback();
+    const callback_port = test_net.boundPort(&probe);
+    probe.deinit(std.testing.io);
 
     // Spawn the simulated browser: connects to the callback port once the
     // login flow is listening and delivers a matching code + state.
@@ -1463,22 +1470,22 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
             // Retry connect until the login flow's listener is up.
             var attempts: u8 = 0;
             while (attempts < 50) : (attempts += 1) {
-                const addr = std.net.Address.parseIp("127.0.0.1", port) catch return;
-                const stream = std.net.tcpConnectToAddress(addr) catch {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
+                const stream = addr.connect(std.testing.io, .{ .mode = .stream }) catch {
+                    clock.sleep(10 * std.time.ns_per_ms);
                     continue;
                 };
-                defer stream.close();
+                defer stream.close(std.testing.io);
                 var buf: [1024]u8 = undefined;
                 const req = std.fmt.bufPrint(
                     &buf,
                     "GET /auth/callback?code=CODE123&state={s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
                     .{state},
                 ) catch return;
-                _ = stream.writeAll(req) catch return;
+                test_net.streamWriteAll(stream, req) catch return;
                 var drain: [4096]u8 = undefined;
                 while (true) {
-                    const n = stream.read(&drain) catch 0;
+                    const n = test_net.streamRead(stream, &drain) catch 0;
                     if (n == 0) break;
                 }
                 return;
@@ -1527,32 +1534,31 @@ test "runLoginFlowWithCodes exchanges code, persists auth.json" {
 test "runLoginFlowWithCodes rejects mismatched state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_abs);
     const auth_path = try std.fs.path.join(std.testing.allocator, &.{ dir_abs, "auth.json" });
     defer std.testing.allocator.free(auth_path);
 
-    const probe_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var probe = try probe_addr.listen(.{ .reuse_address = true });
-    const callback_port = probe.listen_address.getPort();
-    probe.deinit();
+    var probe = try test_net.listenLoopback();
+    const callback_port = test_net.boundPort(&probe);
+    probe.deinit(std.testing.io);
 
     const BrowserCtx = struct {
         fn run(port: u16) void {
             var attempts: u8 = 0;
             while (attempts < 50) : (attempts += 1) {
-                const addr = std.net.Address.parseIp("127.0.0.1", port) catch return;
-                const stream = std.net.tcpConnectToAddress(addr) catch {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
+                const stream = addr.connect(std.testing.io, .{ .mode = .stream }) catch {
+                    clock.sleep(10 * std.time.ns_per_ms);
                     continue;
                 };
-                defer stream.close();
+                defer stream.close(std.testing.io);
                 // Deliberately wrong state.
                 const req = "GET /auth/callback?code=CODE123&state=WRONG HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-                _ = stream.writeAll(req) catch return;
+                test_net.streamWriteAll(stream, req) catch return;
                 var drain: [4096]u8 = undefined;
                 while (true) {
-                    const n = stream.read(&drain) catch 0;
+                    const n = test_net.streamRead(stream, &drain) catch 0;
                     if (n == 0) break;
                 }
                 return;
@@ -1582,5 +1588,5 @@ test "runLoginFlowWithCodes rejects mismatched state" {
     try std.testing.expectError(error.StateMismatch, result);
 
     // auth.json must not have been written.
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(auth_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, auth_path, .{}));
 }

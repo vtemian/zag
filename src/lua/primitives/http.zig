@@ -23,7 +23,10 @@
 //! the socket and frees the connection struct).
 
 const std = @import("std");
+const test_net = @import("../../test_net.zig");
+const clock = @import("../../clock.zig");
 const builtin = @import("builtin");
+const process_io = @import("../../process_io.zig");
 const Allocator = std.mem.Allocator;
 const job_mod = @import("../Job.zig");
 const Job = job_mod.Job;
@@ -72,13 +75,13 @@ pub const AbortCtx = struct {
         const conn = self.connection.load(.acquire) orelse return;
         if (self.shutdown_done.swap(true, .acq_rel)) return;
 
-        // Pull the fd out of the connection's stream_reader and
-        // shutdown both directions. `shutdown(2)` wakes a blocked
-        // recv with ECONNRESET/ENOTCONN (depending on platform) but
-        // keeps the fd valid so `client.deinit` can still call close
-        // on it without hitting EBADF or, worse, a reused fd.
-        const stream = conn.stream_reader.getStream();
-        std.posix.shutdown(stream.handle, .both) catch |err| {
+        // Shutdown both directions on the connection's stream. `shutdown(2)`
+        // wakes a blocked recv with ECONNRESET/ENOTCONN (depending on
+        // platform) but keeps the fd valid so `client.deinit` can still call
+        // close on it without hitting EBADF or, worse, a reused fd. 0.16 made
+        // getStream private; reach the Stream directly and use its io-aware
+        // shutdown rather than the removed std.posix.shutdown.
+        conn.stream_reader.stream.shutdown(process_io.get(), .both) catch |err| {
             log.debug("http abort: shutdown failed: {s}", .{@errorName(err)});
         };
     }
@@ -154,7 +157,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
         return;
     };
 
-    var client = std.http.Client{ .allocator = alloc };
+    var client = std.http.Client{ .allocator = alloc, .io = process_io.get() };
     defer client.deinit();
 
     // Aborter: `abort_ctx` lives on this stack frame. We null the
@@ -284,7 +287,7 @@ fn executeHttpImpl(alloc: Allocator, job: *Job, args: HttpImplArgs) void {
     // Accumulate body into an engine-owned slice. Mirrors
     // `llm.zig`'s StreamingResponse pattern. No errdefer; every
     // early-exit below calls `out.deinit()` explicitly.
-    var out: std.io.Writer.Allocating = .init(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
 
     // Stream the body. We don't bother with decompression here: v1
     // of zag.http.get surfaces raw bytes, so the caller's explicit
@@ -344,16 +347,30 @@ fn mapAndStoreErr(alloc: Allocator, job: *Job, abort_ctx: *AbortCtx, err: anyerr
         error.HttpRedirectLocationMissing,
         error.HttpRedirectLocationOversize,
         => .invalid_uri,
-        error.TlsInitializationFailed => .tls_error,
+        error.TlsInitializationFailed,
+        error.CertificateBundleLoadFailure,
+        => .tls_error,
+        error.Timeout => .timeout,
+        // 0.16 std.Io.net route/connect failures (IpAddress.ConnectError) +
+        // DNS lookup failures (HostName.LookupError). Names verified against
+        // lib/std/Io/net.zig; the 0.15 names ConnectionTimedOut /
+        // TemporaryNameServerFailure / HostLacksNetworkAddresses /
+        // UnexpectedConnectFailure no longer exist (Timeout handled above).
         error.ConnectionRefused,
-        error.NetworkUnreachable,
-        error.ConnectionTimedOut,
         error.ConnectionResetByPeer,
-        error.TemporaryNameServerFailure,
-        error.NameServerFailure,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        error.AddressFamilyUnsupported,
         error.UnknownHostName,
-        error.HostLacksNetworkAddresses,
-        error.UnexpectedConnectFailure,
+        error.NameServerFailure,
+        error.NoAddressReturned,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.DetectingNetworkConfigurationFailed,
         => .connect_failed,
         error.HttpHeadersInvalid,
         error.HttpHeadersOversize,
@@ -381,19 +398,19 @@ test "executeHttpGet fetches from a local test server" {
     defer root.deinit();
 
     // Listen on 127.0.0.1:0; kernel picks a free port.
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Minimal HTTP/1.1 server: accept one connection, read the
     // request (drain until we've seen \r\n\r\n or buffer fills), send
     // a canned 200 OK with "hello world" body, close. Thread exits
     // after serving one request.
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             // Read enough to unblock the client. We only look for
             // \r\n\r\n (end of headers); body would come next but GET
@@ -401,7 +418,7 @@ test "executeHttpGet fetches from a local test server" {
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -414,7 +431,7 @@ test "executeHttpGet fetches from a local test server" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "hello world";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -487,22 +504,22 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
     const root = try Scope.init(alloc, null);
     defer root.deinit();
 
-    const listen_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const port = server.listen_address.getPort();
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
 
     // Slow server: accept, read the request, then sleep 10s before
     // responding. The test cancels long before the sleep ends.
     const ServerCtx = struct {
-        fn run(srv: *std.net.Server) void {
-            const conn = srv.accept() catch return;
-            defer conn.stream.close();
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var buf: [4096]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch return;
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -511,7 +528,7 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
             // Simulate an upstream that's thinking about it. 10s is
             // well past the 1s deadline the test enforces and well
             // under any reasonable CI wall-clock cap.
-            std.Thread.sleep(10 * std.time.ns_per_s);
+            clock.sleep(10 * std.time.ns_per_s);
 
             const resp =
                 "HTTP/1.1 200 OK\r\n" ++
@@ -519,7 +536,7 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "ok";
-            conn.stream.writeAll(resp) catch {};
+            test_net.streamWriteAll(conn, resp) catch {};
         }
     };
     const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
@@ -541,16 +558,16 @@ test "executeHttpGet socket shutdown interrupts blocked recv" {
     // ErrTag.cancelled by `mapAndStoreErr`.
     const CancelCtx = struct {
         fn run(s: *Scope) void {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            clock.sleep(100 * std.time.ns_per_ms);
             s.cancel("test-abort") catch {};
         }
     };
     const cancel_thread = try std.Thread.spawn(.{}, CancelCtx.run, .{root});
     defer cancel_thread.join();
 
-    const start = std.time.milliTimestamp();
+    const start = clock.milliTimestamp();
     executeHttpGet(alloc, &job);
-    const elapsed_ms = std.time.milliTimestamp() - start;
+    const elapsed_ms = clock.milliTimestamp() - start;
 
     try testing.expect(job.err_tag != null);
     try testing.expectEqual(job_mod.ErrTag.cancelled, job.err_tag.?);

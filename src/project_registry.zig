@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const process_io = @import("process_io.zig");
 const types = @import("types.zig");
 
 const log = std.log.scoped(.project_registry);
@@ -50,9 +51,15 @@ pub fn init(allocator: Allocator, config_dir: []const u8) !ProjectRegistry {
     const dir_owned = try allocator.dupe(u8, config_dir);
     errdefer allocator.free(dir_owned);
 
-    std.fs.cwd().makePath(dir_owned) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
+    // access first (follows symlinks): 0.16's createDirPath returns error.NotDir
+    // when the existing leaf is a symlink-to-dir (e.g. a stow/chezmoi-managed
+    // ~/.config/zag), so skip it when the dir already exists.
+    const reg_io = process_io.get();
+    std.Io.Dir.cwd().access(reg_io, dir_owned, .{}) catch {
+        std.Io.Dir.cwd().createDirPath(reg_io, dir_owned) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
     };
 
     const file_path = try std.fs.path.join(allocator, &.{ dir_owned, "projects.json" });
@@ -133,7 +140,7 @@ pub fn listProjects(self: *const ProjectRegistry) ![]Project {
 const max_registry_bytes: usize = 1 * 1024 * 1024;
 
 fn loadFromDisk(self: *ProjectRegistry) !void {
-    const data = std.fs.cwd().readFileAlloc(self.allocator, self.file_path, max_registry_bytes) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(process_io.get(), self.file_path, self.allocator, .limited(max_registry_bytes)) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -185,27 +192,28 @@ fn saveAtomic(self: *ProjectRegistry) !void {
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.{d}.tmp", .{ self.file_path, pid }) catch
         return error.PathTooLong;
 
-    const cwd = std.fs.cwd();
+    const io = process_io.get();
+    const cwd = std.Io.Dir.cwd();
 
     // Belt-and-suspenders: a stale per-PID tmp from a prior crash in
     // *this* process would otherwise inherit its old contents on
     // createFile.truncate. Unlink first so each save starts clean.
-    cwd.deleteFile(tmp_path) catch |err| switch (err) {
+    cwd.deleteFile(io, tmp_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 
     {
-        const tmp_file = try cwd.createFile(tmp_path, .{ .truncate = true });
-        defer tmp_file.close();
+        const tmp_file = try cwd.createFile(io, tmp_path, .{ .truncate = true });
+        defer tmp_file.close(io);
         var scratch: [256]u8 = undefined;
-        var file_w = tmp_file.writer(&scratch);
+        var file_w = tmp_file.writer(io, &scratch);
         try writeRegistry(&file_w.interface, self.projects.items);
         try file_w.interface.flush();
-        try tmp_file.sync();
+        try tmp_file.sync(io);
     }
 
-    try cwd.rename(tmp_path, self.file_path);
+    try cwd.rename(tmp_path, cwd, self.file_path, io);
 }
 
 fn writeRegistry(w: *std.Io.Writer, items: []const Project) !void {
@@ -225,7 +233,7 @@ fn writeRegistry(w: *std.Io.Writer, items: []const Project) !void {
 test "register dedupes and bumps last_seen_ms" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     var reg = try ProjectRegistry.init(std.testing.allocator, tmp_path);
@@ -251,7 +259,7 @@ test "register dedupes and bumps last_seen_ms" {
 test "register persists across reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     {
@@ -276,10 +284,10 @@ test "register persists across reopen" {
 test "malformed registry file recovers to empty list" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "projects.json",
         .data = "{ not valid json",
     });
@@ -305,7 +313,7 @@ test "malformed registry file recovers to empty list" {
 test "listProjects sorts most-recent-first" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     var reg = try ProjectRegistry.init(std.testing.allocator, tmp_path);
@@ -331,15 +339,15 @@ test "listProjects sorts most-recent-first" {
 test "saveAtomic uses a process-scoped tmp filename" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
 
     // Plant a stale tmp file belonging to a *different* pid. saveAtomic
     // must leave it alone (it would belong to another live zag, not us).
     // The legacy shared-tmp path "projects.json.tmp" must also be left
     // alone, since it is no longer in our cleanup namespace.
-    try tmp.dir.writeFile(.{ .sub_path = "projects.json.99999999.tmp", .data = "other-process" });
-    try tmp.dir.writeFile(.{ .sub_path = "projects.json.tmp", .data = "legacy-shared" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "projects.json.99999999.tmp", .data = "other-process" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "projects.json.tmp", .data = "legacy-shared" });
 
     var reg = try ProjectRegistry.init(std.testing.allocator, tmp_path);
     defer reg.deinit();
@@ -350,11 +358,11 @@ test "saveAtomic uses a process-scoped tmp filename" {
     const our_pid: i32 = @intCast(std.c.getpid());
     var our_tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const our_tmp_name = try std.fmt.bufPrint(&our_tmp_buf, "projects.json.{d}.tmp", .{our_pid});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(our_tmp_name, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, our_tmp_name, .{}));
 
     // The foreign-pid tmp and the legacy shared tmp must still be there.
-    try tmp.dir.access("projects.json.99999999.tmp", .{});
-    try tmp.dir.access("projects.json.tmp", .{});
+    try tmp.dir.access(std.testing.io, "projects.json.99999999.tmp", .{});
+    try tmp.dir.access(std.testing.io, "projects.json.tmp", .{});
 
     // And the real registry got written.
     const list = try reg.listProjects();
