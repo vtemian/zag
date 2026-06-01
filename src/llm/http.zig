@@ -893,6 +893,65 @@ test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls mid-body
     try std.testing.expect(elapsed < 1500);
 }
 
+// Like mockTimeoutServer but never writes the response head: drains the
+// request so the client's send completes, then stalls. This exercises the
+// HEAD-read race (receiveHeadWithTimeout) rather than the body-read race.
+fn mockHeadStallServer(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    const io = std.testing.io;
+    var stream = srv.accept(io) catch return;
+    defer stream.close(io);
+
+    const alloc = std.heap.page_allocator;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+    var read_scratch: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_scratch);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = sr.interface.readSliceShort(&tmp) catch break;
+        if (n == 0) break;
+        req.appendSlice(alloc, tmp[0..n]) catch break;
+        if (std.mem.indexOf(u8, req.items, "\r\n\r\n") != null) break;
+    }
+    // No response head is ever written; the client must time out in receiveHead.
+    clock.sleep(sleep_ns);
+}
+
+test "httpPostJsonRaw surfaces error.ReadTimeout when the server stalls before the response head" {
+    // The HEAD-read race (receiveHeadWithTimeout): the server accepts the
+    // connection and drains the request, then never sends the response head.
+    // Without the head-read deadline the client would block in receiveHead until
+    // the OS default (~75s macOS / ~127s Linux); with read_ms=500 it surfaces
+    // error.ReadTimeout. This covers the distinct failure mode the receiveHead
+    // bound was added for (the body-stall test above can only trip
+    // streamWithTimeout, since that mock writes the full head first).
+    const allocator = std.testing.allocator;
+
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
+
+    const thr = try std.Thread.spawn(.{}, mockHeadStallServer, .{ &server, 3 * std.time.ns_per_s });
+    defer {
+        server.deinit(std.testing.io);
+        thr.join();
+    }
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const start = clock.milliTimestamp();
+    const result = httpPostJsonRaw(
+        url,
+        "{}",
+        &.{},
+        allocator,
+        .{ .connect_ms = 1000, .read_ms = 500, .write_ms = 1000 },
+    );
+    const elapsed = clock.milliTimestamp() - start;
+    try std.testing.expectError(error.ReadTimeout, result);
+    try std.testing.expect(elapsed < 1500);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

@@ -33,18 +33,7 @@ const Hooks = @import("../Hooks.zig");
 var test_env_map: ?std.process.Environ.Map = null;
 
 fn ensureTestEnv() *std.process.Environ.Map {
-    if (test_env_map == null) {
-        var m: std.process.Environ.Map = .init(std.heap.page_allocator);
-        var i: usize = 0;
-        while (std.c.environ[i]) |entry| : (i += 1) {
-            const pair = std.mem.span(entry);
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-            m.put(pair[0..eq], pair[eq + 1 ..]) catch {};
-        }
-        test_env_map = m;
-        env_mod.init(&test_env_map.?);
-    }
-    return &test_env_map.?;
+    return env_mod.seedFromEnvironForTest(&test_env_map);
 }
 
 fn getEnvForTest(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {

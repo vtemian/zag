@@ -162,7 +162,7 @@ pub const BufferSink = struct {
                 self.last_assistant_node = null;
                 // Pair the live provider id onto the node itself (Kimi's
                 // `<name>:<index>`, Anthropic's `toolu_*`, ...). The wire
-                // projection reads it back through `Conversation.projectNode`
+                // projection reads it back through `WireProjection.projectNode`
                 // so the next-turn request echoes the model's original ids
                 // verbatim, keeping the live and projected paths consistent.
                 // `input_raw` (raw JSON arguments) is carried alongside so

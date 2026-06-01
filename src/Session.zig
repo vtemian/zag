@@ -757,7 +757,8 @@ pub const SessionHandle = struct {
 /// file is slurped before line-splitting, so an unbounded cap would let a
 /// runaway file freeze the UI loop. Replaces a former 10 MiB cap the largest
 /// real session was already at 90% of (the next big one would have failed
-/// with `error.FileTooBig`). A session legitimately approaching this size
+/// with `error.StreamTooLong`, returned by readFileAlloc's `.limited` cap when
+/// the size is reached or exceeded). A session legitimately approaching this size
 /// would need lazy/windowed loading, which is out of scope here.
 const max_session_bytes: usize = 128 * 1024 * 1024; // 128 MiB
 
@@ -3654,18 +3655,7 @@ test "SessionManager.init succeeds when HOME is unset" {
 var test_env_map: ?std.process.Environ.Map = null;
 
 fn ensureTestEnv() *std.process.Environ.Map {
-    if (test_env_map == null) {
-        var m: std.process.Environ.Map = .init(std.heap.page_allocator);
-        var i: usize = 0;
-        while (std.c.environ[i]) |entry| : (i += 1) {
-            const pair = std.mem.span(entry);
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-            m.put(pair[0..eq], pair[eq + 1 ..]) catch {};
-        }
-        test_env_map = m;
-        env_mod.init(&test_env_map.?);
-    }
-    return &test_env_map.?;
+    return env_mod.seedFromEnvironForTest(&test_env_map);
 }
 
 fn setEnvForTest(name: [:0]const u8, value: []const u8) void {

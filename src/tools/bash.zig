@@ -771,20 +771,11 @@ var bash_test_env_map: ?std.process.Environ.Map = null;
 
 /// Seed `env_mod` from the real process environment so the strict-mode sandbox
 /// tests (which read HOME to build the secret-deny rules) pass regardless of
-/// test order. `env_mod`'s map is process-global but is only installed by a
-/// test that runs an `ensureTestEnv` helper (see env.zig); these bash tests can
-/// run before any other module seeds it. Test scaffolding only.
+/// test order: `env_mod`'s map is process-global but only installed by a test
+/// that seeds it, and these bash tests can run before any other module does.
+/// Test scaffolding only.
 fn ensureTestEnv() void {
-    if (bash_test_env_map != null) return;
-    var m: std.process.Environ.Map = .init(std.heap.page_allocator);
-    var i: usize = 0;
-    while (std.c.environ[i]) |entry| : (i += 1) {
-        const pair = std.mem.span(entry);
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        m.put(pair[0..eq], pair[eq + 1 ..]) catch {};
-    }
-    bash_test_env_map = m;
-    env_mod.init(&bash_test_env_map.?);
+    _ = env_mod.seedFromEnvironForTest(&bash_test_env_map);
 }
 
 test "execute denies reading ~/.ssh on macOS in strict mode" {

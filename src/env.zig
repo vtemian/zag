@@ -52,3 +52,25 @@ pub fn dupeMap(allocator: Allocator) Allocator.Error!std.process.Environ.Map {
     while (it.next()) |e| try out.put(e.key_ptr.*, e.value_ptr.*);
     return out;
 }
+
+/// Test-only: seed `slot` (a module-owned `?Environ.Map`) from the real process
+/// environment and point this module at it, exactly once. Returns the live map
+/// so callers may overlay test entries (HOME, etc.). Each test module keeps its
+/// own slot so concurrently-linked test modules don't fight over a single map.
+/// Copies via `Map.put` over `std.c.environ`, never libc `setenv` — `setenv`
+/// reallocates the array `std.Io.Threaded` froze a pointer to, dangling it.
+/// Uses `page_allocator`: this is process-lifetime test scaffolding, never freed.
+pub fn seedFromEnvironForTest(slot: *?std.process.Environ.Map) *std.process.Environ.Map {
+    if (slot.* == null) {
+        var m: std.process.Environ.Map = .init(std.heap.page_allocator);
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry| : (i += 1) {
+            const pair = std.mem.span(entry);
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            m.put(pair[0..eq], pair[eq + 1 ..]) catch {};
+        }
+        slot.* = m;
+        init(&slot.*.?);
+    }
+    return &slot.*.?;
+}

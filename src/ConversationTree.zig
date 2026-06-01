@@ -64,7 +64,7 @@ pub const Node = struct {
     custom_tag: ?[]const u8 = null,
     /// Provider-issued tool_use_id for `tool_call` nodes (e.g. Kimi's
     /// `<name>:<index>`, Anthropic's `toolu_01...`). Owned when set;
-    /// freed in `deinit`. Read by `Conversation.projectNode` so the
+    /// freed in `deinit`. Read by `WireProjection.projectNode` so the
     /// wire projection echoes the model's original ids back instead of
     /// synthesizing `synth_N` placeholders that drift from what live
     /// turns produce. Null for legacy nodes loaded from JSONL that
