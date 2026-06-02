@@ -2489,6 +2489,63 @@ test "sessions sidebar d on a subagent row is a no-op" {
     );
 }
 
+// The binding lists sessions across every registered project but tags each
+// row with `is_current_project` (true only when the row's project matches the
+// live cwd realpath). Cross-project ids cannot be opened yet, so the sidebar
+// must render only the current-project rows.
+test "sessions sidebar hides sessions from other projects" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer restoreCwd(orig_cwd);
+
+    const fake_home = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(fake_home);
+    const prev_home = getEnvForTest(allocator, "HOME");
+    defer if (prev_home) |p| allocator.free(p);
+    setEnvForTest("HOME", fake_home);
+    defer restoreEnvForTest("HOME", prev_home);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var buffer_registry = BufferRegistry.init(allocator);
+    defer buffer_registry.deinit();
+    engine.buffer_registry = &buffer_registry;
+
+    try runLua(&engine,
+        \\local sidebar = require("zag.builtin.sessions")
+        \\local buf = zag.buffer.create({ kind = "scratch", name = "sessions" })
+        \\sidebar._attach_buffer_for_test(buf)
+        \\local st = sidebar._state_for_test()
+        \\st.filter = ""
+        \\st.expanded = {}
+        \\-- Inject a list with one current-project and one cross-project row,
+        \\-- bypassing zag.sessions.list() so the test does not depend on
+        \\-- on-disk session fixtures across two projects.
+        \\st.session_list_cache = {
+        \\    { id = "11111111111111111111111111111111", name = "here",
+        \\      project = "/p/current", is_current_project = true,
+        \\      updated_ms = 2, created_ms = 1, message_count = 0, status = "idle" },
+        \\    { id = "22222222222222222222222222222222", name = "elsewhere",
+        \\      project = "/p/other", is_current_project = false,
+        \\      updated_ms = 1, created_ms = 1, message_count = 0, status = "idle" },
+        \\}
+        \\sidebar._render()
+        \\local lr = st.last_render
+        \\assert(#lr == 1, "expected only the current-project row, got " .. tostring(#lr))
+        \\assert(lr[1].session_id == "11111111111111111111111111111111",
+        \\       "the visible row must be the current-project session")
+        \\-- Leave module state clean for subsequent tests.
+        \\st.session_list_cache = nil
+    );
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

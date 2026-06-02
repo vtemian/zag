@@ -4,9 +4,11 @@
 //! sidebar plugin. The full surface is:
 //!
 //!   * `zag.sessions.list()`: array of `{id, name, model, created_ms,
-//!     updated_ms, message_count, status, project}` rows aggregated across every
-//!     project recorded in `ProjectRegistry`, sorted by `updated_ms`
-//!     descending.
+//!     updated_ms, message_count, status, project, is_current_project}` rows
+//!     aggregated across every project recorded in `ProjectRegistry`, sorted
+//!     by `updated_ms` descending. `is_current_project` is true when the row's
+//!     project matches the live cwd realpath; the sidebar filters on it because
+//!     cross-project ids cannot be opened yet.
 //!   * `zag.sessions.rename(id, new_name, project_path?)`:update the
 //!     `meta.json` for `id` in `project_path`. When `project_path` is
 //!     omitted, walks the registry to find the owning project. Raises
@@ -92,6 +94,10 @@ fn resolveConfigDir(allocator: std.mem.Allocator) ![]u8 {
 const Row = struct {
     meta: Session.Meta,
     project_path: []const u8,
+    /// True when `project_path` equals the live cwd realpath. The sidebar
+    /// shows only current-project rows because cross-project ids cannot be
+    /// opened yet (`zag.sessions.open` raises `CrossProjectOpenNotSupported`).
+    is_current_project: bool,
 };
 
 /// Owned bundle returned by `collectRows`. `project_paths` holds the
@@ -126,6 +132,21 @@ fn collectRows(allocator: std.mem.Allocator) !Collection {
         project_paths.deinit(allocator);
     }
 
+    // Resolve the cwd realpath once: it tags every row's
+    // `is_current_project` and is folded in below as its own project in
+    // case the registry was unreachable or had not been updated yet.
+    // `[:0]u8`, not `[]u8`: realPathFileAlloc returns a sentinel-terminated
+    // slice and the allocation includes the sentinel byte. Freeing it as a
+    // plain `[]u8` undercounts the length by one and trips the allocator's
+    // Invalid-free check.
+    const cwd_real: ?[:0]u8 = if (std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", allocator)) |p|
+        p
+    else |err| blk: {
+        log.warn("cwd realpath failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (cwd_real) |p| allocator.free(p);
+
     const config_dir = resolveConfigDir(allocator) catch |err| switch (err) {
         // No HOME: degrade to "no registry projects visible". The
         // sidebar still works for whichever project the process happens
@@ -150,18 +171,15 @@ fn collectRows(allocator: std.mem.Allocator) !Collection {
                 allocator.free(projects);
             }
             for (projects) |p| {
-                try appendProjectRows(allocator, &rows, &project_paths, p.path);
+                try appendProjectRows(allocator, &rows, &project_paths, p.path, cwd_real);
             }
         }
     }
 
     // Fold in the current cwd in case the registry was unreachable or
     // had not yet been updated when the sidebar first opened.
-    if (std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", allocator)) |cwd_real| {
-        defer allocator.free(cwd_real);
-        try appendProjectRows(allocator, &rows, &project_paths, cwd_real);
-    } else |err| {
-        log.warn("cwd realpath failed: {s}", .{@errorName(err)});
+    if (cwd_real) |cr| {
+        try appendProjectRows(allocator, &rows, &project_paths, cr, cwd_real);
     }
 
     std.mem.sort(Row, rows.items, {}, struct {
@@ -181,6 +199,7 @@ fn appendProjectRows(
     rows: *std.ArrayList(Row),
     project_paths: *std.ArrayList([]u8),
     project_path: []const u8,
+    cwd_real: ?[]const u8,
 ) !void {
     // Dedupe by linear scan; project counts are tiny (tens at most),
     // so an O(n) probe beats the bookkeeping of a hash map keyed on
@@ -192,6 +211,8 @@ fn appendProjectRows(
     errdefer allocator.free(owned);
     try project_paths.append(allocator, owned);
 
+    const is_current = if (cwd_real) |cr| std.mem.eql(u8, cr, project_path) else false;
+
     const metas = Session.listSessionsAt(allocator, owned) catch |err| {
         log.warn("listSessionsAt({s}) failed: {s}", .{ owned, @errorName(err) });
         return;
@@ -199,14 +220,14 @@ fn appendProjectRows(
     defer allocator.free(metas);
 
     for (metas) |m| {
-        try rows.append(allocator, .{ .meta = m, .project_path = owned });
+        try rows.append(allocator, .{ .meta = m, .project_path = owned, .is_current_project = is_current });
     }
 }
 
 /// Push a single row onto the Lua stack as a table with the public
 /// keys documented at the top of this file.
 fn pushRow(lua: *Lua, row: Row) void {
-    lua.createTable(0, 7);
+    lua.createTable(0, 8);
 
     _ = lua.pushString(row.meta.idSlice());
     lua.setField(-2, "id");
@@ -231,6 +252,9 @@ fn pushRow(lua: *Lua, row: Row) void {
 
     _ = lua.pushString(row.project_path);
     lua.setField(-2, "project");
+
+    lua.pushBoolean(row.is_current_project);
+    lua.setField(-2, "is_current_project");
 }
 
 /// `zag.sessions.list()`:see top-of-file docstring.

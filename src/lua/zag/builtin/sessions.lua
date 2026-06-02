@@ -873,7 +873,11 @@ function M._collect_rows()
     local now_s = state.now_for_test or os.time()
     for _, s in ipairs(sessions) do
         local full = (s.name ~= nil and s.name ~= "") and s.name or "EMPTY SESSION"
-        local matches = filter_lc == nil or full:lower():find(filter_lc, 1, true) ~= nil
+        -- Cross-project sessions are listed by the binding but cannot be
+        -- opened (zag.sessions.open raises CrossProjectOpenNotSupported), so
+        -- the sidebar shows only the current project's sessions.
+        local matches = s.is_current_project
+            and (filter_lc == nil or full:lower():find(filter_lc, 1, true) ~= nil)
         if matches then
             local glyph = state.expanded[s.id] and "▾" or "▸"
             local age = _pad_date(_relative_age(s.updated_ms, now_s))
