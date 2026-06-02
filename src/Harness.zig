@@ -550,11 +550,12 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     while (!done) {
         AgentRunner.dispatchHookRequests(&deps.runner.event_queue, deps.runner.lua_engine, deps.runner.window_manager);
 
-        // Advance any deferred round-trip (compaction) on the same main thread
-        // the interactive tick uses: abort fires whose turn was cancelled,
-        // then pump posted completions so the strategy coroutine retires and
-        // fires its req.done. Runs above the `count == 0` continue so an
-        // in-flight compaction makes progress even when no agent events arrive.
+        // Advance any deferred round-trip (compaction or async hooks) on the
+        // same main thread the interactive tick uses: abort fires whose turn
+        // was cancelled (and enforce hook budgets), then pump posted
+        // completions so the coroutine retires and fires its req.done. Runs
+        // above the `count == 0` continue so an in-flight fire makes progress
+        // even when no agent events arrive.
         if (deps.runner.lua_engine) |eng| {
             eng.cancelTriggeredFires();
             eng.pumpCompletions();

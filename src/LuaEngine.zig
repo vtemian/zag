@@ -2313,6 +2313,11 @@ pub const LuaEngine = struct {
             .bound_hook_request = req,
         };
         self.pending_fires.append(self.allocator, pf) catch {
+            // Under OOM, fail safe: drop the fire and return false so the arm
+            // runs the synchronous fireHook fallback (which parks the loop for
+            // the hook's duration). Astronomically unlikely, and never a UAF or
+            // a lost req.done — just a transient loss of deferral under memory
+            // pressure.
             self.allocator.destroy(pf);
             return false;
         };
@@ -4257,6 +4262,69 @@ test "beginHook defers req.done until the hook coroutine retires and surfaces it
     // finalizePendingFire stamped the aggregated veto onto the request.
     try std.testing.expect(req.cancelled);
     try std.testing.expectEqualStrings("no rm", req.cancel_reason.?);
+    try std.testing.expectEqual(@as(usize, 0), engine.pending_fires.items.len);
+}
+
+test "concurrent deferred hook fires keep their veto scoped per fire" {
+    // Regression guard for routing veto onto the PendingFire instead of the
+    // dispatcher global: two ToolPre fires are in flight at once (both parked
+    // on zag.sleep); the hook vetoes only the "danger" tool. The veto must
+    // land on that fire's request and NOT leak onto the concurrent "safe" one.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", function(evt)
+        \\  zag.sleep(5)
+        \\  if evt.name == "danger" then
+        \\    return { cancel = true, reason = "blocked" }
+        \\  end
+        \\  return nil
+        \\end)
+    );
+
+    var pd: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "danger",
+        .call_id = "d1",
+        .args_json = "{}",
+        .args_rewrite = null,
+    } };
+    var ps: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "safe",
+        .call_id = "s1",
+        .args_json = "{}",
+        .args_rewrite = null,
+    } };
+    var req_danger = Hooks.HookRequest.init(&pd);
+    defer req_danger.freeResult();
+    var req_safe = Hooks.HookRequest.init(&ps);
+    defer req_safe.freeResult();
+
+    // Both fires are registered (and parked on zag.sleep) before either is
+    // pumped, so their coroutines genuinely coexist in flight.
+    try std.testing.expect(engine.beginHook(&req_danger));
+    try std.testing.expect(engine.beginHook(&req_safe));
+    try std.testing.expect(!req_danger.done.isSet());
+    try std.testing.expect(!req_safe.done.isSet());
+
+    const rt = engine.async_runtime.?;
+    var spins: usize = 0;
+    while (!req_danger.done.isSet() or !req_safe.done.isSet()) : (spins += 1) {
+        if (spins >= 100_000) return error.HookDrainTimeout;
+        if (rt.completions.pop()) |job| {
+            try engine.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    try std.testing.expect(req_danger.cancelled);
+    try std.testing.expectEqualStrings("blocked", req_danger.cancel_reason.?);
+    try std.testing.expect(!req_safe.cancelled);
+    try std.testing.expectEqual(@as(?[]const u8, null), req_safe.cancel_reason);
     try std.testing.expectEqual(@as(usize, 0), engine.pending_fires.items.len);
 }
 
