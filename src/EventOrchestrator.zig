@@ -494,6 +494,11 @@ fn tick(
         }
 
         if (self.lua_engine) |eng| {
+            // Abort any in-flight deferred round-trip whose turn was just
+            // cancelled (Ctrl+C), then pump: the pump pops the abort-driven
+            // completions and retires the coroutine, firing its req.done so
+            // the parked producer returns error.Cancelled.
+            eng.cancelTriggeredFires();
             pumpLuaCompletions(eng);
         }
 

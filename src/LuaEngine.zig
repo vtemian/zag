@@ -2845,6 +2845,24 @@ pub const LuaEngine = struct {
         self.failFiresMatching(flag, reason);
     }
 
+    /// Abort the coroutine scope of any in-flight deferred round-trip whose
+    /// producing turn's cancel flag is set (Ctrl+C). Idempotent (`Scope.cancel`
+    /// is). Called from the per-tick pump; the aborted worker job retires the
+    /// coroutine on its next resume, firing the fire's `done`. Mirrors
+    /// `sinkEnforceBudget`'s task scan.
+    pub fn cancelTriggeredFires(self: *LuaEngine) void {
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            const task = entry.value_ptr.*;
+            const pf = task.pending_fire orelse continue;
+            const flag = pf.cancel orelse continue;
+            if (!flag.load(.acquire)) continue;
+            if (task.scope.isCancelled()) continue;
+            task.scope.cancel("turn_cancelled") catch |err|
+                log.warn("cancelTriggeredFires: {s}", .{@errorName(err)});
+        }
+    }
+
     fn spawnCoroutineFull(
         self: *LuaEngine,
         nargs: i32,
@@ -3166,6 +3184,68 @@ test "failAllPendingFires releases a parked compaction producer at shutdown" {
     // deinitAsync (deferred) force-retires the still-parked coroutine; the
     // `finalized` guard prevents a double-stamp and the severed request
     // pointer prevents a UAF. testing.allocator asserts no leak/corruption.
+}
+
+test "cancelTriggeredFires aborts an in-flight fire only once its turn is cancelled" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubCompactProvider{ .response_text = "STUB SUMMARY" };
+    const provider = stub.provider();
+    engine.current_provider = &provider;
+    engine.current_model_spec = .{ .provider_name = "stub", .model_id = "stub-1" };
+    defer {
+        engine.current_provider = null;
+        engine.current_model_spec = null;
+    }
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  local resp = zag.llm.complete({
+        \\    system = "summarize",
+        \\    messages = {{ role = "user", content = "history" }},
+        \\  })
+        \\  return { messages = {}, summary = (resp and resp.text) or "" }
+        \\end)
+    );
+
+    var flag = agent_events.CancelFlag.init(false);
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "history" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    req.cancel = &flag;
+    defer req.freeOutcome();
+
+    const deferred = try engine.handleCompactRequest(&req);
+    try std.testing.expect(deferred);
+
+    // Grab the single parked coroutine.
+    var it = engine.tasks.valueIterator();
+    const task = it.next().?.*;
+
+    // Flag clear: the pump's cancel scan leaves the fire alone.
+    engine.cancelTriggeredFires();
+    try std.testing.expect(!task.scope.isCancelled());
+
+    // Ctrl+C sets the turn flag: the next cancel scan aborts the fire's scope.
+    flag.store(true, .release);
+    engine.cancelTriggeredFires();
+    try std.testing.expect(task.scope.isCancelled());
+
+    // Pump to retirement so the fire finalizes and frees (no leak).
+    const rt = engine.async_runtime.?;
+    while (!req.done.isSet()) {
+        if (rt.completions.pop()) |job| {
+            try engine.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), engine.pending_fires.items.len);
 }
 
 test "sandbox strips os.execute and friends" {
