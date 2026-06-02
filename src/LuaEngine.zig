@@ -2664,7 +2664,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null);
     }
 
     /// Spawn variant that also accepts a `compact_request` pointer. The
@@ -2678,7 +2678,76 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         req: *agent_events.CompactRequest,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, null, req);
+        return self.spawnCoroutineFull(nargs, parent_scope, null, req, null);
+    }
+
+    /// Spawn a coroutine already bound to a `PendingFire`. The binding is set
+    /// before the first resume (inside `spawnCoroutineFull`) so a no-yield
+    /// coroutine that retires inside the spawn still decrements `outstanding`
+    /// via `retireTask`. `compact_request` tags the strategy's return decode;
+    /// pass it through for compaction fires, null for hook fires.
+    fn spawnCoroutineBoundToFire(
+        self: *LuaEngine,
+        nargs: i32,
+        hook_payload: ?*Hooks.HookPayload,
+        compact_request: ?*agent_events.CompactRequest,
+        pf: *PendingFire,
+    ) !i32 {
+        pf.outstanding += 1;
+        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf) catch |err| {
+            // The spawn never registered the task (so retireTask will not run
+            // for it); undo the bump so the guard release still reaches 0.
+            pf.outstanding -= 1;
+            return err;
+        };
+    }
+
+    /// Release the setup guard at the end of a begin-loop. Finalizes (fires
+    /// `done`) immediately if no coroutine remains in flight — i.e. all
+    /// completed synchronously, or none spawned.
+    fn releaseFireGuard(self: *LuaEngine, pf: *PendingFire) void {
+        if (pf.release()) self.finalizePendingFire(pf);
+    }
+
+    /// Stamp results onto the bound round-trip request, restore the hook
+    /// re-entry guard, fire `done`, then free the `PendingFire`. Idempotent
+    /// against a prior shutdown release via the `finalized` guard: in that
+    /// case it only frees. Re-entrancy safe (touches no `tasks` / coroutines).
+    fn finalizePendingFire(self: *LuaEngine, pf: *PendingFire) void {
+        var reason_transferred = false;
+        if (!pf.finalized) {
+            pf.finalized = true;
+            if (pf.kind == .hook) {
+                if (pf.hook_event_kind) |k| {
+                    const d = self.hook_dispatcher.firing_depth.get(k);
+                    if (d > 0) self.hook_dispatcher.firing_depth.set(k, d - 1);
+                }
+                if (pf.bound_hook_request) |req| {
+                    req.cancelled = pf.cancelled;
+                    req.cancel_reason = pf.cancel_reason;
+                    req.reason_allocator = pf.reason_allocator;
+                    reason_transferred = true;
+                }
+            }
+            pf.done.set();
+        }
+        // Free an accumulated veto reason that was never transferred to a
+        // request (compact fires never set one; a shutdown-finalized hook
+        // fire may still own one).
+        if (!reason_transferred) {
+            if (pf.cancel_reason) |r| if (pf.reason_allocator) |a| a.free(r);
+        }
+        self.removePendingFire(pf);
+        self.allocator.destroy(pf);
+    }
+
+    fn removePendingFire(self: *LuaEngine, pf: *PendingFire) void {
+        for (self.pending_fires.items, 0..) |p, i| {
+            if (p == pf) {
+                _ = self.pending_fires.swapRemove(i);
+                return;
+            }
+        }
     }
 
     fn spawnCoroutineFull(
@@ -2687,6 +2756,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
         compact_request: ?*agent_events.CompactRequest,
+        pending_fire: ?*PendingFire,
     ) !i32 {
         // The async runtime must be up before a coroutine can be scheduled.
         // Internal callers (hooks, compaction) only run after `initAsync`,
@@ -2722,6 +2792,7 @@ pub const LuaEngine = struct {
             .compact_request = compact_request,
             .started_at_ms = if (hook_payload != null) clock.milliTimestamp() else 0,
             .budget_ms = if (hook_payload != null) self.hook_dispatcher.hook_budget_ms else null,
+            .pending_fire = pending_fire,
         };
 
         // Stash the Task in the coroutine's extraspace for O(1) lookup in
@@ -2815,6 +2886,10 @@ pub const LuaEngine = struct {
         }
 
         const was_cancelled = task.scope.isCancelled();
+        // Capture the bound fire before the task is destroyed; the decrement
+        // happens after teardown so finalize (which may wake the producer)
+        // never races our own access to `task`.
+        const fire = task.pending_fire;
 
         // Snapshot joiners so we can safely tear down the task's state while
         // still resuming them afterwards. If snapshot alloc fails, joiners
@@ -2856,6 +2931,13 @@ pub const LuaEngine = struct {
 
         task.scope.deinit();
         self.allocator.destroy(task);
+
+        // A coroutine bound to a deferred round-trip just retired. When it is
+        // the last one for that fire, finalize stamps the request and fires
+        // its `done`, releasing the parked producer.
+        if (fire) |pf| {
+            if (pf.retireOne()) self.finalizePendingFire(pf);
+        }
 
         for (joiners_snap) |joiner_ref| {
             const joiner = self.tasks.get(joiner_ref) orelse continue;
@@ -2901,6 +2983,31 @@ test "PendingFire.recordVeto is sticky and last-reason-wins" {
     try std.testing.expect(pf.cancelled);
     try std.testing.expectEqualStrings("second", pf.cancel_reason.?);
     if (pf.cancel_reason) |r| if (pf.reason_allocator) |al| al.free(r);
+}
+
+test "retireTask fires the bound PendingFire's done when its coroutine retires" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    try eng.lua.doString("function noop() return nil end");
+    _ = try eng.lua.getGlobal("noop");
+
+    var done_evt: sync.ResetEvent = .{};
+    const pf = try eng.allocator.create(LuaEngine.PendingFire);
+    pf.* = .{ .kind = .compact, .done = &done_evt, .outstanding = 1 };
+    try eng.pending_fires.append(eng.allocator, pf);
+
+    _ = try eng.spawnCoroutineBoundToFire(0, null, null, pf);
+    // The no-yield body retired synchronously inside the spawn (2 -> 1);
+    // releasing the guard drives outstanding to 0 so finalize fires done
+    // and frees the fire.
+    eng.releaseFireGuard(pf);
+
+    try std.testing.expect(done_evt.isSet());
+    try std.testing.expectEqual(@as(usize, 0), eng.pending_fires.items.len);
 }
 
 test "sandbox strips os.execute and friends" {
