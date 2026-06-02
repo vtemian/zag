@@ -2957,14 +2957,25 @@ pub const LuaEngine = struct {
                 // coroutine retires in a moment and the values disappear.
                 if (task.hook_payload) |hp| {
                     if (num_results >= 1 and task.co.isTable(-1)) {
-                        self.hook_dispatcher.applyHookReturnFromCoroutine(task.co, hp) catch |err| {
+                        const veto = self.hook_dispatcher.applyHookReturnFromCoroutine(task.co, hp) catch |err| blk: {
                             // Fail-soft: the hook ran to completion, but its return
                             // table couldn't be marshalled back into the payload.
                             // Discard the mutations and continue with subsequent hooks.
                             log.warn("hook return apply failed (kind={s}, task={d}): {}, discarding mutations", .{
                                 @tagName(hp.kind()), task.thread_ref, err,
                             });
+                            break :blk null;
                         };
+                        if (veto) |reason| {
+                            // Deferred round-trip hooks accumulate the veto on
+                            // their fire (scoped per fire); in-process hooks feed
+                            // the dispatcher's veto channel read by fireHook.
+                            if (task.pending_fire) |pf| {
+                                pf.recordVeto(reason, self.hook_dispatcher.allocator);
+                            } else {
+                                self.hook_dispatcher.setPendingCancel(reason);
+                            }
+                        }
                     }
                 } else if (task.compact_request) |req| {
                     // Compact-strategy retire path. The strategy's return
