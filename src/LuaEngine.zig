@@ -2047,7 +2047,11 @@ pub const LuaEngine = struct {
             .bound_compact_request = req,
         };
         try self.pending_fires.append(self.allocator, pf);
-        // `pf` is now in the registry; its lifetime is owned by finalize.
+        // `pf` is now in the registry; its lifetime is owned by finalize. The
+        // errdefer above only covers the create..append window. DO NOT add a
+        // fallible `try` below this point: it would fire the errdefer and free
+        // `pf` while it is still in `pending_fires` and finalize-owned, a
+        // double-free. Keep the tail infallible (the spawn error is caught).
 
         _ = self.spawnCoroutineBoundToFire(1, null, req, pf) catch |err| {
             log.warn("compact strategy spawn failed: {s}", .{@errorName(err)});
@@ -2593,12 +2597,20 @@ pub const LuaEngine = struct {
             // coroutine, which finalizePendingFire frees. Bounded wait on the
             // fire set only (parked timers/sleeps are force-retired below, not
             // waited on); a guard caps a pathological re-spawn loop.
-            var drain_guard: usize = 0;
-            while (self.pending_fires.items.len > 0 and drain_guard < 8192) : (drain_guard += 1) {
+            // Progress-keyed: drain posted completions promptly, but give up
+            // after a short idle window rather than blocking on a fire with no
+            // abortable job (e.g. a strategy parked on a pure timer) — the
+            // force-retire loop below is the real safety net and frees those.
+            // An abort-driven completion (cancelled socket / SIGKILL) lands
+            // well within the window.
+            var idle: usize = 0;
+            while (self.pending_fires.items.len > 0 and idle < 64) {
                 if (rt.completions.pop()) |job| {
+                    idle = 0;
                     self.resumeFromJob(job) catch |err|
                         log.warn("deinitAsync fire drain: {s}", .{@errorName(err)});
                 } else {
+                    idle += 1;
                     clock.sleep(1 * std.time.ns_per_ms);
                 }
             }
@@ -3130,7 +3142,9 @@ fn driveCompact(eng: *LuaEngine, req: *agent_events.CompactRequest) !void {
     const deferred = try eng.handleCompactRequest(req);
     if (!deferred) return; // sync fallback / no handler: outcome already final
     const rt = eng.async_runtime.?;
-    while (!req.done.isSet()) {
+    var spins: usize = 0;
+    while (!req.done.isSet()) : (spins += 1) {
+        if (spins >= 100_000) return error.CompactDrainTimeout; // bounded: fail, don't hang
         if (rt.completions.pop()) |job| {
             try eng.resumeFromJob(job);
         } else {
