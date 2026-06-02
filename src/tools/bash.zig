@@ -120,7 +120,7 @@ pub fn execute(
         };
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd: []const u8 = cwd_blk: {
-            const n = std.Io.Dir.cwd().realPath(process_io.get(), &cwd_buf) catch |err| {
+            const n = std.Io.Dir.cwd().realPathFile(process_io.get(), ".", &cwd_buf) catch |err| {
                 log.warn("realpath('.') failed ({s}); sandbox cwd write-scope will be rooted at '/', expect EPERM on writes", .{@errorName(err)});
                 break :cwd_blk "/";
             };
@@ -753,7 +753,7 @@ test "buildSeatbeltProfile actually parses and runs /bin/sh under sandbox-exec" 
     const home = env_mod.get("HOME") orelse "/";
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const io = std.testing.io;
-    const cwd: []const u8 = if (std.Io.Dir.cwd().realPath(io, &cwd_buf)) |n| cwd_buf[0..n] else |_| "/";
+    const cwd: []const u8 = if (std.Io.Dir.cwd().realPathFile(io, ".", &cwd_buf)) |n| cwd_buf[0..n] else |_| "/";
     const profile = try buildSeatbeltProfile(allocator, .{ .cwd = cwd, .home = home });
     defer allocator.free(profile);
 

@@ -91,7 +91,7 @@ fn setNonBlocking(fd: posix.fd_t) error{Unexpected}!void {
 /// Post the welcome banner or a resume notice to the root buffer.
 fn postStartupBanner(view: *Conversation, resume_id: ?[]const u8, session_handle: ?*Session.SessionHandle, model_id: []const u8) !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd: []const u8 = if (std.Io.Dir.cwd().realPath(process_io.get(), &cwd_buf)) |n|
+    const cwd: []const u8 = if (std.Io.Dir.cwd().realPathFile(process_io.get(), ".", &cwd_buf)) |n|
         cwd_buf[0..n]
     else |_|
         "?";
