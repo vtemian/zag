@@ -3261,6 +3261,58 @@ test "cancelTriggeredFires aborts an in-flight fire only once its turn is cancel
     try std.testing.expectEqual(@as(usize, 0), engine.pending_fires.items.len);
 }
 
+test "shutdown-released compaction fire never derefs the freed request" {
+    // The highest-risk corner: after shutdown fires the fire's done, the
+    // producer unwinds and frees `req`, but a coroutine is still parked. A
+    // later resume (resumeTask's .ok decode) or finalize stamp that derefs the
+    // freed request would be a use-after-free. Here `req` is heap-allocated and
+    // actually freed, so deinitAsync's drain/retire segfaults (DebugAllocator
+    // unmaps freed pages) on any regression of the pointer-severing or the
+    // `finalized` guard.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubCompactProvider{ .response_text = "STUB SUMMARY" };
+    const provider = stub.provider();
+    engine.current_provider = &provider;
+    engine.current_model_spec = .{ .provider_name = "stub", .model_id = "stub-1" };
+    defer {
+        engine.current_provider = null;
+        engine.current_model_spec = null;
+    }
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  local resp = zag.llm.complete({
+        \\    system = "summarize",
+        \\    messages = {{ role = "user", content = "history" }},
+        \\  })
+        \\  return { messages = {}, summary = (resp and resp.text) or "" }
+        \\end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "history" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    const req = try alloc.create(agent_events.CompactRequest);
+    req.* = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+
+    const deferred = try engine.handleCompactRequest(req);
+    try std.testing.expect(deferred);
+    try std.testing.expect(!req.done.isSet());
+
+    engine.failAllPendingFires("drained_during_shutdown");
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expectEqualStrings("drained_during_shutdown", req.error_name.?);
+
+    // Producer unwinds + frees req. The still-parked coroutine is torn down by
+    // deinitAsync (deferred), which must not touch the freed request.
+    req.freeOutcome();
+    alloc.destroy(req);
+}
+
 test "sandbox strips os.execute and friends" {
     if (!sandbox_enabled) return error.SkipZigTest;
 
