@@ -2002,8 +2002,8 @@ pub const LuaEngine = struct {
             return false;
         }
 
-        // Build the context table on the main stack. spawnCoroutineForCompact
-        // moves [fn, ctx] to the new thread via xMove.
+        // Build the context table on the main stack. spawnCoroutineBoundToFire
+        // (below) moves [fn, ctx] to the new thread via xMove.
         lua.newTable();
         lua.pushInteger(@intCast(req.tokens_used));
         lua.setField(-2, "tokens_used");
@@ -2719,20 +2719,6 @@ pub const LuaEngine = struct {
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
         return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null);
-    }
-
-    /// Spawn variant that also accepts a `compact_request` pointer. The
-    /// strategy's return value is decoded into `req.outcome` during the
-    /// final `.ok` resume — see `decodeCompactStrategyReturn`. This is
-    /// the entry point `handleCompactRequest` uses; hook callers stay
-    /// on `spawnCoroutineTagged` which passes null.
-    fn spawnCoroutineForCompact(
-        self: *LuaEngine,
-        nargs: i32,
-        parent_scope: ?*async_scope.Scope,
-        req: *agent_events.CompactRequest,
-    ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, null, req, null);
     }
 
     /// Spawn a coroutine already bound to a `PendingFire`. The binding is set
