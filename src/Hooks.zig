@@ -180,6 +180,12 @@ pub const HookRequest = struct {
     /// path. Null for observer-only lifecycle hooks, which cannot veto and
     /// so never receive a reason.
     reason_allocator: ?Allocator = null,
+    /// Borrowed cancel flag of the producing turn, set by `marshalRequest`.
+    /// The deferred hook fire reads it (via its PendingFire) so the pump can
+    /// abort an in-flight async hook on Ctrl+C and shutdown can scope its
+    /// fire-release to this runner. Typed as the raw atomic to avoid a
+    /// Hooks<->agent_events import cycle; identical to `agent_events.CancelFlag`.
+    cancel: ?*std.atomic.Value(bool) = null,
 
     pub fn init(payload: *HookPayload) HookRequest {
         return .{

@@ -194,6 +194,10 @@ pub const LuaEngine = struct {
     /// shutdown can release every producer parked on a request that was
     /// already pulled out of the event queue.
     pending_fires: std.ArrayList(*PendingFire) = .empty,
+    /// Set by `beginHook` for the duration of the dispatcher's spawn loop so
+    /// `sinkSpawnHook` binds each spawned hook coroutine to this deferred fire.
+    /// Null outside a deferred hook dispatch (the in-process `fireHook` path).
+    active_hook_fire: ?*PendingFire = null,
     /// Handlers registered via `zag.context.on_tool_result(name, fn)`.
     /// Keyed by tool name (the engine owns the key bytes; see `JitHandler`).
     /// Walked by `AgentRunner.dispatchHookRequests` when a
@@ -2289,6 +2293,50 @@ pub const LuaEngine = struct {
         return try self.hook_dispatcher.fireHook(payload, self.lua, &sink);
     }
 
+    /// Deferred async hook dispatch for the round-trip path (the
+    /// `.hook_request` arm). Spawns each matching hook coroutine bound to a
+    /// PendingFire that owns `req.done`; the per-tick pump advances them and
+    /// `finalizePendingFire` fires done (with the aggregated veto + the
+    /// re-entry-guard restore) once the last retires. Returns true when it took
+    /// ownership of `req.done` (deferred); false when there is no async runtime
+    /// or no hooks, so the caller runs the synchronous path and signals done.
+    pub fn beginHook(self: *LuaEngine, req: *Hooks.HookRequest) bool {
+        if (self.async_runtime == null) return false;
+        if (self.hook_dispatcher.registry.hooks.items.len == 0) return false;
+
+        const pf = self.allocator.create(PendingFire) catch return false;
+        pf.* = .{
+            .kind = .hook,
+            .done = &req.done,
+            .outstanding = 1, // setup guard, released below
+            .cancel = req.cancel,
+            .bound_hook_request = req,
+        };
+        self.pending_fires.append(self.allocator, pf) catch {
+            self.allocator.destroy(pf);
+            return false;
+        };
+        // `pf` is now registry-owned (freed by finalize). DO NOT add a fallible
+        // `try` below this point — it would leave req.done unsignalled.
+
+        const sink = hook_registry_mod.ResumeSink{
+            .ctx = self,
+            .spawnHookFn = sinkSpawnHook,
+            .drainOneFn = sinkDrainOne,
+            .isAliveFn = sinkIsAlive,
+            .enforceBudgetFn = sinkEnforceBudget,
+        };
+        self.active_hook_fire = pf;
+        const spawned = self.hook_dispatcher.beginHook(req.payload, self.lua, &sink);
+        self.active_hook_fire = null;
+        // Mark for the firing_depth decrement in finalize ONLY when the
+        // dispatcher actually incremented (spawned); a re-entry-capped fire
+        // leaves hook_event_kind null so finalize doesn't underflow the guard.
+        if (spawned) pf.hook_event_kind = req.payload.kind();
+        self.releaseFireGuard(pf);
+        return true;
+    }
+
     /// Invoke a zero-arg Lua callback stored at `ref` in the registry.
     /// Used by `WindowManager.executeAction` to dispatch
     /// `Keymap.Action.lua_callback` bindings. Errors are logged and
@@ -2311,6 +2359,12 @@ pub const LuaEngine = struct {
 
     fn sinkSpawnHook(ctx: *anyopaque, payload: *Hooks.HookPayload) anyerror!i32 {
         const self: *LuaEngine = @ptrCast(@alignCast(ctx));
+        // Deferred dispatch (beginHook) binds each hook to the active fire so
+        // its retirement decrements the fire and its veto routes per-fire; the
+        // in-process fireHook path leaves active_hook_fire null and parks.
+        if (self.active_hook_fire) |pf| {
+            return self.spawnCoroutineBoundToFire(1, payload, null, pf);
+        }
         return self.spawnHookCoroutine(1, null, payload);
     }
 
@@ -2849,15 +2903,30 @@ pub const LuaEngine = struct {
     /// coroutine on its next resume, firing the fire's `done`. Mirrors
     /// `sinkEnforceBudget`'s task scan.
     pub fn cancelTriggeredFires(self: *LuaEngine) void {
+        const now = clock.milliTimestamp();
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
             const task = entry.value_ptr.*;
             const pf = task.pending_fire orelse continue;
-            const flag = pf.cancel orelse continue;
-            if (!flag.load(.acquire)) continue;
             if (task.scope.isCancelled()) continue;
-            task.scope.cancel("turn_cancelled") catch |err|
-                log.warn("cancelTriggeredFires: {s}", .{@errorName(err)});
+            // Turn cancelled (Ctrl+C)?
+            if (pf.cancel) |flag| {
+                if (flag.load(.acquire)) {
+                    task.scope.cancel("turn_cancelled") catch |err|
+                        log.warn("cancelTriggeredFires: {s}", .{@errorName(err)});
+                    continue;
+                }
+            }
+            // Deferred hook past its wall-clock budget? The old drain loop ran
+            // enforceBudget each iteration; restore that here for fire-bound
+            // hooks (budget_ms is null for non-hook tasks). In-process hooks
+            // keep their own drain-loop enforcement.
+            if (task.budget_ms) |budget| {
+                if (budget > 0 and now - task.started_at_ms >= budget) {
+                    task.scope.cancel("budget_exceeded") catch |err|
+                        log.warn("cancelTriggeredFires budget: {s}", .{@errorName(err)});
+                }
+            }
         }
     }
 
@@ -4142,6 +4211,53 @@ test "fireHook applies veto" {
     try std.testing.expect(reason != null);
     defer std.testing.allocator.free(reason.?);
     try std.testing.expectEqualStrings("no rm", reason.?);
+}
+
+test "beginHook defers req.done until the hook coroutine retires and surfaces its veto" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // A ToolPre hook that yields on zag.sleep, then vetoes.
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", { pattern = "bash" }, function(evt)
+        \\  zag.sleep(5)
+        \\  return { cancel = true, reason = "no rm" }
+        \\end)
+    );
+
+    var payload: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "bash",
+        .call_id = "id1",
+        .args_json = "{\"command\":\"rm -rf /\"}",
+        .args_rewrite = null,
+    } };
+    var req = Hooks.HookRequest.init(&payload);
+    defer req.freeResult();
+
+    const deferred = engine.beginHook(&req);
+    try std.testing.expect(deferred);
+    // The hook yielded on zag.sleep; only the main-thread pump can resume it,
+    // so req.done cannot be set yet — proving the dispatch no longer parks the
+    // event loop the way the old inline drain did.
+    try std.testing.expect(!req.done.isSet());
+
+    const rt = engine.async_runtime.?;
+    var spins: usize = 0;
+    while (!req.done.isSet()) : (spins += 1) {
+        if (spins >= 100_000) return error.HookDrainTimeout;
+        if (rt.completions.pop()) |job| {
+            try engine.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    // finalizePendingFire stamped the aggregated veto onto the request.
+    try std.testing.expect(req.cancelled);
+    try std.testing.expectEqualStrings("no rm", req.cancel_reason.?);
+    try std.testing.expectEqual(@as(usize, 0), engine.pending_fires.items.len);
 }
 
 test "fireHook applies args rewrite" {

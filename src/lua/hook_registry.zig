@@ -228,6 +228,57 @@ pub const HookDispatcher = struct {
         return self.consumePendingCancel();
     }
 
+    /// Deferred dispatch (the round-trip `.hook_request` path): increment the
+    /// re-entry guard and spawn each matching hook as a coroutine via the sink
+    /// (which binds it to the engine's active PendingFire), then RETURN — no
+    /// drain loop, no veto consume. The caller (`LuaEngine.beginHook`) owns the
+    /// fire that tracks retirement, and the firing_depth bump is balanced by
+    /// the engine's `finalizePendingFire` (NOT a `defer` here) so the guard
+    /// stays elevated across the async window. Returns true when it incremented
+    /// the guard (caller arranges the matching decrement), false when skipped
+    /// (no hooks / re-entry capped — no increment, nothing owed).
+    pub fn beginHook(
+        self: *HookDispatcher,
+        payload: *Hooks.HookPayload,
+        lua: *Lua,
+        sink: *const ResumeSink,
+    ) bool {
+        if (self.registry.hooks.items.len == 0) return false;
+
+        const kind = payload.kind();
+        const cur_depth = self.firing_depth.get(kind);
+        const cap = maxDepthFor(kind);
+        if (cur_depth >= cap) {
+            log.warn(
+                "hook recursion depth {d} >= max {d}; skipping {s}",
+                .{ cur_depth, cap, @tagName(kind) },
+            );
+            return false;
+        }
+        self.firing_depth.set(kind, cur_depth + 1);
+
+        const pattern_key = hookPatternKey(payload.*);
+        var it = self.registry.iterMatching(kind, pattern_key);
+        while (it.next()) |hook| {
+            const top = lua.getTop();
+            _ = lua.rawGetIndex(zlua.registry_index, hook.lua_ref);
+            self.pushPayloadAsTable(lua, payload.*) catch |err| {
+                log.warn("hook payload marshalling failed for {s}: {}", .{ @tagName(kind), err });
+                lua.setTop(top);
+                continue;
+            };
+            // spawnHookFn binds the Task to the active fire and tags the
+            // payload before the first resume; a synchronously-completing hook
+            // still records its veto via resumeTask's ok-branch and decrements
+            // the fire. No `spawned` tracking needed — the fire counts.
+            _ = sink.spawnHookFn(sink.ctx, payload) catch |err| {
+                log.warn("hook spawn failed for {s}: {}", .{ @tagName(kind), err });
+                continue;
+            };
+        }
+        return true;
+    }
+
     fn anyHookAlive(self: *HookDispatcher, sink: *const ResumeSink, refs: []const i32) bool {
         _ = self;
         for (refs) |r| {

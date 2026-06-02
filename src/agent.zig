@@ -543,6 +543,12 @@ pub fn marshalRequest(
         if (!@hasDecl(T, "freeResult")) @compileError(@typeName(T) ++ " missing 'freeResult' method");
     }
 
+    // Requests serviced as a deferred fire borrow the producing turn's cancel
+    // flag so the main-thread pump can abort them on Ctrl+C and shutdown can
+    // scope its fire-release to this runner. Generic so every cancel-bearing
+    // request type (CompactRequest, HookRequest) is wired in one place.
+    if (@hasField(T, "cancel")) req.cancel = cancel;
+
     queue.push(makeAgentEvent(T, req)) catch return error.EventQueueFull;
 
     while (true) {
@@ -1739,10 +1745,7 @@ pub fn fireCompact(
     if (est.total + reserve_tokens <= tokens_max) return .skipped;
 
     var req = agent_events.CompactRequest.init(messages, est.total, tokens_max, allocator);
-    // The deferred compaction fire borrows this flag (via its PendingFire) so
-    // the pump can abort the strategy on Ctrl+C and so shutdown can scope its
-    // fire-release to this runner.
-    req.cancel = cancel;
+    // marshalRequest threads `cancel` onto req.cancel for the deferred fire.
     marshalRequest(agent_events.CompactRequest, &req, queue, cancel) catch |err| switch (err) {
         error.EventQueueFull => return .skipped,
         error.Cancelled => return error.Cancelled,
