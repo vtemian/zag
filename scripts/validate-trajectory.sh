@@ -14,16 +14,16 @@ echo "echo hello from zag" > "$PROMPT"
 
 "$BIN" --headless --instruction-file="$PROMPT" --trajectory-out="$TRAJ" --no-session
 
-if ! command -v python3 >/dev/null; then
-    echo "skip: python3 not available" >&2
-    exit 0
-fi
-
-if python3 -c "import harbor" 2>/dev/null; then
+# Validate the emitted trajectory against harbor's ATIF validator. harbor
+# requires Python >=3.12; `uv` runs it in an isolated, auto-provisioned env,
+# leaving the system/pyenv interpreter untouched. A validator failure fails
+# this step (set -e) — that is the point of the check.
+if command -v uv >/dev/null; then
+    uv run --quiet --python 3.12 --with 'harbor==0.13.0' --no-project \
+        python -m harbor.utils.trajectory_validator "$TRAJ"
+elif python3 -c "import sys, harbor; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
     python3 -m harbor.utils.trajectory_validator "$TRAJ"
 else
-    echo "skip: harbor not installed in python env" >&2
+    echo "skip: install uv (or a python3.12+ env with harbor) to validate trajectories" >&2
     exit 0
 fi
-
-echo "Trajectory valid: $TRAJ"

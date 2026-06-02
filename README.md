@@ -245,7 +245,7 @@ Single-shot eval for frameworks like harbor:
 zag --headless --instruction-file=prompt.txt --trajectory-out=traj.json --no-session
 ```
 
-The trajectory follows ATIF-v1.2 and validates against `python -m harbor.utils.trajectory_validator`.
+The trajectory follows ATIF-v1.2 and validates against [harbor](https://github.com/harbor-framework/harbor)'s `harbor.utils.trajectory_validator` (Python ≥3.12). `zig build validate-trajectory` runs one headless turn and checks the output through `uv`, which provisions harbor in an isolated 3.12 env so your system/pyenv interpreter is untouched; it skips cleanly when `uv` is unavailable.
 
 `zag-sim` is the end-to-end test driver. It spawns the real binary under a PTY and runs a `.zsm` scenario (verbs `set_env`, `spawn`, `send`, `wait_text`, `wait_idle`, `wait_exit`, `expect_text`, `snapshot`) against a real terminal grid, exiting `0`/`1`/`2`/`3` for pass / assertion failed / child crashed / harness error. `zag-sim replay-gen <session.jsonl>` turns a recorded session into a scenario by re-typing its user turns. By design the simulator inherits your real config and hits your real provider; there are no LLM mocks.
 
