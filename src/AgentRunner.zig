@@ -606,7 +606,7 @@ fn announceSessionStatus(
 /// slipped through the dispatch/drain race window). The producer parks
 /// on `req.done` regardless of which thread answers, so either site is
 /// safe.
-fn serviceRoundTripEvent(
+pub fn serviceRoundTripEvent(
     event: agent_events.AgentEvent,
     engine: ?*LuaEngine,
     window_manager: ?*WindowManager,

@@ -686,35 +686,25 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                         log.warn("capture dropped thinking stop: {s}", .{@errorName(err)});
                     };
                 },
-                .hook_request => |req| req.done.set(),
-                .lua_tool_request => |req| req.done.set(),
-                .layout_request => |req| {
-                    req.is_error = true;
-                    req.done.set();
-                },
-                .prompt_assembly_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .jit_context_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .tool_transform_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .tool_gate_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .loop_detect_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
-                },
-                .compact_request => |req| {
-                    req.error_name = "drained_without_dispatch";
-                    req.done.set();
+                // Round-trip events the pre-drain `dispatchHookRequests`
+                // missed because the worker enqueued them in the window
+                // between its snapshot and `drain()`'s. Service them here
+                // (the loop runs on the main thread, so this is identical to
+                // `dispatchHookRequests`'s own dispatch) rather than failing
+                // them; failing was the source of the headless prompt-assembly
+                // race. Shutdown-time drops are handled by the `.done`/`.err`
+                // arms' `freeOwned`, not here.
+                .hook_request,
+                .lua_tool_request,
+                .layout_request,
+                .prompt_assembly_request,
+                .jit_context_request,
+                .tool_transform_request,
+                .tool_gate_request,
+                .loop_detect_request,
+                .compact_request,
+                => {
+                    _ = AgentRunner.serviceRoundTripEvent(ev, deps.runner.lua_engine, deps.runner.window_manager);
                 },
             }
         }
