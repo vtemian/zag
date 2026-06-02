@@ -1739,6 +1739,10 @@ pub fn fireCompact(
     if (est.total + reserve_tokens <= tokens_max) return .skipped;
 
     var req = agent_events.CompactRequest.init(messages, est.total, tokens_max, allocator);
+    // The deferred compaction fire borrows this flag (via its PendingFire) so
+    // the pump can abort the strategy on Ctrl+C and so shutdown can scope its
+    // fire-release to this runner.
+    req.cancel = cancel;
     marshalRequest(agent_events.CompactRequest, &req, queue, cancel) catch |err| switch (err) {
         error.EventQueueFull => return .skipped,
         error.Cancelled => return error.Cancelled,

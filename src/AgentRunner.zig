@@ -178,6 +178,14 @@ pub fn shutdown(self: *AgentRunner) void {
             self.event_queue.close();
             drainPendingRoundTrips(&self.event_queue, self.allocator);
         }
+        // A deferred round-trip (compaction) pulled out of the ring is owned
+        // by a coroutine, not the queue, so drainPendingRoundTrips can't reach
+        // it — fire its done here (scoped to THIS runner's turn so a shared
+        // engine's other panes are untouched) or t.join() hangs on a producer
+        // parked on a `done` nobody will signal.
+        if (self.lua_engine) |eng| {
+            eng.failPendingFiresForFlag(&self.cancel_flag, "drained_during_shutdown");
+        }
         t.join();
         self.agent_thread = null;
     }

@@ -2581,7 +2581,32 @@ pub const LuaEngine = struct {
     /// pattern). Must run BEFORE `deinit()` since workers may hold references
     /// into the completion queue.
     pub fn deinitAsync(self: *LuaEngine) void {
+        // Release any in-flight deferred round-trip so a parked producer
+        // unblocks, and sever its bound request pointers before the tasks are
+        // force-retired below (retireTask does not resume, so this is belt-and-
+        // suspenders against a future reorder that would deref a freed request).
+        self.failAllPendingFires("engine_shutdown");
         if (self.async_runtime) |rt| {
+            // Drain completions a worker already posted for an in-flight
+            // deferred round-trip but the pump never consumed. resumeFromJob
+            // frees the job payload and retires the (now scope-aborted)
+            // coroutine, which finalizePendingFire frees. Bounded wait on the
+            // fire set only (parked timers/sleeps are force-retired below, not
+            // waited on); a guard caps a pathological re-spawn loop.
+            var drain_guard: usize = 0;
+            while (self.pending_fires.items.len > 0 and drain_guard < 8192) : (drain_guard += 1) {
+                if (rt.completions.pop()) |job| {
+                    self.resumeFromJob(job) catch |err|
+                        log.warn("deinitAsync fire drain: {s}", .{@errorName(err)});
+                } else {
+                    clock.sleep(1 * std.time.ns_per_ms);
+                }
+            }
+            // Free any other already-posted completions (non-fire tasks).
+            while (rt.completions.pop()) |job| {
+                self.resumeFromJob(job) catch |err|
+                    log.warn("deinitAsync drain: {s}", .{@errorName(err)});
+            }
             rt.deinit();
             self.async_runtime = null;
         }
@@ -2765,6 +2790,59 @@ pub const LuaEngine = struct {
                 return;
             }
         }
+    }
+
+    /// Release in-flight deferred round-trips so their parked producers can
+    /// unwind. With `flag` non-null, only fires from that producing turn are
+    /// released — critical because the engine is shared across panes, so one
+    /// runner's shutdown must not abort another pane's in-flight compaction.
+    /// With `flag` null, every fire is released (full engine teardown).
+    ///
+    /// Sets `done` (+ `error_name` where the request supports it) and severs
+    /// the borrowed request pointers on each bound task so a later resume is a
+    /// no-op rather than a use-after-free once the producer frees its request.
+    /// Does NOT free the PendingFire: the task's eventual retirement reaches
+    /// `finalizePendingFire`, which sees `finalized` and only frees. Lua is
+    /// NOT invoked here (the engine may be tearing down).
+    fn failFiresMatching(self: *LuaEngine, flag: ?*agent_events.CancelFlag, reason: []const u8) void {
+        for (self.pending_fires.items) |pf| {
+            if (pf.finalized) continue;
+            if (flag) |f| {
+                if (pf.cancel != f) continue;
+            }
+            pf.finalized = true;
+            switch (pf.kind) {
+                .compact => if (pf.bound_compact_request) |req| {
+                    req.error_name = reason;
+                },
+                .hook => {}, // HookRequest has no error field; done is enough
+            }
+            pf.done.set();
+        }
+        var it = self.tasks.valueIterator();
+        while (it.next()) |task_ptr| {
+            const task = task_ptr.*;
+            const pf = task.pending_fire orelse continue;
+            if (pf.finalized) {
+                task.compact_request = null;
+                task.hook_payload = null;
+                // Abort the coroutine so a subsequent resume unwinds instead
+                // of issuing fresh async work (e.g. another zag.llm.complete);
+                // a parked completion is then drained + freed at teardown.
+                if (!task.scope.isCancelled()) task.scope.cancel("round_trip_aborted") catch {};
+            }
+        }
+    }
+
+    /// Release every in-flight deferred round-trip (engine teardown).
+    pub fn failAllPendingFires(self: *LuaEngine, reason: []const u8) void {
+        self.failFiresMatching(null, reason);
+    }
+
+    /// Release only the in-flight deferred round-trips of the turn identified
+    /// by `flag` (the runner being shut down).
+    pub fn failPendingFiresForFlag(self: *LuaEngine, flag: *agent_events.CancelFlag, reason: []const u8) void {
+        self.failFiresMatching(flag, reason);
     }
 
     fn spawnCoroutineFull(
@@ -3041,6 +3119,53 @@ fn driveCompact(eng: *LuaEngine, req: *agent_events.CompactRequest) !void {
             clock.sleep(1 * std.time.ns_per_ms);
         }
     }
+}
+
+test "failAllPendingFires releases a parked compaction producer at shutdown" {
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubCompactProvider{ .response_text = "STUB SUMMARY" };
+    const provider = stub.provider();
+    engine.current_provider = &provider;
+    engine.current_model_spec = .{ .provider_name = "stub", .model_id = "stub-1" };
+    defer {
+        engine.current_provider = null;
+        engine.current_model_spec = null;
+    }
+
+    try engine.lua.doString(
+        \\zag.compact.strategy(function(ctx)
+        \\  local resp = zag.llm.complete({
+        \\    system = "summarize",
+        \\    messages = {{ role = "user", content = "history" }},
+        \\  })
+        \\  return { messages = {}, summary = (resp and resp.text) or "" }
+        \\end)
+    );
+
+    var b1 = [_]types.ContentBlock{.{ .text = .{ .text = "history" } }};
+    const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
+    var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
+    defer req.freeOutcome();
+
+    // Dispatch but DO NOT pump: the strategy yields on zag.llm.complete and
+    // stays parked (only the pump resumes it), so the fire is in-flight.
+    const deferred = try engine.handleCompactRequest(&req);
+    try std.testing.expect(deferred);
+    try std.testing.expect(!req.done.isSet());
+
+    // Shutdown releases the parked producer and stamps the request.
+    engine.failAllPendingFires("drained_during_shutdown");
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expectEqualStrings("drained_during_shutdown", req.error_name.?);
+    // deinitAsync (deferred) force-retires the still-parked coroutine; the
+    // `finalized` guard prevents a double-stamp and the severed request
+    // pointer prevents a UAF. testing.allocator asserts no leak/corruption.
 }
 
 test "sandbox strips os.execute and friends" {
