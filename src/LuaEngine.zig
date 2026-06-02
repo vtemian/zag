@@ -2875,6 +2875,19 @@ pub const LuaEngine = struct {
         }
     }
 
+    /// Drain every completion a worker has posted, resuming the owning
+    /// coroutine for each. The canonical per-tick pump shared by both agent
+    /// drivers (the interactive `EventOrchestrator.tick` and the headless
+    /// `Harness` loop); advancing a deferred round-trip's coroutine here is
+    /// what fires its `req.done` and keeps the event loop responsive.
+    pub fn pumpCompletions(self: *LuaEngine) void {
+        const runtime = self.async_runtime orelse return;
+        while (runtime.completions.pop()) |job| {
+            self.resumeFromJob(job) catch |err|
+                log.warn("pumpCompletions resume failed: {s}", .{@errorName(err)});
+        }
+    }
+
     fn spawnCoroutineFull(
         self: *LuaEngine,
         nargs: i32,
