@@ -337,12 +337,7 @@ fn pollTimeoutWithHeartbeat(parser_timeout: ?i32, heartbeat_ms: ?i32) i32 {
 /// forward, which may fire hooks and queue more events before returning.
 /// "Pump" conveys that drive-forward behavior better than "drain".
 fn pumpLuaCompletions(eng: *LuaEngine) void {
-    const runtime = eng.async_runtime orelse return;
-    while (runtime.completions.pop()) |job| {
-        eng.resumeFromJob(job) catch |err| {
-            std.log.scoped(.lua).warn("resume from job failed: {}", .{err});
-        };
-    }
+    eng.pumpCompletions();
 }
 
 /// True if any pane (root, tile, or float) has pending visual changes
@@ -494,6 +489,11 @@ fn tick(
         }
 
         if (self.lua_engine) |eng| {
+            // Abort any in-flight deferred round-trip whose turn was just
+            // cancelled (Ctrl+C), then pump: the pump pops the abort-driven
+            // completions and retires the coroutine, firing its req.done so
+            // the parked producer returns error.Cancelled.
+            eng.cancelTriggeredFires();
             pumpLuaCompletions(eng);
         }
 

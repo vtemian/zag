@@ -550,6 +550,16 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     while (!done) {
         AgentRunner.dispatchHookRequests(&deps.runner.event_queue, deps.runner.lua_engine, deps.runner.window_manager);
 
+        // Advance any deferred round-trip (compaction) on the same main thread
+        // the interactive tick uses: abort fires whose turn was cancelled,
+        // then pump posted completions so the strategy coroutine retires and
+        // fires its req.done. Runs above the `count == 0` continue so an
+        // in-flight compaction makes progress even when no agent events arrive.
+        if (deps.runner.lua_engine) |eng| {
+            eng.cancelTriggeredFires();
+            eng.pumpCompletions();
+        }
+
         var drain_buf: [64]agent_events.AgentEvent = undefined;
         const count = deps.runner.event_queue.drain(&drain_buf);
 

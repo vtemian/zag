@@ -178,6 +178,14 @@ pub fn shutdown(self: *AgentRunner) void {
             self.event_queue.close();
             drainPendingRoundTrips(&self.event_queue, self.allocator);
         }
+        // A deferred round-trip (compaction) pulled out of the ring is owned
+        // by a coroutine, not the queue, so drainPendingRoundTrips can't reach
+        // it — fire its done here (scoped to THIS runner's turn so a shared
+        // engine's other panes are untouched) or t.join() hangs on a producer
+        // parked on a `done` nobody will signal.
+        if (self.lua_engine) |eng| {
+            eng.failPendingFiresForFlag(&self.cancel_flag, "drained_during_shutdown");
+        }
         t.join();
         self.agent_thread = null;
     }
@@ -712,12 +720,19 @@ pub fn serviceRoundTripEvent(
             return true;
         },
         .compact_request => |req| {
+            // The async path defers: handleCompactRequest registers a
+            // PendingFire that owns req.done and fires it from the per-tick
+            // pump when the strategy coroutine retires. Only signal done here
+            // when the call completed synchronously (sync fallback, no
+            // handler) or errored before a fire took ownership.
+            var deferred = false;
             if (engine) |eng| {
-                eng.handleCompactRequest(req) catch |err| {
+                deferred = eng.handleCompactRequest(req) catch |err| blk: {
                     req.error_name = @errorName(err);
+                    break :blk false;
                 };
             }
-            req.done.set();
+            if (!deferred) req.done.set();
             return true;
         },
         else => return false,
