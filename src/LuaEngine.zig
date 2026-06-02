@@ -44,6 +44,7 @@ const lua_json = @import("lua/lua_json.zig");
 const lua_message = @import("lua/lua_message.zig");
 const IoBackend = @import("lua/IoBackend.zig").IoBackend;
 const embedded = @import("lua/embedded.zig");
+const sync = @import("sync.zig");
 const provider_bindings = @import("lua/bindings/provider.zig");
 const prompt_bindings = @import("lua/bindings/prompt.zig");
 const sockets_bindings = @import("lua/bindings/sockets.zig");
@@ -188,6 +189,11 @@ pub const LuaEngine = struct {
     bash_config: ?*bash_tool.Config = null,
     /// Registry of active coroutines keyed by thread ref. Drives resume.
     tasks: std.AutoHashMap(i32, *Task),
+    /// In-flight deferred round-trips (compaction / async hooks). Heap-owned
+    /// (engine allocator); each is freed in `finalizePendingFire`. Tracked so
+    /// shutdown can release every producer parked on a request that was
+    /// already pulled out of the event queue.
+    pending_fires: std.ArrayList(*PendingFire) = .empty,
     /// Handlers registered via `zag.context.on_tool_result(name, fn)`.
     /// Keyed by tool name (the engine owns the key bytes; see `JitHandler`).
     /// Walked by `AgentRunner.dispatchHookRequests` when a
@@ -320,6 +326,76 @@ pub const LuaEngine = struct {
         /// `hook_dispatcher.hook_budget_ms` at spawn time so later config changes
         /// don't affect in-flight hooks. Null for non-hook tasks.
         budget_ms: ?i64 = null,
+        /// Non-null while this coroutine belongs to a deferred round-trip.
+        /// Borrowed; the engine owns the `PendingFire`. Set BEFORE the first
+        /// resume so a no-yield coroutine that retires inside the spawn still
+        /// decrements `outstanding` via `retireTask`.
+        pending_fire: ?*PendingFire = null,
+    };
+
+    /// One in-flight round-trip serviced asynchronously on the main thread.
+    /// Created by `serviceRoundTripEvent`'s async arms (compaction / hooks);
+    /// freed when its last coroutine retires (or at shutdown).
+    ///
+    /// `outstanding` starts at 1 (a setup guard held across the spawn loop so
+    /// `done` can never fire mid-spawn) and is bumped once per spawned
+    /// coroutine; the guard is released at the end of the loop. When it reaches
+    /// 0, `finalizePendingFire` stamps results and sets `done`. The counter
+    /// methods here are pure: they never touch `done` (the engine does).
+    pub const PendingFire = struct {
+        pub const Kind = enum { compact, hook };
+
+        kind: Kind,
+        /// Borrowed: lives on the producer's stack frame (it parks on this).
+        done: *sync.ResetEvent,
+        outstanding: usize,
+        /// Set once `finalizePendingFire` (or a shutdown release) has stamped
+        /// results + fired `done`. Guards a shutdown release racing the
+        /// pump-driven retirement so neither double-stamps nor double-fires.
+        finalized: bool = false,
+
+        // --- hook-only veto accumulator (replaces dispatcher-global state) ---
+        cancelled: bool = false,
+        cancel_reason: ?[]const u8 = null,
+        reason_allocator: ?Allocator = null,
+        /// Restored into `HookDispatcher.firing_depth` by finalize (hooks only).
+        hook_event_kind: ?Hooks.EventKind = null,
+
+        // --- cancellation ---
+        /// Borrowed cancel flag of the producing turn; the pump cancels this
+        /// fire's coroutine scopes when it is set. Null for fires with no turn.
+        cancel: ?*agent_events.CancelFlag = null,
+
+        // --- bound request (for finalize to stamp / shutdown to error) ---
+        bound_compact_request: ?*agent_events.CompactRequest = null,
+        bound_hook_request: ?*Hooks.HookRequest = null,
+
+        /// Decrement for the setup guard. Returns true iff this drove
+        /// `outstanding` to 0 (caller must finalize). Does NOT finalize.
+        pub fn release(self: *PendingFire) bool {
+            std.debug.assert(self.outstanding > 0);
+            self.outstanding -= 1;
+            return self.outstanding == 0;
+        }
+
+        /// Decrement for a retired coroutine. Returns true iff it was the last.
+        pub fn retireOne(self: *PendingFire) bool {
+            std.debug.assert(self.outstanding > 0);
+            self.outstanding -= 1;
+            return self.outstanding == 0;
+        }
+
+        /// Accumulate a veto from one hook coroutine. Any veto cancels; the
+        /// reason is last-writer-wins (matches the pre-refactor sticky-bool
+        /// behaviour, now scoped to this fire instead of the dispatcher).
+        pub fn recordVeto(self: *PendingFire, reason: ?[]const u8, alloc: Allocator) void {
+            self.cancelled = true;
+            if (self.cancel_reason) |old| {
+                if (self.reason_allocator) |a| a.free(old);
+            }
+            self.cancel_reason = reason;
+            self.reason_allocator = if (reason != null) alloc else null;
+        }
     };
 
     /// Lua-side handle returned from zag.spawn/zag.detach. Holds a thread_ref
@@ -572,6 +648,8 @@ pub const LuaEngine = struct {
         self.prompt_layer_names.deinit(self.allocator);
         self.prompt_registry.deinit(self.allocator);
         self.reminders.deinit(self.allocator);
+        // Fires are drained by deinitAsync/shutdown; the list is empty here.
+        self.pending_fires.deinit(self.allocator);
         for (self.hook_dispatcher.registry.hooks.items) |h| {
             self.lua.unref(zlua.registry_index, h.lua_ref);
         }
@@ -2797,6 +2875,32 @@ pub const LuaEngine = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "PendingFire.release returns true only when outstanding reaches zero" {
+    var done_evt: sync.ResetEvent = .{};
+    var pf: LuaEngine.PendingFire = .{ .kind = .compact, .done = &done_evt, .outstanding = 1 };
+    try std.testing.expect(pf.release()); // setup guard only: 1 -> 0
+}
+
+test "PendingFire counts coroutines under the setup guard" {
+    var done_evt: sync.ResetEvent = .{};
+    var pf: LuaEngine.PendingFire = .{ .kind = .hook, .done = &done_evt, .outstanding = 1 };
+    pf.outstanding += 2; // two spawned coroutines, plus the guard
+    try std.testing.expect(!pf.release()); // guard released, 2 remain
+    try std.testing.expect(!pf.retireOne()); // 1 remains
+    try std.testing.expect(pf.retireOne()); // last one -> true
+}
+
+test "PendingFire.recordVeto is sticky and last-reason-wins" {
+    var done_evt: sync.ResetEvent = .{};
+    var pf: LuaEngine.PendingFire = .{ .kind = .hook, .done = &done_evt, .outstanding = 1 };
+    const a = std.testing.allocator;
+    pf.recordVeto(try a.dupe(u8, "first"), a);
+    pf.recordVeto(try a.dupe(u8, "second"), a); // frees "first"
+    try std.testing.expect(pf.cancelled);
+    try std.testing.expectEqualStrings("second", pf.cancel_reason.?);
+    if (pf.cancel_reason) |r| if (pf.reason_allocator) |al| al.free(r);
 }
 
 test "sandbox strips os.execute and friends" {
