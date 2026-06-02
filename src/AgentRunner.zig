@@ -712,12 +712,19 @@ pub fn serviceRoundTripEvent(
             return true;
         },
         .compact_request => |req| {
+            // The async path defers: handleCompactRequest registers a
+            // PendingFire that owns req.done and fires it from the per-tick
+            // pump when the strategy coroutine retires. Only signal done here
+            // when the call completed synchronously (sync fallback, no
+            // handler) or errored before a fire took ownership.
+            var deferred = false;
             if (engine) |eng| {
-                eng.handleCompactRequest(req) catch |err| {
+                deferred = eng.handleCompactRequest(req) catch |err| blk: {
                     req.error_name = @errorName(err);
+                    break :blk false;
                 };
             }
-            req.done.set();
+            if (!deferred) req.done.set();
             return true;
         },
         else => return false,

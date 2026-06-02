@@ -964,6 +964,11 @@ pub const CompactRequest = struct {
     /// `@errorName` of whatever went wrong on the main thread. Borrowed
     /// from rodata; do not free.
     error_name: ?[]const u8 = null,
+    /// Borrowed cancel flag of the producing turn. The deferred compaction
+    /// fire reads it (via its PendingFire) so a Ctrl+C mid-compaction aborts
+    /// the strategy coroutine. Null in tests / non-turn callers. Set by
+    /// `fireCompact` before marshalling.
+    cancel: ?*CancelFlag = null,
 
     pub fn init(
         messages: []const types.Message,

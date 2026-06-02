@@ -1982,18 +1982,24 @@ pub const LuaEngine = struct {
     /// here completes when the coroutine retires, at which point
     /// `req.outcome` has been written by `resumeTask`. The agent thread
     /// observes the finalized outcome.
+    /// Service a compaction round-trip. Returns `true` when the strategy was
+    /// dispatched as a deferred coroutine that now owns `req.done` (the
+    /// per-tick pump fires it on retirement); returns `false` when the call
+    /// completed (or no-op'd) synchronously and the caller must signal
+    /// `req.done` itself. Errors are returned to the caller (which stamps
+    /// `error_name` and signals done).
     pub fn handleCompactRequest(
         self: *LuaEngine,
         req: *agent_events.CompactRequest,
-    ) anyerror!void {
-        const fn_ref = self.compact_handler orelse return;
+    ) anyerror!bool {
+        const fn_ref = self.compact_handler orelse return false;
 
         const lua = self.lua;
         _ = lua.rawGetIndex(zlua.registry_index, fn_ref);
         if (!lua.isFunction(-1)) {
             lua.pop(1);
             log.warn("compact strategy: registry slot is not a function", .{});
-            return;
+            return false;
         }
 
         // Build the context table on the main stack. spawnCoroutineForCompact
@@ -2022,30 +2028,41 @@ pub const LuaEngine = struct {
                 log.warn("compact strategy decode failed: {s}", .{@errorName(err)});
                 break :blk .use_default;
             };
-            return;
+            return false;
         }
 
-        const thread_ref = self.spawnCoroutineForCompact(1, null, req) catch |err| {
-            log.warn("compact strategy spawn failed: {s}", .{@errorName(err)});
-            // spawnCoroutineForCompact cleans up its own allocations on
-            // error; the [fn, ctx] pair was already moved off the main
-            // stack so nothing to pop here.
-            return error.LuaHandlerError;
+        // Deferred path: register a PendingFire, spawn the strategy coroutine
+        // bound to it, and return without parking the event loop. The per-tick
+        // pump advances the coroutine; `retireTask` fires `req.done` once it
+        // retires (resumeTask's `.ok` branch has written `req.outcome` by
+        // then). After the fire is registered we never error out — `req.done`
+        // is owned by the fire from here on.
+        const pf = try self.allocator.create(PendingFire);
+        errdefer self.allocator.destroy(pf);
+        pf.* = .{
+            .kind = .compact,
+            .done = &req.done,
+            .outstanding = 1, // setup guard, released below
+            .cancel = req.cancel,
+            .bound_compact_request = req,
         };
+        try self.pending_fires.append(self.allocator, pf);
+        // `pf` is now in the registry; its lifetime is owned by finalize.
 
-        // Drain loop: pump completions until the task retires. resumeTask
-        // writes req.outcome on `.ok` before retire, so when the task
-        // exits self.tasks we know the outcome is final.
-        while (self.tasks.contains(thread_ref)) {
-            const runtime = self.async_runtime orelse unreachable;
-            if (runtime.completions.pop()) |job| {
-                try self.resumeFromJob(job);
-            } else {
-                // No completion available yet. 1ms idle matches fireHook's
-                // drain cadence (src/lua/hook_registry.zig:215).
-                clock.sleep(1 * std.time.ns_per_ms);
-            }
-        }
+        _ = self.spawnCoroutineBoundToFire(1, null, req, pf) catch |err| {
+            log.warn("compact strategy spawn failed: {s}", .{@errorName(err)});
+            // spawnCoroutineBoundToFire cleans up the coroutine's own
+            // allocations and undid its outstanding bump on error; the
+            // [fn, ctx] pair was already moved off the main stack.
+            req.error_name = "compact_spawn_failed";
+            self.releaseFireGuard(pf); // drives outstanding to 0 -> fires done
+            return true;
+        };
+        // If the strategy ran to completion without yielding, it already
+        // retired (dropping outstanding to 1); releasing the guard fires done
+        // now. Otherwise the pump finishes it later.
+        self.releaseFireGuard(pf);
+        return true;
     }
 
     /// Test-only accessor for the compact strategy handler ref.
@@ -3008,6 +3025,22 @@ test "retireTask fires the bound PendingFire's done when its coroutine retires" 
 
     try std.testing.expect(done_evt.isSet());
     try std.testing.expectEqual(@as(usize, 0), eng.pending_fires.items.len);
+}
+
+/// Test helper: service a compact request and, when it deferred, pump the Lua
+/// completion queue until the strategy coroutine retires and fires `req.done`.
+/// Mirrors what `EventOrchestrator.tick`'s `pumpLuaCompletions` does in prod.
+fn driveCompact(eng: *LuaEngine, req: *agent_events.CompactRequest) !void {
+    const deferred = try eng.handleCompactRequest(req);
+    if (!deferred) return; // sync fallback / no handler: outcome already final
+    const rt = eng.async_runtime.?;
+    while (!req.done.isSet()) {
+        if (rt.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
 }
 
 test "sandbox strips os.execute and friends" {
@@ -11008,7 +11041,7 @@ test "handleCompactRequest nil return leaves outcome as use_default" {
     const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
     var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     try std.testing.expect(req.outcome == .use_default);
 }
 
@@ -11024,7 +11057,7 @@ test "handleCompactRequest honours {cancel = true}" {
     const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
     var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     try std.testing.expect(req.outcome == .cancel);
 }
 
@@ -11049,7 +11082,7 @@ test "handleCompactRequest accepts {messages, summary} replacement" {
     const messages = [_]types.Message{.{ .role = .user, .content = &b1 }};
     var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     switch (req.outcome) {
         .replace => |r| {
             try std.testing.expectEqual(@as(usize, 1), r.messages.len);
@@ -11089,7 +11122,7 @@ test "handleCompactRequest preserves tool_use block fidelity in the snapshot" {
     const messages = [_]types.Message{.{ .role = .assistant, .content = &blocks }};
     var req = agent_events.CompactRequest.init(&messages, 100, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     switch (req.outcome) {
         .replace => |r| {
             try std.testing.expectEqualStrings("saw=tool_use", r.messages[0].content[0].text.text);
@@ -11214,7 +11247,7 @@ test "zag.compact.default produces a structured summary end-to-end" {
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
 
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     switch (req.outcome) {
         .replace => |r| {
             // First message must be the wrapped summary; the prefix
@@ -11254,7 +11287,7 @@ test "zag.compact.default returns .use_default when no provider is attached" {
     };
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     try std.testing.expect(req.error_name == null);
     try std.testing.expect(req.outcome == .use_default);
 }
@@ -11356,7 +11389,21 @@ test "handleCompactRequest strategy can yield on zag.llm.complete" {
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
 
-    try engine.handleCompactRequest(&req);
+    // Deferred-done: handleCompactRequest dispatches the strategy and returns
+    // without parking the event loop. The worker may post a completion, but
+    // only the main-thread pump can resume the coroutine, so req.done cannot
+    // be set until we pump — proving the call no longer blocks.
+    const deferred = try engine.handleCompactRequest(&req);
+    try std.testing.expect(deferred);
+    try std.testing.expect(!req.done.isSet());
+    const rt = engine.async_runtime.?;
+    while (!req.done.isSet()) {
+        if (rt.completions.pop()) |job| {
+            try engine.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
 
     switch (req.outcome) {
         .replace => |r| {
@@ -11396,7 +11443,7 @@ test "handleCompactRequest synchronous strategy still works without async runtim
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
 
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     switch (req.outcome) {
         .replace => |r| try std.testing.expectEqualStrings("sync ok", r.messages[0].content[0].text.text),
         else => return error.TestUnexpectedOutcome,
@@ -11460,7 +11507,7 @@ test "handleCompactRequest async strategy raising Lua error does not deadlock" {
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
 
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     try std.testing.expect(req.outcome == .use_default);
 }
 
@@ -11481,7 +11528,7 @@ test "handleCompactRequest treats malformed return as use_default" {
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
 
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
     try std.testing.expect(req.outcome == .use_default);
 }
 
@@ -11661,7 +11708,7 @@ test "zag.llm.complete with stream=true emits compaction_summary_delta to attach
     var req = agent_events.CompactRequest.init(&messages, 850, 1000, alloc);
     defer req.freeOutcome();
 
-    try engine.handleCompactRequest(&req);
+    try driveCompact(&engine, &req);
 
     // Strategy got the assembled text.
     switch (req.outcome) {
