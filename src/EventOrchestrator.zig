@@ -511,6 +511,10 @@ fn tick(
             // completions and retires the coroutine, firing its req.done so
             // the parked producer returns error.Cancelled.
             eng.cancelTriggeredFires();
+            // Propagate a cancelled workflow's cancellation to its in-flight
+            // children (Ctrl+C and the workflow-tool's scope.cancel both mark
+            // the scope; this is where it reaches the child AgentRunners).
+            eng.cancelInFlightWorkflowChildren();
             pumpLuaCompletions(eng);
         }
 

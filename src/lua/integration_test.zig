@@ -28,6 +28,9 @@ const Conversation = @import("../Conversation.zig");
 const ChildAgent = @import("../ChildAgent.zig");
 const ChildRunnerRegistry = @import("../ChildRunnerRegistry.zig");
 const sync = @import("../sync.zig");
+const agent_events = @import("../agent_events.zig");
+const workflow_tool = @import("../tools/workflow.zig");
+const AgentRunner = @import("../AgentRunner.zig");
 
 // 0.16 made the process environment non-global: production code reads env
 // through `env_mod` over a captured `Environ.Map` rather than libc, and the
@@ -934,6 +937,302 @@ test "zag.workflow.max_fanout defaults to 8 and is settable from Lua" {
     try testing.expectError(error.LuaRuntime, res);
     engine.lua.setTop(0);
     try testing.expectEqual(@as(u32, 3), engine.workflow_max_fanout);
+}
+
+// -- The `workflow` tool, end-to-end (Milestone F) --------------------------
+
+/// Runs `workflow_tool.execute` on a worker thread the way an AgentRunner's
+/// tool-worker does: it owns the per-thread `task_context` + `lua_request_queue`
+/// threadlocals (both are set HERE because they are per-thread, and the tool
+/// reads them), parks on the workflow's `done`, and stashes the `ToolResult` for
+/// the test to assert after `join`. The test (main) thread drives the dispatch +
+/// drain loop that actually advances the orchestration coroutine.
+const WorkflowToolWorker = struct {
+    ctx: *const tools.TaskContext,
+    queue: *agent_events.EventQueue,
+    script: []const u8,
+    allocator: std.mem.Allocator,
+    cancel: *std.atomic.Value(bool),
+    result: ?types.ToolResult = null,
+    err: ?anyerror = null,
+
+    fn run(self: *WorkflowToolWorker) void {
+        tools.task_context = self.ctx;
+        tools.lua_request_queue = self.queue;
+        defer {
+            tools.task_context = null;
+            tools.lua_request_queue = null;
+        }
+        // Build {"script":<json-escaped script>} with the codebase's JSON
+        // string writer (the script contains quotes + newlines).
+        var aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.writeAll("{\"script\":") catch |e| {
+            self.err = e;
+            return;
+        };
+        types.writeJsonString(w, self.script) catch |e| {
+            self.err = e;
+            return;
+        };
+        w.writeAll("}") catch |e| {
+            self.err = e;
+            return;
+        };
+        const input = aw.toOwnedSlice() catch |e| {
+            self.err = e;
+            return;
+        };
+        defer self.allocator.free(input);
+        self.result = workflow_tool.execute(input, self.allocator, self.cancel) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+};
+
+/// Drive the main-thread side of a parked workflow tool: service the round-trip
+/// (startWorkflowScript), then drain children + pump completions until the
+/// worker thread finishes. Bounded by a wall-clock deadline so a wiring bug
+/// fails instead of hanging.
+fn driveWorkflowTool(
+    engine: *LuaEngine,
+    queue: *agent_events.EventQueue,
+    registry: *ChildRunnerRegistry,
+    worker: *const WorkflowToolWorker,
+    done: *std.atomic.Value(bool),
+) !void {
+    const deadline = clock.milliTimestamp() + 4000;
+    while (!done.load(.acquire) and clock.milliTimestamp() < deadline) {
+        // Service the workflow_request round-trip (spawns the coroutine) and any
+        // child Lua round-trips, then advance children + completions.
+        AgentRunner.dispatchHookRequests(queue, engine, null);
+        engine.cancelInFlightWorkflowChildren();
+        registry.drainAll();
+        engine.pumpCompletions();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    _ = worker;
+    if (!done.load(.acquire)) return error.WorkflowToolTimedOut;
+}
+
+test "workflow tool runs a parallel script over two subagents and aggregates" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer queue.deinit();
+
+    // Declared AFTER engine so its deinit defer runs after engine.deinitAsync;
+    // the test fully drains it via driveWorkflowTool.
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = &engine,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // Two children fan out via zag.workflow.parallel; the script joins their
+    // summaries. parallel returns { {value={summary=,is_error=}}, ... }.
+    var cancel = std.atomic.Value(bool).init(false);
+    var worker = WorkflowToolWorker{
+        .ctx = &ctx,
+        .queue = &queue,
+        .allocator = allocator,
+        .cancel = &cancel,
+        .script =
+        \\local r = zag.workflow.parallel({
+        \\  function() return zag.task{ prompt = "first" } end,
+        \\  function() return zag.task{ prompt = "second" } end,
+        \\})
+        \\return r[1].value.summary .. "||" .. r[2].value.summary
+        ,
+    };
+
+    var done = std.atomic.Value(bool).init(false);
+    const Runner = struct {
+        fn go(w: *WorkflowToolWorker, d: *std.atomic.Value(bool)) void {
+            w.run();
+            d.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Runner.go, .{ &worker, &done });
+    try driveWorkflowTool(&engine, &queue, &child_registry, &worker, &done);
+    t.join();
+
+    try testing.expect(worker.err == null);
+    const result = worker.result orelse return error.NoResult;
+    defer if (result.owned) allocator.free(result.content);
+    try testing.expect(!result.is_error);
+    // Both child summaries (the stub text) joined by "||".
+    try testing.expect(std.mem.indexOf(u8, result.content, "||") != null);
+    const sep = std.mem.indexOf(u8, result.content, "||").?;
+    try testing.expect(std.mem.indexOf(u8, result.content[0..sep], "RESULT") != null);
+    try testing.expect(std.mem.indexOf(u8, result.content[sep..], "RESULT") != null);
+
+    // Everything drained: registry empty, no live tasks, no leak at deinit.
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+}
+
+test "workflow tool cancel returns promptly with is_error and cancels in-flight children" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // The child blocks until cancelled; without cancel propagation the tool
+    // would hang. The cancel path must reach the in-flight child via the
+    // per-tick cancelInFlightWorkflowChildren sweep.
+    var stub = GatedCancelProvider{};
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer queue.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "gated_cancel",
+        .model_spec = .{ .provider_name = "gated_cancel", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = &engine,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var worker = WorkflowToolWorker{
+        .ctx = &ctx,
+        .queue = &queue,
+        .allocator = allocator,
+        .cancel = &cancel,
+        .script = "return zag.task{ prompt = \"will block until cancelled\" }",
+    };
+
+    var done = std.atomic.Value(bool).init(false);
+    const Runner = struct {
+        fn go(w: *WorkflowToolWorker, d: *std.atomic.Value(bool)) void {
+            w.run();
+            d.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Runner.go, .{ &worker, &done });
+
+    // Pump until the child is registered + actually in-flight (the gated stub
+    // is spinning), then fire the tool-side cancel.
+    const arm_deadline = clock.milliTimestamp() + 2000;
+    while (child_registry.isEmpty() and clock.milliTimestamp() < arm_deadline) {
+        AgentRunner.dispatchHookRequests(&queue, &engine, null);
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expect(!child_registry.isEmpty());
+    cancel.store(true, .release);
+
+    // Drive to completion: the cancel sweep cancels the in-flight child, which
+    // unwinds (error.Cancelled), drainAll retires it, the worker resumes (scope
+    // cancelled) and unwinds, completing the request with is_error.
+    try driveWorkflowTool(&engine, &queue, &child_registry, &worker, &done);
+    t.join();
+
+    try testing.expect(worker.err == null);
+    const result = worker.result orelse return error.NoResult;
+    defer if (result.owned) allocator.free(result.content);
+    try testing.expect(result.is_error);
+
+    // The children were cancelled, not run to completion; everything drained.
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+}
+
+test "workflow tool returns an error result when the driver has no child registry (headless guard)" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    var stub = StubTextProvider{ .response_text = "x" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    // No child_registry: the headless / no-orchestrator path. The tool must
+    // refuse rather than spawn undrained children.
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = &engine,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    tools.task_context = &ctx;
+    defer tools.task_context = null;
+
+    const result = try workflow_tool.execute(
+        "{\"script\":\"return 'x'\"}",
+        allocator,
+        null,
+    );
+    defer if (result.owned) allocator.free(result.content);
+    try testing.expect(result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.content, "orchestrator") != null);
 }
 
 test "zag.detach without an async runtime errors instead of aborting" {

@@ -742,6 +742,22 @@ pub fn serviceRoundTripEvent(
             if (!deferred) req.done.set();
             return true;
         },
+        .workflow_request => |req| {
+            // startWorkflowScript only SPAWNS the orchestration coroutine and
+            // returns; it does NOT block on completion. We therefore do NOT
+            // fire req.done here — the coroutine's retire path (normal return,
+            // runtime error, or cancellation) completes the request and fires
+            // done later, while the tool thread parks on it and the main loop
+            // pumps the coroutine + drains its children. With no engine the
+            // workflow cannot run; fail the request so the tool thread unwinds
+            // (the headless guard in the tool already prevents this path).
+            if (engine) |eng| {
+                eng.startWorkflowScript(req);
+            } else {
+                req.failDropped("workflow request: no engine on this driver");
+            }
+            return true;
+        },
         else => return false,
     }
 }
@@ -822,6 +838,7 @@ fn isRoundTripEvent(event: agent_events.AgentEvent) bool {
         .tool_gate_request,
         .loop_detect_request,
         .compact_request,
+        .workflow_request,
         => true,
         else => false,
     };
@@ -833,7 +850,7 @@ comptime {
     // Round-trip variants need to be added to the switch below so a
     // worker parked on req.done.wait() unblocks during shutdown.
     const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
-    if (variant_count != 21) {
+    if (variant_count != 22) {
         @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
     }
 }
@@ -895,6 +912,7 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
                 r.error_name = "drained_during_shutdown";
                 r.done.set();
             },
+            .workflow_request => |r| r.failDropped("workflow request drained during shutdown"),
             // Payload-bearing events stay in the ring; the post-join
             // drain in `shutdown` calls `freeOwned` on each.
             .text_delta,
@@ -1193,6 +1211,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) void
         .tool_gate_request,
         .loop_detect_request,
         .compact_request,
+        .workflow_request,
         => unreachable,
     }
 }

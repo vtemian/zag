@@ -558,6 +558,11 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         // even when no agent events arrive.
         if (deps.runner.lua_engine) |eng| {
             eng.cancelTriggeredFires();
+            // Symmetric with the interactive driver. Headless refuses workflows
+            // (no child drainer), so this is a no-op here, but keeping the two
+            // tick pumps identical avoids a "works interactively only" surprise
+            // if headless ever gains a child registry.
+            eng.cancelInFlightWorkflowChildren();
             eng.pumpCompletions();
         }
 
@@ -725,6 +730,12 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                 .tool_gate_request,
                 .loop_detect_request,
                 .compact_request,
+                // The workflow tool refuses to dispatch headless (its
+                // ctx.child_registry == null guard fires before any push), so
+                // this arm is unreachable in practice; route it through the
+                // shared servicer for exhaustiveness and a clean error if ever
+                // hit (no child drainer means the request fails fast).
+                .workflow_request,
                 => {
                     _ = AgentRunner.serviceRoundTripEvent(ev, deps.runner.lua_engine, deps.runner.window_manager);
                 },

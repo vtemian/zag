@@ -35,6 +35,7 @@ const edit_tool = @import("tools/edit.zig");
 const bash_tool = @import("tools/bash.zig");
 const layout_tool = @import("tools/layout.zig");
 const task_tool = @import("tools/task.zig");
+const workflow_tool = @import("tools/workflow.zig");
 
 const subagents_mod = @import("subagents.zig");
 const llm = @import("llm.zig");
@@ -278,6 +279,10 @@ pub fn createDefaultRegistry(allocator: Allocator) !Registry {
     try registry.register(layout_tool.close_tool);
     try registry.register(layout_tool.resize_tool);
     try registry.register(layout_tool.pane_read_tool);
+    // Always-on: the workflow tool is gated at runtime (it returns an error
+    // result without an orchestrator/child drainer), not by registration, so
+    // the model always sees it.
+    try registry.register(workflow_tool.tool);
     return registry;
 }
 
@@ -445,6 +450,7 @@ test "createDefaultRegistry has all tools" {
     try std.testing.expect(registry.get("layout_close") != null);
     try std.testing.expect(registry.get("layout_resize") != null);
     try std.testing.expect(registry.get("pane_read") != null);
+    try std.testing.expect(registry.get("workflow") != null);
 }
 
 test "execute sets current_tool_name during execution" {
