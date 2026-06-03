@@ -26,12 +26,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux hits a Zig 0.16 x86_64-backend compiler SEGV compiling
+          # zag (the same code builds and tests on macOS). Non-blocking
+          # until the upstream compiler issue is resolved.
           - target: x86_64-linux
             os: ubuntu-latest
+            allow-failure: true
           - target: aarch64-macos
             os: macos-latest
 
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow-failure || false }}
 
     steps:
       - name: Checkout
@@ -66,12 +71,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Same Zig 0.16 Linux-backend compiler SEGV as the test job;
+          # non-blocking until the upstream compiler issue is resolved.
           - target: aarch64-linux-musl
             os: ubuntu-latest
+            allow-failure: true
           - target: x86_64-macos
             os: macos-latest
 
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow-failure || false }}
 
     steps:
       - name: Checkout
