@@ -8763,3 +8763,82 @@ test "opening the root pane's session focuses root without an extra pane" {
     try std.testing.expectEqual(@as(usize, 0), wm.extra_panes.items.len);
     try std.testing.expectEqual(wm.root_pane.handle.?, handle);
 }
+
+test "re-opening one of several resident sessions reattaches the right pane" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+
+    var mgr_opt: ?Session.SessionManager = try Session.SessionManager.init(allocator);
+
+    var seed_a = try mgr_opt.?.createSession("test-model");
+    var id_a_buf: [32]u8 = undefined;
+    @memcpy(id_a_buf[0..seed_a.id_len], seed_a.id[0..seed_a.id_len]);
+    const id_a = id_a_buf[0..seed_a.id_len];
+    seed_a.close();
+
+    var seed_b = try mgr_opt.?.createSession("test-model");
+    var id_b_buf: [32]u8 = undefined;
+    @memcpy(id_b_buf[0..seed_b.id_len], seed_b.id[0..seed_b.id_len]);
+    const id_b = id_b_buf[0..seed_b.id_len];
+    seed_b.close();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &mgr_opt,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    // Two distinct sessions resident at once.
+    const handle_a = try wm.splitFocusedWithSession(id_a);
+    const conv_a = wm.extra_panes.items[0].pane.conversation.?;
+    _ = try wm.splitFocusedWithSession(id_b);
+    try std.testing.expectEqual(@as(usize, 2), wm.extra_panes.items.len);
+    const conv_b = wm.extra_panes.items[1].pane.conversation.?;
+    try std.testing.expect(conv_a != conv_b);
+
+    // Background A (B stays displayed), then re-open A: the scan must pick
+    // A's entry out of the resident set, not B's. No new pane, and the
+    // foreground pane is A's Conversation.
+    try wm.closeById(handle_a, null);
+    _ = try wm.splitFocusedWithSession(id_a);
+    try std.testing.expectEqual(@as(usize, 2), wm.extra_panes.items.len);
+    try std.testing.expectEqual(conv_a, wm.getFocusedPanePtr().conversation.?);
+}
