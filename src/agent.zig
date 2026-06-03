@@ -733,6 +733,8 @@ pub const StreamContext = struct {
     queue: *agent_events.EventQueue,
     allocator: Allocator,
     text_count: u32 = 0,
+    /// True once any user-visible content (text, thinking, or a tool start) has been emitted to the queue this streaming attempt. Gates the pre-first-token retry in callLlm: re-firing after content was emitted would double-stream. Reset to false by callLlm before each attempt.
+    emitted_any: bool = false,
 };
 
 /// Whether a streaming failure is worth retrying as a single non-streamed
@@ -2849,9 +2851,14 @@ pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         .text_delta => |t| blk: {
             const duped = agent_events.OwnedPayload.dupe(alloc, t) catch return;
             stream_ctx.text_count += 1;
+            stream_ctx.emitted_any = true;
             break :blk .{ .text_delta = duped };
         },
-        .tool_start => |t| .{ .tool_start = .{ .name = agent_events.OwnedPayload.dupe(alloc, t) catch return } },
+        .tool_start => |t| blk: {
+            const duped = agent_events.OwnedPayload.dupe(alloc, t) catch return;
+            stream_ctx.emitted_any = true;
+            break :blk .{ .tool_start = .{ .name = duped } };
+        },
         .usage => |u| .{ .usage = .{ .output_tokens = u.output_tokens } },
         .info => |t| .{ .info = agent_events.OwnedPayload.dupe(alloc, t) catch return },
         .done => return,
@@ -2860,6 +2867,7 @@ pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         // node. Task 1.11 will also fan this into the trajectory capture.
         .thinking_delta => |td| blk: {
             const duped = agent_events.OwnedPayload.dupe(alloc, td.text) catch return;
+            stream_ctx.emitted_any = true;
             break :blk .{ .thinking_delta = .{ .text = duped, .provider = td.provider } };
         },
         .thinking_stop => .thinking_stop,
