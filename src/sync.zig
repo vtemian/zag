@@ -16,6 +16,7 @@
 //! cancellation flows through the explicit `Scope`/atomic-flag machinery.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 
 /// The process-wide io, installed once at startup. All sync primitives read
 /// it here. Calling a lock/wait before `setIo` is a startup-ordering bug;
@@ -126,11 +127,30 @@ pub const ResetEvent = struct {
     }
 
     /// Wait up to `timeout_ns`. Returns `error.Timeout` if not set in time.
+    ///
+    /// `std.Io.Event.waitTimeout` is single-shot and reports a SPURIOUS futex
+    /// wakeup as `error.Timeout` (per its own docs); spurious wakes spike under
+    /// heavy thread contention. Loop against a monotonic deadline so a spurious
+    /// wake re-waits with the time remaining, and only a genuine deadline (or
+    /// `set`) ends the wait.
     pub fn timedWait(self: *ResetEvent, timeout_ns: u64) error{Timeout}!void {
-        self.inner.waitTimeout(theIo(), .{ .duration = durationFromNanos(timeout_ns) }) catch |err| switch (err) {
-            error.Timeout => return error.Timeout,
-            error.Canceled => return error.Timeout,
+        const io = theIo();
+        var timer = clock.Timer.start() catch {
+            // Monotonic clock unavailable (never on macOS/Linux): degrade to a
+            // single shot rather than spin without a deadline.
+            self.inner.waitTimeout(io, .{ .duration = durationFromNanos(timeout_ns) }) catch {};
+            return if (self.inner.isSet()) {} else error.Timeout;
         };
+        while (true) {
+            if (self.inner.isSet()) return;
+            const elapsed = timer.read();
+            if (elapsed >= timeout_ns) return error.Timeout;
+            self.inner.waitTimeout(io, .{ .duration = durationFromNanos(timeout_ns - elapsed) }) catch |err| switch (err) {
+                // Spurious or real; the loop head re-checks `isSet` + the deadline.
+                error.Timeout => {},
+                error.Canceled => return error.Timeout,
+            };
+        }
     }
 };
 
@@ -138,4 +158,31 @@ pub const ResetEvent = struct {
 /// timeout-bearing waits above.
 fn durationFromNanos(ns: u64) std.Io.Clock.Duration {
     return .{ .raw = .fromNanoseconds(@intCast(ns)), .clock = .awake };
+}
+
+test "ResetEvent.timedWait re-waits past a spurious futex wake instead of timing out" {
+    // std.Io.Event.waitTimeout reports a SPURIOUS futex wakeup as
+    // error.Timeout (documented). A correct timedWait must absorb that and
+    // keep waiting until the event is actually set or the real deadline
+    // passes. Deliver a spurious wake while the main thread is parked, then
+    // set shortly after; the wait must succeed, not report a false timeout.
+    var ev: ResetEvent = .{};
+    const io = theIo();
+
+    const Disrupter = struct {
+        fn run(e: *ResetEvent, j: std.Io) void {
+            clock.sleep(40 * std.time.ns_per_ms); // let the waiter park
+            // SPURIOUS wake: futexWake the event word without setting it.
+            j.futexWake(std.Io.Event, &e.inner, std.math.maxInt(u32));
+            clock.sleep(40 * std.time.ns_per_ms);
+            e.set(); // the real signal lands at ~80ms
+        }
+    };
+    var t = try std.Thread.spawn(.{}, Disrupter.run, .{ &ev, io });
+    defer t.join();
+
+    // `set` lands far inside 10s; the only way this returns error.Timeout is
+    // the spurious-wake bug.
+    try ev.timedWait(10 * std.time.ns_per_s);
+    try std.testing.expect(ev.isSet());
 }
