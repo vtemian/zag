@@ -27,9 +27,6 @@ const tools = @import("../tools.zig");
 const subagents_types = @import("../subagents.zig");
 const Conversation = @import("../Conversation.zig");
 const Session = @import("../Session.zig");
-const AgentRunner = @import("../AgentRunner.zig");
-const BufferSink = @import("../sinks/BufferSink.zig").BufferSink;
-const llm = @import("../llm.zig");
 const ChildAgent = @import("../ChildAgent.zig");
 
 /// Maximum nested `task` invocations on a single runner. Picked to
@@ -138,172 +135,83 @@ fn runChild(
     sa: *const subagents_types.Subagent,
     prompt: []const u8,
 ) !types.ToolResult {
-    // Build a fresh one-tool-registry view for the child. `runLoopStreaming`
-    // takes a `*const Registry`, not a Subset; the cleanest shim is a new
-    // Registry that mirrors only the subset-visible tools from the parent.
-    var child_registry = try ChildAgent.buildChildRegistry(allocator, ctx.registry, sa.tools);
-    defer child_registry.deinit();
-
-    // Persist `task_start` with JSON-encoded inputs so replay tooling can
-    // reconstruct what was delegated. Failure is logged but non-fatal; the
-    // subagent still runs.
-    var task_start_id: ?@import("../ulid.zig").Ulid = null;
-    if (ctx.session_handle) |sh| {
-        const start_payload = formatStartPayload(allocator, sa.name, prompt) catch |err| blk: {
-            log.warn("task_start payload format failed: {}", .{err});
-            break :blk null;
-        };
-        if (start_payload) |payload| {
-            defer allocator.free(payload);
-            task_start_id = sh.appendEntry(.{
-                .entry_type = .task_start,
-                .content = payload,
-                .timestamp = clock.milliTimestamp(),
-            }) catch |err| outer: {
-                log.warn("task_start persist failed: {}", .{err});
-                break :outer null;
-            };
-        }
-    }
-
-    // Spawn a child Conversation under the parent. The child is owned
-    // by the parent's `subagents` list; we do NOT destroy it here. The
-    // parent's `deinit` walks subagents and frees the slot. The
-    // parent's tree gains a `subagent_link` node referencing the new
-    // index.
-    const parent_conv = ctx.parent_conv;
-    const child_conv = try parent_conv.spawnSubagent(sa.name, prompt);
-    // Pre-seed the child's persistence chain off the task_start ULID so
-    // the child's first persisted event chains into the delegation scope.
-    child_conv.last_persisted_id = task_start_id;
-
-    // Compose the child's first user prompt: subagent system prompt
-    // prefix, blank line, the caller's prompt.
-    const initial_text = try std.fmt.allocPrint(
-        allocator,
-        "{s}\n\n{s}",
-        .{ sa.prompt, prompt },
-    );
-    defer allocator.free(initial_text);
-
-    // Wire a BufferSink to the child Conversation. Events from the
-    // child runner flow through here into the child's tree (assistant
-    // text, tool_call/tool_result, thinking, errors). The sink owns
-    // its node-correlation state (call_id map, current assistant node)
-    // and is reset on `.run_end`. Heap-allocated would also work; a
-    // stack instance is fine because runChild is the sole owner and
-    // the runner's thread is joined before this function returns.
-    var child_sink = BufferSink.init(allocator, child_conv);
-    defer child_sink.deinit();
-
-    // Construct the child runner. Its wire_arena, event_queue, and
-    // sink are all child-scoped; the agent thread sees a fully
-    // isolated runtime keyed off the child Conversation.
-    var child_runner = AgentRunner.init(allocator, child_sink.sink(), child_conv);
-    defer child_runner.deinit();
-    child_runner.wake_fd = ctx.wake_fd;
-    // The child gets the real Lua engine ONLY when a child_registry is present,
-    // because the engine is safe to wire iff the MAIN thread drains the child's
-    // queue (dispatchHookRequests must run on the main thread, never this agent
-    // thread). With a registry, the orchestrator drains the child on the main
-    // thread; without one (orchestrator-less harness / headless), we fall back
-    // to draining on this thread, which is only safe with a null engine. Tying
-    // the engine to the registry makes the unsafe "engine without a main-thread
-    // drainer" combination impossible by construction rather than by comment.
-    const child_engine = if (ctx.child_registry != null) ctx.lua_engine else null;
-    child_runner.lua_engine = child_engine;
-    // No window_manager wired: subagents do not mutate the window
-    // tree. Layout requests get serviced as errors via the round-trip
-    // dispatcher's no-WM branch, which matches the legacy collector
-    // behaviour ("subagent_unsupported" surfaced as is_error to the
-    // child agent thread).
-    child_runner.task_depth = ctx.task_depth + 1;
-
-    // Submit the user turn: persists a tagged user_message JSONL entry
-    // (subagent_id stamped via the parent backlink) and pushes
-    // `run_start` to the child sink, which appends a user_message
-    // node to the child's tree. The next `submit` projects the tree
-    // into the wire-format messages the agent thread reads.
-    try child_runner.submitInput(initial_text);
-
-    // Subagents inherit the parent's `provider_name` and `model_id` so
-    // their `runLoopStreaming` drives the same per-model prompt pack as
-    // the parent. The compact threshold is intentionally suppressed
-    // here: the strategy socket is a parent-loop concern, and a child
-    // run that hits its model's ceiling surfaces as a normal `MaxTokens`
-    // stop. Building a fresh spec with `context_window = 0` keeps that
-    // contract while keeping the prompt-pack identity intact.
-    const child_model_spec: llm.ModelSpec = .{
-        .provider_name = ctx.model_spec.provider_name,
-        .model_id = ctx.model_spec.model_id,
-        .context_window = 0,
+    // Heap-allocate the ChildAgent so its address is stable: the
+    // ChildRunnerRegistry keys entries on `&child.child_runner` by pointer
+    // identity, so the struct must not move after `start`. The catalog
+    // `Subagent` maps onto the inline `ChildSpec` (its `prompt` is the
+    // child's system prompt; the tool input's `prompt` is the task).
+    const child = try allocator.create(ChildAgent);
+    var freed = false;
+    defer if (!freed) allocator.destroy(child);
+    child.* = .{
+        .allocator = allocator,
+        .child_registry = undefined,
+        .child_sink = undefined,
+        .child_runner = undefined,
+        .child_conv = undefined,
+        .task_start_id = null,
+        .session_handle = ctx.session_handle,
+        .spec = .{
+            .system_prompt = sa.prompt,
+            .prompt = prompt,
+            .tools = sa.tools,
+            .model = sa.model,
+            .name = sa.name,
+        },
     };
 
-    // Inherit the parent's session_id so subagent telemetry lines stay
-    // grouped under the same session in the timeline log.
-    const child_session_id: []const u8 = if (ctx.session_handle) |sh|
-        sh.id[0..sh.id_len]
-    else
-        "";
-
-    try child_runner.submit(.{
-        .allocator = ctx.allocator,
-        .wake_write_fd = ctx.wake_fd orelse 0,
-        .lua_engine = child_engine,
-        .provider = ctx.provider,
-        .model_spec = child_model_spec,
-        .registry = &child_registry,
-        .skills = null,
-        .subagents = ctx.subagents,
-        .session_id = child_session_id,
-        .child_registry = ctx.child_registry,
-    });
+    // Build + spawn the child (registry, task_start, spawnSubagent, sink,
+    // runner init/submit). On any failure here the child never registered, so
+    // a direct teardown is safe.
+    child.start(ctx) catch |err| {
+        child.deinit();
+        return err;
+    };
 
     // Hand the child off to the main thread for draining. The main thread is
     // the only thread allowed to call into the Lua VM, so it (not this agent
     // thread) services the child's hook / prompt / gate / compact round-trips
-    // and pumps content events through `child_sink` into the child's tree. We
-    // park here until the main thread reports the child finished.
+    // and pumps content events through the child sink into the child's tree.
+    // We park here until the main thread reports the child finished.
     //
     // When `ctx.child_registry` is null (test harness / headless with no
-    // orchestrator), fall back to draining on this thread. The child engine was
-    // forced to null above in that case, so the fallback drain is Zig-only and
+    // orchestrator), fall back to draining on this thread. `start` forced the
+    // child engine to null in that case, so the fallback drain is Zig-only and
     // never touches the VM off the main thread.
     if (ctx.child_registry) |registry| {
         var child_done: sync.ResetEvent = .{};
-        try registry.register(.{ .runner = &child_runner, .done = &child_done });
+        try registry.register(.{ .runner = &child.child_runner, .done = &child_done });
         // No errdefer-remove needed: registration cannot fail after this
         // point, and the main thread always removes the entry on the child's
         // `.done` (threadMain guarantees a `.done` even on error).
         while (true) {
             if (parent_cancel) |pc| {
-                if (pc.load(.acquire)) child_runner.cancelAgent();
+                if (pc.load(.acquire)) child.child_runner.cancelAgent();
             }
             if (child_done.timedWait(50 * std.time.ns_per_ms)) |_| break else |_| {}
         }
     } else {
         // Orchestrator-less fallback: drain on this thread. The child engine is
-        // null here (forced above when child_registry is null), so the round-
-        // trip Lua arms no-op and nothing touches the VM off the main thread.
+        // null here (forced in `start` when child_registry is null), so the
+        // round-trip Lua arms no-op and nothing touches the VM off the main
+        // thread.
         while (true) {
             if (parent_cancel) |pc| {
-                if (pc.load(.acquire)) child_runner.cancelAgent();
+                if (pc.load(.acquire)) child.child_runner.cancelAgent();
             }
-            const r = child_runner.drainEvents();
+            const r = child.child_runner.drainEvents();
             if (r.finished) break;
             if (!r.any_drained) clock.sleep(5 * std.time.ns_per_ms);
         }
     }
 
-    // Derive the final summary from the child's tree. The same helper
-    // backs `toWireMessages` projection of `subagent_link`, so the
-    // tool_result the parent's LLM sees and the JSONL `task_end`
-    // content stay in lockstep.
+    // Derive the final summary from the child's tree. The same helper backs
+    // `toWireMessages` projection of `subagent_link`, so the tool_result the
+    // parent's LLM sees and the JSONL `task_end` content stay in lockstep.
     var summary_arena = std.heap.ArenaAllocator.init(allocator);
     defer summary_arena.deinit();
-    const summary = try Conversation.childFinalSummaryForTask(summary_arena.allocator(), child_conv);
-    const is_err = Conversation.childErroredForTask(child_conv);
-    const owned = try allocator.dupe(u8, summary);
+    const res = try child.result(summary_arena.allocator());
+    const owned = try allocator.dupe(u8, res.summary);
     errdefer allocator.free(owned);
 
     if (ctx.session_handle) |sh| {
@@ -311,11 +219,18 @@ fn runChild(
             .entry_type = .task_end,
             .content = owned,
             .timestamp = clock.milliTimestamp(),
-            .parent_id = task_start_id,
+            .parent_id = child.task_start_id,
         }) catch |err| log.warn("task_end persist failed: {}", .{err});
     }
 
-    return .{ .content = owned, .is_error = is_err, .owned = true };
+    // Tear down the child (joins the agent thread — already joined by the
+    // drain — and frees registry/sink/runner) and free the heap slot. Order
+    // matches the legacy stack-defer order: runner, sink, registry.
+    child.deinit();
+    allocator.destroy(child);
+    freed = true;
+
+    return .{ .content = owned, .is_error = res.is_error, .owned = true };
 }
 
 /// Allocate the `task_start` JSON payload. The previous implementation
