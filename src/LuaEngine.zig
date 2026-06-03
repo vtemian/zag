@@ -276,6 +276,12 @@ pub const LuaEngine = struct {
     current_event_queue: ?*@import("agent_events.zig").EventQueue = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
+    /// Per-fan-out-level concurrency bound for workflow combinators. A single
+    /// scalar (not a scope-keyed structure — YAGNI) read live by the Lua
+    /// `zag.workflow.parallel`/`pipeline` sliding window. The depth-8 task cap
+    /// is the orthogonal hard backstop. Tuned by `zag.workflow.set_max_fanout`
+    /// against provider rate limits; defaults to 8.
+    workflow_max_fanout: u32 = 8,
     /// Borrowed registry of in-flight child agents, owned by the
     /// `EventOrchestrator` and wired in `create`. Null in headless / test paths
     /// with no orchestrator. Workflow children are registered here with a
@@ -773,6 +779,10 @@ pub const LuaEngine = struct {
         @import("lua/bindings/command.zig").registerOn(lua);
         // zag.set_*; bound from src/lua/bindings/setters.zig. [zag_table].
         @import("lua/bindings/setters.zig").registerOn(lua);
+        // zag.workflow; orchestration config subtable (set_max_fanout /
+        // max_fanout). The parallel/pipeline combinators are layered onto the
+        // same subtable by combinators.lua. Stack on entry/exit: [zag_table].
+        @import("lua/bindings/workflow.zig").registerOn(lua);
         // zag.provider; single sibling cfunction bound from
         // src/lua/bindings/provider.zig. Stack on entry/exit: [zag_table].
         provider_bindings.registerProviderFn(lua);

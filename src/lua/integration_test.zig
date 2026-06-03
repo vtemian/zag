@@ -451,6 +451,37 @@ test "force-retiring a coroutine with a live workflow child at shutdown tears it
     try testing.expect(child_registry.isEmpty());
 }
 
+// -- Workflow fan-out bound (Milestone D) -----------------------------------
+
+test "zag.workflow.max_fanout defaults to 8 and is settable from Lua" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // The subtable + both functions are installed on the zag global.
+    try runLua(&engine,
+        \\assert(type(zag.workflow) == "table", "zag.workflow missing")
+        \\assert(type(zag.workflow.set_max_fanout) == "function", "set_max_fanout missing")
+        \\assert(type(zag.workflow.max_fanout) == "function", "max_fanout missing")
+    );
+
+    // Default is 8, both on the engine field and through the getter.
+    try testing.expectEqual(@as(u32, 8), engine.workflow_max_fanout);
+    try runLua(&engine, "assert(zag.workflow.max_fanout() == 8, 'default not 8')");
+
+    // Set + read back.
+    try runLua(&engine, "zag.workflow.set_max_fanout(3)");
+    try testing.expectEqual(@as(u32, 3), engine.workflow_max_fanout);
+    try runLua(&engine, "assert(zag.workflow.max_fanout() == 3, 'set did not stick')");
+
+    // n < 1 is rejected as a Lua error; the field is unchanged.
+    const res = engine.lua.doString("zag.workflow.set_max_fanout(0)");
+    try testing.expectError(error.LuaRuntime, res);
+    engine.lua.setTop(0);
+    try testing.expectEqual(@as(u32, 3), engine.workflow_max_fanout);
+}
+
 test "zag.detach without an async runtime errors instead of aborting" {
     const allocator = testing.allocator;
     var engine = try LuaEngine.init(allocator);
