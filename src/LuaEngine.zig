@@ -362,8 +362,6 @@ pub const LuaEngine = struct {
         cancelled: bool = false,
         cancel_reason: ?[]const u8 = null,
         reason_allocator: ?Allocator = null,
-        /// Restored into `HookDispatcher.firing_depth` by finalize (hooks only).
-        hook_event_kind: ?Hooks.EventKind = null,
 
         // --- cancellation ---
         /// Borrowed cancel flag of the producing turn; the pump cancels this
@@ -2332,12 +2330,8 @@ pub const LuaEngine = struct {
             .enforceBudgetFn = sinkEnforceBudget,
         };
         self.active_hook_fire = pf;
-        const spawned = self.hook_dispatcher.beginHook(req.payload, self.lua, &sink);
+        self.hook_dispatcher.beginHook(req.payload, self.lua, &sink);
         self.active_hook_fire = null;
-        // Mark for the firing_depth decrement in finalize ONLY when the
-        // dispatcher actually incremented (spawned); a re-entry-capped fire
-        // leaves hook_event_kind null so finalize doesn't underflow the guard.
-        if (spawned) pf.hook_event_kind = req.payload.kind();
         self.releaseFireGuard(pf);
         return true;
     }
@@ -2817,10 +2811,6 @@ pub const LuaEngine = struct {
         if (!pf.finalized) {
             pf.finalized = true;
             if (pf.kind == .hook) {
-                if (pf.hook_event_kind) |k| {
-                    const d = self.hook_dispatcher.firing_depth.get(k);
-                    if (d > 0) self.hook_dispatcher.firing_depth.set(k, d - 1);
-                }
                 if (pf.bound_hook_request) |req| {
                     req.cancelled = pf.cancelled;
                     req.cancel_reason = pf.cancel_reason;
@@ -3015,6 +3005,24 @@ pub const LuaEngine = struct {
     /// propagates an error to the caller; scheduler work runs on the
     /// main thread and there is no meaningful recovery path.
     fn resumeTask(self: *LuaEngine, task: *Task, num_args_on_co: i32) void {
+        // Re-entry guard for DEFERRED hooks: elevate firing_depth[kind] only
+        // while this hook body actually runs (this resume step), so concurrent
+        // parked fires across panes never stack the counter — only a genuine
+        // same-kind re-fire from within the body (an in-process fireHook) is
+        // caught. In-process hook tasks keep the dispatcher's own guard and are
+        // excluded here (pending_fire == null) to avoid double-counting.
+        const guard_kind: ?Hooks.EventKind = if (task.pending_fire != null) blk: {
+            if (task.hook_payload) |hp| break :blk hp.kind();
+            break :blk null;
+        } else null;
+        if (guard_kind) |k| {
+            self.hook_dispatcher.firing_depth.set(k, self.hook_dispatcher.firing_depth.get(k) + 1);
+        }
+        defer if (guard_kind) |k| {
+            const d = self.hook_dispatcher.firing_depth.get(k);
+            if (d > 0) self.hook_dispatcher.firing_depth.set(k, d - 1);
+        };
+
         var num_results: i32 = 0;
         const status = task.co.resumeThread(self.lua, num_args_on_co, &num_results) catch |err| {
             const msg = task.co.toString(-1) catch "<no msg>";
@@ -4326,6 +4334,57 @@ test "concurrent deferred hook fires keep their veto scoped per fire" {
     try std.testing.expect(!req_safe.cancelled);
     try std.testing.expectEqual(@as(?[]const u8, null), req_safe.cancel_reason);
     try std.testing.expectEqual(@as(usize, 0), engine.pending_fires.items.len);
+}
+
+test "concurrent deferred hook fires beyond the recursion cap are all serviced" {
+    // Regression for the re-entry-guard-vs-concurrency fix: more ToolPre fires
+    // in flight at once than maxDepthFor(.tool_pre) (== 8) must ALL run. The
+    // guard is a recursion-depth limit (bracketed per-resume), not a cross-pane
+    // concurrency ceiling, so none of these independent fires is skipped.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(4, 64);
+    defer engine.deinitAsync();
+
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", function(evt)
+        \\  zag.sleep(2)
+        \\  return { cancel = true, reason = "blocked" }
+        \\end)
+    );
+
+    const n = 12; // > cap (8)
+    var payloads: [n]Hooks.HookPayload = undefined;
+    var reqs: [n]Hooks.HookRequest = undefined;
+    for (0..n) |i| {
+        payloads[i] = .{ .tool_pre = .{
+            .name = "danger",
+            .call_id = "c",
+            .args_json = "{}",
+            .args_rewrite = null,
+        } };
+        reqs[i] = Hooks.HookRequest.init(&payloads[i]);
+        try std.testing.expect(engine.beginHook(&reqs[i]));
+    }
+    defer for (0..n) |i| reqs[i].freeResult();
+
+    const rt = engine.async_runtime.?;
+    var spins: usize = 0;
+    while (engine.pending_fires.items.len > 0) : (spins += 1) {
+        if (spins >= 1_000_000) return error.HookDrainTimeout;
+        if (rt.completions.pop()) |job| {
+            try engine.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    // Every fire ran its body and vetoed — none silently dropped by the guard.
+    for (0..n) |i| {
+        try std.testing.expect(reqs[i].cancelled);
+        try std.testing.expectEqualStrings("blocked", reqs[i].cancel_reason.?);
+    }
 }
 
 test "fireHook applies args rewrite" {

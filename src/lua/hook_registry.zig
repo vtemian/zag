@@ -228,35 +228,27 @@ pub const HookDispatcher = struct {
         return self.consumePendingCancel();
     }
 
-    /// Deferred dispatch (the round-trip `.hook_request` path): increment the
-    /// re-entry guard and spawn each matching hook as a coroutine via the sink
-    /// (which binds it to the engine's active PendingFire), then RETURN — no
-    /// drain loop, no veto consume. The caller (`LuaEngine.beginHook`) owns the
-    /// fire that tracks retirement, and the firing_depth bump is balanced by
-    /// the engine's `finalizePendingFire` (NOT a `defer` here) so the guard
-    /// stays elevated across the async window. Returns true when it incremented
-    /// the guard (caller arranges the matching decrement), false when skipped
-    /// (no hooks / re-entry capped — no increment, nothing owed).
+    /// Deferred dispatch (the round-trip `.hook_request` path): spawn each
+    /// matching hook as a coroutine via the sink (which binds it to the
+    /// engine's active PendingFire), then RETURN — no drain loop, no veto
+    /// consume. The caller (`LuaEngine.beginHook`) owns the fire that tracks
+    /// retirement.
+    ///
+    /// The re-entry guard is NOT applied here. A deferred fire's guard is
+    /// bracketed per-resume in `LuaEngine.resumeTask` (only while the hook body
+    /// actually executes), so concurrent parked fires across panes don't
+    /// inflate `firing_depth`; only a genuine same-kind re-fire while a hook
+    /// body is running is caught. A deferred round-trip hook cannot recurse via
+    /// the round-trip path anyway (its producing agent thread is parked on
+    /// req.done), so the only recursion vector is an in-process `fireHook` from
+    /// the body, which sees the per-resume elevation.
     pub fn beginHook(
         self: *HookDispatcher,
         payload: *Hooks.HookPayload,
         lua: *Lua,
         sink: *const ResumeSink,
-    ) bool {
-        if (self.registry.hooks.items.len == 0) return false;
-
+    ) void {
         const kind = payload.kind();
-        const cur_depth = self.firing_depth.get(kind);
-        const cap = maxDepthFor(kind);
-        if (cur_depth >= cap) {
-            log.warn(
-                "hook recursion depth {d} >= max {d}; skipping {s}",
-                .{ cur_depth, cap, @tagName(kind) },
-            );
-            return false;
-        }
-        self.firing_depth.set(kind, cur_depth + 1);
-
         const pattern_key = hookPatternKey(payload.*);
         var it = self.registry.iterMatching(kind, pattern_key);
         while (it.next()) |hook| {
@@ -276,7 +268,6 @@ pub const HookDispatcher = struct {
                 continue;
             };
         }
-        return true;
     }
 
     fn anyHookAlive(self: *HookDispatcher, sink: *const ResumeSink, refs: []const i32) bool {
