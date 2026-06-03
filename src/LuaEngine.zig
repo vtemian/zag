@@ -2819,14 +2819,18 @@ pub const LuaEngine = struct {
         // each finished child's agent thread and calls `onChildRetiredOnMain`,
         // which (with the orphaned `resume_thread_ref`) takes the task-gone
         // path — deinit + free the ChildAgent, no resume into a dead coroutine.
-        // Fixed-point loop with cancelAll each pass (a child may not have
-        // observed cancellation yet); guarded against a pathological non-finish.
-        // Mirrors EventOrchestrator.drainChildrenToCompletion, but the engine
-        // owns this at shutdown because `deinitAsync` runs before the
+        // UNBOUNDED fixed-point loop with cancelAll each pass (a child may not
+        // have observed cancellation yet). A bound here would be a leak: a child
+        // wedged in a long provider read (cancelAgent is only an atomic flag a
+        // blocked TLS read won't observe for up to read_ms) could outlive the
+        // guard, and proceeding to `tasks.deinit()` / `root_scope.deinit()`
+        // below would abandon a live agent thread against freed engine state.
+        // The agent loop's cancel poll guarantees termination once any in-flight
+        // read returns. Mirrors EventOrchestrator.drainChildrenToCompletion, but
+        // the engine owns this at shutdown because `deinitAsync` runs before the
         // orchestrator drains and frees `self.tasks` here.
         if (self.child_runner_registry) |reg| {
-            var drain_guard: usize = 0;
-            while (!reg.isEmpty() and drain_guard < 4096) : (drain_guard += 1) {
+            while (!reg.isEmpty()) {
                 reg.cancelAll();
                 reg.drainAll();
                 clock.sleep(1 * std.time.ns_per_ms);
@@ -2838,6 +2842,14 @@ pub const LuaEngine = struct {
             s.deinit();
             self.root_scope = null;
         }
+
+        // After engine teardown no drain may route into the engine: the
+        // registry is empty here (the loop above ran to a fixed point), but
+        // sever the borrowed pointer belt-and-braces so a later orchestrator
+        // `drainChildrenToCompletion` can never route a (re)registered child's
+        // resume_fn into the now-freed `self.tasks`. The registry itself is
+        // owned by the orchestrator and outlives the engine.
+        self.child_runner_registry = null;
     }
 
     /// Called by the orchestrator tick after a worker posts a completion.
@@ -2953,6 +2965,15 @@ pub const LuaEngine = struct {
             // Push the result onto the coroutine stack BEFORE freeing the
             // child: the summary slice lives in `arena` (copied into Lua by
             // pushString), so it must outlive the push but not the resume.
+            //
+            // Deliberate deviation from the `resumeFromJob` template (which
+            // deinits the per-task primitive_arena BEFORE `resumeTask`): the
+            // result `arena` is freed by the `defer` ABOVE, i.e. AFTER
+            // `resumeTask` returns. `pushChildResultOntoStack` already copied
+            // the summary into Lua via `pushString`, so the bytes are safe past
+            // the free, but deiniting earlier would buy nothing and risks a
+            // future edit reading `res.summary` after the arena is gone. Do not
+            // "fix" by deiniting the arena before the resume.
             t.pending_child = null;
             const n = pushChildResultOntoStack(t.co, res);
             child.deinit();

@@ -237,7 +237,9 @@ fn testSpawnChild(co: *Lua) i32 {
         .child_runner = undefined,
         .child_conv = undefined,
         .task_start_id = null,
-        .session_handle = null,
+        // Inherit the ctx's session handle so the task_start/task_end audit
+        // rows land on a real session when the test wires one (null otherwise).
+        .session_handle = fx.ctx.session_handle,
         .spec = .{ .system_prompt = "You are a test subagent.", .prompt = "do the thing", .tools = null, .name = "tester" },
         .spec_arena = std.heap.ArenaAllocator.init(fx.ctx.allocator),
         .resume_thread_ref = task.thread_ref,
@@ -452,6 +454,215 @@ test "force-retiring a coroutine with a live workflow child at shutdown tears it
     // The child was joined, deinited, and freed exactly once: the registry is
     // empty and testing.allocator reports no leak at engine.deinit().
     try testing.expect(child_registry.isEmpty());
+}
+
+/// Restore the process cwd after a test that chdir'd into a tmp dir. Mirrors
+/// `tools/task.zig`'s `restoreCwdForTest`: the SessionManager writes JSONL
+/// under the cwd-relative project dir, so a session test must run from a tmp
+/// dir and restore afterwards.
+fn restoreCwdForTest(abs_path: []const u8) void {
+    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
+}
+
+/// Count `task_start` / `task_end` rows in a loaded session and, when both are
+/// present exactly once, confirm `task_end` chains back to the `task_start`
+/// ULID (the open/close sibling pair the sidebar/transcript rely on).
+fn assertTaskStartEndPair(loaded: []const Session.Entry) !void {
+    var start_id: ?[26]u8 = null;
+    var end_count: usize = 0;
+    var start_count: usize = 0;
+    var end_parent: ?[26]u8 = null;
+    for (loaded) |e| {
+        switch (e.entry_type) {
+            .task_start => {
+                start_count += 1;
+                start_id = e.id;
+            },
+            .task_end => {
+                end_count += 1;
+                end_parent = e.parent_id;
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), start_count);
+    try testing.expectEqual(@as(usize, 1), end_count);
+    try testing.expect(start_id != null);
+    try testing.expect(end_parent != null);
+    // task_end's parent_id is the task_start ULID, so they form a sibling pair.
+    try testing.expectEqualSlices(u8, &start_id.?, &end_parent.?);
+}
+
+test "onChildRetiredOnMain persists task_end on the normal-resume path (real session)" {
+    const allocator = testing.allocator;
+
+    // SessionManager writes JSONL under the cwd-relative project dir; run from
+    // a tmp dir so the persisted rows are isolated and cleaned up.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer restoreCwdForTest(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("stub/stub-1");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "child summary text" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+    // Attach the session so the child's transcript persists in order under it.
+    parent_conv.attachSession(&handle);
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        // A real session handle: task_start (in ChildAgent.start) and task_end
+        // (in onChildRetiredOnMain) must both persist against it.
+        .session_handle = &handle,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var fixture = WorkflowSpawnFixture{ .engine = &engine, .registry = &child_registry, .ctx = &ctx };
+    workflow_spawn_fixture = &fixture;
+    defer workflow_spawn_fixture = null;
+
+    engine.lua.pushFunction(zlua.wrap(testSpawnChild));
+    engine.lua.setGlobal("_test_spawn_child");
+
+    try engine.lua.doString(
+        \\function test_workflow() _test_spawn_child() end
+    );
+    _ = try engine.lua.getGlobal("test_workflow");
+    _ = try engine.spawnCoroutine(0, null);
+
+    // Drive the child to completion: drainAll joins the thread and routes the
+    // finished child through onChildRetiredOnMain, which resumes the coroutine
+    // (task still alive) and persists task_end on that normal path.
+    const deadline = clock.milliTimestamp() + 2000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+
+    handle.close();
+    const loaded = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| Session.freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+    try assertTaskStartEndPair(loaded);
+}
+
+test "onChildRetiredOnMain persists task_end on the task-gone/orphaned path (real session)" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer restoreCwdForTest(orig_cwd);
+
+    var mgr = try Session.SessionManager.init(allocator);
+    var handle = try mgr.createSession("stub/stub-1");
+    const session_id = try allocator.dupe(u8, handle.id[0..handle.id_len]);
+    defer allocator.free(session_id);
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+
+    // The gated provider keeps the child thread genuinely live until cancelled,
+    // so the coroutine is force-retired (orphaning the child) BEFORE the child
+    // finishes. When drainAll later joins the cancelled child, the task is gone
+    // (resume_thread_ref = -1) and onChildRetiredOnMain takes the task-gone
+    // path, which (D-3) still persists task_end.
+    var stub = GatedCancelProvider{};
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+    parent_conv.attachSession(&handle);
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+    // The engine owns the registry pointer (no orchestrator here) so deinitAsync
+    // drives the orphaned child to completion.
+    engine.child_runner_registry = &child_registry;
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "gated_cancel",
+        .model_spec = .{ .provider_name = "gated_cancel", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = &handle,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var fixture = WorkflowSpawnFixture{ .engine = &engine, .registry = &child_registry, .ctx = &ctx };
+    workflow_spawn_fixture = &fixture;
+    defer workflow_spawn_fixture = null;
+
+    engine.lua.pushFunction(zlua.wrap(testSpawnChild));
+    engine.lua.setGlobal("_test_spawn_child");
+
+    try engine.lua.doString(
+        \\function test_workflow() _test_spawn_child() end
+    );
+    _ = try engine.lua.getGlobal("test_workflow");
+    _ = try engine.spawnCoroutine(0, null);
+
+    // task_start was persisted by ChildAgent.start; the coroutine is parked on a
+    // live child. Force-retire + drive the orphaned child to teardown, which
+    // persists task_end on the task-gone path.
+    engine.deinitAsync();
+    try testing.expect(child_registry.isEmpty());
+
+    handle.close();
+    const loaded = try Session.loadEntries(session_id, allocator);
+    defer {
+        for (loaded) |e| Session.freeEntry(e, allocator);
+        allocator.free(loaded);
+    }
+    try assertTaskStartEndPair(loaded);
 }
 
 // -- zag.task binding misuse guards (Milestone E1) --------------------------
