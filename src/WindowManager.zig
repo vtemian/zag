@@ -1778,9 +1778,66 @@ pub fn splitFocusedWithSession(
     self: *WindowManager,
     id: []const u8,
 ) !NodeRegistry.Handle {
+    // One resident pane per session: if `id` already has a pane (root or a
+    // backgrounded split), reattach/focus it instead of loading a second
+    // copy from disk. A duplicate mints a fresh runner + Conversation that
+    // read a frozen on-disk snapshot, divorcing the view from the session's
+    // live in-flight stream and leaking a pane per switch.
+    if (self.findSessionPane(id)) |pane| {
+        return self.showSessionPane(pane);
+    }
+
     _ = try self.openSessionPane(id);
     const entry = self.extra_panes.items[self.extra_panes.items.len - 1];
     return self.attachPaneAsSplit(&entry.pane);
+}
+
+/// The on-disk session id this pane is bound to, or null for a
+/// non-persisted (scratch / subagent) pane. Read off the Conversation's
+/// SessionHandle so `root_pane` and `extra_panes` entries answer uniformly.
+fn paneSessionId(pane: *const Pane) ?[]const u8 {
+    const conv = pane.conversation orelse return null;
+    const sh = conv.session_handle orelse return null;
+    return sh.meta.idSlice();
+}
+
+/// Find the single resident pane bound to session `id`, scanning the root
+/// pane and every non-subagent extra pane. Returns null when the session
+/// has no pane yet (first open). Backs the one-pane-per-session invariant:
+/// `splitFocusedWithSession` reattaches the match rather than loading a
+/// duplicate that would read a frozen on-disk snapshot and divorce the
+/// view from the session's live in-flight stream.
+fn findSessionPane(self: *WindowManager, id: []const u8) ?*Pane {
+    if (paneSessionId(&self.root_pane)) |sid| {
+        if (std.mem.eql(u8, sid, id)) return &self.root_pane;
+    }
+    for (self.extra_panes.items) |entry| {
+        if (entry.is_subagent_view) continue;
+        if (paneSessionId(&entry.pane)) |sid| {
+            if (std.mem.eql(u8, sid, id)) return &entry.pane;
+        }
+    }
+    return null;
+}
+
+/// Bring an already-resident session `pane` to the foreground. If its leaf
+/// is still live (the pane is currently displayed) this is a focus; if the
+/// pane was backgrounded (its leaf closed on a prior switch, handle now
+/// stale) its existing surface is re-tiled. Either way the live runner and
+/// Conversation are preserved, so the foreground view reconnects to the
+/// session's in-flight stream.
+fn showSessionPane(self: *WindowManager, pane: *Pane) !NodeRegistry.Handle {
+    if (pane.handle) |h| {
+        if (self.node_registry.resolve(h)) |node| {
+            if (node.* == .leaf) {
+                try self.focusById(h);
+                return h;
+            }
+        } else |_| {
+            // StaleNode: the pane was backgrounded; fall through to re-tile.
+        }
+    }
+    return self.attachPaneAsSplit(pane);
 }
 
 /// Split the focused leaf and attach `pane`'s existing surface on the
@@ -8485,4 +8542,224 @@ test "splitFocusedWithSession rejects sessions when persistence is disabled" {
         wm.splitFocusedWithSession("0123456789abcdef0123456789abcdef"),
     );
     try std.testing.expectEqual(@as(usize, 0), wm.extra_panes.items.len);
+}
+
+test "re-opening a backgrounded session reattaches its pane instead of duplicating" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+
+    var mgr_opt: ?Session.SessionManager = try Session.SessionManager.init(allocator);
+    var seed_handle = try mgr_opt.?.createSession("test-model");
+    const session_id_len = seed_handle.id_len;
+    var session_id_buf: [32]u8 = undefined;
+    @memcpy(session_id_buf[0..session_id_len], seed_handle.id[0..session_id_len]);
+    const session_id = session_id_buf[0..session_id_len];
+    _ = try seed_handle.appendEntry(.{
+        .entry_type = .user_message,
+        .content = "hi from disk",
+        .timestamp = 0,
+    });
+    seed_handle.close();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &mgr_opt,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    // First open: loads from disk, one extra pane.
+    const handle1 = try wm.splitFocusedWithSession(session_id);
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+    const conv1 = wm.extra_panes.items[0].pane.conversation.?;
+
+    // Background it: close its leaf. The PaneEntry + its runner stay
+    // resident in extra_panes (nothing reaps them); only the layout leaf
+    // goes away, mirroring what `_activate` does on a session switch.
+    try wm.closeById(handle1, null);
+    try std.testing.expectError(
+        error.StaleNode,
+        wm.node_registry.resolve(handle1),
+    );
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+
+    // Re-open the same session: must REATTACH the existing pane, not load
+    // a second copy from disk. No new PaneEntry, same Conversation pointer,
+    // and the returned handle is a fresh live leaf.
+    const handle2 = try wm.splitFocusedWithSession(session_id);
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+    try std.testing.expectEqual(conv1, wm.extra_panes.items[0].pane.conversation.?);
+    const node2 = try wm.node_registry.resolve(handle2);
+    try std.testing.expect(node2.* == .leaf);
+    try std.testing.expectEqual(node2, wm.layout.focused);
+}
+
+test "re-opening the currently displayed session focuses it without duplicating" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+
+    var mgr_opt: ?Session.SessionManager = try Session.SessionManager.init(allocator);
+    var seed_handle = try mgr_opt.?.createSession("test-model");
+    const session_id_len = seed_handle.id_len;
+    var session_id_buf: [32]u8 = undefined;
+    @memcpy(session_id_buf[0..session_id_len], seed_handle.id[0..session_id_len]);
+    const session_id = session_id_buf[0..session_id_len];
+    seed_handle.close();
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &mgr_opt,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    const handle1 = try wm.splitFocusedWithSession(session_id);
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+
+    // Re-open while still displayed: focuses the live leaf, no new pane,
+    // and returns the same handle (the leaf was never closed).
+    const handle2 = try wm.splitFocusedWithSession(session_id);
+    try std.testing.expectEqual(@as(usize, 1), wm.extra_panes.items.len);
+    try std.testing.expectEqual(handle1, handle2);
+}
+
+test "opening the root pane's session focuses root without an extra pane" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+
+    var mgr_opt: ?Session.SessionManager = try Session.SessionManager.init(allocator);
+
+    // Build the root pane's session and attach it to the root Conversation,
+    // mirroring main.zig's `root_buffer.attachSession(sh)`.
+    const root_sh = try allocator.create(Session.SessionHandle);
+    defer allocator.destroy(root_sh);
+    root_sh.* = try mgr_opt.?.createSession("test-model");
+    defer root_sh.close();
+    var root_id_buf: [32]u8 = undefined;
+    @memcpy(root_id_buf[0..root_sh.id_len], root_sh.id[0..root_sh.id_len]);
+    const root_id = root_id_buf[0..root_sh.id_len];
+
+    var screen = try @import("Screen.zig").init(allocator, 80, 24);
+    defer screen.deinit();
+    var theme = @import("Theme.zig").defaultTheme();
+    var compositor = @import("Compositor.zig").init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    var view = try Conversation.init(allocator, 0, "root");
+    defer view.deinit();
+    view.attachSession(root_sh);
+    var runner = AgentRunner.init(allocator, TestNullSink.sink(), &view);
+    defer runner.deinit();
+    const root_pane: Pane = .{ .buffer = view.buf(), .view = view.view(), .conversation = &view, .runner = &runner };
+
+    const wm = try allocator.create(WindowManager);
+    defer allocator.destroy(wm);
+    var command_registry = try testCommandRegistry(allocator);
+    defer command_registry.deinit();
+    wm.* = .{
+        .allocator = allocator,
+        .screen = &screen,
+        .layout = &layout,
+        .compositor = &compositor,
+        .root_pane = root_pane,
+        .provider = undefined,
+        .session_mgr = &mgr_opt,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &command_registry,
+    };
+    defer wm.deinit();
+
+    try wm.attachLayoutRegistry();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = view.buf(), .view = view.view(), .viewport = &test_viewport });
+    layout.recalculate(screen.width, screen.height);
+
+    // Opening the root session must reuse root_pane: no extra pane appears.
+    const handle = try wm.splitFocusedWithSession(root_id);
+    try std.testing.expectEqual(@as(usize, 0), wm.extra_panes.items.len);
+    try std.testing.expectEqual(wm.root_pane.handle.?, handle);
 }
