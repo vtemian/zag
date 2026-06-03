@@ -45,6 +45,8 @@ const lua_message = @import("lua/lua_message.zig");
 const IoBackend = @import("lua/IoBackend.zig").IoBackend;
 const embedded = @import("lua/embedded.zig");
 const sync = @import("sync.zig");
+const ChildAgent = @import("ChildAgent.zig");
+const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 const provider_bindings = @import("lua/bindings/provider.zig");
 const prompt_bindings = @import("lua/bindings/prompt.zig");
 const sockets_bindings = @import("lua/bindings/sockets.zig");
@@ -335,6 +337,17 @@ pub const LuaEngine = struct {
         /// resume so a no-yield coroutine that retires inside the spawn still
         /// decrements `outstanding` via `retireTask`.
         pending_fire: ?*PendingFire = null,
+        /// Non-null while this coroutine is suspended awaiting a delegated
+        /// child agent (the `zag.task` workflow path). The child is registered
+        /// in the `ChildRunnerRegistry`; when it finishes, the registry's
+        /// workflow completion path calls `onChildRetiredOnMain`, which clears
+        /// this field, pushes the child's result onto `co`, and resumes. The
+        /// engine OWNS the `ChildAgent` heap slot via this field: it is freed
+        /// either by `onChildRetiredOnMain` (normal completion) or by the
+        /// retire/shutdown teardown arms. Like `taskHandleJoin`'s yield, a
+        /// task may be parked here with neither `pending_job` nor
+        /// `pending_fire` set; nothing asserts otherwise.
+        pending_child: ?*ChildAgent = null,
     };
 
     /// One in-flight round-trip serviced asynchronously on the main thread.
@@ -2746,6 +2759,94 @@ pub const LuaEngine = struct {
         self.resumeTask(task, num_values);
 
         if (err_detail) |d| self.allocator.free(d);
+    }
+
+    /// Push a finished child's result onto its awaiting coroutine's stack as
+    /// the `(result, err)` 2-tuple the binding convention expects. Mirrors the
+    /// `.llm_complete` arm of `pushJobResultOntoStack`: build a result table,
+    /// push `nil` for the error slot, return the value count. The orchestration
+    /// script reads `summary` / `is_error` off the table; structured output
+    /// (a later milestone) extends this shape.
+    fn pushChildResultOntoStack(co: *Lua, res: ChildAgent.ChildResult) i32 {
+        co.newTable();
+        _ = co.pushString(res.summary);
+        co.setField(-2, "summary");
+        co.pushBoolean(res.is_error);
+        co.setField(-2, "is_error");
+        co.pushNil();
+        return 2;
+    }
+
+    /// Adapter the `ChildRunnerRegistry` workflow completion path targets via
+    /// its `resume_fn` pointer. The registry stores the engine and the
+    /// `ChildAgent` as `*anyopaque` to avoid an import cycle; this casts them
+    /// back to their concrete types and calls `onChildRetiredOnMain`. Runs on
+    /// the main drain thread, with no registry lock held, after the child agent
+    /// thread is joined.
+    pub fn resumeWorkflowChild(ctx: *anyopaque, child_ptr: *anyopaque) void {
+        const self: *LuaEngine = @ptrCast(@alignCast(ctx));
+        const child: *ChildAgent = @ptrCast(@alignCast(child_ptr));
+        self.onChildRetiredOnMain(child);
+    }
+
+    /// Complete a finished workflow child: resume its awaiting coroutine with
+    /// the child's result, then free the child. The single entry the registry
+    /// calls when a `OnDone.workflow` child finishes. Runs on the MAIN thread,
+    /// post-join, post-remove (the registry removed the entry before calling).
+    ///
+    /// The engine OWNS the heap `ChildAgent` (referenced from `task.pending_child`),
+    /// so this is the one place outside teardown that frees it. Order mirrors
+    /// `resumeFromJob`: derive the result, tear the child down, THEN resume, so
+    /// a re-entrant resume can never observe a half-dead child.
+    ///
+    /// `task_end` is persisted UNCONDITIONALLY (D-3), even when the awaiting
+    /// coroutine is already gone (cancel / shutdown), so every `task_start`
+    /// pairs a `task_end` and the sidebar/transcript always close the row.
+    pub fn onChildRetiredOnMain(self: *LuaEngine, child: *ChildAgent) void {
+        const task = self.tasks.get(child.resume_thread_ref);
+
+        // Derive the result while the child is still live (the summary reads
+        // the child's conversation tree). Arena-scoped so the owned task_end
+        // copy is the only allocation that outlives this call.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const res = child.result(arena.allocator()) catch ChildAgent.ChildResult{
+            .summary = "internal error: failed to derive subagent result",
+            .is_error = true,
+        };
+
+        // Persist task_end before teardown so it is recorded on every path,
+        // including the task-gone (cancel/shutdown) one. Mirrors task.zig's
+        // task_end block: an owned copy chained back to the task_start ULID.
+        if (child.session_handle) |sh| {
+            const owned = self.allocator.dupe(u8, res.summary) catch null;
+            if (owned) |content| {
+                defer self.allocator.free(content);
+                _ = sh.appendEntry(.{
+                    .entry_type = .task_end,
+                    .content = content,
+                    .timestamp = clock.milliTimestamp(),
+                    .parent_id = child.task_start_id,
+                }) catch |err| log.warn("workflow task_end persist failed: {}", .{err});
+            }
+        }
+
+        if (task) |t| {
+            // Push the result onto the coroutine stack BEFORE freeing the
+            // child: the summary slice lives in `arena` (copied into Lua by
+            // pushString), so it must outlive the push but not the resume.
+            t.pending_child = null;
+            const n = pushChildResultOntoStack(t.co, res);
+            child.deinit();
+            self.allocator.destroy(child);
+            self.resumeTask(t, n);
+            return;
+        }
+
+        // Awaiting coroutine already retired (cancel / shutdown): tear down
+        // only. task_end was persisted above.
+        child.deinit();
+        self.allocator.destroy(child);
     }
 
     /// Creates a coroutine for the Lua function + `nargs` arguments that are

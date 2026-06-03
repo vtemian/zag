@@ -72,6 +72,14 @@ session_handle: ?*Session.SessionHandle,
 spec: ChildSpec,
 /// Once-only teardown latch so `deinit` is idempotent.
 retired: bool = false,
+/// In workflow (coroutine-await) mode, the `thread_ref` of the orchestration
+/// coroutine that spawned this child and is suspended waiting on it. The
+/// `ChildRunnerRegistry` workflow completion path hands this back to
+/// `LuaEngine.onChildRetiredOnMain`, which looks the task up by this key to
+/// resume it. Set by the spawner (the `zag.task` binding, a later milestone);
+/// the default `-1` is never a valid registry ref, so a child left in park
+/// mode resolves to "no task" and is torn down without a stray resume.
+resume_thread_ref: i32 = -1,
 
 /// Build + spawn the child agent. Transcribes the pre-park half of the
 /// `task` tool's old `runChild`. MUST be called after `self` is at its
