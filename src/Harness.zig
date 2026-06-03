@@ -565,6 +565,17 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         const count = deps.runner.event_queue.drain(&drain_buf);
 
         if (count == 0) {
+            // Idle: block on the wake pipe instead of busy-spinning a core.
+            // Both an agent-event push (EventQueue) and a worker completion
+            // post (LuaCompletionQueue.wake_fd, wired above) write this pipe,
+            // so an in-flight deferred fire wakes us promptly. The heartbeat
+            // bounds the wait so time-based work (hook budget enforcement in
+            // cancelTriggeredFires) still runs if a wake is ever missed.
+            const idle_heartbeat_ms = 250;
+            var fds = [_]posix.pollfd{
+                .{ .fd = deps.wake_read_fd, .events = posix.POLL.IN, .revents = 0 },
+            };
+            _ = posix.poll(&fds, idle_heartbeat_ms) catch {};
             var wake_buf: [64]u8 = undefined;
             _ = wake_pipe.read(deps.wake_read_fd, &wake_buf) catch {};
             continue;
