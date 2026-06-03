@@ -331,6 +331,20 @@ fn pollTimeoutWithHeartbeat(parser_timeout: ?i32, heartbeat_ms: ?i32) i32 {
     return -1;
 }
 
+/// True when the working line ("* Working… (Ns)") was painted on the last
+/// rendered frame but the agent has since stopped, so a composite must run to
+/// erase it even on an otherwise-idle frame.
+///
+/// `last_rendered_working_secs` is non-null only after a frame rendered with
+/// `agent_running` true (see the tail of `tick`), so it doubles as "a working
+/// line is currently on screen". Without forcing a frame here, the idle
+/// early-return nulls the tracker and skips the redraw; and because the
+/// heartbeat only arms while an agent runs, no later tick fires to clear it —
+/// freezing "* Working…" on screen after the turn ends.
+fn workingLineNeedsClear(agent_running: bool, last_rendered_working_secs: ?u64) bool {
+    return !agent_running and last_rendered_working_secs != null;
+}
+
 /// Pop every finished Lua async job off the completion queue and resume
 /// the owning coroutine in the engine. Despite the name, this does not
 /// just empty a data structure: each call feeds the Lua state machine
@@ -554,7 +568,8 @@ fn tick(
 
     const any_dirty = self.anyPaneDirty();
     const frame_dirty = any_dirty or self.window_manager.compositor.layout_dirty or
-        (maybe_event != null and maybe_event.? != .mouse) or time_dirty;
+        (maybe_event != null and maybe_event.? != .mouse) or time_dirty or
+        workingLineNeedsClear(agent_running, self.last_rendered_working_secs);
 
     if (!frame_dirty) {
         // Reset the tracker on the idle path so the next agent run
@@ -2361,4 +2376,17 @@ test "pollTimeoutWithHeartbeat preserves the parser's drain-now signal" {
     // parser.pollTimeoutMs returns 0 when a complete event is already queued.
     // The heartbeat must never delay that.
     try std.testing.expectEqual(@as(i32, 0), pollTimeoutWithHeartbeat(0, 250));
+}
+
+test "workingLineNeedsClear fires only on the stop frame after a working render" {
+    // Agent still running: the working line is repainted by the running path,
+    // nothing to clear out-of-band.
+    try std.testing.expect(!workingLineNeedsClear(true, 5));
+    try std.testing.expect(!workingLineNeedsClear(true, null));
+    // Agent stopped and no working line was ever painted: nothing to erase.
+    try std.testing.expect(!workingLineNeedsClear(false, null));
+    // Agent stopped but the last rendered frame drew a working line
+    // (tracker still non-null): one composite must run to erase it.
+    try std.testing.expect(workingLineNeedsClear(false, 5));
+    try std.testing.expect(workingLineNeedsClear(false, 0));
 }
