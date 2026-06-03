@@ -228,6 +228,48 @@ pub const HookDispatcher = struct {
         return self.consumePendingCancel();
     }
 
+    /// Deferred dispatch (the round-trip `.hook_request` path): spawn each
+    /// matching hook as a coroutine via the sink (which binds it to the
+    /// engine's active PendingFire), then RETURN — no drain loop, no veto
+    /// consume. The caller (`LuaEngine.beginHook`) owns the fire that tracks
+    /// retirement.
+    ///
+    /// The re-entry guard is NOT applied here. A deferred fire's guard is
+    /// bracketed per-resume in `LuaEngine.resumeTask` (only while the hook body
+    /// actually executes), so concurrent parked fires across panes don't
+    /// inflate `firing_depth`; only a genuine same-kind re-fire while a hook
+    /// body is running is caught. A deferred round-trip hook cannot recurse via
+    /// the round-trip path anyway (its producing agent thread is parked on
+    /// req.done), so the only recursion vector is an in-process `fireHook` from
+    /// the body, which sees the per-resume elevation.
+    pub fn beginHook(
+        self: *HookDispatcher,
+        payload: *Hooks.HookPayload,
+        lua: *Lua,
+        sink: *const ResumeSink,
+    ) void {
+        const kind = payload.kind();
+        const pattern_key = hookPatternKey(payload.*);
+        var it = self.registry.iterMatching(kind, pattern_key);
+        while (it.next()) |hook| {
+            const top = lua.getTop();
+            _ = lua.rawGetIndex(zlua.registry_index, hook.lua_ref);
+            self.pushPayloadAsTable(lua, payload.*) catch |err| {
+                log.warn("hook payload marshalling failed for {s}: {}", .{ @tagName(kind), err });
+                lua.setTop(top);
+                continue;
+            };
+            // spawnHookFn binds the Task to the active fire and tags the
+            // payload before the first resume; a synchronously-completing hook
+            // still records its veto via resumeTask's ok-branch and decrements
+            // the fire. No `spawned` tracking needed — the fire counts.
+            _ = sink.spawnHookFn(sink.ctx, payload) catch |err| {
+                log.warn("hook spawn failed for {s}: {}", .{ @tagName(kind), err });
+                continue;
+            };
+        }
+    }
+
     fn anyHookAlive(self: *HookDispatcher, sink: *const ResumeSink, refs: []const i32) bool {
         _ = self;
         for (refs) |r| {
@@ -385,11 +427,18 @@ pub const HookDispatcher = struct {
     /// the engine's `resumeTask` when a hook coroutine retires with a
     /// return value. Table sits at the top of `co` and is NOT popped
     /// here; the caller pops via `co.pop(num_results)`.
+    /// Apply a coroutine hook's return table: mutate the payload's rewrite
+    /// slots, and — for a veto-capable kind that returned `cancel=true` —
+    /// return the duped veto reason (caller owns; dispatcher-allocated), else
+    /// null. Unlike the sync `applyHookReturn`, this does NOT touch the
+    /// dispatcher's veto channel: the caller (`resumeTask`) routes the reason
+    /// either onto the task's `PendingFire` (deferred round-trip hooks) or via
+    /// `setPendingCancel` (the in-process `fireHook` path).
     pub fn applyHookReturnFromCoroutine(
         self: *HookDispatcher,
         co: *Lua,
         payload: *Hooks.HookPayload,
-    ) !void {
+    ) !?[]const u8 {
         _ = co.getField(-1, "cancel");
         const cancel = co.isBoolean(-1) and co.toBoolean(-1);
         co.pop(1);
@@ -401,18 +450,17 @@ pub const HookDispatcher = struct {
             };
             if (!veto_allowed) {
                 log.warn("hook returned cancel=true for observer-only event {s}; ignored", .{@tagName(payload.kind())});
-                return;
+                return null;
             }
-            self.pending_cancel = true;
+            var reason: ?[]const u8 = null;
             _ = co.getField(-1, "reason");
             if (co.isString(-1)) {
                 if (co.toString(-1)) |reason_text| {
-                    if (self.pending_cancel_reason) |old| self.allocator.free(old);
-                    self.pending_cancel_reason = self.allocator.dupe(u8, reason_text) catch null;
+                    reason = self.allocator.dupe(u8, reason_text) catch null;
                 } else |_| {}
             }
             co.pop(1);
-            return;
+            return reason;
         }
 
         switch (payload.*) {
@@ -465,6 +513,17 @@ pub const HookDispatcher = struct {
             },
             else => {},
         }
+        return null;
+    }
+
+    /// Feed the in-process veto channel (read by `consumePendingCancel`).
+    /// Used by the synchronous `fireHook` path for coroutine hooks that are
+    /// NOT bound to a `PendingFire`; deferred round-trip hooks route their
+    /// veto onto their fire instead. Takes ownership of `reason`.
+    pub fn setPendingCancel(self: *HookDispatcher, reason: []const u8) void {
+        self.pending_cancel = true;
+        if (self.pending_cancel_reason) |old| self.allocator.free(old);
+        self.pending_cancel_reason = reason;
     }
 
     /// Read-and-reset the internal veto channel populated by
