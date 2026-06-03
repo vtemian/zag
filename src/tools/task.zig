@@ -30,6 +30,7 @@ const Session = @import("../Session.zig");
 const AgentRunner = @import("../AgentRunner.zig");
 const BufferSink = @import("../sinks/BufferSink.zig").BufferSink;
 const llm = @import("../llm.zig");
+const ChildAgent = @import("../ChildAgent.zig");
 
 /// Maximum nested `task` invocations on a single runner. Picked to
 /// match the plan's recursion cap; keeps runaway delegation loops from
@@ -140,7 +141,7 @@ fn runChild(
     // Build a fresh one-tool-registry view for the child. `runLoopStreaming`
     // takes a `*const Registry`, not a Subset; the cleanest shim is a new
     // Registry that mirrors only the subset-visible tools from the parent.
-    var child_registry = try buildChildRegistry(allocator, ctx.registry, sa.tools);
+    var child_registry = try ChildAgent.buildChildRegistry(allocator, ctx.registry, sa.tools);
     defer child_registry.deinit();
 
     // Persist `task_start` with JSON-encoded inputs so replay tooling can
@@ -315,34 +316,6 @@ fn runChild(
     }
 
     return .{ .content = owned, .is_error = is_err, .owned = true };
-}
-
-/// Build a fresh Registry that exposes only the tools visible through
-/// `parent.subset(allowlist)`. `runLoopStreaming` needs a concrete
-/// `*const Registry` rather than a `Subset`, so we materialise one here
-/// and hand back the copy. The caller deinits it after the child
-/// finishes.
-fn buildChildRegistry(
-    allocator: Allocator,
-    parent: *const tools.Registry,
-    allowlist: ?[]const []const u8,
-) !tools.Registry {
-    var child = tools.Registry.init(allocator);
-    errdefer child.deinit();
-
-    if (allowlist) |list| {
-        for (list) |name| {
-            if (parent.get(name)) |t| try child.register(t);
-        }
-        return child;
-    }
-
-    // Null allowlist inherits every parent tool verbatim.
-    var it = parent.tools.iterator();
-    while (it.next()) |entry| {
-        try child.register(entry.value_ptr.*);
-    }
-    return child;
 }
 
 /// Allocate the `task_start` JSON payload. The previous implementation
