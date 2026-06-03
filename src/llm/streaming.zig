@@ -83,6 +83,14 @@ pub const StreamingResponse = struct {
     /// SO_RCVTIMEO is inert (see socket_timeouts.streamWithTimeout).
     read_ms: u32 = 0,
 
+    /// Absolute monotonic deadline (ns, from `clock.monotonicNs`) for body
+    /// reads. When set, every `readChunk` is additionally bounded by the time
+    /// remaining until this instant and returns `error.ReadTimeout` once it
+    /// passes. The provider parser uses it for a TOTAL first-token budget that
+    /// a per-read idle timeout (reset by SSE keep-alives) cannot enforce.
+    /// null = only `read_ms` applies.
+    body_deadline_ns: ?u64 = null,
+
     /// Accumulates partial lines across network reads.
     pending_line: std.ArrayList(u8),
     /// Leftover bytes after a newline that belong to subsequent lines.
@@ -153,6 +161,7 @@ pub const StreamingResponse = struct {
             .allocator = allocator,
             .body_done = false,
             .read_ms = if (opts.timeouts) |to| to.read_ms else 0,
+            .body_deadline_ns = null,
         };
         errdefer self.client.deinit();
 
@@ -517,13 +526,25 @@ pub const StreamingResponse = struct {
     /// so callers can distinguish a genuine timeout from a transport failure.
     fn readChunk(self: *StreamingResponse, chunk: []u8) !usize {
         if (self.body_done) return 0;
+        // Bound this read by the smaller of read_ms and the time remaining in an
+        // absolute body deadline (the first-token budget). Enforced on EVERY chunk
+        // read, so a keep-alive-only wedge (short reads, no real token) still trips
+        // once the budget elapses. Never pass 0 (=unbounded) derived from the
+        // deadline. read_ms == 0 alone still means unbounded.
+        var effective_read_ms = self.read_ms;
+        if (self.body_deadline_ns) |deadline| {
+            const now = clock.monotonicNs();
+            if (now >= deadline) return error.ReadTimeout;
+            const remaining_ms: u32 = @intCast(@min(@as(u64, std.math.maxInt(u32)), (deadline - now) / std.time.ns_per_ms + 1));
+            effective_read_ms = if (self.read_ms == 0) remaining_ms else @min(self.read_ms, remaining_ms);
+        }
         var writer: std.Io.Writer = .fixed(chunk);
         const n = socket_timeouts.streamWithTimeout(
             process_io.get(),
             self.body_reader,
             &writer,
             .limited(chunk.len),
-            self.read_ms,
+            effective_read_ms,
         ) catch |err| switch (err) {
             error.EndOfStream => {
                 self.body_done = true;
@@ -740,6 +761,26 @@ const ChoppyReader = struct {
         return written;
     }
 };
+
+test "readChunk trips immediately when the body deadline has already passed" {
+    const allocator = std.testing.allocator;
+    var fake = std.Io.Reader.fixed("data: hello\n\n"); // would yield bytes if read
+    var sr: StreamingResponse = .{
+        .client = undefined,
+        .req = undefined,
+        .body_reader = &fake,
+        .transfer_buf = undefined,
+        .read_ms = 0,
+        .pending_line = .empty,
+        .remainder = .empty,
+        .allocator = allocator,
+        .body_deadline_ns = clock.monotonicNs() - 1, // already past
+    };
+    defer sr.pending_line.deinit(allocator);
+    defer sr.remainder.deinit(allocator);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.ReadTimeout, sr.readChunk(&buf));
+}
 
 test "readLine reassembles a line split across reads with a 0-byte short read between chunks" {
     // Regression: the stdlib body reader can return 0 bytes from

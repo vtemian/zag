@@ -46,6 +46,13 @@ const monotonic_clock: posix.clockid_t = switch (@import("builtin").os.tag) {
     else => posix.CLOCK.MONOTONIC,
 };
 
+/// Monotonic nanoseconds, immune to wall-clock jumps (same source as `Timer`:
+/// UPTIME_RAW on macOS, MONOTONIC on Linux). For absolute read deadlines.
+pub fn monotonicNs() u64 {
+    const ts = clockGet(monotonic_clock);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 /// Monotonic elapsed-time counter. Drop-in for `std.time.Timer`.
 pub const Timer = struct {
     start_ns: u64,
@@ -120,4 +127,10 @@ fn fillSecure(_: *anyopaque, buf: []u8) void {
 /// A process-wide secure `std.Random`. Drop-in for `std.crypto.random`.
 pub fn random() std.Random {
     return .{ .ptr = undefined, .fillFn = fillSecure };
+}
+
+test "monotonicNs is non-decreasing" {
+    const a = monotonicNs();
+    const b = monotonicNs();
+    try std.testing.expect(b >= a);
 }
