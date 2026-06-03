@@ -157,13 +157,22 @@ fn runChild(
             .model = sa.model,
             .name = sa.name,
         },
+        // Park mode passes catalog-owned strings that already outlive the
+        // child, so the spec arena stays unused (an empty arena deinits to a
+        // no-op). It exists only so the workflow `zag.task` path can dupe
+        // Lua-stack strings that die after the call.
+        .spec_arena = std.heap.ArenaAllocator.init(allocator),
     };
 
     // Build + spawn the child (registry, task_start, spawnSubagent, sink,
-    // runner init/submit). `start` is self-unwinding: on error it has already
-    // torn down everything it built, so we MUST NOT call `deinit` — the
-    // outer `defer` only destroys the (now-clean) heap slot.
-    try child.start(ctx);
+    // runner init/submit). `start` is self-unwinding for everything it builds;
+    // the caller-owned `spec_arena` is the one exception, released here on the
+    // failed-start path. On error we MUST NOT call `deinit` — the outer
+    // `defer` only destroys the (now-clean) heap slot.
+    child.start(ctx) catch |err| {
+        child.spec_arena.deinit();
+        return err;
+    };
     // `start` succeeded: from here `deinit` is the caller's responsibility.
     // Run it unconditionally on every exit (success or any later error). The
     // agent thread is always joined before deinit runs (the drain/park joins

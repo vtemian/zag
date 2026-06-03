@@ -70,6 +70,15 @@ child_conv: *Conversation,
 task_start_id: ?ulid.Ulid,
 session_handle: ?*Session.SessionHandle,
 spec: ChildSpec,
+/// Owns the spec strings when the spawner's source bytes do not outlive the
+/// child (the `zag.task` workflow binding: Lua stack strings die after the
+/// call returns, but the child runs on past it). The binding dupes
+/// prompt/system/tools/model/schema/name in here before `start`, then points
+/// `spec` at the duped copies. Park-mode callers (the `task` tool) pass
+/// catalog-owned strings that already outlive the child, so they leave this
+/// arena unused; `deinit` releases it either way. Initialized by the caller
+/// (init at create) so the field is live before any dupe.
+spec_arena: std.heap.ArenaAllocator,
 /// Once-only teardown latch so `deinit` is idempotent.
 retired: bool = false,
 /// In workflow (coroutine-await) mode, the `thread_ref` of the orchestration
@@ -92,6 +101,12 @@ resume_thread_ref: i32 = -1,
 /// — `child_runner`/`child_sink` would still be `undefined` and `deinit`
 /// would read garbage. The caller only destroys the heap slot. On success the
 /// caller owns teardown and MUST call `deinit` exactly once.
+///
+/// The lone exception to the self-unwinding rule is `spec_arena`: the caller
+/// creates it (and, for the `zag.task` path, dupes the spec into it) BEFORE
+/// `start`, so `start` neither owns nor unwinds it. On a failed `start` the
+/// caller must release it (`child.spec_arena.deinit()`) alongside destroying
+/// the heap slot; on success `deinit` releases it.
 pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
     // Build a fresh one-tool-registry view for the child. `runLoopStreaming`
     // takes a `*const Registry`, not a Subset; we materialise a Registry that
@@ -131,12 +146,18 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
     self.child_conv.last_persisted_id = self.task_start_id;
 
     // Compose the child's first user prompt: system prompt prefix, blank
-    // line, the caller's prompt.
-    const initial_text = try std.fmt.allocPrint(
-        self.allocator,
-        "{s}\n\n{s}",
-        .{ self.spec.system_prompt, self.spec.prompt },
-    );
+    // line, the caller's prompt. An empty system prompt (the `zag.task`
+    // binding when `system` is absent/empty) skips the prefix entirely, so
+    // the child's first message is just the prompt with no leading blank
+    // lines. Both branches own `initial_text` via the same defer.
+    const initial_text = if (self.spec.system_prompt.len == 0)
+        try self.allocator.dupe(u8, self.spec.prompt)
+    else
+        try std.fmt.allocPrint(
+            self.allocator,
+            "{s}\n\n{s}",
+            .{ self.spec.system_prompt, self.spec.prompt },
+        );
     defer self.allocator.free(initial_text);
 
     // Wire a BufferSink to the child Conversation. Events from the child
@@ -213,6 +234,7 @@ pub fn deinit(self: *ChildAgent) void {
     self.child_runner.deinit();
     self.child_sink.deinit();
     self.child_registry.deinit();
+    self.spec_arena.deinit();
 }
 
 /// Derive the result (summary + is_error) for the park/return path. The
@@ -370,6 +392,7 @@ test "ChildAgent starts, drains to completion, and reports the summary" {
             .tools = null,
             .name = "tester",
         },
+        .spec_arena = std.heap.ArenaAllocator.init(allocator),
     };
 
     try child.start(&ctx);
@@ -454,6 +477,11 @@ test "ChildAgent.start unwinds cleanly on allocation failure at any stage" {
                 .tools = null,
                 .name = "tester",
             },
+            // The spec arena is caller-owned and outside `start`'s allocation
+            // sweep, so back it with the real (non-failing) allocator. An empty
+            // arena deinits to a no-op; deinit it explicitly on the failed-start
+            // path (the contract's lone exception to self-unwinding).
+            .spec_arena = std.heap.ArenaAllocator.init(allocator),
         };
 
         if (child.start(&ctx)) |_| {
@@ -473,7 +501,10 @@ test "ChildAgent.start unwinds cleanly on allocation failure at any stage" {
         } else |err| {
             // Contract: a failed `start` has already unwound itself, so we must
             // NOT call `deinit`. The `errdefer` chain inside `start` released
-            // everything; only the heap slot remains (freed by the defer above).
+            // everything; only the heap slot (freed by the defer above) and the
+            // caller-owned spec arena remain — release the arena per the
+            // contract's lone exception to self-unwinding.
+            child.spec_arena.deinit();
             try testing.expectEqual(error.OutOfMemory, err);
         }
     }

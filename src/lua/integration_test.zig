@@ -239,10 +239,13 @@ fn testSpawnChild(co: *Lua) i32 {
         .task_start_id = null,
         .session_handle = null,
         .spec = .{ .system_prompt = "You are a test subagent.", .prompt = "do the thing", .tools = null, .name = "tester" },
+        .spec_arena = std.heap.ArenaAllocator.init(fx.ctx.allocator),
         .resume_thread_ref = task.thread_ref,
     };
     child.start(fx.ctx) catch {
-        // start is self-unwinding; only free the heap slot.
+        // start is self-unwinding for what it builds; release the caller-owned
+        // spec arena and free the heap slot.
+        child.spec_arena.deinit();
         fx.engine.allocator.destroy(child);
         co.raiseErrorStr("child.start failed", .{});
     };
@@ -449,6 +452,56 @@ test "force-retiring a coroutine with a live workflow child at shutdown tears it
     // The child was joined, deinited, and freed exactly once: the registry is
     // empty and testing.allocator reports no leak at engine.deinit().
     try testing.expect(child_registry.isEmpty());
+}
+
+// -- zag.task binding misuse guards (Milestone E1) --------------------------
+
+test "zag.task is installed and raises when called outside a coroutine" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine, "assert(type(zag.task) == 'function', 'zag.task missing')");
+
+    // The main Lua state is not yieldable, so zag.task refuses with a clear
+    // error rather than spawning a child the main thread could never await.
+    const res = engine.lua.doString("zag.task{prompt='hello'}");
+    try testing.expectError(error.LuaRuntime, res);
+    const msg = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, msg, "inside") != null);
+    engine.lua.setTop(0);
+}
+
+test "zag.task inside a coroutine without a workflow context raises" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // A plain spawned coroutine has no workflow_ctx; zag.task must refuse. The
+    // raise surfaces inside the coroutine, so capture it with pcall and stash
+    // the message for the assertion. The coroutine runs to completion (pcall
+    // catches the raise, no yield), so it retires synchronously.
+    try engine.lua.doString(
+        \\function test_no_ctx()
+        \\  local ok, err = pcall(function() return zag.task{prompt='hello'} end)
+        \\  _no_ctx_ok = ok
+        \\  _no_ctx_err = tostring(err)
+        \\end
+    );
+    _ = try engine.lua.getGlobal("test_no_ctx");
+    _ = try engine.spawnCoroutine(0, null);
+
+    _ = try engine.lua.getGlobal("_no_ctx_ok");
+    try testing.expect(!engine.lua.toBoolean(-1)); // pcall reported failure
+    engine.lua.pop(1);
+    _ = try engine.lua.getGlobal("_no_ctx_err");
+    const err_msg = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, err_msg, "workflow context") != null);
+    engine.lua.pop(1);
 }
 
 // -- Workflow fan-out bound (Milestone D) -----------------------------------
