@@ -55,7 +55,7 @@ pub const UNKNOWN_MODEL: llm.ModelSpec = .{
 /// any content (`error.ReadTimeout` with nothing emitted). The transient
 /// moonshot/kimi gateway hang is per-connection, so a fresh connection
 /// usually succeeds; cap the attempts so a persistent outage still surfaces.
-const max_prestream_retries: u8 = 2;
+pub const max_prestream_retries: u8 = 2;
 /// Brief pause before re-firing, giving a wedged gateway a moment to clear.
 const prestream_retry_backoff_ms: u64 = 300;
 

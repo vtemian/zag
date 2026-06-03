@@ -3149,3 +3149,18 @@ test "callLlm does not retry a ReadTimeout once content was emitted" {
     try std.testing.expectError(error.ReadTimeout, result);
     try std.testing.expectEqual(@as(u32, 1), stub.attempt);
 }
+
+test "callLlm gives up after the pre-first-token retry budget is exhausted" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var stub = FlakyStreamProvider{ .fail_attempts = 99 };
+    const p = stub.provider();
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    try std.testing.expectError(error.ReadTimeout, result);
+    try std.testing.expectEqual(@as(u32, 1 + agent.max_prestream_retries), stub.attempt);
+}
