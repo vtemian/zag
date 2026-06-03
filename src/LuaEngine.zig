@@ -2274,6 +2274,17 @@ pub const LuaEngine = struct {
     pub fn fireHook(self: *LuaEngine, payload: *Hooks.HookPayload) !?[]const u8 {
         if (self.hook_dispatcher.registry.hooks.items.len == 0) return null;
 
+        // This is the IN-PROCESS fire path. It must never bind its coroutines
+        // to a deferred fire, even when re-entered synchronously from inside a
+        // deferred hook body (a deferred hook's first resume runs inline inside
+        // beginHook, where `active_hook_fire` is set; a body that fires an
+        // in-process hook from there must not have it bound to the outer fire).
+        // Disown any active fire for our duration so `sinkSpawnHook` spawns
+        // unbound (in-process) coroutines.
+        const saved_fire = self.active_hook_fire;
+        self.active_hook_fire = null;
+        defer self.active_hook_fire = saved_fire;
+
         // No async runtime → legacy synchronous protectedCall path. The
         // dispatcher handles it directly; no sink needed.
         if (self.async_runtime == null) {
@@ -2865,6 +2876,11 @@ pub const LuaEngine = struct {
                 .hook => {}, // HookRequest has no error field; done is enough
             }
             pf.done.set();
+            // Sever the borrowed cancel-flag pointer too: the fire lingers in
+            // `pending_fires` until its coroutine retires, and `cancelTriggeredFires`
+            // dereferences `pf.cancel` every tick — once the producer is released
+            // its flag storage may die, so a dangling read is otherwise possible.
+            pf.cancel = null;
         }
         var it = self.tasks.valueIterator();
         while (it.next()) |task_ptr| {
@@ -4271,6 +4287,44 @@ test "beginHook defers req.done until the hook coroutine retires and surfaces it
     try std.testing.expect(req.cancelled);
     try std.testing.expectEqualStrings("no rm", req.cancel_reason.?);
     try std.testing.expectEqual(@as(usize, 0), engine.pending_fires.items.len);
+}
+
+test "in-process fireHook disowns an active deferred fire (re-entrancy mis-bind guard)" {
+    // A deferred hook body that synchronously fires an in-process hook must not
+    // have that in-process hook bound to the outer deferred fire. Simulate the
+    // mid-beginHook state (active_hook_fire set), fire an in-process veto hook,
+    // and assert its veto surfaces via the in-process channel — never routed
+    // onto the outer fire, whose state stays untouched.
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    try engine.lua.doString(
+        \\zag.hook("ToolPre", function(evt) return { cancel = true, reason = "inner" } end)
+    );
+
+    var done_evt: sync.ResetEvent = .{};
+    var outer_pf: LuaEngine.PendingFire = .{ .kind = .hook, .done = &done_evt, .outstanding = 1 };
+    engine.active_hook_fire = &outer_pf;
+
+    var payload: Hooks.HookPayload = .{ .tool_pre = .{
+        .name = "bash",
+        .call_id = "id1",
+        .args_json = "{}",
+        .args_rewrite = null,
+    } };
+    const reason = try engine.fireHook(&payload);
+
+    // Veto came back via the in-process return, NOT onto the outer fire.
+    try std.testing.expect(reason != null);
+    try std.testing.expectEqualStrings("inner", reason.?);
+    try std.testing.expect(!outer_pf.cancelled);
+    try std.testing.expectEqual(@as(usize, 1), outer_pf.outstanding);
+
+    if (reason) |r| engine.hook_dispatcher.allocator.free(r);
+    engine.active_hook_fire = null;
 }
 
 test "concurrent deferred hook fires keep their veto scoped per fire" {
