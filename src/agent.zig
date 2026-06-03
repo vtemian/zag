@@ -51,6 +51,14 @@ pub const UNKNOWN_MODEL: llm.ModelSpec = .{
     .model_id = "unknown",
 };
 
+/// Bounded streaming re-fires for a connection that wedges BEFORE producing
+/// any content (`error.ReadTimeout` with nothing emitted). The transient
+/// moonshot/kimi gateway hang is per-connection, so a fresh connection
+/// usually succeeds; cap the attempts so a persistent outage still surfaces.
+pub const max_prestream_retries: u8 = 2;
+/// Brief pause before re-firing, giving a wedged gateway a moment to clear.
+const prestream_retry_backoff_ms: u64 = 300;
+
 /// Runs the streaming agent loop: call LLM, execute tools, repeat until
 /// the model produces a text-only response or the cancel flag is set.
 /// Pushes events to the queue for UI updates. Returns errors to the caller
@@ -739,6 +747,8 @@ pub const StreamContext = struct {
     queue: *agent_events.EventQueue,
     allocator: Allocator,
     text_count: u32 = 0,
+    /// True once any user-visible content (text, thinking, or a tool start) has been emitted to the queue this streaming attempt. Gates the pre-first-token retry in callLlm: re-firing after content was emitted would double-stream. Reset to false by callLlm before each attempt.
+    emitted_any: bool = false,
 };
 
 /// Whether a streaming failure is worth retrying as a single non-streamed
@@ -826,49 +836,69 @@ pub fn callLlm(
         .error_detail_out = error_detail_out,
     };
 
-    return provider.callStreaming(&stream_req) catch |streaming_err| {
-        // A fatal streaming error re-fires into the same wall non-streamed,
-        // so skip the fallback and propagate. If partial text was already
-        // rendered, discard it first so the turn doesn't strand an
-        // orphaned partial assistant node when the error surfaces (RESIL-6:
-        // the reset must fire on the fatal-propagate path too, not only
-        // when the fallback runs).
-        if (!isStreamingRetryable(streaming_err)) {
+    var attempt: u8 = 0;
+    return outer: while (true) {
+        stream_ctx.emitted_any = false;
+        break provider.callStreaming(&stream_req) catch |streaming_err| {
+            // A connection that wedges BEFORE any content is the transient
+            // per-connection moonshot/kimi hang: a fresh connection usually
+            // succeeds, so re-fire (bounded) rather than failing the turn.
+            // Once content was emitted, re-firing would double-stream, so
+            // fall through to the existing recovery. Cancellation also skips
+            // retry.
+            if (streaming_err == error.ReadTimeout and
+                !stream_ctx.emitted_any and
+                attempt < max_prestream_retries and
+                !cancel.load(.acquire))
+            {
+                attempt += 1;
+                log.warn("pre-first-token stall; retrying streaming (attempt {d}/{d})", .{ attempt, max_prestream_retries });
+                clock.sleep(prestream_retry_backoff_ms * std.time.ns_per_ms);
+                continue;
+            }
+            // A fatal streaming error re-fires into the same wall non-streamed,
+            // so skip the fallback and propagate. If partial text was already
+            // rendered, discard it first so the turn doesn't strand an
+            // orphaned partial assistant node when the error surfaces (RESIL-6:
+            // the reset must fire on the fatal-propagate path too, not only
+            // when the fallback runs).
+            if (!isStreamingRetryable(streaming_err)) {
+                if (stream_ctx.text_count > 0) {
+                    queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
+                }
+                return streaming_err;
+            }
+            log.warn("streaming failed ({s}), falling back to non-streaming", .{@errorName(streaming_err)});
+            const req = llm.Request{
+                .system_stable = system_stable,
+                .system_volatile = system_volatile,
+                .messages = messages,
+                .tool_definitions = tool_defs,
+                .allocator = allocator,
+                .thinking_effort = thinking_effort,
+                .error_detail_out = error_detail_out,
+            };
+            const fallback = try provider.call(&req);
+            // If streaming already rendered partial text, discard it so the
+            // full fallback response doesn't appear concatenated to the partial.
             if (stream_ctx.text_count > 0) {
                 queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
             }
-            return streaming_err;
-        }
-        log.warn("streaming failed ({s}), falling back to non-streaming", .{@errorName(streaming_err)});
-        const req = llm.Request{
-            .system_stable = system_stable,
-            .system_volatile = system_volatile,
-            .messages = messages,
-            .tool_definitions = tool_defs,
-            .allocator = allocator,
-            .thinking_effort = thinking_effort,
-            .error_detail_out = error_detail_out,
-        };
-        const fallback = try provider.call(&req);
-        // If streaming already rendered partial text, discard it so the
-        // full fallback response doesn't appear concatenated to the partial.
-        if (stream_ctx.text_count > 0) {
-            queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
-        }
-        // Push text to queue since streaming callback didn't fire (or was reset)
-        for (fallback.content) |block| {
-            switch (block) {
-                .text => |t| {
-                    const duped = agent_events.OwnedPayload.dupe(allocator, t.text) catch |err| {
-                        log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
-                        continue;
-                    };
-                    queue.pushWithBackpressure(.{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
-                },
-                else => {},
+            // Push text to queue since streaming callback didn't fire (or was reset)
+            for (fallback.content) |block| {
+                switch (block) {
+                    .text => |t| {
+                        const duped = agent_events.OwnedPayload.dupe(allocator, t.text) catch |err| {
+                            log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
+                            continue;
+                        };
+                        queue.pushWithBackpressure(.{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
+                    },
+                    else => {},
+                }
             }
-        }
-        return fallback;
+            break :outer fallback;
+        };
     };
 }
 
@@ -2852,9 +2882,14 @@ pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         .text_delta => |t| blk: {
             const duped = agent_events.OwnedPayload.dupe(alloc, t) catch return;
             stream_ctx.text_count += 1;
+            stream_ctx.emitted_any = true;
             break :blk .{ .text_delta = duped };
         },
-        .tool_start => |t| .{ .tool_start = .{ .name = agent_events.OwnedPayload.dupe(alloc, t) catch return } },
+        .tool_start => |t| blk: {
+            const duped = agent_events.OwnedPayload.dupe(alloc, t) catch return;
+            stream_ctx.emitted_any = true;
+            break :blk .{ .tool_start = .{ .name = duped } };
+        },
         .usage => |u| .{ .usage = .{ .output_tokens = u.output_tokens } },
         .info => |t| .{ .info = agent_events.OwnedPayload.dupe(alloc, t) catch return },
         .done => return,
@@ -2863,6 +2898,7 @@ pub fn streamEventToQueue(ctx: *anyopaque, event: llm.StreamEvent) void {
         // node. Task 1.11 will also fan this into the trajectory capture.
         .thinking_delta => |td| blk: {
             const duped = agent_events.OwnedPayload.dupe(alloc, td.text) catch return;
+            stream_ctx.emitted_any = true;
             break :blk .{ .thinking_delta = .{ .text = duped, .provider = td.provider } };
         },
         .thinking_stop => .thinking_stop,
