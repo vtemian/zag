@@ -169,6 +169,17 @@ pub const ThinkingConfig = union(enum) {
     pub const Effort = enum { low, medium, high };
 };
 
+/// Controls whether/which tool the model must call this turn.
+/// `.auto` emits no wire key (byte-identical to today). `.tool` forces a
+/// single named tool; its tool_use input is consumed as the structured
+/// result of a terminal turn (see runLoopStreaming forced-output path).
+pub const ToolChoice = union(enum) {
+    auto,
+    none,
+    /// Forced tool name, borrowed for the call duration, caller-owned.
+    tool: []const u8,
+};
+
 /// Report whether a Claude model identifier advertises extended-thinking
 /// support. Substring match, not an exhaustive catalog; the set of
 /// thinking-capable Claude models grows and this function is the one place
@@ -203,6 +214,9 @@ pub const Request = struct {
     messages: []const types.Message,
     /// Tools offered to the LLM for this turn. May be empty.
     tool_definitions: []const types.ToolDefinition,
+    /// Whether/which tool the model must call this turn. Default `.auto`
+    /// emits no wire key, so existing callers are byte-identical.
+    tool_choice: ToolChoice = .auto,
     /// Allocator for response allocations owned by the caller.
     allocator: Allocator,
     /// Optional extended-thinking override. `null` lets the provider pick
@@ -264,6 +278,9 @@ pub const StreamRequest = struct {
     messages: []const types.Message,
     /// Tools the model may call during this turn.
     tool_definitions: []const types.ToolDefinition,
+    /// Whether/which tool the model must call this turn. Default `.auto`
+    /// emits no wire key, so existing callers are byte-identical.
+    tool_choice: ToolChoice = .auto,
     /// Allocator used for any per-request scratch buffers the provider needs.
     allocator: Allocator,
     /// Handler invoked for each streamed event. Owns no request state.
@@ -1234,6 +1251,33 @@ test "Request.joinedSystem round-trips a single-string prompt via system_stable"
     const joined = try req.joinedSystem(allocator);
     defer allocator.free(joined);
     try std.testing.expectEqualStrings("you are zag", joined);
+}
+
+test "Request defaults tool_choice to auto" {
+    const r: Request = .{
+        .messages = &.{},
+        .tool_definitions = &.{},
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expect(r.tool_choice == .auto);
+}
+
+test "StreamRequest defaults tool_choice to auto" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const noop: StreamCallback = .{
+        .ctx = @ptrFromInt(@alignOf(u8)),
+        .on_event = struct {
+            fn on(_: *anyopaque, _: StreamEvent) void {}
+        }.on,
+    };
+    const r: StreamRequest = .{
+        .messages = &.{},
+        .tool_definitions = &.{},
+        .allocator = std.testing.allocator,
+        .callback = noop,
+        .cancel = &cancel,
+    };
+    try std.testing.expect(r.tool_choice == .auto);
 }
 
 test "StreamRequest.joinedSystem folds stable and per-turn halves" {
