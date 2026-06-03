@@ -1778,13 +1778,24 @@ pub fn splitFocusedWithSession(
     self: *WindowManager,
     id: []const u8,
 ) !NodeRegistry.Handle {
+    _ = try self.openSessionPane(id);
+    const entry = self.extra_panes.items[self.extra_panes.items.len - 1];
+    return self.attachPaneAsSplit(&entry.pane);
+}
+
+/// Split the focused leaf and attach `pane`'s existing surface on the
+/// `.second` side, stamping the new leaf's handle onto the pane and its
+/// runner. Shared by the fresh-load path (a pane just built by
+/// `openSessionPane`) and the reattach path (a backgrounded pane whose
+/// leaf was closed on a prior session switch). `pane` MUST reference the
+/// pane's final stable storage (`&entry.pane` or `&self.root_pane`) so the
+/// borrowed `&pane.viewport` survives later `extra_panes` resizes.
+fn attachPaneAsSplit(self: *WindowManager, pane: *Pane) !NodeRegistry.Handle {
     const prev_focus = self.layout.getFocusedLeaf();
-    const pane = try self.openSessionPane(id);
-    const split_entry = self.extra_panes.items[self.extra_panes.items.len - 1];
     const surface: Layout.Surface = .{
         .buffer = pane.buffer,
         .view = pane.view,
-        .viewport = &split_entry.pane.viewport,
+        .viewport = &pane.viewport,
     };
     try self.layout.splitVerticalSide(0.5, surface, .second);
 
@@ -1794,7 +1805,7 @@ pub fn splitFocusedWithSession(
     if (self.layout.focused) |new_leaf| {
         if (self.handleForNode(new_leaf)) |h| {
             if (pane.runner) |r| r.pane_handle_packed = @bitCast(h);
-            split_entry.pane.handle = h;
+            pane.handle = h;
             new_handle = h;
         } else |err| {
             log.warn("session pane leaf missing from registry: {}", .{err});
