@@ -3060,3 +3060,56 @@ test "RESIL-6: fatal streaming error after partial text emits reset_assistant_te
     try std.testing.expect(saw_text);
     try std.testing.expect(saw_reset);
 }
+
+const FlakyStreamProvider = struct {
+    fail_attempts: u32,
+    reply: []const u8 = "recovered",
+    attempt: u32 = 0,
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "flaky_stream_stub",
+    };
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *FlakyStreamProvider = @ptrCast(@alignCast(ptr));
+        self.attempt += 1;
+        if (self.attempt <= self.fail_attempts) return error.ReadTimeout;
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = self.reply });
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+    fn provider(self: *FlakyStreamProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "callLlm retries a pre-first-token ReadTimeout and recovers on a fresh attempt" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var stub = FlakyStreamProvider{ .fail_attempts = 1 };
+    const p = stub.provider();
+    const resp = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 2), stub.attempt);
+    try std.testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
+    var buf: [16]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    var saw_reply = false;
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .text_delta => |t| if (std.mem.eql(u8, t.bytes, "recovered")) {
+                saw_reply = true;
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    try std.testing.expect(saw_reply);
+}
