@@ -11,10 +11,22 @@ const types = @import("../types.zig");
 const llm = @import("../llm.zig");
 const Provider = llm.Provider;
 const Allocator = std.mem.Allocator;
+const test_net = @import("../test_net.zig");
+const clock = @import("../clock.zig");
 
 const log = std.log.scoped(.openai);
 
 const default_max_tokens = 8192;
+
+/// After a terminal `finish_reason`, the turn's content is complete: only the
+/// trailing usage chunk and the `[DONE]` sentinel (or a connection close)
+/// should remain, and those ride back over the already-open connection within
+/// a round-trip. Some OpenAI-compatible endpoints (Moonshot/Kimi) finish the
+/// turn but neither send `[DONE]` nor close, which would otherwise block the
+/// next SSE read for the full body `read_ms` (up to 10 min). Once finish lands,
+/// the read deadline drops to this grace so a missing terminator costs at most
+/// this long instead of wedging the whole turn at `status: working`.
+const post_finish_read_ms: u32 = 1500;
 
 /// OpenAI Chat Completions serializer state.
 pub const OpenAiSerializer = struct {
@@ -488,6 +500,12 @@ fn parseSseStream(
     var output_tokens: u32 = 0;
     var cache_read_tokens: u32 = 0;
 
+    // Set once a terminal `finish_reason` lands. After that the turn's content
+    // is complete and only the trailing usage chunk / `[DONE]` should remain,
+    // so a stalled read is no longer a mid-turn failure but a missing
+    // terminator we can stop waiting on (see `post_finish_read_ms`).
+    var saw_finish_reason = false;
+
     var text_content: std.ArrayList(u8) = .empty;
     defer text_content.deinit(allocator);
 
@@ -506,7 +524,16 @@ fn parseSseStream(
 
     const debug_sse = env_mod.get("ZAG_DEBUG_SSE_DUMP") != null;
 
-    while (try stream.nextSseEvent(cancel, &scratch, &sse_data)) |sse| {
+    while (true) {
+        const sse = stream.nextSseEvent(cancel, &scratch, &sse_data) catch |err| {
+            // Past a terminal finish_reason the response is already whole; a
+            // stalled or absent terminator must not fail the turn. Bail
+            // cleanly on the (now shortened) post-finish read deadline instead
+            // of surfacing error.ReadTimeout. Before finish_reason a timeout is
+            // a genuine mid-turn stall and still propagates.
+            if (saw_finish_reason and err == error.ReadTimeout) break;
+            return err;
+        } orelse break;
         if (debug_sse) log.warn("[sse-raw] {s}", .{sse.data});
         if (std.mem.eql(u8, sse.data, "[DONE]")) break;
 
@@ -565,6 +592,18 @@ fn parseSseStream(
                     stop_reason = .tool_use
                 else if (std.mem.eql(u8, fr.string, "length"))
                     stop_reason = .max_tokens;
+
+                // The turn is logically done. Shorten the read deadline so a
+                // provider that finishes without a `[DONE]`/close (Moonshot
+                // /Kimi) can't wedge the next read for the full body timeout.
+                // An unbounded (0) or longer deadline drops to the grace; a
+                // stricter endpoint timeout is left intact.
+                if (!saw_finish_reason) {
+                    saw_finish_reason = true;
+                    if (stream.read_ms == 0 or stream.read_ms > post_finish_read_ms) {
+                        stream.read_ms = post_finish_read_ms;
+                    }
+                }
             }
         }
 
@@ -2019,4 +2058,110 @@ test "openai writeMessage echoes any-provider thinking after JSONL replay" {
         "claude-style deliberating",
         parsed.value.object.get("reasoning_content").?.string,
     );
+}
+
+/// Stream a complete chat turn (content + terminal finish_reason + the
+/// include_usage trailing chunk) as one chunked-transfer SSE chunk, then hold
+/// the connection open WITHOUT a `[DONE]` sentinel or a closing 0-length chunk.
+/// Reproduces a provider (Moonshot/Kimi) that finishes the turn but never emits
+/// a terminator the body reader can see as end-of-stream.
+fn mockPostFinishStallServer(srv: *std.Io.net.Server, sleep_ns: u64) void {
+    var conn = srv.accept(std.testing.io) catch return;
+    defer conn.close(std.testing.io);
+
+    const alloc = std.heap.page_allocator;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = test_net.streamRead(conn, &tmp) catch return;
+        if (n == 0) return;
+        req.appendSlice(alloc, tmp[0..n]) catch return;
+        if (std.mem.indexOf(u8, req.items, "\r\n\r\n") != null) break;
+    }
+
+    const head = "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Connection: close\r\n\r\n";
+    _ = test_net.streamWriteAll(conn, head) catch return;
+
+    const sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi there. How can I help?\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n";
+
+    var chunk_buf: [16]u8 = undefined;
+    const chunk_header = std.fmt.bufPrint(&chunk_buf, "{x}\r\n", .{sse.len}) catch return;
+    _ = test_net.streamWriteAll(conn, chunk_header) catch return;
+    _ = test_net.streamWriteAll(conn, sse) catch return;
+    _ = test_net.streamWriteAll(conn, "\r\n") catch return;
+
+    // Hold the connection open past the client's read deadline so the
+    // post-finish read is what trips, not the connection close.
+    clock.sleep(sleep_ns);
+}
+
+test "parseSseStream returns after finish_reason when the provider stalls without [DONE]" {
+    // Regression: Moonshot/Kimi finishes a turn (full answer + finish_reason +
+    // usage) but holds the connection open without sending `[DONE]`. The SSE
+    // loop only broke on `[DONE]`, so it blocked on the next read for the full
+    // body timeout (10 min in prod); the turn never reached `.done`, the
+    // session stayed `status: working` forever, and autoNameSession (gated on
+    // turn completion) never ran, leaving the placeholder name. The fix caps
+    // the post-finish wait: once a terminal finish_reason lands, the read
+    // deadline drops so a missing terminator bails with the response intact.
+    const allocator = std.testing.allocator;
+
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
+
+    // Hold the connection well past both the configured read timeout and the
+    // post-finish grace so the deadline race is unambiguous.
+    const thr = try std.Thread.spawn(.{}, mockPostFinishStallServer, .{ &server, 5 * std.time.ns_per_s });
+    defer {
+        server.deinit(std.testing.io);
+        thr.join();
+    }
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const stream = try llm.streaming.StreamingResponse.createWithOptions(.{
+        .url = url,
+        .body = "",
+        .extra_headers = &.{},
+        .telemetry_opt = null,
+        .allocator = allocator,
+        .timeouts = .{ .connect_ms = 1000, .read_ms = 3000, .write_ms = 1000 },
+    });
+    defer stream.destroy();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const cb: llm.StreamCallback = .{ .ctx = undefined, .on_event = noopStreamCallback };
+    const reasoning: llm.Endpoint.ReasoningConfig = .{
+        .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" },
+    };
+
+    const start = clock.milliTimestamp();
+    const resp = try parseSseStream(stream, reasoning, allocator, cb, &cancel, null, null);
+    defer resp.deinit(allocator);
+    const elapsed = clock.milliTimestamp() - start;
+
+    // Returned cleanly (not error.ReadTimeout) with the full answer and the
+    // usage the trailing chunk carried.
+    try std.testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
+    try std.testing.expectEqual(@as(u32, 7), resp.output_tokens);
+    try std.testing.expect(resp.content.len >= 1);
+    try std.testing.expect(resp.content[resp.content.len - 1] == .text);
+    try std.testing.expectEqualStrings(
+        "Hi there. How can I help?",
+        resp.content[resp.content.len - 1].text.text,
+    );
+
+    // Bailed on the lowered post-finish deadline, not the 3 s read timeout.
+    // The old `[DONE]`-only loop would block the full 3 s and then surface
+    // error.ReadTimeout instead of returning.
+    try std.testing.expect(elapsed < 2500);
 }
