@@ -144,3 +144,95 @@ function zag.timeout(ms, fn)
   end
   return result_value, result_err
 end
+
+-- Bounded fan-out combinators on the zag.workflow subtable (built in Zig by
+-- bindings/workflow.zig, which also carries set_max_fanout / max_fanout). These
+-- slide a window capped at zag.workflow.max_fanout() so a workflow never holds
+-- more than that many concurrent siblings, regardless of how many units it has.
+-- Every spawned worker is joined before returning, so no child scope ever
+-- orphans. Like zag.all, workers close over a shared results table and write
+-- their own slot, working around join()'s no-return-value limitation.
+
+-- Read the live per-level fan-out bound, clamped to at least 1 so the window
+-- always admits a worker.
+local function fanout_cap()
+  local cap = zag.workflow.max_fanout()
+  if cap == nil or cap < 1 then return 1 end
+  return cap
+end
+
+-- Run a sliding window over `count` units. `spawn_unit(i)` must return a handle
+-- whose worker writes `results[i]`. Caps concurrency at fanout_cap(): primes the
+-- window, then for each join frees one slot and spawns the next pending unit.
+-- Every handle is joined; a worker that retired without writing its slot (cancel
+-- or error before assignment) gets a synthesized failure slot.
+local function run_windowed(count, results, spawn_unit)
+  local cap = fanout_cap()
+  local handles = {}
+  local next_spawn = 1
+  local next_join = 1
+
+  -- Prime: at most `cap` workers in flight.
+  while next_spawn <= count and (next_spawn - next_join) < cap do
+    handles[next_spawn] = spawn_unit(next_spawn)
+    next_spawn = next_spawn + 1
+  end
+
+  -- Drain + refill: each join frees a slot, so spawning one more keeps the
+  -- in-flight count at the cap until the pending units run out.
+  while next_join <= count do
+    local _, err = handles[next_join]:join()
+    if results[next_join] == nil then
+      results[next_join] = { value = nil, err = err or "cancelled" }
+    end
+    handles[next_join] = nil
+    next_join = next_join + 1
+    if next_spawn <= count then
+      handles[next_spawn] = spawn_unit(next_spawn)
+      next_spawn = next_spawn + 1
+    end
+  end
+end
+
+-- zag.workflow.parallel(fns)
+-- Run every fn concurrently, but never more than max_fanout() at a time.
+-- Returns an array aligned with `fns`; each element is { value = <return>,
+-- err = <err> } (same shape as zag.all). Order of the results array follows the
+-- input order regardless of completion order.
+function zag.workflow.parallel(fns)
+  local n = #fns
+  local results = {}
+  run_windowed(n, results, function(i)
+    return zag.spawn(function()
+      local v, e = fns[i]()
+      results[i] = { value = v, err = e }
+    end)
+  end)
+  return results
+end
+
+-- zag.workflow.pipeline(items, stage1, stage2, ...)
+-- Each item flows through all stages sequentially in its own worker: stage_n's
+-- result feeds stage_(n+1). Workers run concurrently under the same window cap,
+-- with NO barrier between stages across items. A stage that returns a non-nil
+-- error short-circuits that item (later stages do not run). Returns an array
+-- aligned with `items`; each element is { value = <final stage output>,
+-- err = <first stage error or nil> }.
+function zag.workflow.pipeline(items, ...)
+  local stages = { ... }
+  local n = #items
+  local results = {}
+  run_windowed(n, results, function(i)
+    return zag.spawn(function()
+      local value = items[i]
+      local err = nil
+      for s = 1, #stages do
+        local v, e = stages[s](value)
+        value = v
+        if e ~= nil then err = e; break end
+      end
+      results[i] = { value = value, err = err }
+    end)
+  end)
+  return results
+end

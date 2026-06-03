@@ -6641,6 +6641,128 @@ test "zag.timeout passes through value when fn beats deadline" {
     eng.lua.pop(1);
 }
 
+test "zag.workflow.parallel caps concurrency and preserves input order" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // cap=2 over 6 sleep-based workers. Each worker bumps a shared in-flight
+    // counter on entry and decrements on exit, tracking a high-water mark; with
+    // the window capped at 2 the mark must never exceed 2. Results must land in
+    // input order (worker i writes results[i].value = i*10) regardless of the
+    // out-of-order sleeps.
+    try eng.lua.doString(
+        \\function test_parallel()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  _in_flight = 0
+        \\  _hwm = 0
+        \\  local fns = {}
+        \\  for i = 1, 6 do
+        \\    fns[i] = function()
+        \\      _in_flight = _in_flight + 1
+        \\      if _in_flight > _hwm then _hwm = _in_flight end
+        \\      zag.sleep((7 - i) * 3)
+        \\      _in_flight = _in_flight - 1
+        \\      return i * 10
+        \\    end
+        \\  end
+        \\  local r = zag.workflow.parallel(fns)
+        \\  _p_count = #r
+        \\  _p_ordered = true
+        \\  for i = 1, 6 do
+        \\    if r[i].value ~= i * 10 then _p_ordered = false end
+        \\  end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_parallel");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_p_count");
+    try std.testing.expectEqual(@as(i64, 6), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_p_ordered");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_hwm");
+    const hwm = try eng.lua.toInteger(-1);
+    eng.lua.pop(1);
+    try std.testing.expect(hwm >= 1); // at least one worker ran
+    try std.testing.expect(hwm <= 2); // never exceeded the cap
+}
+
+test "zag.workflow.pipeline threads stage outputs and respects the cap" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // cap=2 over 4 items, each run through two stages: +1 then *10. Item i
+    // (value i) becomes (i+1)*10. The same in-flight high-water tracking proves
+    // the window holds at most 2 item-workers concurrently across all stages
+    // (no inter-stage barrier). A sleep inside stage 1 forces overlap.
+    try eng.lua.doString(
+        \\function test_pipeline()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  _pl_in_flight = 0
+        \\  _pl_hwm = 0
+        \\  local stage1 = function(x)
+        \\    _pl_in_flight = _pl_in_flight + 1
+        \\    if _pl_in_flight > _pl_hwm then _pl_hwm = _pl_in_flight end
+        \\    zag.sleep(5)
+        \\    return x + 1
+        \\  end
+        \\  local stage2 = function(x)
+        \\    local r = x * 10
+        \\    _pl_in_flight = _pl_in_flight - 1
+        \\    return r
+        \\  end
+        \\  local r = zag.workflow.pipeline({ 1, 2, 3, 4 }, stage1, stage2)
+        \\  _pl_count = #r
+        \\  _pl_ordered = true
+        \\  for i = 1, 4 do
+        \\    if r[i].value ~= (i + 1) * 10 then _pl_ordered = false end
+        \\  end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_pipeline");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_pl_count");
+    try std.testing.expectEqual(@as(i64, 4), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pl_ordered");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pl_hwm");
+    const hwm = try eng.lua.toInteger(-1);
+    eng.lua.pop(1);
+    try std.testing.expect(hwm >= 1);
+    try std.testing.expect(hwm <= 2);
+}
+
 test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
     var eng = try LuaEngine.init(std.testing.allocator);
     defer eng.deinit();
