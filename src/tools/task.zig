@@ -184,7 +184,7 @@ fn runChild(
     // never touches the VM off the main thread.
     if (ctx.child_registry) |registry| {
         var child_done: sync.ResetEvent = .{};
-        try registry.register(.{ .runner = &child.child_runner, .done = &child_done });
+        try registry.register(.{ .runner = &child.child_runner, .on_done = .{ .park = &child_done } });
         // No errdefer-remove needed: registration cannot fail after this
         // point, and the main thread always removes the entry on the child's
         // `.done` (threadMain guarantees a `.done` even on error).

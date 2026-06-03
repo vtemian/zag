@@ -369,7 +369,7 @@ test "ChildAgent starts, drains to completion, and reports the summary" {
     // Drive the child to completion through a ChildRunnerRegistry drain loop on
     // this thread, exactly as the main thread would.
     var done: sync.ResetEvent = .{};
-    try child_registry_drainer.register(.{ .runner = &child.child_runner, .done = &done });
+    try child_registry_drainer.register(.{ .runner = &child.child_runner, .on_done = .{ .park = &done } });
     while (true) {
         child_registry_drainer.drainAll();
         if (done.timedWait(5 * std.time.ns_per_ms)) |_| break else |_| {}
@@ -455,7 +455,7 @@ test "ChildAgent.start unwinds cleanly on allocation failure at any stage" {
             var drainer = ChildRunnerRegistry.init(allocator);
             defer drainer.deinit();
             var done: sync.ResetEvent = .{};
-            try drainer.register(.{ .runner = &child.child_runner, .done = &done });
+            try drainer.register(.{ .runner = &child.child_runner, .on_done = .{ .park = &done } });
             while (true) {
                 drainer.drainAll();
                 if (done.timedWait(5 * std.time.ns_per_ms)) |_| break else |_| {}

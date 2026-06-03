@@ -2241,7 +2241,7 @@ test "ChildRunnerRegistry.drainAll finishes a child, signals done, removes entry
     defer registry.deinit();
 
     var child_done: sync.ResetEvent = .{};
-    try registry.register(.{ .runner = &runner, .done = &child_done });
+    try registry.register(.{ .runner = &runner, .on_done = .{ .park = &child_done } });
 
     // Worker thread parks on `done`, exactly as runChild would. It must wake
     // only after the test thread's drainAll() finishes the child.
