@@ -110,14 +110,36 @@ pub fn sleep(ns: u64) void {
 // 0.16 removed `std.crypto.random`; the secure source now lives behind
 // `io.randomSecure`. The few random sites in Zag (PKCE/state nonces, session
 // IDs) sit deep in io-free helpers, so rather than thread io to each we use
-// libc `arc4random_buf` — a kernel-seeded CSPRNG that needs no io, no
-// explicit seeding, and is threadsafe on every platform Zag targets.
+// platform libc calls directly.
+
+const builtin = @import("builtin");
 
 /// Fill `buf` with cryptographically secure random bytes. Drop-in for
 /// `std.crypto.random.bytes`.
 pub fn randomBytes(buf: []u8) void {
     if (buf.len == 0) return;
-    std.c.arc4random_buf(buf.ptr, buf.len);
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            std.c.arc4random_buf(buf.ptr, buf.len);
+        },
+        else => {
+            // Linux (glibc >= 2.25, musl): getrandom(2) never blocks once
+            // the entropy pool is initialised, and the pool is ready long
+            // before userland runs. GRND_NONBLOCK is omitted so we block
+            // only during very early boot, which is acceptable.
+            var remaining = buf;
+            while (remaining.len > 0) {
+                const n = std.c.getrandom(remaining.ptr, remaining.len, 0);
+                if (n < 0) {
+                    switch (posix.errno(@as(c_int, @intCast(n)))) {
+                        .INTR => continue,
+                        else => @panic("getrandom failed"),
+                    }
+                }
+                remaining = remaining[@as(usize, @intCast(n))..];
+            }
+        },
+    }
 }
 
 fn fillSecure(_: *anyopaque, buf: []u8) void {

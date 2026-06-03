@@ -28,18 +28,19 @@ const default_max_tokens = 8192;
 /// this long instead of wedging the whole turn at `status: working`.
 const post_finish_read_ms: u32 = 1500;
 
-/// Total wall-clock budget for the FIRST content delta of a turn, measured
-/// from the start of body reading with a monotonic timer. A wedged moonshot
-/// /kimi gateway connection produces nothing — or only SSE keep-alive
-/// comments — for minutes; this budget surfaces that as error.ReadTimeout in
-/// ~this long (then retried by agent.callLlm) instead of parking the turn for
-/// the full body read_ms (up to 10 min). It is a TOTAL budget, not a per-read
-/// idle timeout: it only shrinks and is never reset by a received keep-alive,
-/// so a keep-alive-only wedge still trips. Sized comfortably above kimi
-/// thinking time-to-first-token so a slow-but-live start is never abandoned.
-/// Restored to the endpoint's read_ms on the first content of any kind, so a
-/// slow MID-stream gap keeps the full budget.
-const pre_first_token_deadline_ms: u32 = 120_000;
+/// Total wall-clock budget for each content delta of a turn (the first, and
+/// every one after it), measured with a monotonic timer. A wedged moonshot
+/// /kimi gateway connection produces nothing, or only SSE keep-alive comments,
+/// for minutes; this budget surfaces that as error.ReadTimeout in ~this long
+/// (then retried by agent.callLlm) instead of parking the turn for the full
+/// body read_ms (up to 10 min). It is a TOTAL budget per gap, not a per-read
+/// idle timeout: a received keep-alive never resets it, so a keep-alive-only
+/// wedge still trips. Re-armed on every content delta, so a wedge before the
+/// first token AND a wedge mid-stream (kimi stalling after streaming some
+/// reasoning, before the answer text) both trip; a genuinely slow-but-live
+/// stream keeps re-arming as its deltas trickle in. Sized comfortably above
+/// kimi time-to-first-token so a slow-but-live start is never abandoned.
+const content_stall_budget_ms: u32 = 120_000;
 
 /// OpenAI Chat Completions serializer state.
 pub const OpenAiSerializer = struct {
@@ -128,7 +129,7 @@ pub const OpenAiSerializer = struct {
         });
         defer stream.destroy();
 
-        return parseSseStream(stream, self.endpoint.reasoning, pre_first_token_deadline_ms, req.allocator, req.callback, req.cancel, req.telemetry, req.error_detail_out);
+        return parseSseStream(stream, self.endpoint.reasoning, content_stall_budget_ms, req.allocator, req.callback, req.cancel, req.telemetry, req.error_detail_out);
     }
 };
 
@@ -502,7 +503,7 @@ const StreamingToolCall = struct {
 fn parseSseStream(
     stream: *llm.streaming.StreamingResponse,
     reasoning: llm.Endpoint.ReasoningConfig,
-    first_token_deadline_ms: u32,
+    stall_budget_ms: u32,
     allocator: Allocator,
     callback: llm.StreamCallback,
     cancel: *std.atomic.Value(bool),
@@ -520,15 +521,15 @@ fn parseSseStream(
     // terminator we can stop waiting on (see `post_finish_read_ms`).
     var saw_finish_reason = false;
 
-    // Bound the wait for the FIRST content delta by a TOTAL wall-clock budget,
+    // Bound the wait for each content delta by a TOTAL wall-clock budget,
     // enforced per-read in StreamingResponse.readChunk via body_deadline_ns.
     // Because the deadline is checked on EVERY chunk read (not just per
     // dispatched SSE event), a wedge that only dribbles keep-alive comments
-    // still trips at the budget. Cleared on the first content of any kind and on
-    // a terminal finish_reason, so a slow mid-stream gap keeps the full read_ms.
-    var saw_first_content = false;
-    if (first_token_deadline_ms != 0) {
-        stream.body_deadline_ns = clock.monotonicNs() + @as(u64, first_token_deadline_ms) * std.time.ns_per_ms;
+    // still trips at the budget. Armed here for the first delta, re-armed on
+    // every content delta below, then dropped to the post-finish grace once a
+    // terminal finish_reason lands.
+    if (stall_budget_ms != 0) {
+        stream.body_deadline_ns = clock.monotonicNs() + @as(u64, stall_budget_ms) * std.time.ns_per_ms;
     }
 
     var text_content: std.ArrayList(u8) = .empty;
@@ -713,14 +714,17 @@ fn parseSseStream(
             };
         };
 
-        // First content of any kind (text / thinking / tool_call) means the
-        // connection is live and producing the turn; clear the first-token
-        // budget so a slow mid-stream gap is not killed by it.
-        if (!saw_first_content and
+        // Each content delta (text / thinking / tool_call) proves the connection
+        // is live and producing the turn, so re-arm the keep-alive-immune budget
+        // to a fresh deadline rather than clearing it. A moonshot/kimi gateway
+        // that wedges AFTER streaming some reasoning, before the answer text,
+        // then still trips at the budget instead of parking the turn for the
+        // full body read_ms. Skip once finish landed: the turn is logically done
+        // and the post-finish grace owns the deadline.
+        if (!saw_finish_reason and stall_budget_ms != 0 and
             (text_content.items.len > 0 or thinking_content.items.len > 0 or tool_calls.items.len > 0))
         {
-            saw_first_content = true;
-            stream.body_deadline_ns = null;
+            stream.body_deadline_ns = clock.monotonicNs() + @as(u64, stall_budget_ms) * std.time.ns_per_ms;
         }
     }
 
@@ -2266,7 +2270,7 @@ test "parseSseStream trips the first-token budget on a zero-byte wedge" {
     try std.testing.expect(elapsed < 1500); // budget, not the 5s endpoint read_ms
 }
 
-test "parseSseStream restores the endpoint deadline after the first content delta" {
+test "parseSseStream re-arms the budget on each content delta" {
     const allocator = std.testing.allocator;
     const sse_body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
     var fake = std.Io.Reader.fixed(sse_body);
@@ -2287,11 +2291,14 @@ test "parseSseStream restores the endpoint deadline after the first content delt
     const cb: llm.StreamCallback = .{ .ctx = undefined, .on_event = noopStreamCallback };
     const reasoning: llm.Endpoint.ReasoningConfig = .{ .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" } };
 
-    // A real budget (120s) is active; content arrives immediately (fixed reader),
-    // so the budget never elapses and is cleared once the first delta lands.
+    // A real budget (120s) is active; content arrives immediately (fixed reader).
+    // The delta does not clear the deadline; it re-arms it to a fresh budget so a
+    // later mid-stream wedge would still trip. The deadline therefore stays armed
+    // in the future rather than dropping to null.
     const resp = try parseSseStream(&sr, reasoning, 120_000, allocator, cb, &cancel, null, null);
     defer resp.deinit(allocator);
-    try std.testing.expectEqual(@as(?u64, null), sr.body_deadline_ns);
+    try std.testing.expect(sr.body_deadline_ns != null);
+    try std.testing.expect(sr.body_deadline_ns.? > clock.monotonicNs());
 }
 
 fn mockKeepAliveWedgeServer(srv: *std.Io.net.Server, total_ns: u64) void {
@@ -2359,5 +2366,92 @@ test "parseSseStream trips the first-token budget despite keep-alives" {
     try std.testing.expectError(error.ReadTimeout, result);
     // Tripped at the ~300ms budget despite 3s of keep-alives flowing — proof the
     // budget is enforced per-read (readChunk), not per dispatched SSE event.
+    try std.testing.expect(elapsed < 1500);
+}
+
+/// Stream ONE reasoning delta, then dribble keep-alive comments. The connection
+/// stays alive (bytes flow) but never produces the answer text or a
+/// finish_reason. Models the moonshot/kimi mid-stream wedge: reasoning arrives
+/// (the folded thinking block), then the gateway stalls, masked by keep-alives.
+fn mockMidStreamWedgeServer(srv: *std.Io.net.Server, total_ns: u64) void {
+    var conn = srv.accept(std.testing.io) catch return;
+    defer conn.close(std.testing.io);
+    const alloc = std.heap.page_allocator;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(alloc);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = test_net.streamRead(conn, &tmp) catch return;
+        if (n == 0) return;
+        req.appendSlice(alloc, tmp[0..n]) catch return;
+        if (std.mem.indexOf(u8, req.items, "\r\n\r\n") != null) break;
+    }
+    const head = "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Connection: close\r\n\r\n";
+    _ = test_net.streamWriteAll(conn, head) catch return;
+
+    // One reasoning delta proves the stream is live, which disarmed the old
+    // first-token-only budget.
+    const reasoning_sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n";
+    var hdr_buf: [8]u8 = undefined;
+    const reasoning_hdr = std.fmt.bufPrint(&hdr_buf, "{x}\r\n", .{reasoning_sse.len}) catch return;
+    _ = test_net.streamWriteAll(conn, reasoning_hdr) catch return;
+    _ = test_net.streamWriteAll(conn, reasoning_sse) catch return;
+    _ = test_net.streamWriteAll(conn, "\r\n") catch return;
+
+    // Then keep-alive comments only, never the answer text or finish_reason.
+    const payload = ": keep-alive\n\n";
+    var chunk_buf: [8]u8 = undefined;
+    const chunk_header = std.fmt.bufPrint(&chunk_buf, "{x}\r\n", .{payload.len}) catch return;
+    const deadline = clock.milliTimestamp() + @as(i64, @intCast(total_ns / std.time.ns_per_ms));
+    while (clock.milliTimestamp() < deadline) {
+        _ = test_net.streamWriteAll(conn, chunk_header) catch return;
+        _ = test_net.streamWriteAll(conn, payload) catch return;
+        _ = test_net.streamWriteAll(conn, "\r\n") catch return;
+        clock.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
+test "parseSseStream trips the budget on a mid-stream wedge after reasoning" {
+    // Regression for the post-thinking wedge: kimi streams reasoning (the folded
+    // thinking block), then the gateway stalls before the answer text while
+    // dribbling keep-alives. The old first-token-only budget was cleared by the
+    // reasoning delta, so the read fell back to the full body read_ms (~10 min)
+    // and the turn parked at `status: working`. Re-arming the budget on each
+    // content delta surfaces the wedge at the budget instead.
+    const allocator = std.testing.allocator;
+    var server = try test_net.listenLoopback();
+    const port = test_net.boundPort(&server);
+    const thr = try std.Thread.spawn(.{}, mockMidStreamWedgeServer, .{ &server, 3 * std.time.ns_per_s });
+    defer {
+        server.deinit(std.testing.io);
+        thr.join();
+    }
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const stream = try llm.streaming.StreamingResponse.createWithOptions(.{
+        .url = url,
+        .body = "",
+        .extra_headers = &.{},
+        .telemetry_opt = null,
+        .allocator = allocator,
+        // Loose endpoint read_ms so ONLY the re-armed budget can fire.
+        .timeouts = .{ .connect_ms = 1000, .read_ms = 5000, .write_ms = 1000 },
+    });
+    defer stream.destroy();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const cb: llm.StreamCallback = .{ .ctx = undefined, .on_event = noopStreamCallback };
+    const reasoning: llm.Endpoint.ReasoningConfig = .{ .response_fields = &[_][]const u8{ "reasoning_content", "reasoning" } };
+
+    const start = clock.milliTimestamp();
+    const result = parseSseStream(stream, reasoning, 300, allocator, cb, &cancel, null, null);
+    const elapsed = clock.milliTimestamp() - start;
+    try std.testing.expectError(error.ReadTimeout, result);
+    // Tripped on the ~300ms budget re-armed by the reasoning delta, not the 5s
+    // endpoint read_ms and not the 3s server runtime.
     try std.testing.expect(elapsed < 1500);
 }

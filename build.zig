@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
         "Restrict Lua plugins: strip os/io/debug/package/require etc.",
     ) orelse false;
     const sim_enabled = b.option(bool, "sim", "Build zag-sim") orelse false;
+    // Restrict `zig build test` to tests whose name contains this substring.
+    // The default suite runs ~2000 tests across two binaries and can flake on
+    // timing-sensitive perf tests under load; a filter isolates a single area.
+    const test_filter = b.option([]const u8, "test-filter", "Only run unit tests whose name contains this substring");
 
     // Shared build options module for comptime feature flags
     const build_options = b.addOptions();
@@ -176,6 +180,7 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -194,6 +199,7 @@ pub fn build(b: *std.Build) void {
 
     const agent_tests = b.addTest(.{
         .root_module = agent_test_mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_agent_tests = b.addRunArtifact(agent_tests);
     test_step.dependOn(&run_agent_tests.step);

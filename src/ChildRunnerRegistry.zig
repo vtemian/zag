@@ -245,14 +245,15 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     // so any finite ceiling distinguishes "released the lock" from "deadlocked
     // behind the join". The ceiling is only a liveness backstop, so keep it
     // generous; a tight 2s value gets the test SIGKILL'd under heavy parallel
-    // builds when the spawned threads cannot schedule in time.
-    try registered.timedWait(30 * std.time.ns_per_s);
+    // builds when the spawned threads cannot schedule in time. 30s proved too
+    // tight on macOS CI runners under thread contention, so we use 120s.
+    try registered.timedWait(120 * std.time.ns_per_s);
     registrar.join();
     try testing.expect(!drain_done.isSet()); // drainAll genuinely still stalled
 
     // Release the join; the child finishes, drainAll completes and removes it.
     gate.set();
-    try drain_done.timedWait(30 * std.time.ns_per_s);
+    try drain_done.timedWait(120 * std.time.ns_per_s);
     drainer.join();
 
     try testing.expect(child_done.isSet());
