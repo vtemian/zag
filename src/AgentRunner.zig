@@ -621,20 +621,27 @@ pub fn serviceRoundTripEvent(
 ) bool {
     switch (event) {
         .hook_request => |req| {
+            // Async path defers: beginHook registers a PendingFire that owns
+            // req.done and fires it from the per-tick pump once every hook
+            // coroutine retires (with the aggregated veto). Only signal done
+            // here for the synchronous fallback (no async runtime / no hooks)
+            // or no engine — the agent thread parks on req.done until then.
+            var deferred = false;
             if (engine) |eng| {
-                const veto = eng.fireHook(req.payload) catch |err| blk: {
-                    log.warn("hook dispatch failed: {}", .{err});
-                    break :blk null;
-                };
-                if (veto) |reason| {
-                    req.cancelled = true;
-                    req.cancel_reason = reason;
+                if (eng.beginHook(req)) {
+                    deferred = true;
+                } else {
+                    const veto = eng.fireHook(req.payload) catch |err| blk: {
+                        log.warn("hook dispatch failed: {}", .{err});
+                        break :blk null;
+                    };
+                    if (veto) |reason| {
+                        req.cancelled = true;
+                        req.cancel_reason = reason;
+                    }
                 }
             }
-            // Always signal, even without an engine: the agent thread
-            // is parked on `req.done` and must be released so the
-            // tool call can proceed (or fail) cleanly.
-            req.done.set();
+            if (!deferred) req.done.set();
             return true;
         },
         .lua_tool_request => |req| {
