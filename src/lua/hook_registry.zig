@@ -357,6 +357,7 @@ pub const HookDispatcher = struct {
                 return;
             }
             self.pending_cancel = true;
+            var got_reason = false;
             _ = lua.getField(-1, "reason");
             if (lua.isString(-1)) {
                 // Borrowed from Lua VM; must be duped before the pop below.
@@ -364,9 +365,17 @@ pub const HookDispatcher = struct {
                     // Free any previously stored reason before overwriting.
                     if (self.pending_cancel_reason) |old| self.allocator.free(old);
                     self.pending_cancel_reason = self.allocator.dupe(u8, reason_text) catch null;
+                    got_reason = true;
                 } else |_| {}
             }
             lua.pop(1);
+            // A reason-less `cancel = true` still vetoes: store an empty reason
+            // so consumePendingCancel returns a non-null value the caller routes
+            // as a real veto (matches applyHookReturnFromCoroutine).
+            if (!got_reason) {
+                if (self.pending_cancel_reason) |old| self.allocator.free(old);
+                self.pending_cancel_reason = self.allocator.dupe(u8, "") catch null;
+            }
             return;
         }
 
@@ -460,7 +469,11 @@ pub const HookDispatcher = struct {
                 } else |_| {}
             }
             co.pop(1);
-            return reason;
+            // A `cancel = true` veto takes effect even without a reason string.
+            // Return an empty (non-null) reason so the caller routes it as a
+            // real veto instead of silently dropping it (the reason is surfaced
+            // to the producer as `cancelled` with an empty `cancel_reason`).
+            return reason orelse (self.allocator.dupe(u8, "") catch null);
         }
 
         switch (payload.*) {

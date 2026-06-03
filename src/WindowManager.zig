@@ -2452,6 +2452,15 @@ fn swapProviderOnPanePtr(
             var waited_ms: u64 = 0;
             while (runner.isAgentRunning()) : (waited_ms += 1) {
                 if (waited_ms >= timeout_ms) return error.SwapTimeout;
+                // Run the engine pump here too: a turn parked mid-compaction
+                // (or in an async hook) only makes progress when something
+                // aborts its fire (cancelAgent set the flag above) and pumps
+                // the completion that retires the coroutine. Without this the
+                // cancelled turn can't unwind and the loop hits SwapTimeout.
+                if (runner.lua_engine) |eng| {
+                    eng.cancelTriggeredFires();
+                    eng.pumpCompletions();
+                }
                 _ = runner.drainEvents();
                 clock.sleep(1 * std.time.ns_per_ms);
             }

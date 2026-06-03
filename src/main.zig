@@ -127,7 +127,10 @@ pub fn main(start: std.process.Init) !void {
     // path never returns and runs before any normal startup (no GPA, no
     // tracing, no logfile). Linux-only; comptime-dead elsewhere.
     if (comptime builtin.os.tag == .linux) {
-        const raw_argv = std.os.argv;
+        // Raw POSIX argv vector ([]const [*:0]const u8) from the process
+        // Init, read before any allocator is set up so the sandbox-helper
+        // short-circuit runs with zero startup state.
+        const raw_argv = start.minimal.args.vector;
         if (raw_argv.len >= 2) {
             const arg1 = std.mem.span(raw_argv[1]);
             if (std.mem.eql(u8, arg1, sandbox_helper.flag)) {
