@@ -156,7 +156,15 @@ pub fn main(start: std.process.Init) !void {
     // thread, Lua worker pool, cmd/http helpers). A multithread-safe
     // `Threaded` instance is required because that sharing is concurrent;
     // `init.io` (single-threaded) would disable concurrency.
-    var io_threaded = std.Io.Threaded.init(allocator, .{});
+    //
+    // Seed the backend with the real process environment. `std.process.spawn`
+    // fills a child's environment from this backend block whenever its
+    // `environ_map` is null (the default the bash tool and `cmd` `.inherit`
+    // mode rely on). Left unset it defaults to `.empty`, so every spawned
+    // child would run with NO environment, no PATH, and the shell would fall
+    // back to the system default path, making /opt/homebrew/bin tools (gh,
+    // etc.) invisible while /bin and /usr/bin commands still resolved.
+    var io_threaded = std.Io.Threaded.init(allocator, .{ .environ = start.minimal.environ });
     defer io_threaded.deinit();
     const io = io_threaded.io();
     // Install the process io for the sync primitives (sync.Mutex/Condition/

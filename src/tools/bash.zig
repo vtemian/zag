@@ -904,3 +904,40 @@ test "Linux sandbox helper imports seccomp module" {
 //   ./zig-out/bin/zag --__sandbox-helper "$PWD" "$HOME" -- /bin/sh -c \
 //     'cat ~/.ssh/id_rsa 2>&1; echo exit=$?'
 //   # Expected: "Permission denied" from cat; ssh key not in output.
+
+test "spawned children inherit the io backend's process environment" {
+    // Root-cause guard for "the bash tool can't find gh / homebrew tools".
+    // `std.process.spawn` fills a child's environment from the io backend's
+    // process_environ whenever `environ_map` is null (the default the bash
+    // tool and `cmd` `.inherit` mode rely on). main.zig must seed the shared
+    // `std.Io.Threaded` with the real process environ; an unseeded backend
+    // (`.empty`) hands every child a bare environment with no PATH, so only
+    // /bin and /usr/bin commands resolve and /opt/homebrew/bin tools vanish.
+    // This test stands up its own backends because `std.testing.io` carries
+    // its own environ, so a process_io-based test cannot observe the gap.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const argv = [_][]const u8{ "/bin/sh", "-c", "printf %s \"$ZAG_ENV_PROPAGATION_TEST\"" };
+
+    // Seeded backend: the child sees the seeded variable.
+    {
+        const entries = [_:null]?[*:0]const u8{"ZAG_ENV_PROPAGATION_TEST=present"};
+        const seeded: std.process.Environ = .{ .block = .{ .slice = &entries } };
+        var t = std.Io.Threaded.init(alloc, .{ .environ = seeded });
+        defer t.deinit();
+        const r = try std.process.run(alloc, t.io(), .{ .argv = &argv });
+        defer alloc.free(r.stdout);
+        defer alloc.free(r.stderr);
+        try std.testing.expectEqualStrings("present", r.stdout);
+    }
+
+    // Unseeded backend (the bug shape): the child gets no environment.
+    {
+        var t = std.Io.Threaded.init(alloc, .{});
+        defer t.deinit();
+        const r = try std.process.run(alloc, t.io(), .{ .argv = &argv });
+        defer alloc.free(r.stdout);
+        defer alloc.free(r.stderr);
+        try std.testing.expectEqualStrings("", r.stdout);
+    }
+}
