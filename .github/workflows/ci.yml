@@ -57,8 +57,9 @@ jobs:
       - name: Run unit tests
         run: zig build test
 
-      - name: Run simulator tests
-        run: zig build test-sim
+      # The zag-sim suite is parked until ghostty supports Zig 0.16
+      # (https://github.com/ghostty-org/ghostty/pull/12726). The `test-sim`
+      # build step only exists when sim is enabled, which pulls in ghostty.
 
   cross-compile:
     strategy:
