@@ -196,12 +196,6 @@ pub fn build(b: *std.Build) void {
         .root_module = agent_test_mod,
     });
     const run_agent_tests = b.addRunArtifact(agent_tests);
-    // Run the two test binaries serially (agent after unit), not concurrently.
-    // Several tests spawn OS threads guarded by liveness timeouts (e.g.
-    // ChildRunnerRegistry's drainAll, 3 threads / 30s backstop); running both
-    // binaries at once oversubscribes small CI runners enough to starve those
-    // threads past their deadline. Serial execution keeps the gate deterministic.
-    run_agent_tests.step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_agent_tests.step);
 }
 
