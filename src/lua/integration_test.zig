@@ -354,6 +354,103 @@ test "a coroutine yields on a workflow child and resumes with its result" {
     engine.lua.pop(1);
 }
 
+/// Stub provider whose stream call spins until the caller's cancel flag is
+/// set, then returns `error.Cancelled`. Keeps the child agent thread genuinely
+/// live (and unjoined) until shutdown cancels it, exercising the
+/// retire/shutdown orphan -> teardown path with a real in-flight thread.
+const GatedCancelProvider = struct {
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "gated_cancel",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(_: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        while (!req.cancel.load(.acquire)) {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+        return error.Cancelled;
+    }
+
+    fn provider(self: *GatedCancelProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "force-retiring a coroutine with a live workflow child at shutdown tears it down cleanly" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+
+    var stub = GatedCancelProvider{};
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    // The engine owns the registry pointer (no orchestrator here), so its
+    // shutdown sweep can drive the orphaned child to completion.
+    engine.child_runner_registry = &child_registry;
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "gated_cancel",
+        .model_spec = .{ .provider_name = "gated_cancel", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var fixture = WorkflowSpawnFixture{ .engine = &engine, .registry = &child_registry, .ctx = &ctx };
+    workflow_spawn_fixture = &fixture;
+    defer workflow_spawn_fixture = null;
+
+    engine.lua.pushFunction(zlua.wrap(testSpawnChild));
+    engine.lua.setGlobal("_test_spawn_child");
+
+    try engine.lua.doString(
+        \\function test_workflow() _test_spawn_child() end
+    );
+    _ = try engine.lua.getGlobal("test_workflow");
+    _ = try engine.spawnCoroutine(0, null);
+
+    // The coroutine is parked on a live child whose agent thread is spinning
+    // on the cancel flag (the gated provider never returns until cancelled).
+    try testing.expectEqual(@as(u32, 1), engine.tasks.count());
+    try testing.expect(!child_registry.isEmpty());
+
+    // Shutdown: force-retire the coroutine (orphaning the child) and drive the
+    // orphaned child to join + deinit + free through the registry sweep. No
+    // leak (testing.allocator), no UAF, no hang (the cancel sweep releases the
+    // gated provider). deinitAsync owns the registry drain because it runs
+    // before any orchestrator drain and frees `self.tasks` itself.
+    engine.deinitAsync();
+
+    // The child was joined, deinited, and freed exactly once: the registry is
+    // empty and testing.allocator reports no leak at engine.deinit().
+    try testing.expect(child_registry.isEmpty());
+}
+
 test "zag.detach without an async runtime errors instead of aborting" {
     const allocator = testing.allocator;
     var engine = try LuaEngine.init(allocator);

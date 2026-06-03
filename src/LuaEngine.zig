@@ -276,6 +276,13 @@ pub const LuaEngine = struct {
     current_event_queue: ?*@import("agent_events.zig").EventQueue = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
+    /// Borrowed registry of in-flight child agents, owned by the
+    /// `EventOrchestrator` and wired in `create`. Null in headless / test paths
+    /// with no orchestrator. Workflow children are registered here with a
+    /// `OnDone.workflow` handle; teardown (`retireTask` / `deinitAsync`) drives
+    /// it to join + free a child whose awaiting coroutine is force-retired,
+    /// keeping the registry+drain loop the single owner of join+deinit.
+    child_runner_registry: ?*ChildRunnerRegistry = null,
 
     /// Per-tool-name JIT context handler. The map key aliases
     /// `tool_name` so insert/remove operates on a single owned slice
@@ -2699,6 +2706,11 @@ pub const LuaEngine = struct {
             rt.deinit();
             self.async_runtime = null;
         }
+        // Cancel any in-flight workflow children up front so their agent
+        // threads start winding down before we force-retire the coroutines
+        // that await them. cancelAll is a no-op when no child is registered.
+        if (self.child_runner_registry) |reg| reg.cancelAll();
+
         // Retire any coroutine still parked at shutdown -- the common case
         // is a detached poller blocked in `zag.sleep`. Each parked task owns
         // a Scope still linked under `root_scope`; `retireTask` unlinks and
@@ -2707,6 +2719,8 @@ pub const LuaEngine = struct {
         // Drain by repeatedly retiring the first task, since retireTask
         // removes from `self.tasks` and may resume joiners that retire more;
         // a count ceiling guards against a pathological re-spawn loop.
+        // retireTask's pending_child arm cancels + ORPHANS (resume_thread_ref
+        // = -1) any awaited child, leaving it registered for the drain below.
         if (self.tasks.count() > 0) {
             std.log.scoped(.lua).warn("deinitAsync: retiring {d} task(s) still alive", .{self.tasks.count()});
         }
@@ -2715,6 +2729,25 @@ pub const LuaEngine = struct {
             var it = self.tasks.valueIterator();
             self.retireTask(it.next().?.*);
         }
+
+        // Drive any orphaned workflow children to completion: drainAll joins
+        // each finished child's agent thread and calls `onChildRetiredOnMain`,
+        // which (with the orphaned `resume_thread_ref`) takes the task-gone
+        // path — deinit + free the ChildAgent, no resume into a dead coroutine.
+        // Fixed-point loop with cancelAll each pass (a child may not have
+        // observed cancellation yet); guarded against a pathological non-finish.
+        // Mirrors EventOrchestrator.drainChildrenToCompletion, but the engine
+        // owns this at shutdown because `deinitAsync` runs before the
+        // orchestrator drains and frees `self.tasks` here.
+        if (self.child_runner_registry) |reg| {
+            var drain_guard: usize = 0;
+            while (!reg.isEmpty() and drain_guard < 4096) : (drain_guard += 1) {
+                reg.cancelAll();
+                reg.drainAll();
+                clock.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+
         self.tasks.deinit();
         if (self.root_scope) |s| {
             s.deinit();
@@ -3217,6 +3250,21 @@ pub const LuaEngine = struct {
             a.deinit();
             self.allocator.destroy(a);
             // task about to be destroyed; no need to null the field
+        }
+
+        // A task retiring while it still awaits a workflow child means the
+        // coroutine is being torn down out from under a child whose agent
+        // thread may still be live. We MUST NOT deinit the child here: direct
+        // teardown of a child whose thread is unjoined is a UAF. Instead cancel
+        // its runner and orphan its resume target so the later drainAll-driven
+        // `onChildRetiredOnMain` joins it and takes the task-gone path (free,
+        // no resume into a dead coroutine). The registry + drain loop stay the
+        // single owner of join + deinit. The shutdown drain in `deinitAsync`
+        // (or the orchestrator's drain-to-completion) finishes the job.
+        if (task.pending_child) |child| {
+            child.child_runner.cancelAgent();
+            child.resume_thread_ref = -1;
+            task.pending_child = null;
         }
 
         const was_cancelled = task.scope.isCancelled();

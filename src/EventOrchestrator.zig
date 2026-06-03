@@ -219,9 +219,12 @@ pub fn create(cfg: Config) !*EventOrchestrator {
 
     // Lua layout/pane bindings call the window manager directly on the main
     // thread; point the engine at the now-stable manager and buffer registry.
+    // The child-runner registry is also a stable interior address now, so the
+    // engine can drive it to drain workflow children at retire/shutdown.
     if (cfg.lua_engine) |engine| {
         engine.window_manager = &self.window_manager;
         engine.buffer_registry = &self.window_manager.buffer_registry;
+        engine.child_runner_registry = &self.child_runner_registry;
     }
 
     // The root runner services `layout_request` round-trips against this WM
