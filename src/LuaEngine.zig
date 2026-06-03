@@ -3001,7 +3001,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null);
     }
 
     /// Spawn a coroutine that inherits a workflow context from its spawner.
@@ -3016,7 +3016,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         workflow_ctx: ?*const tools_mod.TaskContext,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx);
+        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, null);
     }
 
     /// Spawn a coroutine already bound to a `PendingFire`. The binding is set
@@ -3032,7 +3032,7 @@ pub const LuaEngine = struct {
         pf: *PendingFire,
     ) !i32 {
         pf.outstanding += 1;
-        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null) catch |err| {
+        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null) catch |err| {
             // The spawn never registered the task (so retireTask will not run
             // for it); undo the bump so the guard release still reaches 0.
             pf.outstanding -= 1;
@@ -3188,6 +3188,81 @@ pub const LuaEngine = struct {
         }
     }
 
+    /// Compile + run a workflow script as a result-capturing coroutine. MUST be
+    /// called on the MAIN thread: it touches the Lua VM (compile + spawn). The
+    /// future `workflow` tool's agent thread round-trips a `WorkflowRequest` to
+    /// main, which calls this; the agent thread then parks on `req.done` while
+    /// the main loop pumps the coroutine + drains its children to completion.
+    ///
+    /// The script runs as a `Task` whose scope parents to `root_scope`: the
+    /// workflow is its own cancellation domain, and children spawned inside it
+    /// (`zag.task`, `zag.spawn`) auto-parent to it so one cancel cascades.
+    ///
+    /// Completion is exactly-once: a compile error completes `req` here; a
+    /// successful run captures the coroutine's returned string in `resumeTask`'s
+    /// `.ok` arm; a runtime error / cancellation completes it via the resume
+    /// error branch or `retireTask`. Every path routes through
+    /// `completeWorkflowRequest`, which nulls `task.workflow_request`.
+    pub fn startWorkflowScript(self: *LuaEngine, req: *WorkflowRequest) void {
+        const script_z = self.allocator.dupeZ(u8, req.script) catch {
+            completeWorkflowRequestOwned(req, "internal error: workflow script dupe failed", true);
+            return;
+        };
+        defer self.allocator.free(script_z);
+
+        // Compile the chunk onto the main stack. A syntax error pushes a
+        // message we surface as the (error) tool result.
+        self.lua.loadString(script_z) catch |err| {
+            const msg = if (err == error.LuaSyntax) self.lua.toString(-1) catch "<unprintable>" else @errorName(err);
+            completeWorkflowRequestOwned(req, msg, true);
+            self.lua.setTop(0);
+            return;
+        };
+
+        // Spawn the compiled chunk as a coroutine parented to root, tagged with
+        // the workflow context (so its `zag.task` calls resolve) and the request
+        // (so its return value is captured). Both are set before the first
+        // resume inside spawnCoroutineFull, so even a no-yield script that
+        // returns immediately has its result captured.
+        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req) catch |err| {
+            // The spawn never registered a task (so retireTask cannot complete
+            // the request); complete it here. The chunk on the stack was either
+            // consumed by spawnCoroutineFull (on the xMove) or left on a failure
+            // before it; clear the stack to be safe.
+            self.lua.setTop(0);
+            completeWorkflowRequestOwned(req, @errorName(err), true);
+        };
+    }
+
+    /// Complete a `WorkflowRequest` exactly once: dupe `message`/result into
+    /// the requester's allocator, stamp `is_error`, sever the borrowed scope,
+    /// and fire `done`. A second call (e.g. retire after a normal completion)
+    /// is a no-op because the caller nulls `task.workflow_request` first; this
+    /// guards the request's own `done` against a double-fire via `done.isSet`.
+    fn completeWorkflowRequestOwned(req: *WorkflowRequest, message: []const u8, is_error: bool) void {
+        if (req.done.isSet()) return;
+        req.result = req.allocator.dupe(u8, message) catch null;
+        req.is_error = is_error;
+        req.scope = null;
+        req.done.set();
+    }
+
+    /// Capture a finished workflow coroutine's return value into its request.
+    /// Reads the top-of-stack return (a string, or nil) WITHOUT popping (the
+    /// caller pops after), dupes it into the requester's allocator, and fires
+    /// `done`. Called from `resumeTask`'s `.ok` arm.
+    fn captureWorkflowReturn(req: *WorkflowRequest, co: *Lua, num_results: i32) void {
+        if (req.done.isSet()) return;
+        var text: []const u8 = "";
+        if (num_results >= 1 and co.isString(-1)) {
+            text = co.toString(-1) catch "";
+        }
+        req.result = req.allocator.dupe(u8, text) catch null;
+        req.is_error = false;
+        req.scope = null;
+        req.done.set();
+    }
+
     fn spawnCoroutineFull(
         self: *LuaEngine,
         nargs: i32,
@@ -3196,6 +3271,7 @@ pub const LuaEngine = struct {
         compact_request: ?*agent_events.CompactRequest,
         pending_fire: ?*PendingFire,
         workflow_ctx: ?*const tools_mod.TaskContext,
+        workflow_request: ?*WorkflowRequest,
     ) !i32 {
         // The async runtime must be up before a coroutine can be scheduled.
         // Internal callers (hooks, compaction) only run after `initAsync`,
@@ -3235,7 +3311,18 @@ pub const LuaEngine = struct {
             // Inherited from the spawner so combinator workers can call
             // `zag.task`. Set before the first resume below.
             .workflow_ctx = workflow_ctx,
+            // Set before the first resume so a no-yield workflow script that
+            // retires inside this spawn still has its return value captured by
+            // resumeTask's `.ok` arm.
+            .workflow_request = workflow_request,
         };
+
+        // Expose the workflow coroutine's scope on its request BEFORE the first
+        // resume so a parked agent thread (the workflow tool) can cancel the
+        // whole workflow + cascade to children via `Scope.cancel` (which is
+        // VM-free, so it is safe to call off the main thread). Valid only while
+        // the coroutine is alive; `completeWorkflowRequest` nulls it.
+        if (workflow_request) |req| req.scope = scope;
 
         // Stash the Task in the coroutine's extraspace for O(1) lookup in
         // taskForCoroutine. Written here so the slot is valid before the
@@ -3327,6 +3414,13 @@ pub const LuaEngine = struct {
                             break :blk .use_default;
                         };
                     }
+                } else if (task.workflow_request) |req| {
+                    // Workflow-script retire path. The script's returned string
+                    // (or nil) lives at the coroutine's stack top; capture it
+                    // into the request BEFORE the pop, then null the field so
+                    // retireTask's completion arm is a no-op (exactly-once).
+                    captureWorkflowReturn(req, task.co, num_results);
+                    task.workflow_request = null;
                 }
                 task.co.pop(num_results);
                 self.retireTask(task);
@@ -3372,6 +3466,19 @@ pub const LuaEngine = struct {
         }
 
         const was_cancelled = task.scope.isCancelled();
+
+        // A workflow-script coroutine reaching retire WITHOUT having captured
+        // its return (normal completion nulls `workflow_request` first) means it
+        // is being torn down by a runtime error or cancellation. Complete the
+        // request with an error so the parked agent thread unwinds instead of
+        // hanging on `done`. The message distinguishes cancel from a Lua error
+        // (already logged by the resume-error branch).
+        if (task.workflow_request) |req| {
+            const msg: []const u8 = if (was_cancelled) "cancelled" else "workflow script error";
+            completeWorkflowRequestOwned(req, msg, true);
+            task.workflow_request = null;
+        }
+
         // Capture the bound fire before the task is destroyed; the decrement
         // happens after teardown so finalize (which may wake the producer)
         // never races our own access to `task`.

@@ -504,6 +504,196 @@ test "zag.task inside a coroutine without a workflow context raises" {
     engine.lua.pop(1);
 }
 
+// -- runWorkflowScript engine entry (Milestone E2) --------------------------
+
+/// Drive a started workflow script to completion the way an agent driver's
+/// main loop would: drain finished children (resuming the coroutine through
+/// `onChildRetiredOnMain`) and pump job completions (sleeps, etc.) until the
+/// request fires `done`. Bounded by a wall-clock deadline so a wiring bug
+/// fails the test instead of hanging it.
+fn pumpWorkflowToDone(
+    engine: *LuaEngine,
+    registry: *ChildRunnerRegistry,
+    req: *LuaEngine.WorkflowRequest,
+) !void {
+    const deadline = clock.milliTimestamp() + 4000;
+    while (!req.done.isSet() and clock.milliTimestamp() < deadline) {
+        registry.drainAll();
+        engine.pumpCompletions();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    if (!req.done.isSet()) return error.WorkflowTimedOut;
+}
+
+test "startWorkflowScript runs a script that spawns two subagents and aggregates" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    // Declared AFTER `engine` so its deinit defer runs after `engine.deinitAsync`
+    // — the engine never reads a freed registry. The test fully drains the
+    // registry itself (pumpWorkflowToDone), so the engine need not own it for a
+    // shutdown sweep.
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        // The orchestration coroutine runs on this (main) thread; children must
+        // be drained on the main thread, so wire the registry the script's
+        // zag.task calls register into.
+        .child_registry = &child_registry,
+    };
+
+    // The script spawns two subagents sequentially and concatenates their
+    // summaries with a separator, then returns the string.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\local a = zag.task{ prompt = "first" }
+        \\local b = zag.task{ prompt = "second" }
+        \\return a.summary .. "||" .. b.summary
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    // Two child summaries, both containing the stub text, joined by "||".
+    try testing.expect(std.mem.indexOf(u8, result, "||") != null);
+    const sep = std.mem.indexOf(u8, result, "||").?;
+    try testing.expect(std.mem.indexOf(u8, result[0..sep], "RESULT") != null);
+    try testing.expect(std.mem.indexOf(u8, result[sep..], "RESULT") != null);
+
+    // Everything drained: no live tasks, registry empty, no leak at deinit.
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+}
+
+test "startWorkflowScript completes with is_error on a compile error" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    var stub = StubTextProvider{ .response_text = "x" };
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = stub.provider(),
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    var req = LuaEngine.WorkflowRequest{
+        .script = "this is not ( valid lua",
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    // A compile error completes the request synchronously inside the call.
+    engine.startWorkflowScript(&req);
+    try testing.expect(req.done.isSet());
+    try testing.expect(req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expect(result.len > 0); // carries the syntax-error message
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
+test "startWorkflowScript completes with is_error when the script raises at runtime" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    var stub = StubTextProvider{ .response_text = "x" };
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = stub.provider(),
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // A script that compiles cleanly but raises at runtime. It retires through
+    // resumeTask's error catch -> retireTask, which completes the request with
+    // is_error and the "workflow script error" message.
+    var req = LuaEngine.WorkflowRequest{
+        .script = "error('boom from the script')",
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+
+    try testing.expect(req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expect(result.len > 0);
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
 // -- Workflow fan-out bound (Milestone D) -----------------------------------
 
 test "zag.workflow.max_fanout defaults to 8 and is settable from Lua" {
