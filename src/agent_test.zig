@@ -3113,3 +3113,39 @@ test "callLlm retries a pre-first-token ReadTimeout and recovers on a fresh atte
     }
     try std.testing.expect(saw_reply);
 }
+
+const EmitThenStallProvider = struct {
+    attempt: u32 = 0,
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "emit_then_stall_stub",
+    };
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *EmitThenStallProvider = @ptrCast(@alignCast(ptr));
+        self.attempt += 1;
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = "partial" });
+        return error.ReadTimeout;
+    }
+    fn provider(self: *EmitThenStallProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "callLlm does not retry a ReadTimeout once content was emitted" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var stub = EmitThenStallProvider{};
+    const p = stub.provider();
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    try std.testing.expectError(error.ReadTimeout, result);
+    try std.testing.expectEqual(@as(u32, 1), stub.attempt);
+}
