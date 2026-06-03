@@ -141,8 +141,7 @@ fn runChild(
     // `Subagent` maps onto the inline `ChildSpec` (its `prompt` is the
     // child's system prompt; the tool input's `prompt` is the task).
     const child = try allocator.create(ChildAgent);
-    var freed = false;
-    defer if (!freed) allocator.destroy(child);
+    defer allocator.destroy(child);
     child.* = .{
         .allocator = allocator,
         .child_registry = undefined,
@@ -161,12 +160,17 @@ fn runChild(
     };
 
     // Build + spawn the child (registry, task_start, spawnSubagent, sink,
-    // runner init/submit). On any failure here the child never registered, so
-    // a direct teardown is safe.
-    child.start(ctx) catch |err| {
-        child.deinit();
-        return err;
-    };
+    // runner init/submit). `start` is self-unwinding: on error it has already
+    // torn down everything it built, so we MUST NOT call `deinit` — the
+    // outer `defer` only destroys the (now-clean) heap slot.
+    try child.start(ctx);
+    // `start` succeeded: from here `deinit` is the caller's responsibility.
+    // Run it unconditionally on every exit (success or any later error). The
+    // agent thread is always joined before deinit runs (the drain/park joins
+    // it), and the `retired` latch makes deinit idempotent, so this single
+    // defer guarantees the runner's wire arena + event queue, the sink, and
+    // the registry are released exactly once on every path.
+    defer child.deinit();
 
     // Hand the child off to the main thread for draining. The main thread is
     // the only thread allowed to call into the Lua VM, so it (not this agent
@@ -223,31 +227,9 @@ fn runChild(
         }) catch |err| log.warn("task_end persist failed: {}", .{err});
     }
 
-    // Tear down the child (joins the agent thread — already joined by the
-    // drain — and frees registry/sink/runner) and free the heap slot. Order
-    // matches the legacy stack-defer order: runner, sink, registry.
-    child.deinit();
-    allocator.destroy(child);
-    freed = true;
-
+    // Teardown (child.deinit then allocator.destroy) runs via the two defers
+    // above, deepest-first: runner, sink, registry, then the heap slot.
     return .{ .content = owned, .is_error = res.is_error, .owned = true };
-}
-
-/// Allocate the `task_start` JSON payload. The previous implementation
-/// formatted into a 2 KiB stack buffer and silently fell back to `"{}"`
-/// on overflow, which collapsed any non-trivial subagent prompt to an
-/// empty audit row. The caller owns the returned slice and must free
-/// it with `allocator`.
-fn formatStartPayload(allocator: Allocator, agent_name: []const u8, prompt: []const u8) ![]u8 {
-    var aw = std.Io.Writer.Allocating.init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll("{\"agent\":");
-    try types.writeJsonString(w, agent_name);
-    try w.writeAll(",\"prompt\":");
-    try types.writeJsonString(w, prompt);
-    try w.writeAll("}");
-    return aw.toOwnedSlice();
 }
 
 fn formatUnknownAgent(
@@ -404,7 +386,7 @@ test "task_start payload survives prompts longer than 2KB" {
     @memset(&prompt_buf, 'x');
     const long_prompt = prompt_buf[0..];
 
-    const payload = try formatStartPayload(allocator, "reviewer", long_prompt);
+    const payload = try ChildAgent.formatStartPayload(allocator, "reviewer", long_prompt);
     defer allocator.free(payload);
 
     try testing.expect(payload.len > 4000);
@@ -416,7 +398,7 @@ test "task_start payload survives prompts longer than 2KB" {
 test "task_start payload escapes JSON special characters in prompt" {
     const allocator = testing.allocator;
 
-    const payload = try formatStartPayload(allocator, "reviewer", "say \"hi\"\nnew\\line");
+    const payload = try ChildAgent.formatStartPayload(allocator, "reviewer", "say \"hi\"\nnew\\line");
     defer allocator.free(payload);
 
     try testing.expect(std.mem.indexOf(u8, payload, "\\\"hi\\\"") != null);

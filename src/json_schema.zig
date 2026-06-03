@@ -15,9 +15,10 @@
 //!   is interpreted as a literal, not a regex: regex metacharacters are NOT
 //!   special. A leading `^` and trailing `$` are stripped as anchors; the
 //!   remaining body is matched as an exact string (`^body$`) or as a required
-//!   prefix (`^body`). A pattern without a leading `^` is treated as a required
-//!   substring. This covers the common version-tag / id-prefix cases; richer
-//!   regex is out of scope until a real engine is available.
+//!   prefix (`^body`). A pattern with only a trailing `$` (`body$`) is matched
+//!   as a required suffix. A pattern without a leading `^` is treated as a
+//!   required substring. This covers the common version-tag / id-prefix cases;
+//!   richer regex is out of scope until a real engine is available.
 //! - `additionalProperties:false`: reject any input key not named in
 //!   `properties` (enforced at every object level).
 //!

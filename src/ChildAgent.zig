@@ -77,6 +77,13 @@ retired: bool = false,
 /// `task` tool's old `runChild`. MUST be called after `self` is at its
 /// final heap address: the child runner the registry keys on lives inside
 /// `self`, so the struct cannot move after this returns.
+///
+/// Self-unwinding: if `start` returns an error it has already torn down
+/// everything it built (each stage's `errdefer` cleans only what that stage
+/// constructed). The caller MUST NOT call `deinit` on a `start` that errored
+/// — `child_runner`/`child_sink` would still be `undefined` and `deinit`
+/// would read garbage. The caller only destroys the heap slot. On success the
+/// caller owns teardown and MUST call `deinit` exactly once.
 pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
     // Build a fresh one-tool-registry view for the child. `runLoopStreaming`
     // takes a `*const Registry`, not a Subset; we materialise a Registry that
@@ -88,7 +95,7 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
     // reconstruct what was delegated. Failure is logged but non-fatal; the
     // subagent still runs.
     self.task_start_id = null;
-    if (ctx.session_handle) |sh| {
+    if (self.session_handle) |sh| {
         const start_payload = formatStartPayload(self.allocator, self.spec.name, self.spec.prompt) catch |err| blk: {
             log.warn("task_start payload format failed: {}", .{err});
             break :blk null;
@@ -129,11 +136,13 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
     // tool_call/tool_result, thinking, errors). The sink owns its
     // node-correlation state and is reset on `.run_end`.
     self.child_sink = BufferSink.init(self.allocator, self.child_conv);
+    errdefer self.child_sink.deinit();
 
     // Construct the child runner. Its wire_arena, event_queue, and sink are
     // all child-scoped; the agent thread sees a fully isolated runtime keyed
     // off the child Conversation.
     self.child_runner = AgentRunner.init(self.allocator, self.child_sink.sink(), self.child_conv);
+    errdefer self.child_runner.deinit();
     self.child_runner.wake_fd = ctx.wake_fd;
     // The child gets the real Lua engine ONLY when a child_registry is present,
     // because the engine is safe to wire iff the MAIN thread drains the child's
@@ -164,7 +173,7 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
 
     // Inherit the parent's session_id so subagent telemetry lines stay grouped
     // under the same session in the timeline log.
-    const child_session_id: []const u8 = if (ctx.session_handle) |sh|
+    const child_session_id: []const u8 = if (self.session_handle) |sh|
         sh.id[0..sh.id_len]
     else
         "";
@@ -237,9 +246,12 @@ pub fn buildChildRegistry(
     return child;
 }
 
-/// Allocate the `task_start` JSON payload. The caller owns the returned slice
-/// and must free it with `allocator`.
-fn formatStartPayload(allocator: Allocator, agent_name: []const u8, prompt: []const u8) ![]u8 {
+/// Allocate the `task_start` JSON payload. The previous implementation
+/// formatted into a 2 KiB stack buffer and silently fell back to `"{}"`
+/// on overflow, which collapsed any non-trivial subagent prompt to an
+/// empty audit row. The caller owns the returned slice and must free
+/// it with `allocator`.
+pub fn formatStartPayload(allocator: Allocator, agent_name: []const u8, prompt: []const u8) ![]u8 {
     var aw = std.Io.Writer.Allocating.init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
@@ -372,4 +384,90 @@ test "ChildAgent starts, drains to completion, and reports the summary" {
     // Clean teardown: idempotent and leak-free under the testing allocator.
     child.deinit();
     child.deinit(); // second call is a no-op via the `retired` latch.
+}
+
+test "ChildAgent.start unwinds cleanly on allocation failure at any stage" {
+    const allocator = testing.allocator;
+
+    // Sweep the failure point across every allocation `start` performs. For
+    // each index we force OOM at that allocation and assert `start` returns an
+    // error while leaving no leak under `testing.allocator` — proving every
+    // stage's `errdefer` releases exactly what that stage built. Per the
+    // self-unwinding contract the caller does NOT call `deinit` on a failed
+    // `start`; it only destroys the heap slot. We stop once a higher index lets
+    // `start` succeed, which means the sweep has covered all start allocations.
+    var fail_index: usize = 0;
+    const max_sweep = 256;
+    while (fail_index < max_sweep) : (fail_index += 1) {
+        var stub = StubTextProvider{ .response_text = "child summary text" };
+        const p = stub.provider();
+
+        var parent_registry = tools.Registry.init(allocator);
+        defer parent_registry.deinit();
+        try parent_registry.register(@import("tools/read.zig").tool);
+
+        var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+        defer parent_conv.deinit();
+
+        var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_alloc = failing.allocator();
+
+        const ctx: tools.TaskContext = .{
+            .allocator = allocator,
+            .subagents = undefined,
+            .provider = p,
+            .provider_name = "stub_text",
+            .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+            .registry = &parent_registry,
+            .session_handle = null,
+            .lua_engine = null,
+            .task_depth = 0,
+            .wake_fd = null,
+            .parent_conv = &parent_conv,
+            .child_registry = null,
+        };
+
+        const child = try allocator.create(ChildAgent);
+        defer allocator.destroy(child);
+        child.* = .{
+            // The child's own allocator is the failing one: every allocation
+            // `start` makes flows through it, so `fail_index` selects which
+            // stage OOMs.
+            .allocator = failing_alloc,
+            .child_registry = undefined,
+            .child_sink = undefined,
+            .child_runner = undefined,
+            .child_conv = undefined,
+            .task_start_id = null,
+            .session_handle = null,
+            .spec = .{
+                .system_prompt = "You are a test subagent.",
+                .prompt = "do the thing",
+                .tools = null,
+                .name = "tester",
+            },
+        };
+
+        if (child.start(&ctx)) |_| {
+            // start succeeded at this fail_index: every earlier allocation has
+            // been exercised by a failing run. Drive it to completion and tear
+            // down so the success path stays leak-free too, then stop.
+            var drainer = ChildRunnerRegistry.init(allocator);
+            defer drainer.deinit();
+            var done: sync.ResetEvent = .{};
+            try drainer.register(.{ .runner = &child.child_runner, .done = &done });
+            while (true) {
+                drainer.drainAll();
+                if (done.timedWait(5 * std.time.ns_per_ms)) |_| break else |_| {}
+            }
+            child.deinit();
+            return;
+        } else |err| {
+            // Contract: a failed `start` has already unwound itself, so we must
+            // NOT call `deinit`. The `errdefer` chain inside `start` released
+            // everything; only the heap slot remains (freed by the defer above).
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    return error.StartNeverSucceeded;
 }
