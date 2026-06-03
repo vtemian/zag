@@ -3780,3 +3780,42 @@ test "gutter-reduced wrapping width keeps rowPlan and getWindow consistent" {
     const logical = try cb.lineCount();
     try std.testing.expect(got.total_rows > @as(u32, @intCast(logical)));
 }
+
+test "rowPlan matches defaultGetWindow for wrapping markdown assistant text" {
+    // Row-count consistency guard for markdown assistant content (extends the
+    // tool-node coverage at 3551/3744 to multi-paragraph markdown with a list
+    // and an indented block). The gutter-aware rowPlan metric and the
+    // decorated-line measurement (defaultGetWindow, which mirrors the actual
+    // drawStyledLineWrapped render) must agree on total physical rows; a
+    // mismatch would land the tail anchor wrong and clip rows off an edge.
+    const allocator = std.testing.allocator;
+    const theme = Theme.defaultTheme();
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 0;
+
+    const md =
+        \\I had two separate problems to work through here today before things worked:
+        \\
+        \\1. PATH: /opt/homebrew/bin was not on my shell PATH in this particular session run
+        \\2. Auth: even with the full path, gh returned exit code 4 for the authenticated request
+        \\
+        \\    github.com:
+        \\        users:
+        \\            vtemian:
+    ;
+    _ = try cb.appendNode(null, .assistant_text, md);
+
+    const content_width: u16 = 40;
+
+    var arena_got = std.heap.ArenaAllocator.init(allocator);
+    defer arena_got.deinit();
+    var arena_want = std.heap.ArenaAllocator.init(allocator);
+    defer arena_want.deinit();
+
+    const v = cb.view();
+    const got = try v.getWindow(arena_got.allocator(), allocator, &theme, content_width, 100, 0);
+    const want = try View.defaultGetWindow(v, arena_want.allocator(), allocator, &theme, content_width, 100, 0);
+
+    try std.testing.expectEqual(want.total_rows, got.total_rows);
+}
