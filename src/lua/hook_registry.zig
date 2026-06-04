@@ -609,6 +609,17 @@ pub const HookDispatcher = struct {
                 setTableInt(lua, "cols", @intCast(p.cols));
                 setTableInt(lua, "rows", @intCast(p.rows));
             },
+            .subagent_spawn => |p| {
+                setTableString(lua, "name", p.name);
+                setTableInt(lua, "index", @intCast(p.index));
+                setTableString(lua, "parent_pane", p.parent_pane);
+            },
+            .subagent_end => |p| {
+                setTableString(lua, "name", p.name);
+                setTableInt(lua, "index", @intCast(p.index));
+                setTableString(lua, "parent_pane", p.parent_pane);
+                setTableBool(lua, "is_error", p.is_error);
+            },
         }
     }
 

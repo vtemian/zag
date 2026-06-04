@@ -225,6 +225,15 @@ pub fn create(cfg: Config) !*EventOrchestrator {
         engine.window_manager = &self.window_manager;
         engine.buffer_registry = &self.window_manager.buffer_registry;
         engine.child_runner_registry = &self.child_runner_registry;
+        // Drive the SubagentSpawn/SubagentEnd lifecycle hooks from the one
+        // main-thread choke point that sees every child in both spawn modes
+        // (drainAll). The registry stays import-cycle-free via these opaque
+        // adapters that cast back to *ChildAgent and fire the hooks.
+        self.child_runner_registry.lifecycle_sink = .{
+            .ctx = engine,
+            .on_spawn = LuaEngine.fireSubagentSpawn,
+            .on_end = LuaEngine.fireSubagentEnd,
+        };
     }
 
     // The root runner services `layout_request` round-trips against this WM

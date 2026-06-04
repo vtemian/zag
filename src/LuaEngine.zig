@@ -46,6 +46,7 @@ const embedded = @import("lua/embedded.zig");
 const sync = @import("sync.zig");
 const ChildAgent = @import("ChildAgent.zig");
 const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
+const Conversation = @import("Conversation.zig");
 const provider_bindings = @import("lua/bindings/provider.zig");
 const prompt_bindings = @import("lua/bindings/prompt.zig");
 const sockets_bindings = @import("lua/bindings/sockets.zig");
@@ -2923,6 +2924,71 @@ pub const LuaEngine = struct {
         const self: *LuaEngine = @ptrCast(@alignCast(ctx));
         const child: *ChildAgent = @ptrCast(@alignCast(child_ptr));
         self.onChildRetiredOnMain(child);
+    }
+
+    /// Adapter for `ChildRunnerRegistry.LifecycleSink.on_spawn`. Casts the
+    /// opaque pointers back to their concrete types and fires `SubagentSpawn`.
+    /// Runs on the main drain thread with no registry lock held; the hook
+    /// callbacks run as main-thread coroutines and may call zag.layout.* /
+    /// zag.task.
+    pub fn fireSubagentSpawn(ctx: *anyopaque, child_ptr: *anyopaque) void {
+        const self: *LuaEngine = @ptrCast(@alignCast(ctx));
+        const child: *ChildAgent = @ptrCast(@alignCast(child_ptr));
+
+        var pane_buf: [16]u8 = undefined;
+        var payload: Hooks.HookPayload = .{ .subagent_spawn = .{
+            .name = child.spec.name,
+            .index = subagentIndex(child),
+            .parent_pane = self.parentPaneHandle(child, &pane_buf),
+        } };
+        _ = self.fireHook(&payload) catch |err| {
+            log.warn("SubagentSpawn hook fire failed: {}", .{err});
+        };
+    }
+
+    /// Adapter for `ChildRunnerRegistry.LifecycleSink.on_end`. Fires
+    /// `SubagentEnd` with the authoritative error/cancel state, which only
+    /// this side can compute (it reaches the concrete child conversation).
+    /// Runs on the main drain thread, after the registry handle is removed
+    /// and BEFORE the OnDone completion (the child is still live here).
+    pub fn fireSubagentEnd(ctx: *anyopaque, child_ptr: *anyopaque) void {
+        const self: *LuaEngine = @ptrCast(@alignCast(ctx));
+        const child: *ChildAgent = @ptrCast(@alignCast(child_ptr));
+
+        var pane_buf: [16]u8 = undefined;
+        var payload: Hooks.HookPayload = .{ .subagent_end = .{
+            .name = child.spec.name,
+            .index = subagentIndex(child),
+            .parent_pane = self.parentPaneHandle(child, &pane_buf),
+            .is_error = Conversation.childErroredForTask(child.child_conv),
+        } };
+        _ = self.fireHook(&payload) catch |err| {
+            log.warn("SubagentEnd hook fire failed: {}", .{err});
+        };
+    }
+
+    /// 1-based position of `child` among its parent's subagents, derived from
+    /// `child_conv.parent_subagent_id` (the 0-based index into
+    /// `parent.subagents`, stamped at `spawnSubagent`). This is the cheapest
+    /// correct source: O(1), set before the child ever runs, and the same
+    /// value the wire projection / NodeRenderer key children on. 0 when the
+    /// child has no parent link (defensive; should not happen for a spawned
+    /// subagent).
+    fn subagentIndex(child: *ChildAgent) i64 {
+        if (child.child_conv.parent == null) return 0;
+        return @as(i64, child.child_conv.parent_subagent_id) + 1;
+    }
+
+    /// Format the parent conversation's live pane handle as the `n<u32>`
+    /// string the layout bindings use, or `""` when the parent has no live
+    /// tile (headless, or a backgrounded pane). Writes into `dest`. Mirrors
+    /// `WindowManager.handleString`'s inline-format to dodge an allocation.
+    fn parentPaneHandle(self: *LuaEngine, child: *ChildAgent, dest: []u8) []const u8 {
+        const parent_conv = child.child_conv.parent orelse return "";
+        const wm = self.window_manager orelse return "";
+        const handle = wm.paneHandleForConversation(parent_conv) orelse return "";
+        const packed_u32: u32 = @bitCast(handle);
+        return std.fmt.bufPrint(dest, "n{d}", .{packed_u32}) catch "";
     }
 
     /// Complete a finished workflow child: resume its awaiting coroutine with
