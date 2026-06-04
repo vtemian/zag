@@ -271,6 +271,13 @@ pub fn deinit(self: *EventOrchestrator) void {
     self.shutdownAgents();
     // shutdownAgents drives every in-flight child to completion, so the
     // registry is empty here; deinit only frees its backing ArrayList.
+    // Sever the engine's borrowed registry pointer before freeing it: the
+    // orchestrator owns this registry inline, and `lua_engine.deinitAsync`
+    // (now deferred to run after `orchestrator.destroy`) would otherwise
+    // dereference the freed storage via its `child_runner_registry`
+    // cancel/drain. The children are already drained above, so deinitAsync's
+    // registry passes are pure no-ops once the pointer is null.
+    if (self.lua_engine) |eng| eng.child_runner_registry = null;
     self.child_runner_registry.deinit();
     self.window_manager.deinit();
 }
