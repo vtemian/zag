@@ -13,11 +13,13 @@
 //!   and posts `.http_stream_line_done` jobs back through the engine
 //!   completion queue.
 //!
-//! v1 scope: GET only (body-less), no headers/status accessors on the
-//! handle, no keep-alive reuse, no auto-retry. `:close()` calls
-//! `posix.shutdown(fd, .both)` on the underlying socket so a helper
-//! thread blocked in `body_reader.stream(...)` returns immediately
-//! with an EOS/IO-error and the handle shuts down promptly.
+//! Scope: GET/POST/DELETE with an optional request body and request
+//! headers (see `StreamSpec`), plus `:status()` / `:header(name)`
+//! accessors snapshotting the response head. No keep-alive reuse, no
+//! auto-retry. `:close()` calls `posix.shutdown(fd, .both)` on the
+//! underlying socket so a helper thread blocked in
+//! `body_reader.stream(...)` returns immediately with an EOS/IO-error
+//! and the handle shuts down promptly.
 
 const std = @import("std");
 const test_net = @import("../../test_net.zig");
@@ -56,6 +58,23 @@ pub const State = enum(u8) {
     closed,
 };
 
+/// Request shape for a streaming connection. A bare
+/// `StreamSpec{}` reproduces the original body-less GET, so
+/// `zag.http.stream(url)` stays backward-identical. The binding caps
+/// `method` to GET/POST/DELETE; DELETE carries no body in practice but
+/// the field set stays uniform.
+pub const StreamSpec = struct {
+    method: std.http.Method = .GET,
+    /// Request body bytes, or null for a body-less request. Borrowed
+    /// from the binding's arena for the request's lifetime.
+    body: ?[]const u8 = null,
+    /// Content-Type to inject when `body != null` and no caller header
+    /// already set one. Empty means "don't inject".
+    content_type: []const u8 = "",
+    /// Extra request headers, borrowed from the binding's arena.
+    headers: []const job_mod.HttpHeader = &.{},
+};
+
 /// Heap-allocated handle state.
 pub const HttpStreamHandle = struct {
     /// Allocator that owns `self`, the arena, and every string we dup.
@@ -84,10 +103,14 @@ pub const HttpStreamHandle = struct {
     /// Body reader borrowed from `req` after `receiveHead`. Helper
     /// reads from this to pull the next chunk.
     body_reader: *std.Io.Reader,
-    /// HTTP status pulled out of `receiveHead`. Not exposed to Lua yet
-    /// (the task's out-of-scope list excludes accessors); kept so
-    /// debugging and future `:status()` work is one field away.
+    /// HTTP status pulled out of `receiveHead`. Exposed to Lua via
+    /// `:status()`.
     status: u16,
+    /// Response headers snapshot taken right after `receiveHead`. Names
+    /// and values are duped into the handle's arena, so they outlive the
+    /// transient `Response` value. Looked up case-insensitively by
+    /// `:header(name)`.
+    headers: []std.http.Header,
 
     /// Helper thread running `helperLoop`.
     helper: std.Thread,
@@ -138,20 +161,22 @@ pub const HttpStreamHandle = struct {
         OutOfMemory,
     };
 
-    /// Open a streaming GET connection up to receiveHead, then launch
-    /// the helper. Blocks the caller until headers are in; documented
+    /// Open a streaming connection up to receiveHead, then launch the
+    /// helper. Blocks the caller until headers are in; documented
     /// design knob: receiveHead is done on the calling thread, so a
     /// slow server shows up as latency at `zag.http.stream()` time.
     ///
-    /// `url` is already arena-owned by the caller (the binding dupes
-    /// it into `arena_ptr`'s arena before calling us). The arena is
-    /// adopted by the handle and freed in `shutdownAndCleanup`.
+    /// `url` and every slice reachable from `spec` are already
+    /// arena-owned by the caller (the binding dupes them into
+    /// `arena_ptr`'s arena before calling us). The arena is adopted by
+    /// the handle and freed in `shutdownAndCleanup`.
     pub fn init(
         alloc: Allocator,
         completions: *completion_mod.Queue,
         root_scope: *Scope,
         arena: *std.heap.ArenaAllocator,
         url: []const u8,
+        spec: StreamSpec,
     ) InitError!*HttpStreamHandle {
         const self = try alloc.create(HttpStreamHandle);
         errdefer alloc.destroy(self);
@@ -165,15 +190,48 @@ pub const HttpStreamHandle = struct {
             .req = undefined,
             .body_reader = undefined,
             .status = 0,
+            .headers = &.{},
             .helper = undefined,
         };
         errdefer self.client.deinit();
 
         const uri = std.Uri.parse(url) catch return error.InvalidUri;
 
-        self.req = self.client.request(.GET, uri, .{
-            .redirect_behavior = @enumFromInt(3),
+        // Build the extra-header list in the request's arena (the same
+        // arena that owns `url` and the spec slices). Reserve +1 slot
+        // for a possibly-injected Content-Type. Content-Type precedence
+        // mirrors the one-shot POST path: a caller-supplied Content-Type
+        // header wins, else `spec.content_type` when a body is present.
+        const arena_alloc = arena.allocator();
+        var std_headers: std.ArrayList(std.http.Header) = .empty;
+        std_headers.ensureTotalCapacity(arena_alloc, spec.headers.len + 1) catch return error.OutOfMemory;
+        var caller_set_content_type = false;
+        for (spec.headers) |h| {
+            std_headers.appendAssumeCapacity(.{ .name = h.name, .value = h.value });
+            if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+                caller_set_content_type = true;
+            }
+        }
+        if (spec.body != null and spec.content_type.len > 0 and !caller_set_content_type) {
+            std_headers.appendAssumeCapacity(.{
+                .name = "Content-Type",
+                .value = spec.content_type,
+            });
+        }
+
+        // A request carrying a body cannot safely auto-follow 307/308
+        // (we can't replay the payload), so mirror the one-shot path:
+        // bodied requests use `.unhandled`, body-less GET keeps the
+        // 3-hop redirect budget the stream primitive always allowed.
+        const redirect: std.http.Client.Request.RedirectBehavior = if (spec.body != null)
+            .unhandled
+        else
+            @enumFromInt(3);
+
+        self.req = self.client.request(spec.method, uri, .{
+            .redirect_behavior = redirect,
             .keep_alive = false,
+            .extra_headers = std_headers.items,
             .headers = .{
                 // Compressed bodies would defeat the line reader;
                 // body_reader would see gzip bytes, not text lines.
@@ -185,10 +243,35 @@ pub const HttpStreamHandle = struct {
         };
         errdefer self.req.deinit();
 
-        self.req.sendBodiless() catch |err| {
-            log.warn("http_stream: sendBodiless failed: {s}", .{@errorName(err)});
-            return mapHttpErr(err);
-        };
+        // Send the body the way the one-shot http path does
+        // (transfer_encoding + sendBodyUnflushed + end + flush), or a
+        // bodiless request when `spec.body` is null.
+        if (spec.body) |payload| {
+            self.req.transfer_encoding = .{ .content_length = payload.len };
+            var body_writer = self.req.sendBodyUnflushed(&.{}) catch |err| {
+                log.warn("http_stream: sendBodyUnflushed failed: {s}", .{@errorName(err)});
+                return mapHttpErr(err);
+            };
+            body_writer.writer.writeAll(payload) catch |err| {
+                log.warn("http_stream: body writeAll failed: {s}", .{@errorName(err)});
+                return mapHttpErr(err);
+            };
+            body_writer.end() catch |err| {
+                log.warn("http_stream: body end failed: {s}", .{@errorName(err)});
+                return mapHttpErr(err);
+            };
+            if (self.req.connection) |conn| {
+                conn.flush() catch |err| {
+                    log.warn("http_stream: body flush failed: {s}", .{@errorName(err)});
+                    return mapHttpErr(err);
+                };
+            }
+        } else {
+            self.req.sendBodiless() catch |err| {
+                log.warn("http_stream: sendBodiless failed: {s}", .{@errorName(err)});
+                return mapHttpErr(err);
+            };
+        }
 
         var redirect_buf: [2048]u8 = undefined;
         var response = self.req.receiveHead(&redirect_buf) catch |err| {
@@ -196,6 +279,15 @@ pub const HttpStreamHandle = struct {
             return mapHttpErr(err);
         };
         self.status = @intFromEnum(response.head.status);
+
+        // Snapshot the response headers into the arena before the
+        // `response` value (and its borrowed header storage) goes away.
+        // Arena-owned, so freed wholesale by `shutdownAndCleanup`'s
+        // `arena.deinit()`; no separate free path.
+        self.headers = captureHeaders(arena.allocator(), &response.head) catch |err| blk: {
+            log.warn("http_stream: captureHeaders failed: {s}", .{@errorName(err)});
+            break :blk &.{};
+        };
 
         // response is a value; its reader() method borrows from the
         // Request's connection. Since self.req is pinned (we live on
@@ -437,6 +529,38 @@ pub const HttpStreamHandle = struct {
         return line;
     }
 
+    /// Case-insensitive response-header lookup, backing `:header(name)`.
+    /// Returns the first matching value (arena-owned, lives as long as
+    /// the handle) or null when absent.
+    pub fn headerValue(self: *const HttpStreamHandle, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    /// Cap on captured response headers; mirrors streaming.zig's bound so
+    /// a pathological response can't balloon the arena.
+    const MAX_RESPONSE_HEADERS: usize = 64;
+
+    /// Snapshot response headers into `alloc` (the handle's arena). Both
+    /// name and value are duped so they outlive the transient `Response`.
+    /// Mirrors `StreamingResponse.captureHeaders` in src/llm/streaming.zig.
+    fn captureHeaders(
+        alloc: Allocator,
+        head: *const std.http.Client.Response.Head,
+    ) ![]std.http.Header {
+        var captured: std.ArrayList(std.http.Header) = .empty;
+        var it = head.iterateHeaders();
+        while (it.next()) |h| {
+            if (captured.items.len >= MAX_RESPONSE_HEADERS) break;
+            const name = try alloc.dupe(u8, h.name);
+            const value = try alloc.dupe(u8, h.value);
+            try captured.append(alloc, .{ .name = name, .value = value });
+        }
+        return captured.toOwnedSlice(alloc);
+    }
+
     /// Post the read-line completion. `line == null` encodes EOF.
     /// `thread_ref == 0` is not expected on this path but handled
     /// defensively (GC never triggers read_line).
@@ -626,7 +750,7 @@ test "HttpStreamHandle close interrupts blocked helper read" {
     arena_ptr.* = std.heap.ArenaAllocator.init(alloc);
     const url_dup = try arena_ptr.allocator().dupe(u8, url);
 
-    const handle = try HttpStreamHandle.init(alloc, &completions, root, arena_ptr, url_dup);
+    const handle = try HttpStreamHandle.init(alloc, &completions, root, arena_ptr, url_dup, .{});
 
     // Kick off one read_line. The helper will pull "line1" from the
     // buffered response, post the line back, and loop into another
@@ -662,6 +786,282 @@ test "HttpStreamHandle close interrupts blocked helper read" {
     const elapsed_ms = clock.milliTimestamp() - close_start;
 
     try testing.expect(elapsed_ms < 1000);
+}
+
+// Drive a stream handle to completion against a one-shot fixture server,
+// collecting every line into `out`. Shared by the POST / status / EOF
+// tests below so each only has to supply the server behaviour and the
+// StreamSpec. Returns once `:lines()` reports EOF (a null line).
+fn drainStream(
+    alloc: Allocator,
+    handle: *HttpStreamHandle,
+    completions: *completion_queue.Queue,
+    out: *std.ArrayList([]const u8),
+) !void {
+    var thread_ref: i32 = 100;
+    while (true) {
+        try handle.submit(.{ .read_line = .{ .thread_ref = thread_ref } });
+        thread_ref += 1;
+        const poll_start = clock.milliTimestamp();
+        const job = blk: while (true) {
+            if (completions.pop()) |j| break :blk j;
+            if (clock.milliTimestamp() - poll_start > 5000) return error.TestTimedOut;
+            clock.sleep(1 * std.time.ns_per_ms);
+        };
+        defer alloc.destroy(job);
+        if (job.kind.http_stream_line_done.line) |line| {
+            try out.append(alloc, line);
+        } else {
+            if (job.err_detail) |d| alloc.free(d);
+            break;
+        }
+    }
+}
+
+test "HttpStreamHandle POST sends method and body, streams response" {
+    std.testing.log_level = .err;
+    const alloc = testing.allocator;
+    const root = try @import("../Scope.zig").Scope.init(alloc, null);
+    defer root.deinit();
+
+    var completions = try completion_queue.Queue.init(alloc, 16);
+    defer {
+        while (completions.pop()) |j| alloc.destroy(j);
+        completions.deinit();
+    }
+
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
+
+    // The server records the full request it saw so the test can assert
+    // the method line and echo the body back as a response line.
+    const ServerCtx = struct {
+        request: [4096]u8 = undefined,
+        request_len: usize = 0,
+
+        fn run(ctx: *@This(), srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+
+            // Read until headers complete, then keep reading until we've
+            // pulled the declared content-length body.
+            var total: usize = 0;
+            var header_end: ?usize = null;
+            var content_length: usize = 0;
+            while (total < ctx.request.len) {
+                const n = test_net.streamRead(conn, ctx.request[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (header_end == null) {
+                    if (std.mem.indexOf(u8, ctx.request[0..total], "\r\n\r\n")) |idx| {
+                        header_end = idx + 4;
+                        const headers = ctx.request[0..idx];
+                        if (findHeaderValue(headers, "content-length")) |cl| {
+                            content_length = std.fmt.parseInt(usize, std.mem.trim(u8, cl, " "), 10) catch 0;
+                        }
+                    }
+                }
+                if (header_end) |he| {
+                    if (total - he >= content_length) break;
+                }
+            }
+            ctx.request_len = total;
+
+            const body = if (header_end) |he| ctx.request[he..total] else "";
+            var resp_buf: [4096]u8 = undefined;
+            const resp = std.fmt.bufPrint(&resp_buf,
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "\r\n" ++
+                "{s}\n", .{ body.len + 1, body }) catch return;
+            test_net.streamWriteAll(conn, resp) catch return;
+        }
+
+        // Case-insensitive header lookup over a raw header block; returns
+        // the value slice (sans leading space) or null.
+        fn findHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+            var it = std.mem.splitSequence(u8, headers, "\r\n");
+            while (it.next()) |line| {
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name)) {
+                    return line[colon + 1 ..];
+                }
+            }
+            return null;
+        }
+    };
+    var ctx: ServerCtx = .{};
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{ &ctx, &server });
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const arena_ptr = try alloc.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(alloc);
+    const url_dup = try arena_ptr.allocator().dupe(u8, url);
+
+    const handle = try HttpStreamHandle.init(alloc, &completions, root, arena_ptr, url_dup, .{
+        .method = .POST,
+        .body = "{\"hello\":\"world\"}",
+        .content_type = "application/json",
+    });
+    defer handle.shutdownAndCleanup();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |l| alloc.free(l);
+        lines.deinit(alloc);
+    }
+    try drainStream(alloc, handle, &completions, &lines);
+
+    const request = ctx.request[0..ctx.request_len];
+    try testing.expect(std.mem.startsWith(u8, request, "POST "));
+    try testing.expect(std.mem.indexOf(u8, request, "{\"hello\":\"world\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, request, "Content-Type: application/json") != null);
+
+    try testing.expectEqual(@as(usize, 1), lines.items.len);
+    try testing.expectEqualStrings("{\"hello\":\"world\"}", lines.items[0]);
+}
+
+test "HttpStreamHandle snapshots response status and headers" {
+    std.testing.log_level = .err;
+    const alloc = testing.allocator;
+    const root = try @import("../Scope.zig").Scope.init(alloc, null);
+    defer root.deinit();
+
+    var completions = try completion_queue.Queue.init(alloc, 16);
+    defer {
+        while (completions.pop()) |j| alloc.destroy(j);
+        completions.deinit();
+    }
+
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
+
+    const ServerCtx = struct {
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: text/event-stream\r\n" ++
+                "Mcp-Session-Id: abc123\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "\r\n" ++
+                "data\n";
+            test_net.streamWriteAll(conn, resp) catch return;
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const arena_ptr = try alloc.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(alloc);
+    const url_dup = try arena_ptr.allocator().dupe(u8, url);
+
+    const handle = try HttpStreamHandle.init(alloc, &completions, root, arena_ptr, url_dup, .{});
+    defer handle.shutdownAndCleanup();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |l| alloc.free(l);
+        lines.deinit(alloc);
+    }
+    try drainStream(alloc, handle, &completions, &lines);
+
+    try testing.expectEqual(@as(u16, 200), handle.status);
+    // Case-insensitive lookup of a header that's present.
+    try testing.expectEqualStrings("text/event-stream", handle.headerValue("content-type").?);
+    try testing.expectEqualStrings("text/event-stream", handle.headerValue("Content-Type").?);
+    try testing.expectEqualStrings("abc123", handle.headerValue("mcp-session-id").?);
+    // A header that isn't present returns null.
+    try testing.expect(handle.headerValue("missing") == null);
+}
+
+test "HttpStreamHandle delivers a single unterminated line at EOF" {
+    // Streamable HTTP `application/json` responses carry one JSON object
+    // with no trailing newline. The reader must hand that final
+    // unterminated chunk over before signalling EOF.
+    std.testing.log_level = .err;
+    const alloc = testing.allocator;
+    const root = try @import("../Scope.zig").Scope.init(alloc, null);
+    defer root.deinit();
+
+    var completions = try completion_queue.Queue.init(alloc, 16);
+    defer {
+        while (completions.pop()) |j| alloc.destroy(j);
+        completions.deinit();
+    }
+
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
+
+    const ServerCtx = struct {
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+
+            // Body is `{"x":1}`: 7 bytes, no trailing newline.
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: 7\r\n" ++
+                "\r\n" ++
+                "{\"x\":1}";
+            test_net.streamWriteAll(conn, resp) catch return;
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const arena_ptr = try alloc.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(alloc);
+    const url_dup = try arena_ptr.allocator().dupe(u8, url);
+
+    const handle = try HttpStreamHandle.init(alloc, &completions, root, arena_ptr, url_dup, .{});
+    defer handle.shutdownAndCleanup();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |l| alloc.free(l);
+        lines.deinit(alloc);
+    }
+    try drainStream(alloc, handle, &completions, &lines);
+
+    try testing.expectEqual(@as(usize, 1), lines.items.len);
+    try testing.expectEqualStrings("{\"x\":1}", lines.items[0]);
 }
 
 test {

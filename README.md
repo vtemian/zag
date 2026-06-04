@@ -191,6 +191,24 @@ The script returns a string, which becomes the tool result.
 
 ---
 
+## MCP servers
+
+zag is an [MCP](https://modelcontextprotocol.io) client. Declare servers in `config.lua` and the agent reaches their tools through a single `mcp` gateway tool, about 200 tokens, instead of 150 to 300 tokens of schema per individual tool. Connections are lazy, metadata is cached on disk, and stdio, Streamable HTTP, and OAuth-protected servers all work.
+
+```lua
+local mcp = require("zag.mcp")
+mcp.setup{
+  servers = {
+    context7 = { command = { "npx", "-y", "@upstash/context7-mcp" } },
+    linear   = { url = "https://mcp.linear.app/sse", auth = "oauth" },
+  },
+}
+```
+
+The model discovers tools with `mcp({ search = "..." })` and calls them with `mcp({ tool = "...", args = "{...}" })`. Servers with a small, stable surface can register their tools directly instead. Full reference, OAuth setup, and troubleshooting in [`docs/mcp.md`](docs/mcp.md).
+
+---
+
 ## Performance
 
 - Selective dirty-rectangle ANSI diff renderer — only changed cells update

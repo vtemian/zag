@@ -13,6 +13,7 @@ const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const async_job = @import("../Job.zig");
 const http_stream_mod = @import("../primitives/http_stream.zig");
+const http_callback_mod = @import("../primitives/http_callback.zig");
 const lua_json = @import("../lua_json.zig");
 
 /// `zag.http.get(url, opts?)`: synchronous-looking HTTP GET. Yields
@@ -357,21 +358,40 @@ pub const HttpStreamHandleUd = struct {
     pub const METATABLE_NAME = http_stream_mod.HttpStreamHandle.METATABLE_NAME;
 };
 
-/// `zag.http.stream(url, opts?)`: open a streaming GET and return
-/// a handle userdata with `:lines()` and `:close()`.
+/// Map a Lua-supplied method string (any case) to the streaming
+/// primitive's accepted set. DELETE is here for the MCP session
+/// teardown path; PUT/PATCH/etc. are intentionally rejected until a
+/// caller needs them. Returns null for anything unrecognized.
+fn parseStreamMethod(s: []const u8) ?std.http.Method {
+    if (std.ascii.eqlIgnoreCase(s, "GET")) return .GET;
+    if (std.ascii.eqlIgnoreCase(s, "POST")) return .POST;
+    if (std.ascii.eqlIgnoreCase(s, "DELETE")) return .DELETE;
+    return null;
+}
+
+/// `zag.http.stream(url, opts?)`: open a streaming connection and
+/// return a handle userdata with `:lines()`, `:close()`, `:status()`,
+/// and `:header(name)`.
 ///
-/// `opts` is reserved for future use; v1 accepts the arg so
-/// callers don't have to pass nil but ignores its contents. Body-
-/// less GET only; streaming POST lands later.
+/// `opts` is an optional table mirroring `zag.http.post`:
+///   - `method`: string, upper-cased; one of GET/POST/DELETE (default
+///     GET). Anything else raises.
+///   - `body`: string (raw bytes) OR table (auto-encoded to JSON).
+///   - `content_type`: string. Overrides the defaults below.
+///   - `headers`: map of string->string request headers.
+///
+/// Content-Type behaviour matches `zag.http.post` (only when `body` is
+/// non-nil): caller `headers["Content-Type"]` wins, else
+/// `opts.content_type`, else `"application/json"` for table bodies.
+///
+/// `zag.http.stream(url)` with no opts stays a body-less GET.
 ///
 /// Returns `(handle, nil)` on success, `(nil, err)` on failure.
 fn zagHttpStreamFn(co: *Lua) i32 {
     const engine = LuaEngine.getEngineFromState(co);
 
     const url_raw = co.checkString(1);
-    // opts slot 2 is reserved for future wire-up; unused in v1.
-    // Leaving the arg shape stable keeps 7.5/8.x additions
-    // non-breaking for callers that already pass `nil` or `{}`.
+    const opts_idx: i32 = 2;
 
     const root = engine.root_scope orelse {
         co.raiseErrorStr("zag.http.stream: async runtime not initialized", .{});
@@ -395,6 +415,98 @@ fn zagHttpStreamFn(co: *Lua) i32 {
         co.raiseErrorStr("zag.http.stream url dupe failed", .{});
     };
 
+    // Parse opts into a StreamSpec backed by the same arena. On any
+    // parse error we free the arena before raising (longjmp-safe: no
+    // userdata exists on the stack yet).
+    var method: std.http.Method = .GET;
+    var headers: std.ArrayList(async_job.HttpHeader) = .empty;
+    var body_slice: ?[]const u8 = null;
+    var body_was_table = false;
+    var content_type: []const u8 = "";
+
+    if (co.isTable(opts_idx)) {
+        _ = co.getField(opts_idx, "method");
+        if (co.isString(-1)) {
+            const m = co.toString(-1) catch "";
+            method = parseStreamMethod(m) orelse {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.http.stream method must be GET, POST, or DELETE", .{});
+            };
+        }
+        co.pop(1);
+
+        _ = co.getField(opts_idx, "content_type");
+        if (co.isString(-1)) {
+            const s = co.toString(-1) catch "";
+            content_type = arena.dupe(u8, s) catch {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.http.stream content_type dupe failed", .{});
+            };
+        }
+        co.pop(1);
+
+        _ = co.getField(opts_idx, "headers");
+        if (co.isTable(-1)) {
+            co.pushNil();
+            while (co.next(-2)) {
+                if (!co.isString(-2) or !co.isString(-1)) {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.http.stream headers entries must be string->string", .{});
+                }
+                const k = co.toString(-2) catch "";
+                const v = co.toString(-1) catch "";
+                const name = arena.dupe(u8, k) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.http.stream header dupe failed", .{});
+                };
+                const val = arena.dupe(u8, v) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.http.stream header dupe failed", .{});
+                };
+                headers.append(arena, .{ .name = name, .value = val }) catch {
+                    arena_ptr.deinit();
+                    engine.allocator.destroy(arena_ptr);
+                    co.raiseErrorStr("zag.http.stream headers append failed", .{});
+                };
+                co.pop(1);
+            }
+        }
+        co.pop(1); // pop headers table (or nil)
+
+        // Body is string OR table. Table → JSON; string → raw; nil → none.
+        _ = co.getField(opts_idx, "body");
+        if (co.isTable(-1)) {
+            body_was_table = true;
+            const json = lua_json.luaTableToJson(co, -1, arena) catch {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.http.stream body JSON encode failed", .{});
+            };
+            body_slice = json;
+        } else if (co.isString(-1)) {
+            const s = co.toString(-1) catch "";
+            body_slice = arena.dupe(u8, s) catch {
+                arena_ptr.deinit();
+                engine.allocator.destroy(arena_ptr);
+                co.raiseErrorStr("zag.http.stream body dupe failed", .{});
+            };
+        }
+        co.pop(1); // pop body
+    }
+
+    // Default Content-Type for table bodies when the caller gave no
+    // explicit hint; string bodies stay opaque unless asked.
+    if (body_slice != null and body_was_table and content_type.len == 0) {
+        content_type = "application/json";
+    }
+
+    const headers_slice = headers.toOwnedSlice(arena) catch &.{};
+
     // Pre-create the userdata with a null ptr + metatable BEFORE
     // HttpStreamHandle.init, so a Lua longjmp between newUserdata
     // and setMetatable can't land on a typed userdata without a
@@ -410,6 +522,12 @@ fn zagHttpStreamFn(co: *Lua) i32 {
         root,
         arena_ptr,
         url,
+        .{
+            .method = method,
+            .body = body_slice,
+            .content_type = content_type,
+            .headers = headers_slice,
+        },
     ) catch |err| {
         // Init failed before the helper thread launched; arena
         // is still ours, free it and surface an error tuple. The
@@ -511,6 +629,34 @@ fn httpStreamClose(co: *Lua) i32 {
     return 0;
 }
 
+/// `HttpStreamHandle:status()`: the HTTP status code of the response,
+/// as an integer (e.g. 200). Available immediately after
+/// `zag.http.stream` returns, since `init` blocks through `receiveHead`.
+fn httpStreamStatus(co: *Lua) i32 {
+    const ud = co.checkUserdata(HttpStreamHandleUd, 1, HttpStreamHandleUd.METATABLE_NAME);
+    const h = ud.ptr orelse {
+        co.raiseErrorStr("http_stream:status: invalid handle", .{});
+    };
+    co.pushInteger(@intCast(h.status));
+    return 1;
+}
+
+/// `HttpStreamHandle:header(name)`: case-insensitive response-header
+/// lookup. Returns the value string, or nil when the header is absent.
+fn httpStreamHeader(co: *Lua) i32 {
+    const ud = co.checkUserdata(HttpStreamHandleUd, 1, HttpStreamHandleUd.METATABLE_NAME);
+    const h = ud.ptr orelse {
+        co.raiseErrorStr("http_stream:header: invalid handle", .{});
+    };
+    const name = co.checkString(2);
+    if (h.headerValue(name)) |value| {
+        _ = co.pushString(value);
+    } else {
+        co.pushNil();
+    }
+    return 1;
+}
+
 /// `__gc` metamethod for HttpStreamHandle userdata. Joins the
 /// helper and frees the handle. Idempotent: if `:close()` was
 /// called previously the helper is already winding down and the
@@ -520,6 +666,127 @@ fn httpStreamGc(lua: *Lua) i32 {
     const h = ud.ptr orelse return 0;
     h.shutdownAndCleanup();
     return 0;
+}
+
+/// `zag.http.await_callback{ port = 19876, path = "/callback",
+/// timeout_ms = 300000 }`: bind a one-shot loopback listener, yield the
+/// coroutine, and resume with `(params_table, nil)` once a single GET on
+/// `path` arrives (query params URL-decoded into a string->string table),
+/// or `(nil, "timeout" | "cancelled" | err)` on failure. Purpose-built
+/// for the OAuth redirect leg.
+///
+/// `port` is required (the OAuth `redirect_uri` pins it); `path`
+/// defaults to "/callback"; `timeout_ms` defaults to 300000 (5 min).
+/// A bind failure (port in use) surfaces synchronously as `(nil, err)`
+/// before the coroutine yields.
+fn zagHttpAwaitCallbackFn(co: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(co);
+
+    if (!co.isYieldable()) {
+        co.raiseErrorStr("zag.http.await_callback must be called inside zag.async/hook/keymap", .{});
+    }
+    if (!co.isTable(1)) {
+        co.raiseErrorStr("zag.http.await_callback: arg 1 must be an opts table", .{});
+    }
+
+    // port (required, 1..65535).
+    _ = co.getField(1, "port");
+    if (!co.isInteger(-1)) {
+        co.raiseErrorStr("zag.http.await_callback: opts.port (integer) is required", .{});
+    }
+    const port_raw = co.toInteger(-1) catch 0;
+    co.pop(1);
+    if (port_raw < 1 or port_raw > 65535) {
+        co.raiseErrorStr("zag.http.await_callback: opts.port must be in 1..65535", .{});
+    }
+    const port: u16 = @intCast(port_raw);
+
+    // path (optional, default "/callback"). Copied below into the
+    // listener's own allocation, so a transient stack/Lua string is fine.
+    var path: []const u8 = http_callback_mod.DEFAULT_PATH;
+    _ = co.getField(1, "path");
+    if (co.isString(-1)) {
+        path = co.toString(-1) catch http_callback_mod.DEFAULT_PATH;
+    }
+    // Leave the path string on the stack until after init copies it.
+
+    // timeout_ms (optional, default 5 min). 0 disables the timeout.
+    var timeout_ms: u64 = 300_000;
+    _ = co.getField(1, "timeout_ms");
+    if (co.isInteger(-1)) {
+        const v = co.toInteger(-1) catch 300_000;
+        timeout_ms = if (v < 0) 0 else @intCast(v);
+    }
+    co.pop(1);
+
+    const runtime = engine.async_runtime orelse {
+        co.pop(1); // path
+        co.raiseErrorStr("zag.http.await_callback: async runtime not initialized", .{});
+    };
+    const completions = runtime.completions;
+
+    const task = engine.taskForCoroutine(co) orelse {
+        co.pop(1); // path
+        co.raiseErrorStr("zag.http.await_callback: no task for this coroutine", .{});
+    };
+
+    // Bind synchronously (before any yield) so a port-in-use error is a
+    // clean (nil, err) tuple rather than a deferred surprise. The
+    // listener owns its own copy of `path`.
+    const listener = http_callback_mod.HttpCallbackListener.init(
+        engine.allocator,
+        completions,
+        task.scope,
+        port,
+        path,
+        timeout_ms,
+        task.thread_ref,
+    ) catch |err| {
+        co.pop(1); // path
+        co.pushNil();
+        _ = co.pushString(switch (err) {
+            error.AddressInUse => "address_in_use",
+            error.BindFailed => "bind_failed",
+            error.SpawnFailed => "io_error: spawn failed",
+            error.OutOfMemory => "io_error: oom",
+        });
+        return 2;
+    };
+    co.pop(1); // path (init copied it)
+
+    // Register a scope abort-carrier so a turn cancel shuts the listener
+    // socket down promptly. The listener takes ownership of the Job and
+    // unregisters + frees it in shutdownAndCleanup (main thread).
+    const abort_job = engine.allocator.create(async_job.Job) catch {
+        // The listener thread is already running; tear it down so we
+        // don't leak the helper, then surface OOM.
+        listener.shutdownAndCleanup();
+        co.raiseErrorStr("zag.http.await_callback: abort job alloc failed", .{});
+    };
+    abort_job.* = .{
+        .kind = .{ .sleep = .{ .ms = 0 } }, // carrier only; never executed
+        .thread_ref = task.thread_ref,
+        .scope = task.scope,
+        .aborter = listener.aborter(),
+    };
+    task.scope.registerJob(abort_job) catch {
+        engine.allocator.destroy(abort_job);
+        listener.shutdownAndCleanup();
+        co.raiseErrorStr("zag.http.await_callback: abort job register failed", .{});
+    };
+    listener.attachAbortJob(abort_job);
+
+    // Record the listener on the task so a teardown that retires this parked
+    // coroutine (engine shutdown) joins the helper + frees the listener before
+    // freeing the scope/queue the helper still points at. resumeFromJob clears
+    // this once the single completion lands.
+    task.pending_callback_listener = listener;
+
+    // If the scope was already cancelled before we registered, the
+    // helper's first isCancelled() check posts `cancelled` promptly; no
+    // special-case needed here.
+    co.yield(0);
+    // yield is noreturn on Lua 5.4.
 }
 
 /// Build the plain `zag.http` namespace table (with `get`, `post`,
@@ -537,6 +804,8 @@ pub fn registerOn(lua: *Lua) void {
     lua.setField(-2, "post"); // zag.http.post = fn; [zag_table, http_table]
     lua.pushFunction(zlua.wrap(zagHttpStreamFn));
     lua.setField(-2, "stream"); // zag.http.stream = fn; [zag_table, http_table]
+    lua.pushFunction(zlua.wrap(zagHttpAwaitCallbackFn));
+    lua.setField(-2, "await_callback"); // zag.http.await_callback = fn
     lua.setField(-2, "http"); // zag.http = http_table; [zag_table]
 }
 
@@ -550,6 +819,10 @@ pub fn registerHandleMetatable(lua: *Lua) !void {
     lua.setField(-2, "lines");
     lua.pushFunction(zlua.wrap(httpStreamClose));
     lua.setField(-2, "close");
+    lua.pushFunction(zlua.wrap(httpStreamStatus));
+    lua.setField(-2, "status");
+    lua.pushFunction(zlua.wrap(httpStreamHeader));
+    lua.setField(-2, "header");
     lua.pushValue(-1);
     lua.setField(-2, "__index");
     lua.pushFunction(zlua.wrap(httpStreamGc));

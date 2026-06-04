@@ -227,6 +227,11 @@ pub const LuaToolRequest = struct {
     result_owned: bool,
     /// If set, tool execution failed; caller surfaces as an error.
     error_name: ?[]const u8,
+    /// Set by the parked tool thread to request cancellation. The
+    /// per-tick main-thread sweep observes it and cancels the tool
+    /// coroutine's scope ON MAIN (same contract as
+    /// WorkflowRequest.cancel_requested: never touch the scope off-main).
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 pub const Hook = struct {
