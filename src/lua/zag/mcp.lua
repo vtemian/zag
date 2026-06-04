@@ -620,6 +620,232 @@ function http_send_reply(srv, msg)
 end
 
 -- ---------------------------------------------------------------------------
+-- Legacy SSE transport (Milestone G3, MCP 2024-11-05 "HTTP+SSE")
+--
+-- The pre-Streamable transport splits the two directions across connections:
+--   * a long-lived GET event stream (Accept: text/event-stream) carries every
+--     server->client message, including JSON-RPC responses;
+--   * the FIRST event on that stream is an `endpoint` event whose data is the
+--     URL to POST client->server messages to (resolved against srv.url);
+--   * each request is POSTed there (202 expected); its response arrives back
+--     on the GET stream and is matched by id.
+--
+-- Because reading the GET stream blocks (yields per line) and requests must be
+-- POSTed concurrently, a per-server reader coroutine (`srv.sse_reader`,
+-- spawned via zag.spawn) owns the GET stream's `:lines()` loop. Requests
+-- register a pending slot keyed by id; the reader fills the slot when the
+-- matching response lands. The requester busy-waits on its slot under the
+-- request deadline. Reader death (EOF/error) marks the server disconnected
+-- and fails every pending slot so no requester hangs.
+-- ---------------------------------------------------------------------------
+
+-- Resolve a (possibly relative) endpoint URL from an `endpoint` event against
+-- the server's base url. Handles absolute URLs, absolute paths (/foo), and a
+-- relative tail. Minimal by design: MCP servers emit absolute paths or full
+-- URLs in practice.
+local function resolve_endpoint(base, endpoint)
+  if endpoint:match("^https?://") then return endpoint end
+  local scheme, host = base:match("^(https?://)([^/]+)")
+  if not scheme then return endpoint end
+  if endpoint:sub(1, 1) == "/" then
+    return scheme .. host .. endpoint
+  end
+  -- Relative to the base path's directory.
+  local dir = base:match("^(https?://[^?#]*/)") or (scheme .. host .. "/")
+  return dir .. endpoint
+end
+
+-- Deliver one decoded server->client message into the SSE machinery: route a
+-- response to its pending slot, answer/refuse a server-initiated request, or
+-- drop a notification.
+local function sse_route_message(srv, msg)
+  if msg.id ~= nil and (msg.result ~= nil or msg.error ~= nil) then
+    -- A response. Hand it to the waiting requester's slot.
+    local slot = srv.sse_pending and srv.sse_pending[msg.id]
+    if slot then
+      if msg.error then
+        slot.err = "rpc error: " .. tostring(msg.error.message or msg.error.code)
+      else
+        slot.result = msg.result or {}
+      end
+      slot.empty = false
+    end
+  elseif msg.method ~= nil and msg.id ~= nil then
+    -- Server-initiated request: answer ping, refuse the rest (over POST).
+    if msg.method == "ping" then
+      rpc_reply(srv, msg.id, {})
+    else
+      rpc_reply(srv, msg.id, nil,
+        { code = -32601, message = "method not found: " .. tostring(msg.method) })
+    end
+  else
+    -- A notification (method, no id): dropped in v1.
+  end
+end
+
+-- Fail every pending request slot (reader died / disconnect). Requesters
+-- waiting on `slot.empty` see the error and bail.
+local function sse_fail_pending(srv, reason)
+  if not srv.sse_pending then return end
+  for _, slot in pairs(srv.sse_pending) do
+    if slot.empty then
+      slot.err = reason
+      slot.empty = false
+    end
+  end
+end
+
+-- The per-server reader coroutine body. Owns the GET stream's :lines() loop:
+-- parses SSE events, captures the endpoint, and routes message events. On EOF
+-- or error it marks the server disconnected and fails all pending slots.
+local function sse_reader_loop(srv, stream)
+  local parser = sse_new()
+  for line in stream:lines() do
+    local ev = sse_feed(parser, line)
+    if ev then
+      if ev.event == "endpoint" then
+        srv.sse_endpoint = resolve_endpoint(srv.url, ev.data)
+      elseif ev.data and #ev.data > 0 then
+        local msg = zag.json.decode(ev.data)
+        if type(msg) == "table" then
+          sse_route_message(srv, msg)
+        end
+      end
+    end
+  end
+  -- Stream ended: the connection is dead. `sse_dead` (not `status`) is the
+  -- liveness signal the connect / request waiters poll, because `status` is
+  -- still "disconnected" during the connect handshake itself.
+  srv.sse_dead = true
+  srv.sse_endpoint = nil
+  srv.status = "disconnected"
+  sse_fail_pending(srv, "connection closed")
+end
+
+-- POST one JSON-RPC message to the legacy endpoint, expecting 202. Returns
+-- (true, nil) or (nil, err). Used for requests (the response comes back on the
+-- GET stream), notifications, and server-request replies.
+local function sse_post(srv, msg)
+  if not srv.sse_endpoint then return nil, "no SSE endpoint yet" end
+  local resp, err = zag.http.post(srv.sse_endpoint, {
+    body = msg,
+    content_type = "application/json",
+    headers = (function()
+      local h = {}
+      local a = auth_header(srv)
+      if a then h["Authorization"] = a end
+      return h
+    end)(),
+  })
+  if not resp then return nil, "http error: " .. tostring(err) end
+  -- 202 Accepted is the spec answer; 200 is tolerated.
+  if resp.status == 202 or resp.status == 200 then return true end
+  return nil, string.format("http status %d", resp.status)
+end
+
+-- Legacy-SSE request seam: register a pending slot, POST the request, then
+-- busy-wait on the slot under the deadline while the reader coroutine drives
+-- the GET stream.
+function sse_send_request(srv, msg, deadline)
+  srv.sse_pending = srv.sse_pending or {}
+  local slot = { empty = true }
+  srv.sse_pending[msg.id] = slot
+
+  local ok, err = sse_post(srv, msg)
+  if not ok then
+    srv.sse_pending[msg.id] = nil
+    return nil, err
+  end
+
+  while slot.empty do
+    if srv.sse_dead then
+      srv.sse_pending[msg.id] = nil
+      return nil, "connection closed"
+    end
+    if M._now() >= deadline then
+      srv.sse_pending[msg.id] = nil
+      return nil, "timeout"
+    end
+    zag.sleep(10)
+  end
+
+  srv.sse_pending[msg.id] = nil
+  if slot.err then return nil, slot.err end
+  return slot.result or {}, nil
+end
+
+function sse_send_notification(srv, msg)
+  return sse_post(srv, msg)
+end
+
+function sse_send_reply(srv, msg)
+  return sse_post(srv, msg)
+end
+
+-- Open the legacy SSE transport: GET the event stream, spawn the reader
+-- coroutine, wait for the endpoint event, then run the shared initialize
+-- handshake. Returns (true, nil) or (nil, err).
+function sse_connect(srv)
+  srv.transport_mode = "sse"
+  srv.next_id = 0
+  srv.busy = false
+  srv.sse_pending = {}
+  srv.sse_endpoint = nil
+  srv.sse_dead = false
+
+  local stream, err = zag.http.stream(srv.url, {
+    method = "GET",
+    headers = (function()
+      local h = { Accept = "text/event-stream" }
+      local a = auth_header(srv)
+      if a then h["Authorization"] = a end
+      return h
+    end)(),
+  })
+  if not stream then return nil, "sse connect failed: " .. tostring(err) end
+  if stream:status() ~= 200 then
+    local s = stream:status()
+    stream:close()
+    return nil, string.format("sse connect: http status %d", s)
+  end
+  srv.sse_stream = stream
+
+  -- Spawn the per-server reader coroutine; keep the handle for teardown.
+  srv.sse_reader = zag.spawn(function() sse_reader_loop(srv, stream) end)
+
+  -- Wait for the endpoint event (the reader sets srv.sse_endpoint). Bounded by
+  -- the per-request timeout so a broken server does not hang connect forever.
+  local deadline = M._now() + math.ceil((srv.request_timeout_ms or DEFAULT_REQUEST_TIMEOUT_MS) / 1000)
+  while not srv.sse_endpoint do
+    if srv.sse_dead then
+      return nil, "sse stream closed before endpoint event"
+    end
+    if M._now() >= deadline then
+      disconnect(srv)
+      return nil, "timed out waiting for SSE endpoint event"
+    end
+    zag.sleep(10)
+  end
+
+  -- Shared initialize handshake (routes through sse_send_request).
+  local init_result, init_err = rpc_request(srv, "initialize", {
+    protocolVersion = PROTOCOL_VERSION,
+    capabilities = { tools = {} },
+    clientInfo = { name = "zag", version = CLIENT_VERSION },
+  })
+  if not init_result then
+    disconnect(srv)
+    return nil, "initialize failed: " .. tostring(init_err)
+  end
+
+  srv.protocol_version = PROTOCOL_VERSION
+  rpc_notify(srv, "notifications/initialized", nil)
+  srv.status = "connected"
+  srv.last_used = M._now()
+  return true
+end
+
+-- ---------------------------------------------------------------------------
 -- Connect / disconnect
 -- ---------------------------------------------------------------------------
 
@@ -1316,6 +1542,7 @@ local function http_disconnect(srv)
   srv.transport_mode = nil
   srv.sse_endpoint = nil
   srv.sse_pending = nil
+  srv.sse_dead = true
   srv.status = "disconnected"
 end
 
@@ -1777,6 +2004,7 @@ M._test = {
   -- G2/G3 transport internals.
   auth_header = function(srv) return auth_header(srv) end,
   http_headers = function(srv, accept) return http_headers(srv, accept) end,
+  resolve_endpoint = function(base, ep) return resolve_endpoint(base, ep) end,
 }
 
 return M
