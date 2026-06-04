@@ -68,6 +68,13 @@ pub const HttpCallbackListener = struct {
     /// Set the first time we shut the listening socket down (cancel or
     /// teardown), so a racing cancel + GC don't double-shutdown.
     shutdown_done: std.atomic.Value(bool) = .init(false),
+    /// Set by `shutdownAndCleanup` BEFORE it shuts the socket down, so the
+    /// helper woken by that shutdown returns WITHOUT posting a completion.
+    /// At engine teardown `shutdownAndCleanup` runs after the completion
+    /// queue has already been freed; a post then would be a use-after-free
+    /// (and the job would leak, since nothing drains it). The helper checks
+    /// this before every `post*`.
+    tearing_down: std.atomic.Value(bool) = .init(false),
     /// Set once `shutdownAndCleanup` has joined + freed, guarding a
     /// double cleanup from a cancel path racing the resume path.
     cleaned_up: bool = false,
@@ -331,6 +338,16 @@ pub const HttpCallbackListener = struct {
     }
 
     fn postDone(self: *HttpCallbackListener, params: []const job_mod.HttpCallbackParam) void {
+        // Teardown freed the completion queue: drop the result rather than
+        // push into freed memory. Free the params we would have handed off.
+        if (self.tearing_down.load(.acquire)) {
+            for (params) |p| {
+                self.alloc.free(p.name);
+                self.alloc.free(p.value);
+            }
+            if (params.len > 0) self.alloc.free(params);
+            return;
+        }
         const job = self.alloc.create(Job) catch |err| {
             log.err("await_callback done alloc failed: {s}", .{@errorName(err)});
             for (params) |p| {
@@ -349,6 +366,9 @@ pub const HttpCallbackListener = struct {
     }
 
     fn postErr(self: *HttpCallbackListener, tag: job_mod.ErrTag) void {
+        // Teardown freed the completion queue: a push would be a UAF and the
+        // job would leak unconsumed, so drop it.
+        if (self.tearing_down.load(.acquire)) return;
         const job = self.alloc.create(Job) catch |err| {
             log.err("await_callback err alloc failed: {s}", .{@errorName(err)});
             return;
@@ -391,6 +411,12 @@ pub const HttpCallbackListener = struct {
     pub fn shutdownAndCleanup(self: *HttpCallbackListener) void {
         if (self.cleaned_up) return;
         self.cleaned_up = true;
+
+        // Suppress the helper's post BEFORE we wake it: at engine teardown
+        // the completion queue is already freed, so the `.cancelled` the
+        // shutdown wake would otherwise trigger must be dropped, not pushed.
+        // Set before `shutdownSocket` so the wake is observed after the flag.
+        self.tearing_down.store(true, .release);
 
         // Wake a blocked accept/poll so the helper exits promptly.
         self.shutdownSocket();

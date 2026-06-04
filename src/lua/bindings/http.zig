@@ -631,6 +631,12 @@ fn zagHttpAwaitCallbackFn(co: *Lua) i32 {
     };
     listener.attachAbortJob(abort_job);
 
+    // Record the listener on the task so a teardown that retires this parked
+    // coroutine (engine shutdown) joins the helper + frees the listener before
+    // freeing the scope/queue the helper still points at. resumeFromJob clears
+    // this once the single completion lands.
+    task.pending_callback_listener = listener;
+
     // If the scope was already cancelled before we registered, the
     // helper's first isCancelled() check posts `cancelled` promptly; no
     // special-case needed here.
