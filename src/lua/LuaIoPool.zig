@@ -113,7 +113,7 @@ pub const Pool = struct {
             if (job.scope.isCancelled()) {
                 job.err_tag = .cancelled;
             } else {
-                executeJob(self.alloc, job);
+                executeJob(self.alloc, job, &self.shutdown);
             }
             // The finished job is the only handle that resumes the waiting
             // coroutine, so dropping it would strand that coroutine forever.
@@ -142,7 +142,13 @@ pub const Pool = struct {
 /// Dispatch a job based on its kind. Module-scope so it can be exercised
 /// without instantiating a Pool. Each variant is responsible for filling
 /// either job.result (success) or job.err_tag (failure), not both.
-fn executeJob(alloc: Allocator, job: *Job) void {
+///
+/// `shutdown` is the owning pool's teardown flag (null in standalone tests
+/// that drive `executeJob` without a Pool). A long-sleeping worker must
+/// observe it so `Pool.deinit`'s join can't stall for the full sleep window
+/// (a detached poller parked in `zag.sleep(30000)` at teardown would
+/// otherwise block shutdown for up to 30s).
+fn executeJob(alloc: Allocator, job: *Job, shutdown: ?*const std.atomic.Value(bool)) void {
     switch (job.kind) {
         .sleep => |s| {
             const deadline = clock.milliTimestamp() + @as(i64, @intCast(s.ms));
@@ -150,6 +156,12 @@ fn executeJob(alloc: Allocator, job: *Job) void {
                 if (job.scope.isCancelled()) {
                     job.err_tag = .cancelled;
                     return;
+                }
+                if (shutdown) |sd| {
+                    if (sd.load(.acquire)) {
+                        job.err_tag = .cancelled;
+                        return;
+                    }
                 }
                 clock.sleep(10 * std.time.ns_per_ms);
             }

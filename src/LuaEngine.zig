@@ -3619,6 +3619,21 @@ pub const LuaEngine = struct {
             // task about to be destroyed; no need to null the field
         }
 
+        // A task force-retired at shutdown while parked on a pool job (the
+        // common case is a detached poller in `zag.sleep`) still owns the
+        // submitted Job via `pending_job`. The normal completion path nulls
+        // this in `resumeFromJob` before freeing, so a non-null value here
+        // means the job was abandoned by the (already torn-down) pool and
+        // nobody else will free it. The worker is joined by the time
+        // `deinitAsync` reaches the force-retire loop, so there is no live
+        // reference to race with. Without this, every `zag.sleep`-parked
+        // detached coroutine leaks its Job at engine teardown.
+        if (task.pending_job) |job| {
+            if (job.err_detail) |d| self.allocator.free(d);
+            self.allocator.destroy(job);
+            task.pending_job = null;
+        }
+
         // A task retiring while it still awaits a workflow child means the
         // coroutine is being torn down out from under a child whose agent
         // thread may still be live. We MUST NOT deinit the child here: direct
