@@ -157,7 +157,7 @@ src/
   CommandRegistry.zig       slash-command registry
   Sink.zig                  event sink interface (transcript, collector, null)
   skills.zig                skill discovery (AGENTS.md / agent skills)
-  subagents.zig             subagent spawn/wait/cancel
+  ChildAgent.zig            reusable inline-subagent spawn/drain/teardown machinery
   frontmatter.zig           YAML frontmatter parser
   json_schema.zig           JSON Schema subset for tool input validation
   ulid.zig                  ULID generator for session and event ids
@@ -190,7 +190,8 @@ src/
     edit.zig                exact text replacement
     bash.zig                shell command execution (with seatbelt on macOS)
     layout.zig              window-system mutation tool
-    task.zig                spawn subagent (child Conversation) via task tool
+    task.zig                spawn one inline subagent (child Conversation) and return its result
+    workflow.zig            run a Lua orchestration script that spawns/coordinates many subagents
 
   Session.zig               JSONL session persistence and management
   Conversation.zig          conversation (tree, registry, persistence,
@@ -266,6 +267,59 @@ src/
     phase1_e2e_test.zig      end-to-end smoke test
     scenarios/               .zsm scenarios hitting the user's real provider
 ```
+
+## Subagents & workflows
+
+The model has two always-on tools for delegating work to subagents. There is no
+named-agent catalog: every subagent is described inline at spawn time.
+
+**`task` — one-shot delegation.** Spawn a single subagent, block until it
+finishes, and get its result back as the tool result. Input:
+
+| field    | required | meaning                                                                 |
+|----------|----------|-------------------------------------------------------------------------|
+| `prompt` | yes      | the task for the subagent                                               |
+| `system` | no       | persona/system prompt prepended to the task                             |
+| `tools`  | no       | allowlist of tool names (a subset of the caller's); omit to inherit all |
+| `model`  | no       | model override — carried but inert in v1 (the child uses the parent's)  |
+| `schema` | no       | JSON-schema string; forces structured output (see below)               |
+| `name`   | no       | display name in the transcript (default `"subagent"`)                   |
+
+**`workflow` — orchestration.** Spawn and coordinate many subagents by writing a
+Lua script. The script runs as a main-thread coroutine and may call:
+
+- `zag.task{ prompt=, system=, tools=, model=, schema=, name= }` — spawn a
+  subagent and yield until it finishes. Returns `{summary=, is_error=}`, plus a
+  decoded `output` table when `schema` is set, so the script can branch on the
+  result.
+- `zag.workflow.parallel(fns)` — run worker functions concurrently, bounded by
+  the fan-out window.
+- `zag.workflow.pipeline(items, stage1, stage2, ...)` — thread each item through
+  the stages, bounded by the same window.
+- `zag.workflow.max_fanout()` / `zag.workflow.set_max_fanout(n)` — read/tune the
+  per-level concurrency bound (default 8). The one knob an author tunes against
+  provider rate limits.
+
+The script returns a string, which becomes the tool result.
+
+**Structured output.** Pass a `schema` (to `task`) or `schema` (to `zag.task`)
+and the subagent's final turn is forced to emit one matching JSON object; the
+validated object is returned in place of the prose summary. A schema-violating
+emit returns an error. The validator (`json_schema.zig`) supports `enum`,
+`pattern`, nested objects, and `additionalProperties`.
+
+**Nesting & bounds.** Subagents inherit `task` + `workflow` by default, so a
+subagent can spawn its own children or run its own workflow. Two orthogonal
+limits keep this bounded: the per-level fan-out window (`max_fanout`) caps
+concurrent siblings, and a hard depth backstop of 8 (`ChildAgent.max_task_depth`)
+caps the delegation chain. Hand a subagent a narrower `tools` list to force a
+leaf.
+
+**Headless limitation.** Under `claude --headless` / the eval `Harness` there is
+no main-thread child drainer, so the `workflow` tool returns an error
+(`workflow requires an orchestrator (headless/no child drainer)`) rather than
+spawning undrained children. The `task` tool still works headless (it drains on
+its own thread).
 
 ## Commit messages
 ```
