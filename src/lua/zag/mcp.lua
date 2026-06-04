@@ -292,8 +292,11 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Forward declarations: the http/sse back-ends, connect/disconnect, and the
--- per-server reader coroutine reference each other.
-local connect, disconnect_handle, http_connect
+-- per-server reader coroutine reference each other. `disconnect` is defined
+-- far below (lifecycle section) but sse_connect calls it on its failure paths,
+-- so it must be a forward-declared local. Without it the call resolves to a
+-- nil global.
+local connect, disconnect, disconnect_handle, http_connect
 local http_send_request, http_send_notification, http_send_reply
 local http_reinitialize
 local sse_send_request, sse_send_notification, sse_send_reply
@@ -840,6 +843,10 @@ function sse_connect(srv)
   local deadline = M._now() + math.ceil((srv.request_timeout_ms or DEFAULT_REQUEST_TIMEOUT_MS) / 1000)
   while not srv.sse_endpoint do
     if srv.sse_dead then
+      -- Reader died before the endpoint event arrived. Tear the half-open
+      -- transport down (reader coroutine + GET stream) before returning, the
+      -- same as the timeout path; otherwise srv.sse_reader/srv.sse_stream leak.
+      disconnect(srv)
       return nil, "sse stream closed before endpoint event"
     end
     if M._now() >= deadline then
@@ -1589,7 +1596,9 @@ end
 -- signal), then escalate to TERM and reap with :wait(). Mirrors the __gc
 -- escalation order without the busy-spin. Skipped while a call is in flight.
 -- HTTP servers DELETE the session and tear down any SSE reader instead.
-local function disconnect(srv)
+-- Assigns the forward-declared `disconnect` local (declared near the top so
+-- sse_connect's failure paths can reach it) rather than shadowing it.
+function disconnect(srv)
   if srv.transport == "http" then
     http_disconnect(srv)
     return

@@ -1766,6 +1766,9 @@ const LegacySseFixture = struct {
     /// Whether the GET handler should close the stream immediately after the
     /// endpoint event (drives the reader-death failure path).
     die_after_endpoint: bool = false,
+    /// Whether the GET handler should close the stream BEFORE sending the
+    /// endpoint event (drives the death-before-endpoint cleanup path).
+    die_before_endpoint: bool = false,
 
     /// Tiny CAS spinlock guarding the queue (0.16 dropped std.Thread.Mutex and
     /// std.Io.Mutex needs an io handle; a spinlock is plenty for a test).
@@ -1863,6 +1866,14 @@ const LegacySseFixture = struct {
             "Content-Type: text/event-stream\r\n" ++
             "Transfer-Encoding: chunked\r\n\r\n";
         test_net.streamWriteAll(conn, head) catch return;
+
+        if (ctx.die_before_endpoint) {
+            // Close (chunked terminator) without ever sending the endpoint
+            // event, so the reader sees EOF while connect still waits on it.
+            test_net.streamWriteAll(conn, "0\r\n\r\n") catch {};
+            return;
+        }
+
         writeChunk(conn, "event: endpoint\ndata: /messages?session=s1\n\n") catch return;
 
         if (ctx.die_after_endpoint) {
@@ -1916,11 +1927,12 @@ const LegacySseFixture = struct {
     }
 };
 
-fn startLegacyFixture(engine: *LuaEngine, ctx: *LegacySseFixture, opts: struct { die: bool = false }) !std.Thread {
+fn startLegacyFixture(engine: *LuaEngine, ctx: *LegacySseFixture, opts: struct { die: bool = false, die_before: bool = false }) !std.Thread {
     ctx.* = .{
         .server = try test_net.listenLoopback(),
         .reject_streamable = true,
         .die_after_endpoint = opts.die,
+        .die_before_endpoint = opts.die_before,
     };
     const port = test_net.boundPort(&ctx.server);
     const thread = try std.Thread.spawn(.{}, LegacySseFixture.run, .{ctx});
@@ -1995,5 +2007,37 @@ test "mcp legacy SSE: reader death fails pending requests" {
         \\  assert(not ok, "connect must fail when the reader dies")
         \\  assert(err ~= nil, "an error is surfaced")
         \\  assert(legacy.status == "disconnected", "server marked disconnected, got " .. tostring(legacy.status))
+    );
+}
+
+test "mcp legacy SSE: death before the endpoint event disconnects and clears the reader" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: LegacySseFixture = undefined;
+    const thread = try startLegacyFixture(&engine, &ctx, .{ .die_before = true });
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        if (ctx.sse_thread) |t| t.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // The GET stream closes BEFORE any endpoint event, so the endpoint wait
+    // observes sse_dead. connect must fail, mark the server disconnected, and
+    // tear the half-open transport down (clear sse_reader + sse_stream) just
+    // like the timeout path — otherwise the reader coroutine and stream leak.
+    try runCoroutineBody(&engine,
+        \\  local ok, err = mcp._test.connect(legacy)
+        \\  assert(not ok, "connect must fail when the stream dies before the endpoint event")
+        \\  assert(err ~= nil, "an error is surfaced")
+        \\  assert(err:find("endpoint", 1, true), "error names the missing endpoint: " .. tostring(err))
+        \\  assert(legacy.status == "disconnected", "server marked disconnected, got " .. tostring(legacy.status))
+        \\  assert(legacy.sse_reader == nil, "reader coroutine cleared (no leak)")
+        \\  assert(legacy.sse_stream == nil, "GET stream cleared (no leak)")
     );
 }
