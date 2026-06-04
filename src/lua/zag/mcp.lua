@@ -190,10 +190,32 @@ function M.setup(config)
   -- wait for a coroutine context (file reads yield).
   M._raw_config = config
 
-  -- Register the proxy tool now (config load is the only time registerTools
-  -- harvests). Zero servers -> zero tools, to honor the token philosophy.
-  if next(M._servers) ~= nil and not M._settings.disable_proxy_tool then
+  -- Harvest direct tools from the (synchronously loaded) metadata cache.
+  -- Config load is the only time `registerTools` reads the engine's tool
+  -- list, so direct tools must register here or not at all. `cached_servers`
+  -- gates `disable_proxy_tool`: only suppress the proxy when EVERY configured
+  -- server has a valid cache entry (otherwise the model keeps the proxy as its
+  -- handle on the uncached servers).
+  local has_servers = next(M._servers) ~= nil
+  local cached_servers, total = 0, 0
+  if has_servers then
+    cached_servers, total = M._register_direct_tools()
+  end
+
+  -- Register the proxy tool now. Zero servers -> zero tools, to honor the
+  -- token philosophy. `disable_proxy_tool` is honored only when every server
+  -- is fully cached (so direct tools cover the whole surface).
+  local all_cached = has_servers and (cached_servers == total)
+  local drop_proxy = M._settings.disable_proxy_tool and all_cached
+  if has_servers and not drop_proxy then
     M._register_proxy_tool()
+  end
+
+  -- Register the /mcp slash commands (status / reconnect / tools). A separate
+  -- human-facing surface from the proxy tool, so it registers whenever any
+  -- server is configured even if the proxy tool itself is suppressed.
+  if has_servers then
+    M._register_commands()
   end
 
   -- If any server is eager, register the one-shot turn_start connector. Hook
@@ -622,6 +644,23 @@ local function cache_load()
     zag.log.warn("zag.mcp: failed to read metadata cache: %s", tostring(err))
     return
   end
+  local decoded = zag.json.decode(raw)
+  if type(decoded) ~= "table" or decoded.version ~= CACHE_VERSION
+      or type(decoded.servers) ~= "table" then
+    return
+  end
+  M._cache = decoded
+end
+
+-- Synchronous cache read for `setup` (config load, before the async runtime
+-- is up). Direct-tool registration (Task F1) needs the cache at config load,
+-- where the yielding `zag.fs.read` is unavailable; `zag.fs.read_file_sync`
+-- does a bounded blocking read on the main thread. Tolerant of missing or
+-- corrupt files, like the async loader.
+local function cache_load_sync()
+  M._cache = { version = CACHE_VERSION, servers = {} }
+  local raw = zag.fs.read_file_sync(cache_path())
+  if not raw then return end
   local decoded = zag.json.decode(raw)
   if type(decoded) ~= "table" or decoded.version ~= CACHE_VERSION
       or type(decoded.servers) ~= "table" then
@@ -1154,52 +1193,16 @@ local function mode_connect(server_name)
   return mode_list(server_name)
 end
 
--- mcp({ tool = "name", args = "{...}" }) -> lazy connect, call, return text.
-local function mode_call(tool_name, args_json, server_override)
-  -- Resolve the server holding this tool.
-  local srv, tool_meta
-  if server_override then
-    srv = M._servers[server_override]
-    if not srv then
-      return string.format('Server "%s" not found. Use mcp({}) to see available servers.', server_override)
-    end
-    tool_meta = find_tool(metadata_for(srv), tool_name)
-  else
-    for _, s in pairs(M._servers) do
-      local t = find_tool(metadata_for(s), tool_name)
-      if t then srv = s; tool_meta = t; break end
-    end
-  end
-
-  -- Lazy connect if the tool isn't in the (cached) view yet but a server is
-  -- named, or to refresh after connecting.
-  local refreshed = false
-  if srv and not tool_meta then
-    local ok = ensure_connected_and_fresh(srv)
-    refreshed = ok
-    if ok then tool_meta = find_tool(metadata_for(srv), tool_name) end
-  end
-
-  if not srv or not tool_meta then
-    return string.format('Tool "%s" not found. Use mcp({ search = "..." }) to search.', tool_name)
-  end
-
-  -- Decode the args JSON string (the proxy schema takes args as a string).
-  local args = {}
-  if type(args_json) == "string" and #args_json > 0 then
-    local decoded, derr = zag.json.decode(args_json)
-    if type(decoded) ~= "table" then
-      return "Invalid args JSON: " .. tostring(derr)
-    end
-    args = decoded
-  elseif type(args_json) == "table" then
-    args = args_json
-  end
-
-  -- Connect if needed for the actual call. Skip when the lazy-connect
-  -- above already connected and refreshed this server during this call;
-  -- a second pass would re-run the full metadata fetch for nothing.
-  if not refreshed then
+-- Shared connect-lazily-and-call path. Connects `srv` if needed, runs the
+-- tool/resource call under the in_flight + last_used discipline, and renders
+-- the result to the plain-string ToolResult. Used by BOTH the proxy
+-- (`mode_call`) and the direct-tool execute wrappers (Task F1) so the
+-- lifecycle bookkeeping lives in one place. `tool_meta` is a metadata-view
+-- record ({ original_name, input_schema, resource_uri? }); `args` is a
+-- decoded table. `already_fresh` skips the (re)connect+metadata refresh when
+-- the caller has just done it during this same call.
+local function invoke_tool(srv, tool_meta, args, already_fresh)
+  if not already_fresh then
     local ok, cerr = ensure_connected_and_fresh(srv)
     if not ok and srv.status ~= "connected" then
       return string.format('Failed to connect to "%s": %s', srv.name, tostring(cerr))
@@ -1254,6 +1257,51 @@ local function mode_call(tool_name, args_json, server_override)
   return text
 end
 
+-- mcp({ tool = "name", args = "{...}" }) -> lazy connect, call, return text.
+local function mode_call(tool_name, args_json, server_override)
+  -- Resolve the server holding this tool.
+  local srv, tool_meta
+  if server_override then
+    srv = M._servers[server_override]
+    if not srv then
+      return string.format('Server "%s" not found. Use mcp({}) to see available servers.', server_override)
+    end
+    tool_meta = find_tool(metadata_for(srv), tool_name)
+  else
+    for _, s in pairs(M._servers) do
+      local t = find_tool(metadata_for(s), tool_name)
+      if t then srv = s; tool_meta = t; break end
+    end
+  end
+
+  -- Lazy connect if the tool isn't in the (cached) view yet but a server is
+  -- named, or to refresh after connecting.
+  local refreshed = false
+  if srv and not tool_meta then
+    local ok = ensure_connected_and_fresh(srv)
+    refreshed = ok
+    if ok then tool_meta = find_tool(metadata_for(srv), tool_name) end
+  end
+
+  if not srv or not tool_meta then
+    return string.format('Tool "%s" not found. Use mcp({ search = "..." }) to search.', tool_name)
+  end
+
+  -- Decode the args JSON string (the proxy schema takes args as a string).
+  local args = {}
+  if type(args_json) == "string" and #args_json > 0 then
+    local decoded, derr = zag.json.decode(args_json)
+    if type(decoded) ~= "table" then
+      return "Invalid args JSON: " .. tostring(derr)
+    end
+    args = decoded
+  elseif type(args_json) == "table" then
+    args = args_json
+  end
+
+  return invoke_tool(srv, tool_meta, args, refreshed)
+end
+
 -- Top-level dispatch. Order mirrors pi: tool > connect > describe > search >
 -- server > status.
 function M._proxy_execute(input)
@@ -1272,6 +1320,116 @@ function M._proxy_execute(input)
   else
     return mode_status()
   end
+end
+
+-- ---------------------------------------------------------------------------
+-- Direct tools (Task F1): one `zag.tool` per MCP tool, registered at config
+-- load straight from a VALID metadata cache entry (no server runs at startup,
+-- so the cache is the only source). The model sees the tools by name instead
+-- of going through the `mcp` proxy; the trade-off is token cost (~150-300 per
+-- tool) versus the proxy's flat ~200. Per-server `direct_tools` is a boolean
+-- (every tool) or an array (just those original names); the global
+-- `settings.direct_tools` is the fallback default.
+-- ---------------------------------------------------------------------------
+
+-- The built-in tool names that direct registrations must never shadow. Kept
+-- in sync with `createDefaultRegistry` (src/tools.zig) plus the `mcp` proxy
+-- itself. A direct tool whose generated name collides is skipped with a
+-- warning rather than silently overwriting a core capability.
+local BUILTIN_TOOL_NAMES = {
+  read = true, write = true, edit = true, bash = true,
+  layout_tree = true, layout_focus = true, layout_split = true,
+  layout_close = true, layout_resize = true, pane_read = true,
+  task = true, workflow = true, mcp = true,
+}
+
+-- Skipped-collision names, recorded for the warning and surfaced to tests.
+M._direct_collisions = {}
+
+-- Is this server's direct_tools setting on for `original_name`? Returns true
+-- when direct mode covers the tool: a boolean true (all tools), an array
+-- containing the original name, or the global default when the server leaves
+-- direct_tools unset.
+local function direct_wants(srv, original_name)
+  local d = srv.direct_tools
+  if d == nil then d = M._settings.direct_tools end
+  if d == true then return true end
+  if type(d) == "table" then
+    for _, n in ipairs(d) do
+      if n == original_name then return true end
+    end
+    return false
+  end
+  return false
+end
+
+-- Register direct tools for one server from its valid cache entry. Names are
+-- generated under the active prefix mode; `exclude_tools` and builtin/seen
+-- collisions filter the set. `seen` accumulates already-registered direct
+-- names across servers so two servers can't both claim one bare name.
+local function register_direct_tools_for(srv, entry, seen)
+  local meta = build_metadata(srv, entry)
+  for _, t in ipairs(meta) do
+    if direct_wants(srv, t.original_name) then
+      local name = t.name
+      if BUILTIN_TOOL_NAMES[name] or seen[name] then
+        M._direct_collisions[#M._direct_collisions + 1] = name
+        zag.log.warn("zag.mcp: direct tool %q (server %q) collides with a built-in or"
+          .. " another direct tool; skipping", name, srv.name)
+      else
+        seen[name] = true
+        -- Capture by value so the closure does not chase upvalue mutation.
+        local server_name = srv.name
+        local original_name = t.original_name
+        local resource_uri = t.resource_uri
+        local input_schema = t.input_schema
+        local description = t.description
+        zag.tool{
+          name = name,
+          description = (description ~= "" and description)
+            or ("MCP tool " .. original_name .. " (server " .. server_name .. ")"),
+          input_schema = input_schema or { type = "object" },
+          execute = function(input)
+            local s = M._servers[server_name]
+            if not s then return nil, "mcp: server " .. server_name .. " not configured" end
+            M.ensure_config_loaded()
+            return invoke_tool(s, {
+              original_name = original_name,
+              resource_uri = resource_uri,
+              input_schema = input_schema,
+            }, input or {}, false)
+          end,
+        }
+      end
+    end
+  end
+end
+
+-- Harvest direct tools for every configured server from the cache. Loads the
+-- cache synchronously first (config load is before the async runtime, so the
+-- yielding loader is unavailable). Returns the count of servers that had a
+-- valid cache entry, so setup() can decide whether `disable_proxy_tool` is
+-- safe (pi's rule: only drop the proxy when EVERY server's metadata is cached,
+-- else the model loses its only handle on the uncached servers). Exposed as an
+-- `M.` method so the early `setup()` can call it before this point in the file.
+function M._register_direct_tools()
+  cache_load_sync()
+  M._direct_collisions = {}
+  local seen = {}
+  local cached_servers = 0
+  local total = 0
+  for _, srv in pairs(M._servers) do
+    total = total + 1
+    local entry = cache_get_valid(srv)
+    if entry then
+      cached_servers = cached_servers + 1
+      local wants_any = (srv.direct_tools ~= nil) or (M._settings.direct_tools ~= false)
+      if wants_any then
+        register_direct_tools_for(srv, entry, seen)
+      end
+    end
+  end
+  return cached_servers, total
 end
 
 -- Register the single proxy tool. Called from setup() only when at least one
@@ -1295,6 +1453,120 @@ function M._register_proxy_tool()
       },
     },
     execute = function(input) return M._proxy_execute(input) end,
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- /mcp slash command (Task F2)
+--
+-- Slash-command dispatch in zag is exact-match on the whole draft string with
+-- no argument passing, and the Lua callback runs synchronously on the main
+-- thread (NOT a coroutine: `LuaEngine.invokeCallback` does a zero-arg
+-- protectedCall and ignores the return). So we register three distinct
+-- entries instead of `/mcp <subcommand>`, and surface output through
+-- `zag.notify` (the only text-to-UI channel today). The I/O-bearing commands
+-- run their body in a `zag.detach` worker (legal from the command's
+-- protectedCall context once the async runtime is up) and notify
+-- "reconnecting..." up front so the UI is never silent during the round-trip.
+-- Per-server reconnect/connect stays available through the proxy tool
+-- (`mcp({connect="server"})`), which the slash form cannot express.
+-- ---------------------------------------------------------------------------
+
+-- Status text for the bare `/mcp` command: reuse the proxy's status formatter.
+local function cmd_status_text()
+  M.ensure_config_loaded()
+  return mode_status()
+end
+
+-- A flat listing of every tool across all servers (cached + live), each
+-- tagged with its source so the user can tell which servers are connected.
+local function cmd_tools_text()
+  M.ensure_config_loaded()
+  local names = {}
+  for name in pairs(M._servers) do names[#names + 1] = name end
+  table.sort(names)
+
+  local lines = {}
+  local total = 0
+  for _, name in ipairs(names) do
+    local srv = M._servers[name]
+    local meta = metadata_for(srv)
+    local marker = (srv.status == "connected") and "live" or "cached"
+    for _, t in ipairs(meta or {}) do
+      total = total + 1
+      lines[#lines + 1] = string.format("- %s [%s/%s]", t.name, name, marker)
+    end
+  end
+
+  if total == 0 then
+    return "No MCP tools available. Configure servers and run /mcp-reconnect."
+  end
+  return string.format("MCP tools (%d):\n", total) .. table.concat(lines, "\n")
+end
+
+-- Reconnect one server (when `server_name` is given) or all of them. Tears the
+-- existing handle down then connects + refreshes metadata. Returns a summary
+-- string suitable for notify. Yields (disconnect/connect), so the caller runs
+-- it in a coroutine (the command path detaches it).
+local function cmd_reconnect(server_name)
+  M.ensure_config_loaded()
+  local targets = {}
+  if server_name then
+    if not M._servers[server_name] then
+      return string.format('MCP: server "%s" not found.', server_name)
+    end
+    targets[1] = server_name
+  else
+    for name in pairs(M._servers) do targets[#targets + 1] = name end
+    table.sort(targets)
+  end
+
+  local results = {}
+  for _, name in ipairs(targets) do
+    local srv = M._servers[name]
+    disconnect(srv)
+    local ok, err = ensure_connected_and_fresh(srv)
+    if ok then
+      local meta = metadata_for(srv)
+      results[#results + 1] = string.format("\xE2\x9C\x93 %s (%d tools)", name, meta and #meta or 0)
+    else
+      srv.status = "failed"
+      results[#results + 1] = string.format("\xE2\x9C\x97 %s: %s", name, tostring(err))
+    end
+  end
+  return "MCP reconnect:\n" .. table.concat(results, "\n")
+end
+
+-- Register the slash commands. Called from setup() only when at least one
+-- server is configured (same token philosophy as the proxy tool).
+function M._register_commands()
+  zag.command{
+    name = "mcp",
+    desc = "Show MCP server status",
+    fn = function()
+      zag.detach(function()
+        zag.notify(cmd_status_text())
+      end)
+    end,
+  }
+  zag.command{
+    name = "mcp-reconnect",
+    desc = "Reconnect all MCP servers",
+    fn = function()
+      zag.notify("MCP: reconnecting servers...")
+      zag.detach(function()
+        zag.notify(cmd_reconnect(nil))
+      end)
+    end,
+  }
+  zag.command{
+    name = "mcp-tools",
+    desc = "List all MCP tools (cached and live)",
+    fn = function()
+      zag.detach(function()
+        zag.notify(cmd_tools_text())
+      end)
+    end,
   }
 end
 
@@ -1343,6 +1615,16 @@ M._test = {
   metadata = function() return M._metadata end,
   proxy_execute = function(input) return M._proxy_execute(input) end,
   register_proxy_tool = function() return M._register_proxy_tool() end,
+  -- F1 direct-tool internals.
+  invoke_tool = function(srv, meta, args, fresh) return invoke_tool(srv, meta, args, fresh) end,
+  direct_wants = function(srv, n) return direct_wants(srv, n) end,
+  register_direct_tools = function() return M._register_direct_tools() end,
+  cache_load_sync = function() return cache_load_sync() end,
+  collisions = function() return M._direct_collisions end,
+  -- F2 command internals.
+  cmd_status_text = function() return cmd_status_text() end,
+  cmd_tools_text = function() return cmd_tools_text() end,
+  cmd_reconnect = function(name) return cmd_reconnect(name) end,
   -- E5 lifecycle internals.
   disconnect = function(srv) return disconnect(srv) end,
   maintenance_tick = function() return maintenance_tick() end,

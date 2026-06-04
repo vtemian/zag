@@ -810,3 +810,375 @@ test "mcp lifecycle: keep-alive server is exempt from idle disconnect" {
         \\  mcp._test.disconnect(fake)
     );
 }
+
+// ---------------------------------------------------------------------------
+// F1: direct tools registered from the metadata cache
+// ---------------------------------------------------------------------------
+
+/// Stand up an engine pointed at a tmp cache dir with a pinned clock, write a
+/// VALID metadata cache entry for `fake` to disk (the only source direct
+/// tools draw from at setup time), then run `setup` with the given settings
+/// Lua-table literal. The fixture command is `{ "sh", <fake-mcp.sh> }`, so a
+/// direct tool that actually calls round-trips to the canned server.
+///
+/// `setup` runs synchronously and harvests direct tools inside this call, so
+/// the registrations are observable on the engine immediately afterward.
+fn setupDirectEngine(
+    engine: *LuaEngine,
+    tmp: *std.testing.TmpDir,
+    abs_buf: []u8,
+    settings_literal: [:0]const u8,
+    cached_at: i64,
+) !void {
+    const path = try writeFixture(tmp, "fake-mcp.sh", fake_mcp_sh, abs_buf);
+    _ = engine.lua.pushString(path);
+    engine.lua.setGlobal("_fixture_path");
+    const dir_len = try tmp.dir.realPathFile(std.testing.io, ".", abs_buf);
+    _ = engine.lua.pushString(abs_buf[0..dir_len]);
+    engine.lua.setGlobal("_cache_dir");
+    _ = engine.lua.pushString(settings_literal);
+    engine.lua.setGlobal("_settings_src");
+    var clock_buf: [32]u8 = undefined;
+    _ = engine.lua.pushString(try std.fmt.bufPrint(&clock_buf, "{d}", .{cached_at}));
+    engine.lua.setGlobal("_cached_at");
+
+    // Write a valid cache entry to disk BEFORE setup, with a config_hash that
+    // matches the server `setup` will normalize. Done in a coroutine because
+    // cache_save yields on zag.fs.write.
+    try runCoroutineBody(engine,
+        \\  local mcp = require("zag.mcp")
+        \\  mcp._test.set_cache_dir(_cache_dir)
+        \\  mcp._test.set_now(1000000)
+        \\  local srv = mcp._test.normalize_server("fake", { command = { "sh", _fixture_path } })
+        \\  mcp._test.cache().servers.fake = {
+        \\    config_hash = mcp._test.config_hash(srv),
+        \\    cached_at = tonumber(_cached_at),
+        \\    tools = { { name = "add", description = "adds two numbers",
+        \\      input_schema = { type = "object",
+        \\        properties = { a = { type = "number" }, b = { type = "number" } },
+        \\        required = { "a", "b" } } } },
+        \\    resources = {},
+        \\  }
+        \\  mcp._test.cache_save()
+    );
+
+    // setup() harvests direct tools synchronously from the on-disk cache.
+    var setup_buf: [512]u8 = undefined;
+    const setup_src = try std.fmt.bufPrintZ(&setup_buf,
+        \\local mcp = require("zag.mcp")
+        \\mcp._test.set_cache_dir(_cache_dir)
+        \\mcp._test.set_now(1000000)
+        \\mcp.setup{{ servers = {{ fake = {{ command = {{ "sh", _fixture_path }}, {s} }} }} }}
+    , .{settings_literal});
+    try runLua(engine, setup_src);
+}
+
+test "mcp direct: cached server with direct_tools=true registers a prefixed tool" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // direct_tools = true on the server; tool_prefix defaults to "server".
+    try setupDirectEngine(&engine, &tmp, &abs_buf, "direct_tools = true", 1000000);
+
+    // The proxy tool is still registered (not disabled), plus the direct tool
+    // under the "server" prefix.
+    try testing.expect(hasTool(&engine, "mcp"));
+    try testing.expect(hasTool(&engine, "fake_add"));
+}
+
+test "mcp direct: collision with a builtin tool is skipped with a warning" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try writeFixture(&tmp, "fake-mcp.sh", fake_mcp_sh, &abs_buf);
+    _ = engine.lua.pushString(path);
+    engine.lua.setGlobal("_fixture_path");
+    const dir_len = try tmp.dir.realPathFile(std.testing.io, ".", &abs_buf);
+    _ = engine.lua.pushString(abs_buf[0..dir_len]);
+    engine.lua.setGlobal("_cache_dir");
+
+    // Cache a server whose tool is literally named "bash" so that under the
+    // "none" prefix the direct name collides with the builtin bash tool.
+    try runCoroutineBody(&engine,
+        \\  local mcp = require("zag.mcp")
+        \\  mcp._test.set_cache_dir(_cache_dir)
+        \\  mcp._test.set_now(1000000)
+        \\  local srv = mcp._test.normalize_server("fake", { command = { "sh", _fixture_path } })
+        \\  mcp._test.cache().servers.fake = {
+        \\    config_hash = mcp._test.config_hash(srv),
+        \\    cached_at = 1000000,
+        \\    tools = { { name = "bash", description = "shadow", input_schema = { type = "object" } } },
+        \\    resources = {},
+        \\  }
+        \\  mcp._test.cache_save()
+    );
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp._test.set_cache_dir(_cache_dir)
+        \\mcp._test.set_now(1000000)
+        \\mcp.setup{
+        \\  servers = { fake = { command = { "sh", _fixture_path }, direct_tools = true } },
+        \\  settings = { tool_prefix = "none" },
+        \\}
+    );
+
+    // The bare "bash" name collides with the builtin: no second registration.
+    // (The builtin is in the Zig registry, not engine.tools, so we assert the
+    // direct registration was skipped by checking the warning was recorded.)
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local w = mcp._test.collisions()
+        \\assert(#w == 1, "expected one skipped collision, got " .. #w)
+        \\assert(w[1] == "bash", "collided name recorded: " .. tostring(w[1]))
+    );
+    // The proxy tool is unaffected.
+    try testing.expect(hasTool(&engine, "mcp"));
+}
+
+test "mcp direct: exclude_tools filters a direct registration" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupDirectEngine(&engine, &tmp, &abs_buf,
+        "direct_tools = true, exclude_tools = { \"add\" }", 1000000);
+
+    // Excluded: no direct tool, but the proxy remains.
+    try testing.expect(hasTool(&engine, "mcp"));
+    try testing.expect(!hasTool(&engine, "fake_add"));
+}
+
+test "mcp direct: stale cache registers no direct tools; proxy stays" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // cached_at far in the past relative to the pinned now (1000000): TTL is
+    // 7 days, so cached_at = 0 is well past expiry.
+    try setupDirectEngine(&engine, &tmp, &abs_buf, "direct_tools = true", 0);
+
+    try testing.expect(hasTool(&engine, "mcp"));
+    try testing.expect(!hasTool(&engine, "fake_add"));
+}
+
+test "mcp direct: array form registers only the listed tool" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // The cache only carries "add"; an array listing "add" registers it,
+    // while an array listing something else registers nothing.
+    try setupDirectEngine(&engine, &tmp, &abs_buf,
+        "direct_tools = { \"add\" }", 1000000);
+    try testing.expect(hasTool(&engine, "fake_add"));
+
+    var engine2 = try LuaEngine.init(testing.allocator);
+    defer engine2.deinit();
+    engine2.storeSelfPointer();
+    try engine2.initAsync(2, 16);
+    defer engine2.deinitAsync();
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var abs_buf2: [std.fs.max_path_bytes]u8 = undefined;
+    try setupDirectEngine(&engine2, &tmp2, &abs_buf2,
+        "direct_tools = { \"nonexistent\" }", 1000000);
+    try testing.expect(!hasTool(&engine2, "fake_add"));
+}
+
+test "mcp direct: calling a registered direct tool round-trips to the server" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupDirectEngine(&engine, &tmp, &abs_buf, "direct_tools = true", 1000000);
+    try testing.expect(hasTool(&engine, "fake_add"));
+
+    // Driving the direct tool through the coroutine tool path lazy-connects
+    // the server and returns the fixture's content text ("3").
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "fake_add",
+        .input_raw = "{\"a\":1,\"b\":2}",
+        .allocator = testing.allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    engine.startLuaToolCall(&req);
+    try pumpToolToDone(&engine, &req);
+    try testing.expect(req.result_owned);
+    defer testing.allocator.free(@constCast(req.result_content.?));
+    try testing.expectEqualStrings("3", req.result_content.?);
+    try testing.expect(!req.result_is_error);
+}
+
+// ---------------------------------------------------------------------------
+// F2: the /mcp slash command (+ /mcp-reconnect, /mcp-tools)
+// ---------------------------------------------------------------------------
+
+/// Whether `slash_name` (with the leading slash) resolves to a Lua-callback
+/// command on the engine.
+fn hasCommand(engine: *LuaEngine, slash_name: []const u8) bool {
+    const hit = engine.command_registry.lookup(slash_name) orelse return false;
+    return hit == .lua_callback;
+}
+
+test "mcp command: setup registers /mcp, /mcp-reconnect, /mcp-tools" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp.setup{ servers = { fake = { command = { "echo" } } } }
+    );
+    try testing.expect(hasCommand(&engine, "/mcp"));
+    try testing.expect(hasCommand(&engine, "/mcp-reconnect"));
+    try testing.expect(hasCommand(&engine, "/mcp-tools"));
+
+    // Zero servers -> no commands, mirroring the proxy-tool token philosophy.
+    var bare = try LuaEngine.init(testing.allocator);
+    defer bare.deinit();
+    bare.storeSelfPointer();
+    try runLua(&bare,
+        \\local mcp = require("zag.mcp")
+        \\mcp.setup{ servers = {} }
+    );
+    try testing.expect(!hasCommand(&bare, "/mcp"));
+}
+
+test "mcp command: status text names the configured server" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    // cmd_status_text mirrors what the bare /mcp command surfaces via notify.
+    // It runs ensure_config_loaded (which starts the detached maintenance loop
+    // that parks in zag.sleep forever), so pump on a completion flag rather
+    // than waiting for every task to retire.
+    try runLua(&engine,
+        \\function _run() _status = mcp._test.cmd_status_text(); _done = true end
+    );
+    _ = try engine.lua.getGlobal("_run");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_done");
+    try runLua(&engine,
+        \\assert(type(_status) == "string", "status is a string")
+        \\assert(_status:find("fake", 1, true), "status names the server: " .. _status)
+        \\assert(_status:find("MCP:", 1, true), "status has the header")
+    );
+}
+
+test "mcp command: tools text lists cached tools with a marker" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    try runLua(&engine,
+        \\function _run() _tools = mcp._test.cmd_tools_text(); _done = true end
+    );
+    _ = try engine.lua.getGlobal("_run");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_done");
+    try runLua(&engine,
+        \\assert(_tools:find("fake_add", 1, true), "lists the cached tool: " .. _tools)
+        \\assert(_tools:find("cached", 1, true), "marks it cached")
+    );
+}
+
+test "mcp command: reconnect exercises disconnect then connect" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    // Connect once, then drive cmd_reconnect against the live fixture: it must
+    // tear the handle down and bring it back up. Both steps yield; the
+    // ensure_config_loaded inside cmd_reconnect starts the detached
+    // maintenance loop (parks forever), so pump on a flag and record the
+    // outcome into globals to assert from Zig. The body is pcall-wrapped so a
+    // Lua assert surfaces as _ok=false rather than a lost error.
+    try runLua(&engine,
+        \\function _run()
+        \\  _ok, _err = pcall(function()
+        \\    local srv = mcp._test.servers().fake
+        \\    assert(mcp._test.connect(srv), "initial connect")
+        \\    local first = srv.handle
+        \\    assert(first ~= nil, "handle present after connect")
+        \\    local report = mcp._test.cmd_reconnect("fake")
+        \\    assert(srv.status == "connected", "reconnected: " .. tostring(srv.status))
+        \\    assert(srv.handle ~= nil, "handle present after reconnect")
+        \\    assert(srv.handle ~= first, "handle was replaced (real disconnect+connect)")
+        \\    assert(report:find("fake", 1, true), "report names the server: " .. report)
+        \\    mcp._test.disconnect(srv)
+        \\  end)
+        \\  _done = true
+        \\end
+    );
+    _ = try engine.lua.getGlobal("_run");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_done");
+    _ = try engine.lua.getGlobal("_ok");
+    const ok = engine.lua.toBoolean(-1);
+    engine.lua.pop(1);
+    if (!ok) {
+        _ = engine.lua.getGlobal("_err") catch {};
+        std.debug.print("\nreconnect body failed: {s}\n", .{engine.lua.toStringEx(-1)});
+        engine.lua.pop(1);
+        return error.ReconnectBodyFailed;
+    }
+}
