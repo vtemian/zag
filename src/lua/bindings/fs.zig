@@ -117,6 +117,11 @@ fn zagFsReadFn(co: *Lua) i32 {
 
 /// Shared body for `zag.fs.write` and `zag.fs.append`: identical
 /// except for the `mode` field on the job spec.
+///
+/// Optional 3rd-arg opts table: `{ mode = <octal int> }` stamps POSIX
+/// permission bits on the created/opened file (e.g.
+/// `{ mode = tonumber("600", 8) }` for an OAuth token file). Omitting
+/// it leaves the OS default in place.
 fn zagFsWriteImpl(co: *Lua, comptime mode: enum { overwrite, append }) i32 {
     const op_name = switch (mode) {
         .overwrite => "zag.fs.write",
@@ -129,6 +134,29 @@ fn zagFsWriteImpl(co: *Lua, comptime mode: enum { overwrite, append }) i32 {
         staged.engine.allocator.destroy(staged.arena_ptr);
         co.raiseErrorStr("zag.fs write content dupe failed", .{});
     };
+
+    var file_mode: ?std.posix.mode_t = null;
+    if (co.isTable(3)) {
+        _ = co.getField(3, "mode");
+        // A present-but-non-integer mode must NOT silently fall back to the
+        // OS default: token files would land with wide perms. Reject it.
+        if (!co.isNil(-1) and !co.isInteger(-1)) {
+            staged.arena_ptr.deinit();
+            staged.engine.allocator.destroy(staged.arena_ptr);
+            co.raiseErrorStr("zag.fs.write: opts.mode must be an integer in 0..0o7777", .{});
+        }
+        if (co.isInteger(-1)) {
+            const v = co.toInteger(-1) catch -1;
+            if (v < 0 or v > 0o7777) {
+                staged.arena_ptr.deinit();
+                staged.engine.allocator.destroy(staged.arena_ptr);
+                co.raiseErrorStr("zag.fs.write: opts.mode must be in 0..0o7777", .{});
+            }
+            file_mode = @intCast(v);
+        }
+        co.pop(1);
+    }
+
     return submitFsJob(co, staged.engine, staged.arena_ptr, .{ .fs_write = .{
         .path = staged.path,
         .content = content,
@@ -136,10 +164,11 @@ fn zagFsWriteImpl(co: *Lua, comptime mode: enum { overwrite, append }) i32 {
             .overwrite => .overwrite,
             .append => .append,
         },
+        .file_mode = file_mode,
     } }, op_name);
 }
 
-/// `zag.fs.write(path, content)`: overwrite-or-create.
+/// `zag.fs.write(path, content, opts?)`: overwrite-or-create.
 fn zagFsWriteFn(co: *Lua) i32 {
     return zagFsWriteImpl(co, .overwrite);
 }

@@ -37,6 +37,7 @@ const async_scope = @import("lua/Scope.zig");
 const async_job = @import("lua/Job.zig");
 const cmd_handle_mod = @import("lua/primitives/cmd_handle.zig");
 const http_stream_mod = @import("lua/primitives/http_stream.zig");
+const http_callback_mod = @import("lua/primitives/http_callback.zig");
 const job_result_mod = @import("lua/job_result.zig");
 const hook_registry_mod = @import("lua/hook_registry.zig");
 const lua_json = @import("lua/lua_json.zig");
@@ -381,6 +382,16 @@ pub const LuaEngine = struct {
         /// Same exactly-once + park-until-retire contract as `workflow_request`.
         /// Borrowed; the parked tool thread owns it.
         lua_tool_request: ?*Hooks.LuaToolRequest = null,
+        /// Non-null while this coroutine is parked in `zag.http.await_callback`:
+        /// the listener whose helper thread holds raw pointers into this task's
+        /// `scope` and the engine completion queue. Set by the binding right
+        /// after the listener is created + its abort Job registered; cleared by
+        /// `resumeFromJob` once the single completion is consumed (the binding's
+        /// `shutdownAndCleanup` already ran by then). `retireTask` reads it to
+        /// join the helper + free the listener BEFORE `scope.deinit()`, so the
+        /// helper never derefs a freed scope/queue at teardown. Engine borrows;
+        /// the listener owns itself and is freed by `shutdownAndCleanup`.
+        pending_callback_listener: ?*http_callback_mod.HttpCallbackListener = null,
     };
 
     /// A workflow-script run requested by a parked agent thread (the future
@@ -875,6 +886,17 @@ pub const LuaEngine = struct {
         // All async entries yield the coroutine; `exists` is sync.
         // Cfunction bodies and `registerOn` live in lua/bindings/fs.zig.
         @import("lua/bindings/fs.zig").registerOn(lua);
+
+        // zag.json; sync bidirectional JSON <-> Lua marshalling
+        // (`decode`/`encode`). Pure CPU, no yield. Bodies + `registerOn`
+        // live in lua/bindings/json.zig. Stack on entry/exit: [zag_table].
+        @import("lua/bindings/json.zig").registerOn(lua);
+
+        // zag.crypto; sync `sha256`/`random_bytes`/`base64url` helpers
+        // (PKCE + metadata-cache hashing). Pure CPU, no yield. Bodies +
+        // `registerOn` live in lua/bindings/crypto.zig. Stack on
+        // entry/exit: [zag_table].
+        @import("lua/bindings/crypto.zig").registerOn(lua);
 
         // zag.layout; plain namespace table for window-tree inspection
         // and mutation. Requires a live window manager, which main.zig
@@ -2803,6 +2825,17 @@ pub const LuaEngine = struct {
             switch (job.kind) {
                 .cmd_read_line_done => |r| if (r.line) |l| self.allocator.free(l),
                 .http_stream_line_done => |r| if (r.line) |l| self.allocator.free(l),
+                .http_callback_done => |r| {
+                    for (r.params) |p| {
+                        self.allocator.free(p.name);
+                        self.allocator.free(p.value);
+                    }
+                    if (r.params.len > 0) self.allocator.free(r.params);
+                    if (r.listener) |l| {
+                        const listener: *http_callback_mod.HttpCallbackListener = @ptrCast(@alignCast(l));
+                        listener.shutdownAndCleanup();
+                    }
+                },
                 else => {},
             }
             self.allocator.destroy(job);
@@ -2810,9 +2843,23 @@ pub const LuaEngine = struct {
         };
         task.pending_job = null;
 
+        // The await_callback listener owns a helper thread + listening
+        // socket that must be torn down on the main thread after the
+        // single completion is consumed. Capture the pointer before the
+        // Job is freed; clean up after pushing the result.
+        const callback_listener: ?*http_callback_mod.HttpCallbackListener = switch (job.kind) {
+            .http_callback_done => |r| if (r.listener) |l| @ptrCast(@alignCast(l)) else null,
+            else => null,
+        };
+        // The completion ends the await; the listener is torn down below, so
+        // retireTask must not try to tear it down again.
+        if (callback_listener != null) task.pending_callback_listener = null;
+
         const num_values = job_result_mod.pushJobResultOntoStack(self.allocator, task.co, job);
         const err_detail = job.err_detail;
         self.allocator.destroy(job);
+
+        if (callback_listener) |l| l.shutdownAndCleanup();
 
         // Result strings have been copied onto the coroutine stack; the
         // per-task primitive arena (argv/cwd/url/headers) is safe to free
@@ -3587,6 +3634,18 @@ pub const LuaEngine = struct {
             task.pending_child = null;
         }
 
+        // A task retiring while parked in `zag.http.await_callback` owns a
+        // listener whose helper thread holds raw pointers into `task.scope`
+        // and the completion queue. Tear it down BEFORE `scope.deinit()`:
+        // `shutdownAndCleanup` joins the helper (which by then suppresses its
+        // post, so a freed queue is tolerated) and unregisters the abort Job
+        // off the scope while the scope is still live. Idempotent via the
+        // listener's `cleaned_up` guard.
+        if (task.pending_callback_listener) |l| {
+            l.shutdownAndCleanup();
+            task.pending_callback_listener = null;
+        }
+
         const was_cancelled = task.scope.isCancelled();
 
         // A workflow-script coroutine reaching retire WITHOUT having captured
@@ -4126,6 +4185,46 @@ test "zag.sleep yields, worker sleeps, coroutine resumes with (true, nil)" {
     _ = eng.lua.getField(-1, "err_is_nil");
     try std.testing.expect(eng.lua.toBoolean(-1));
     eng.lua.pop(1);
+}
+
+test "deinitAsync tears down a coroutine parked in await_callback without UAF/leak" {
+    // A coroutine parked in `zag.http.await_callback` owns a listener whose
+    // helper thread holds raw pointers into the task scope and the completion
+    // queue. If shutdown frees those before the helper is joined, the helper
+    // derefs freed memory and the listener (+ abort job, path, socket) leaks.
+    // Drive the real binding to the park, then assert deinitAsync is clean
+    // under the testing allocator.
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Grab a free loopback port the binding can bind. Close the probe before
+    // the bind; reuse_address tolerates the brief window.
+    var probe = try test_net.listenLoopback();
+    const port = test_net.boundPort(&probe);
+    probe.deinit(std.testing.io);
+
+    // Long timeout so the only way the listener winds down is teardown — no
+    // request is ever sent, so the coroutine stays parked until deinitAsync.
+    try eng.lua.doString(
+        \\function test_await()
+        \\  zag.http.await_callback({ port = _test_port, timeout_ms = 60000 })
+        \\end
+    );
+    eng.lua.pushInteger(@intCast(port));
+    eng.lua.setGlobal("_test_port");
+
+    _ = try eng.lua.getGlobal("test_await");
+    _ = try eng.spawnCoroutine(0, null);
+
+    // The coroutine yielded inside await_callback; exactly one task is parked.
+    try std.testing.expectEqual(@as(u32, 1), eng.tasks.count());
+
+    // The deferred `eng.deinitAsync()` retires the parked task and must join
+    // the helper + free the listener before freeing the scope/queue. A clean
+    // testing-allocator report (no leak) and no crash is the assertion.
 }
 
 test "taskForCoroutine fast path matches the linear scan for a yielding coroutine" {

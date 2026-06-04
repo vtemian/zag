@@ -131,6 +131,27 @@ pub fn pushJobResultOntoStack(allocator: Allocator, co: *Lua, job: *async_job.Jo
             co.pushNil();
             return 2;
         },
+        .http_callback_done => |r| {
+            // zag.http.await_callback success: build a string->string
+            // table of the URL-decoded query params, then free the
+            // worker-owned slices. Failure (timeout / cancelled) went
+            // through the generic err_tag branch above, so a job that
+            // reaches here always carries a (possibly empty) param set.
+            co.newTable();
+            for (r.params) |param| {
+                _ = co.pushString(param.name);
+                _ = co.pushString(param.value);
+                co.setTable(-3);
+            }
+            for (r.params) |param| {
+                allocator.free(param.name);
+                allocator.free(param.value);
+            }
+            if (r.params.len > 0) allocator.free(r.params);
+
+            co.pushNil();
+            return 2;
+        },
         .http_get, .http_post => {
             // On success the worker populated job.result.http with
             // a heap-allocated body (on engine allocator). In v1
