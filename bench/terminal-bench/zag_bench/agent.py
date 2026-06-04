@@ -125,13 +125,18 @@ class ZagAgent(BaseInstalledAgent):
         finally:
             os.unlink(host_instruction)
 
+        # zag is silent on stdout; its diagnostics go to $HOME/.zag/logs.
+        # Copy that log into /logs/agent so harbor collects it, preserving
+        # zag's exit code (pipefail carries it through the tee).
         await self.exec_as_agent(
             environment,
             command=(
                 f"{_CONTAINER_BIN} --headless "
                 f"--instruction-file={_CONTAINER_INSTRUCTION} "
                 f"--trajectory-out={_CONTAINER_TRAJECTORY} "
-                f"--no-session 2>&1 | stdbuf -oL tee {_CONTAINER_LOG}"
+                f"--no-session 2>&1 | stdbuf -oL tee {_CONTAINER_LOG}; "
+                'rc=$?; cat "$HOME"/.zag/logs/*.log >> /logs/agent/zag-internal.log 2>/dev/null; '
+                "exit $rc"
             ),
             env={"ZAG_BENCH_MODEL": self.model_name},
         )
