@@ -153,6 +153,10 @@ local function normalize_server(name, raw)
   return srv
 end
 
+-- Forward declaration: the eager-server turn_start hook is defined in the
+-- lifecycle section (later), but setup() references it.
+local register_eager_hook
+
 -- ---------------------------------------------------------------------------
 -- setup(): runs at config load. SYNCHRONOUS — nothing here may yield (the
 -- async runtime is not up yet). File reads (.mcp.json, cache) defer to the
@@ -188,11 +192,17 @@ function M.setup(config)
 
   -- Register the proxy tool now (config load is the only time registerTools
   -- harvests). Zero servers -> zero tools, to honor the token philosophy.
-  -- (Wired in Task E4.)
-  if M._register_proxy_tool and next(M._servers) ~= nil
-      and not M._settings.disable_proxy_tool then
+  if next(M._servers) ~= nil and not M._settings.disable_proxy_tool then
     M._register_proxy_tool()
   end
+
+  -- If any server is eager, register the one-shot turn_start connector. Hook
+  -- registration does not yield, so it is safe at config load.
+  local has_eager = false
+  for _, srv in pairs(M._servers) do
+    if srv.lifecycle == "eager" then has_eager = true; break end
+  end
+  if has_eager then register_eager_hook() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -886,6 +896,75 @@ local function content_text(content)
 end
 
 -- ---------------------------------------------------------------------------
+-- Lifecycle: disconnect, idle reaper, keep-alive reconnect, maintenance loop
+-- ---------------------------------------------------------------------------
+
+-- Polite disconnect: close the child's stdin (EOF is the MCP stdio shutdown
+-- signal), then escalate to TERM and reap with :wait(). Mirrors the __gc
+-- escalation order without the busy-spin. Skipped while a call is in flight.
+local function disconnect(srv)
+  if not srv.handle then
+    srv.status = "disconnected"
+    return
+  end
+  local h = srv.handle
+  -- Detach the handle from the server first so a concurrent reconnect can't
+  -- race on the same userdata.
+  srv.handle = nil
+  srv.line_iter = nil
+  srv.status = "disconnected"
+  pcall(function() h:close_stdin() end)
+  pcall(function() h:kill("TERM") end)
+  pcall(function() h:wait() end)
+end
+
+-- One maintenance pass over every server. Disconnects idle non-keep-alive
+-- servers; reconnects dead keep-alive servers. Exposed for deterministic
+-- testing (the real loop calls this between sleeps).
+local function maintenance_tick()
+  for _, srv in pairs(M._servers) do
+    local idle_s = (srv.idle_timeout_min or M._settings.idle_timeout_min or 10) * 60
+    if srv.status == "connected" and srv.lifecycle ~= "keep-alive" then
+      if (srv.in_flight or 0) == 0 and (M._now() - (srv.last_used or 0)) > idle_s then
+        disconnect(srv)
+      end
+    elseif srv.lifecycle == "keep-alive" and srv.status ~= "connected" then
+      pcall(connect, srv)
+    end
+  end
+end
+
+-- Lazily start the detached maintenance coroutine. Idempotent: only one loop
+-- runs for the engine's lifetime. zag.detach roots the coroutine at the root
+-- scope so it survives the spawning tool call.
+M._maintenance_started = false
+function M.ensure_maintenance()
+  if M._maintenance_started then return end
+  M._maintenance_started = true
+  zag.detach(function()
+    while M._started do
+      zag.sleep(30000)
+      pcall(maintenance_tick)
+    end
+  end)
+end
+
+-- One-shot turn_start hook: connect every `eager` server not yet connected,
+-- then remove itself so the cost is paid exactly once per session.
+function register_eager_hook()
+  local hook_id
+  hook_id = zag.hook("TurnStart", function()
+    M.ensure_maintenance()
+    for _, srv in pairs(M._servers) do
+      if srv.lifecycle == "eager" and srv.status ~= "connected" then
+        pcall(connect, srv)
+      end
+    end
+    if hook_id then zag.hook_del(hook_id) end
+  end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Proxy tool dispatch (port of pi proxy-modes.ts)
 -- ---------------------------------------------------------------------------
 
@@ -1253,6 +1332,9 @@ M._test = {
   metadata = function() return M._metadata end,
   proxy_execute = function(input) return M._proxy_execute(input) end,
   register_proxy_tool = function() return M._register_proxy_tool() end,
+  -- E5 lifecycle internals.
+  disconnect = function(srv) return disconnect(srv) end,
+  maintenance_tick = function() return maintenance_tick() end,
 }
 
 return M

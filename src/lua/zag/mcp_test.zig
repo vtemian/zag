@@ -51,6 +51,27 @@ fn runCoroutineToDone(engine: *LuaEngine, nargs: i32) !void {
     if (engine.tasks.count() > 0) return error.CoroutineTimedOut;
 }
 
+/// Pump completions until the Lua global `flag` becomes truthy. Unlike
+/// `runCoroutineToDone`, this tolerates lingering background tasks (e.g. the
+/// detached MCP maintenance loop parked in `zag.sleep`), which never retire.
+fn pumpUntilGlobalTrue(engine: *LuaEngine, flag: [:0]const u8) !void {
+    const deadline = clock.milliTimestamp() + 5000;
+    while (clock.milliTimestamp() < deadline) {
+        engine.pumpCompletions();
+        // getGlobal raises LuaError when the global is still nil; treat that
+        // as "not set yet" rather than a failure.
+        if (engine.lua.getGlobal(flag)) |_| {
+            const set = engine.lua.toBoolean(-1);
+            engine.lua.pop(1);
+            if (set) return;
+        } else |_| {
+            engine.lua.pop(1);
+        }
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    return error.FlagNeverSet;
+}
+
 /// Run a Lua body (a sequence of statements) inside a coroutine, wrapping it
 /// in pcall so an `assert`/error inside the coroutine is captured rather than
 /// lost. The body runs in a context where it can yield on the async runtime.
@@ -251,12 +272,18 @@ test "mcp .mcp.json merges under Lua-declared servers" {
     );
 
     // ensure_config_loaded() reads .mcp.json; it yields, so run it as a
-    // coroutine and pump.
+    // coroutine and pump. It also starts the detached maintenance loop (which
+    // parks in zag.sleep forever), so pump on a completion flag rather than
+    // waiting for every task to retire.
     try runLua(&engine,
-        \\function _mcp_load() require("zag.mcp").ensure_config_loaded() end
+        \\function _mcp_load()
+        \\  require("zag.mcp").ensure_config_loaded()
+        \\  _mcp_loaded = true
+        \\end
     );
     _ = try engine.lua.getGlobal("_mcp_load");
-    try runCoroutineToDone(&engine, 0);
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_mcp_loaded");
 
     try runLua(&engine,
         \\local mcp = require("zag.mcp")
@@ -689,4 +716,97 @@ test "mcp proxy tool is registered only when a server is configured" {
         \\mcp.setup{ servers = { fake = { command = { "echo" } } } }
     );
     try testing.expect(hasTool(&engine, "mcp"));
+}
+
+// ---------------------------------------------------------------------------
+// E5: lifecycle — idle disconnect, in_flight guard, keep-alive reconnect
+// ---------------------------------------------------------------------------
+
+test "mcp lifecycle: idle disconnect fires; in_flight blocks it" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupFakeServer(&engine, &tmp, fake_mcp_sh, &abs_buf);
+
+    try runCoroutineBody(&engine,
+        \\  mcp._test.set_now(1000000)
+        \\  mcp._test.servers().fake = fake  -- register so maintenance_tick sees it
+        \\  fake.lifecycle = "lazy"
+        \\  fake.idle_timeout_min = 10
+        \\  assert(mcp._test.connect(fake), "connect")
+        \\  assert(fake.status == "connected", "connected")
+        \\  -- last_used was set to now at connect. Advance the clock past the
+        \\  -- 10-minute idle window with a call still in flight: NO disconnect.
+        \\  fake.in_flight = 1
+        \\  mcp._test.set_now(1000000 + 11 * 60)
+        \\  mcp._test.maintenance_tick()
+        \\  assert(fake.status == "connected", "in_flight > 0 must block idle disconnect")
+        \\  -- Settle in_flight; the next tick reaps the idle server.
+        \\  fake.in_flight = 0
+        \\  mcp._test.maintenance_tick()
+        \\  assert(fake.status == "disconnected", "idle disconnect should fire")
+        \\  assert(fake.handle == nil, "handle cleared on disconnect")
+    );
+}
+
+test "mcp lifecycle: keep-alive reconnects a dead server" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupFakeServer(&engine, &tmp, fake_mcp_sh, &abs_buf);
+
+    try runCoroutineBody(&engine,
+        \\  mcp._test.set_now(2000000)
+        \\  mcp._test.servers().fake = fake
+        \\  fake.lifecycle = "keep-alive"
+        \\  assert(mcp._test.connect(fake), "initial connect")
+        \\  -- Simulate the child dying out from under us: drop the handle and
+        \\  -- mark the server disconnected (what a pipe EOF would lead to).
+        \\  mcp._test.disconnect(fake)
+        \\  assert(fake.status == "disconnected", "dead")
+        \\  -- A maintenance pass must revive a keep-alive server.
+        \\  assert(fake.lifecycle == "keep-alive", "lifecycle preserved")
+        \\  assert(fake.status ~= "connected", "precondition: dead before tick")
+        \\  mcp._test.maintenance_tick()
+        \\  assert(fake.status == "connected", "keep-alive should reconnect, status=" .. tostring(fake.status))
+        \\  mcp._test.disconnect(fake)
+    );
+}
+
+test "mcp lifecycle: keep-alive server is exempt from idle disconnect" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupFakeServer(&engine, &tmp, fake_mcp_sh, &abs_buf);
+
+    try runCoroutineBody(&engine,
+        \\  mcp._test.set_now(3000000)
+        \\  mcp._test.servers().fake = fake
+        \\  fake.lifecycle = "keep-alive"
+        \\  fake.idle_timeout_min = 1
+        \\  assert(mcp._test.connect(fake), "connect")
+        \\  -- Well past the idle window, but keep-alive servers never idle out.
+        \\  mcp._test.set_now(3000000 + 60 * 60)
+        \\  mcp._test.maintenance_tick()
+        \\  assert(fake.status == "connected", "keep-alive must not idle-disconnect")
+        \\  mcp._test.disconnect(fake)
+    );
 }
