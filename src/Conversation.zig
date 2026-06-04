@@ -1513,6 +1513,25 @@ pub fn childErroredForTask(child: *const Conversation) bool {
     return WireProjection.childErroredForTask(child);
 }
 
+/// Live status of this (child) Conversation, derived from its tree tail:
+///   * `ready`:   no nodes yet (spawn marker, no turn).
+///   * `running`: has nodes but the tail isn't an end-state.
+///   * `done`:    tail is `assistant_text` (the agent's final summary).
+///   * `failed`:  tail is `err`.
+/// The single source of truth for subagent status, shared by the
+/// `subagent_link` renderer (`NodeRenderer.subagentStatus`) and the
+/// `zag.pane.subagents` Lua binding so the transcript and the plugin
+/// surface can never disagree.
+pub fn subagentStatus(self: *const Conversation) []const u8 {
+    if (self.tree.root_children.items.len == 0) return "ready";
+    const tail = self.tree.root_children.items[self.tree.root_children.items.len - 1];
+    return switch (tail.node_type) {
+        .err => "failed",
+        .assistant_text => "done",
+        else => "running",
+    };
+}
+
 /// Resolve a node's bytes through the buffer registry. Returns an empty
 /// slice if the node has no buffer (tool_call, redacted thinking) or if
 /// the handle is stale (shouldn't happen in practice). Public so

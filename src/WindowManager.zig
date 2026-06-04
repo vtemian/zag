@@ -5029,6 +5029,135 @@ test "divorce sweep leaves unrelated subagent views untouched" {
     try std.testing.expectEqual(@as(usize, 0), f.wm.extra_floats.items.len);
 }
 
+// -- zag.pane.subagents / zag.pane.attach_subagent (Milestone C3) ------------
+
+/// Build a SubagentViewFixture wired to a live LuaEngine, so the
+/// `zag.pane.*` bindings (which resolve `engine.window_manager`) drive the
+/// real attach/enumerate paths. The engine is heap-owned by the caller;
+/// `engine.window_manager` borrows `&f.wm`. Returns the root pane's handle
+/// string (caller frees) so the Lua scripts can target the parent pane.
+fn rootPaneHandleString(allocator: std.mem.Allocator, wm: *WindowManager) ![]u8 {
+    const h = wm.root_pane.handle orelse return error.RootHandleMissing;
+    return NodeRegistry.formatId(allocator, h);
+}
+
+test "zag.pane.subagents enumerates children with 1-based index, name, and status" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    // Two children: the first gets a turn (an assistant_text node -> "done"),
+    // the second stays a bare spawn marker (-> "ready").
+    const first = try f.root_conv.spawnSubagent("alpha", "");
+    _ = try f.root_conv.spawnSubagent("beta", "");
+    _ = try first.appendNode(null, .assistant_text, "all done");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+    // Stash the parent pane handle as a global the script reads.
+    _ = engine.lua.pushString(root_id);
+    engine.lua.setGlobal("_root_id");
+
+    try engine.lua.doString(
+        \\local subs = zag.pane.subagents(_root_id)
+        \\assert(#subs == 2, "expected 2 subagents, got " .. tostring(#subs))
+        \\assert(subs[1].index == 1, "first index must be 1, got " .. tostring(subs[1].index))
+        \\assert(subs[1].name == "alpha", "first name: " .. tostring(subs[1].name))
+        \\assert(subs[1].status == "done", "first status: " .. tostring(subs[1].status))
+        \\assert(subs[2].index == 2, "second index must be 2, got " .. tostring(subs[2].index))
+        \\assert(subs[2].name == "beta", "second name: " .. tostring(subs[2].name))
+        \\assert(subs[2].status == "ready", "second status: " .. tostring(subs[2].status))
+    );
+}
+
+test "zag.pane.attach_subagent returns a pane id present in the tree, dedups, and respects focus=false" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    _ = try f.root_conv.spawnSubagent("codereview", "");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+    _ = engine.lua.pushString(root_id);
+    engine.lua.setGlobal("_root_id");
+
+    // The focused leaf before the attach (focus=false must not change it).
+    const focus_before = f.wm.layout.getFocusedLeaf();
+
+    try engine.lua.doString(
+        \\-- focus defaults to false; the view must not steal focus.
+        \\local view_id = zag.pane.attach_subagent(_root_id, 1)
+        \\assert(type(view_id) == "string" and view_id ~= "", "attach must return a pane id string")
+        \\_view_id = view_id
+        \\
+        \\-- The new view pane shows up in the live tree. describe() returns
+        \\-- { root = "n<u32>", focus = ..., nodes = { ["n<u32>"] = {...} } },
+        \\-- so a live leaf is present exactly when nodes[id] is non-nil.
+        \\local tree = zag.layout.tree()
+        \\assert(tree.nodes[view_id] ~= nil,
+        \\       "view pane id must be present in zag.layout.tree().nodes")
+        \\
+        \\-- Attaching the same child again returns the SAME handle (dedup).
+        \\local again = zag.pane.attach_subagent(_root_id, 1)
+        \\assert(again == view_id, "attach twice must dedup to the same id: "
+        \\       .. tostring(again) .. " vs " .. tostring(view_id))
+    );
+
+    // focus=false: the focused leaf is unchanged across both attaches.
+    const focus_after = f.wm.layout.getFocusedLeaf();
+    try std.testing.expectEqual(focus_before, focus_after);
+
+    // Exactly one borrowed view pane exists (dedup held on the Zig side too).
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+    try std.testing.expect(f.wm.extra_panes.items[0].is_subagent_view);
+
+    // zag.layout.close detaches the view leaf from the tiled tree.
+    try engine.lua.doString(
+        \\zag.layout.close(_view_id)
+    );
+}
+
+test "zag.pane.attach_subagent raises cleanly on an out-of-range child index" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    _ = try f.root_conv.spawnSubagent("only-child", "");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+    _ = engine.lua.pushString(root_id);
+    engine.lua.setGlobal("_root_id");
+
+    // Index 2 is out of range (only one child); the binding must raise, and a
+    // pcall captures it cleanly (no crash, no dangling view).
+    try engine.lua.doString(
+        \\local ok, err = pcall(function() return zag.pane.attach_subagent(_root_id, 2) end)
+        \\assert(not ok, "out-of-range index must raise")
+        \\assert(tostring(err):find("attach_subagent"), "error must name the binding: " .. tostring(err))
+    );
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_panes.items.len);
+}
+
 test "executeAction lua_callback runs the Lua function via the engine" {
     const allocator = std.testing.allocator;
 
