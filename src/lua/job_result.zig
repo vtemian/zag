@@ -314,6 +314,37 @@ pub fn pushJobResultOntoStack(allocator: Allocator, co: *Lua, job: *async_job.Jo
     }
 }
 
+/// Free the worker-owned payload slices of a result that will never be
+/// pushed onto Lua (the awaiting coroutine was force-retired at engine
+/// teardown before the completion could be drained). Mirrors the inline
+/// frees `pushJobResultOntoStack` performs after Lua copies each slice;
+/// keep the two in sync when a result kind gains an owned slice.
+pub fn freeAbandonedResult(allocator: Allocator, result: async_job.JobResult) void {
+    switch (result) {
+        .empty, .fs_stat => {},
+        .cmd_exec => |r| {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        },
+        .http => |r| {
+            // Guard the outer-slice free so the v1 `&.{}` sentinel (no
+            // backing allocation) doesn't hit the allocator.
+            allocator.free(r.body);
+            for (r.headers) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            if (r.headers.len > 0) allocator.free(r.headers);
+        },
+        .fs_read => |r| allocator.free(r.bytes),
+        .fs_list => |r| {
+            for (r.entries) |entry| allocator.free(entry.name);
+            if (r.entries.len > 0) allocator.free(r.entries);
+        },
+        .llm_complete => |r| allocator.free(r.text),
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

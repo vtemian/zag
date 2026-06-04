@@ -3630,6 +3630,11 @@ pub const LuaEngine = struct {
         // detached coroutine leaks its Job at engine teardown.
         if (task.pending_job) |job| {
             if (job.err_detail) |d| self.allocator.free(d);
+            // A worker may have completed the job (filling `result` with
+            // owned payload slices) in the window between deinitAsync's
+            // completion drain and the pool join; nobody will push it onto
+            // Lua now, so free the payloads here too.
+            if (job.result) |res| job_result_mod.freeAbandonedResult(self.allocator, res);
             self.allocator.destroy(job);
             task.pending_job = null;
         }
