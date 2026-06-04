@@ -1267,6 +1267,75 @@ test "startWorkflowScript completes with is_error when the script raises at runt
     try testing.expectEqual(@as(u32, 0), engine.tasks.count());
 }
 
+// -- Lua tool coroutine + child process (Milestone A) -----------------------
+
+/// Drive a started Lua-tool coroutine to completion the way an agent driver's
+/// main loop would: pump job completions (the tool's spawn/write/lines/wait
+/// yields land here) until the request fires `done`. Bounded by a wall-clock
+/// deadline so a wiring bug fails the test instead of hanging it.
+fn pumpLuaToolToDone(engine: *LuaEngine, req: *Hooks.LuaToolRequest) !void {
+    const deadline = clock.milliTimestamp() + 4000;
+    while (!req.done.isSet() and clock.milliTimestamp() < deadline) {
+        engine.pumpCompletions();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    if (!req.done.isSet()) return error.LuaToolTimedOut;
+}
+
+test "a zag.tool execute spawns a child and round-trips a line through it" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // The tool's execute fn spawns a child shell, writes a line to its stdin,
+    // closes stdin, reads the echoed line back, and waits for it. Every step
+    // yields on async I/O, so this proves a Lua tool survives multiple yields
+    // mid-execute — the exact shape the MCP stdio client relies on.
+    try runLua(&engine,
+        \\zag.tool({
+        \\  name = "echo_rpc",
+        \\  description = "d",
+        \\  input_schema = { type = "object" },
+        \\  execute = function(input)
+        \\    local h, err = zag.cmd.spawn(
+        \\      { "sh", "-c", "read line; printf '%s\n' \"$line\"" },
+        \\      { capture_stdout = true, capture_stdin = true })
+        \\    if not h then return nil, err end
+        \\    h:write("hello\n")
+        \\    h:close_stdin()
+        \\    local out
+        \\    for line in h:lines() do out = line end
+        \\    h:wait()
+        \\    return out or "no output"
+        \\  end,
+        \\})
+    );
+
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "echo_rpc",
+        .input_raw = "{}",
+        .allocator = allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    engine.startLuaToolCall(&req);
+    try pumpLuaToolToDone(&engine, &req);
+
+    defer if (req.result_owned) allocator.free(req.result_content.?);
+    try testing.expect(!req.result_is_error);
+    try testing.expectEqualStrings("hello", req.result_content.?);
+
+    // The tool coroutine retired; no live tasks, no leak at deinit.
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
 // -- Workflow fan-out bound (Milestone D) -----------------------------------
 
 test "zag.workflow.max_fanout defaults to 8 and is settable from Lua" {
