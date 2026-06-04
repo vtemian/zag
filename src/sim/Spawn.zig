@@ -30,19 +30,20 @@ pub fn spawn(
     // No errdefer here: ownership splits after fork, so each error path
     // below performs targeted cleanup on the fds it still owns.
 
-    const err_pipe = posix.pipe2(.{ .CLOEXEC = true }) catch |e| {
+    const err_pipe = pipeCloexec() catch |e| {
         pty.close();
         return e;
     };
 
-    const pid = posix.fork() catch |e| {
-        posix.close(err_pipe[0]);
-        posix.close(err_pipe[1]);
+    const pid = std.c.fork();
+    if (pid < 0) {
+        std.Io.Threaded.closeFd(err_pipe[0]);
+        std.Io.Threaded.closeFd(err_pipe[1]);
         pty.close();
-        return e;
-    };
+        return error.ForkFailed;
+    }
     if (pid == 0) {
-        posix.close(err_pipe[0]);
+        std.Io.Threaded.closeFd(err_pipe[0]);
         childPreExec(pty) catch |e| reportAndExit(err_pipe[1], e);
         // Build null-terminated argv/envp on the stack (no alloc).
         var argv_buf: [64]?[*:0]const u8 = undefined;
@@ -53,24 +54,62 @@ pub fn spawn(
         argv_buf[argv.len] = null;
         for (envp, 0..) |e, i| envp_buf[i] = e;
         envp_buf[envp.len] = null;
+        // execve only, no PATH search: libc has no portable execvpe (macOS
+        // lacks it) and scenario `spawn` paths are absolute or ./-relative.
         const argv0 = argv[0];
-        const exec_err = posix.execvpeZ(argv0, @ptrCast(&argv_buf), @ptrCast(&envp_buf));
-        reportAndExit(err_pipe[1], exec_err);
+        _ = std.c.execve(argv0, @ptrCast(&argv_buf), @ptrCast(&envp_buf));
+        reportAndExit(err_pipe[1], error.ExecFailed);
     }
 
-    posix.close(err_pipe[1]);
-    posix.close(pty.slave);
+    std.Io.Threaded.closeFd(err_pipe[1]);
+    std.Io.Threaded.closeFd(pty.slave);
     // Slave is owned by child now; parent only owns `pty.master`.
 
     var buf: [@sizeOf(anyerror)]u8 = undefined;
     const n = posix.read(err_pipe[0], &buf) catch 0;
-    posix.close(err_pipe[0]);
+    std.Io.Threaded.closeFd(err_pipe[0]);
     if (n > 0) {
-        _ = posix.waitpid(pid, 0);
-        posix.close(pty.master);
+        _ = waitPid(pid);
+        std.Io.Threaded.closeFd(pty.master);
         return error.ChildSetupFailed;
     }
     return .{ .pid = pid, .pty = .{ .master = pty.master, .slave = -1 } };
+}
+
+/// CLOEXEC pipe. Drop-in for the removed `std.posix.pipe2(.{ .CLOEXEC = true })`:
+/// the write end must close on the child's successful exec so the parent's
+/// read returns EOF (success) or the smuggled setup error.
+fn pipeCloexec() ![2]posix.fd_t {
+    var fds: [2]std.c.fd_t = undefined;
+    while (true) switch (posix.errno(std.c.pipe(&fds))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        else => return error.Unexpected,
+    };
+    errdefer {
+        std.Io.Threaded.closeFd(fds[0]);
+        std.Io.Threaded.closeFd(fds[1]);
+    }
+    for (fds) |fd| {
+        const flags = std.c.fcntl(fd, std.c.F.GETFD, @as(usize, 0));
+        if (flags < 0) return error.Unexpected;
+        if (std.c.fcntl(fd, std.c.F.SETFD, @as(usize, @intCast(flags | posix.FD_CLOEXEC))) < 0) return error.Unexpected;
+    }
+    return .{ fds[0], fds[1] };
+}
+
+/// waitpid wrapper returning the raw status. Drop-in for the removed
+/// `std.posix.waitpid(pid, 0)` (EINTR-retried).
+pub fn waitPid(pid: posix.pid_t) u32 {
+    var status: c_int = 0;
+    while (true) {
+        const rc = std.c.waitpid(pid, &status, 0);
+        if (rc >= 0) break;
+        if (posix.errno(rc) != .INTR) break;
+    }
+    return @bitCast(status);
 }
 
 fn childPreExec(pty: Pty) !void {
@@ -79,17 +118,17 @@ fn childPreExec(pty: Pty) !void {
         .SUCCESS => {},
         else => return error.TIOCSCTTY,
     }
-    try posix.dup2(pty.slave, 0);
-    try posix.dup2(pty.slave, 1);
-    try posix.dup2(pty.slave, 2);
-    if (pty.slave > 2) posix.close(pty.slave);
-    posix.close(pty.master);
+    if (std.c.dup2(pty.slave, 0) < 0) return error.Dup2;
+    if (std.c.dup2(pty.slave, 1) < 0) return error.Dup2;
+    if (std.c.dup2(pty.slave, 2) < 0) return error.Dup2;
+    if (pty.slave > 2) std.Io.Threaded.closeFd(pty.slave);
+    std.Io.Threaded.closeFd(pty.master);
 }
 
 fn reportAndExit(fd: posix.fd_t, err: anyerror) noreturn {
     const bytes = std.mem.asBytes(&err);
-    _ = posix.write(fd, bytes) catch {};
-    posix.exit(127);
+    _ = std.c.write(fd, bytes.ptr, bytes.len);
+    std.c._exit(127);
 }
 
 test "spawn /bin/cat round-trips one byte" {
@@ -98,11 +137,11 @@ test "spawn /bin/cat round-trips one byte" {
     const sp = try spawn(&argv, &envp, 80, 24);
     defer {
         _ = posix.kill(sp.pid, posix.SIG.KILL) catch {};
-        _ = posix.waitpid(sp.pid, 0);
-        posix.close(sp.pty.master);
+        _ = waitPid(sp.pid);
+        std.Io.Threaded.closeFd(sp.pty.master);
     }
 
-    _ = try posix.write(sp.pty.master, "x\n");
+    try std.testing.expect(std.c.write(sp.pty.master, "x\n", 2) > 0);
     var out: [8]u8 = undefined;
     // Set a 1s timeout via poll; cat echoes input in line buffered mode.
     var fds = [_]posix.pollfd{.{ .fd = sp.pty.master, .events = posix.POLL.IN, .revents = 0 }};

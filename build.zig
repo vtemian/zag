@@ -67,9 +67,35 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         sim_mod.addImport("build_options", build_options.createModule());
-        // ghostty (ghostty-vt) is dropped on the 0.16 branch (0.15-only; see
-        // build.zig.zon). zag-sim cannot build until ghostty supports 0.16
-        // (PR 12726); re-add the lazyDependency import here when it does.
+        // clock.zig and process_io.zig live outside the sim module root
+        // (src/sim/), so expose them as named modules instead of relative
+        // file imports.
+        sim_mod.addImport("clock", b.createModule(.{
+            .root_source_file = b.path("src/clock.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        sim_mod.addImport("process_io", b.createModule(.{
+            .root_source_file = b.path("src/process_io.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        sim_mod.addImport("env", b.createModule(.{
+            .root_source_file = b.path("src/env.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        // emit-lib-vt puts ghostty's build in libghostty-vt-only mode: it
+        // skips the GTK dist resources (whose pkg-config probe for
+        // libadwaita-1 panics on macOS at graph-config time). The
+        // xcframework default flips to "if xcodebuild exists" in that mode,
+        // so pin it off; we only consume the ghostty-vt module.
+        if (b.lazyDependency("ghostty", .{
+            .@"emit-lib-vt" = true,
+            .@"emit-xcframework" = false,
+        })) |dep| {
+            sim_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        }
         sim_mod.link_libc = true;
         if (target.result.os.tag == .linux) {
             sim_mod.linkSystemLibrary("util", .{});

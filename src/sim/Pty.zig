@@ -36,16 +36,17 @@ pub fn open(cols: u16, rows: u16) !Pty {
     var m: c_int = undefined;
     var s: c_int = undefined;
     if (c.openpty(&m, &s, null, null, &ws) < 0) return error.OpenptyFailed;
-    errdefer posix.close(m);
-    errdefer posix.close(s);
-    const flags = try posix.fcntl(m, posix.F.GETFD, 0);
-    _ = try posix.fcntl(m, posix.F.SETFD, flags | posix.FD_CLOEXEC);
+    errdefer std.Io.Threaded.closeFd(m);
+    errdefer std.Io.Threaded.closeFd(s);
+    const flags = std.c.fcntl(m, std.c.F.GETFD, @as(usize, 0));
+    if (flags < 0) return error.FcntlFailed;
+    if (std.c.fcntl(m, std.c.F.SETFD, @as(usize, @intCast(flags | posix.FD_CLOEXEC))) < 0) return error.FcntlFailed;
     return .{ .master = m, .slave = s };
 }
 
 pub fn close(self: Pty) void {
-    posix.close(self.master);
-    posix.close(self.slave);
+    std.Io.Threaded.closeFd(self.master);
+    std.Io.Threaded.closeFd(self.slave);
 }
 
 test "open returns positive fds" {

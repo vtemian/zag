@@ -15,6 +15,7 @@
 //! surfaced as `error.MalformedEntry`.
 
 const std = @import("std");
+const process_io = @import("process_io");
 const Allocator = std.mem.Allocator;
 
 /// One user-typed message extracted from a session JSONL.
@@ -28,8 +29,7 @@ pub const UserTurn = struct {
 
 pub const ParseError = error{
     MalformedEntry,
-} || Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError ||
-    std.fs.Dir.StatFileError;
+} || Allocator.Error || std.Io.Dir.ReadFileAllocError;
 
 /// Defensive cap. Sessions in the wild are kilobytes.
 const max_session_bytes: usize = std.math.maxInt(u32);
@@ -37,7 +37,7 @@ const max_session_bytes: usize = std.math.maxInt(u32);
 /// Read `path` and delegate to `parseSlice`. Path may be absolute or
 /// relative to the process cwd.
 pub fn parseFile(alloc: Allocator, path: []const u8) ![]UserTurn {
-    const src = try std.fs.cwd().readFileAlloc(alloc, path, max_session_bytes);
+    const src = try std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, alloc, .limited(max_session_bytes));
     defer alloc.free(src);
     return parseSlice(alloc, src);
 }

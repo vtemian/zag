@@ -7,6 +7,8 @@
 //! missing file, flag parse error) maps to `harness_error` (3).
 
 const std = @import("std");
+const process_io = @import("process_io");
+const env_mod = @import("env");
 const Scenario = @import("Scenario.zig");
 const Runner = @import("Runner.zig");
 const Artifacts = @import("Artifacts.zig");
@@ -31,13 +33,20 @@ comptime {
 /// failure to even start a scenario. Mirrors `Runner.Outcome.harness_error`.
 const exit_harness_error: u8 = @intFromEnum(Runner.Outcome.harness_error);
 
-pub fn main() !u8 {
+pub fn main(start: std.process.Init) !u8 {
     var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const argv = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, argv);
+    // One process-wide io for every fs call site, mirroring zag's own
+    // process_io pattern. Seed environ so spawned children inherit PATH.
+    var io_threaded = std.Io.Threaded.init(alloc, .{ .environ = start.minimal.environ });
+    defer io_threaded.deinit();
+    process_io.init(io_threaded.io());
+    env_mod.init(start.environ_map);
+
+    const argv = try start.minimal.args.toSlice(alloc);
+    defer alloc.free(argv);
 
     if (argv.len < 2) {
         printUsage(stderrFile());
@@ -64,7 +73,7 @@ pub fn main() !u8 {
 /// Parse `run` flags and delegate to the scenario driver. Any failure before
 /// the scenario starts executing (flag parse error, missing path, IO error on
 /// read) maps to `harness_error` and is reported to stderr.
-fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
+fn dispatchRun(alloc: std.mem.Allocator, args: []const [:0]const u8) !u8 {
     var artifacts_override: ?[]const u8 = null;
     var scenario_path: ?[]const u8 = null;
     var wait_default_ms: ?u32 = null;
@@ -120,7 +129,7 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         writeLine(stdoutFile(), "scenario: result");
         return code;
     };
-    _ = stdoutFile().write(line) catch {};
+    stdoutFile().writeStreamingAll(process_io.get(), line) catch {};
     return code;
 }
 
@@ -129,7 +138,7 @@ fn dispatchRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 /// a fresh zag run; everything else is opaque LLM-system output and is
 /// silently skipped at parse time. Any failure before the file is on disk
 /// maps to `harness_error` and is reported to stderr.
-fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
+fn dispatchReplayGen(alloc: std.mem.Allocator, args: []const [:0]const u8) !u8 {
     var session_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
 
@@ -160,7 +169,7 @@ fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return exit_harness_error;
     };
 
-    std.fs.cwd().makePath(dir) catch |e| {
+    std.Io.Dir.cwd().createDirPath(process_io.get(), dir) catch |e| {
         reportFmt("zag-sim replay-gen: cannot create out dir '{s}': {s}\n", .{ dir, @errorName(e) });
         return exit_harness_error;
     };
@@ -185,7 +194,7 @@ fn dispatchReplayGen(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const summary = std.fmt.bufPrint(&scratch, "replay-gen wrote {s} ({d} user turn(s))\n", .{
         scenario_path, turns.len,
     }) catch "replay-gen: ok\n";
-    _ = stdoutFile().write(summary) catch {};
+    stdoutFile().writeStreamingAll(process_io.get(), summary) catch {};
     return 0;
 }
 
@@ -194,15 +203,16 @@ fn writeScenario(
     turns: []const Replay.UserTurn,
     opts: Replay.EmitOptions,
 ) !void {
-    const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer f.close();
+    const io = process_io.get();
+    const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
     var fw_buf: [4096]u8 = undefined;
-    var fw = f.writer(&fw_buf);
+    var fw = f.writer(io, &fw_buf);
     try Replay.emitScenario(&fw.interface, turns, opts);
     try fw.interface.flush();
 }
 
-fn printUsage(file: std.fs.File) void {
+fn printUsage(file: std.Io.File) void {
     const msg =
         \\zag-sim: terminal scenario driver
         \\
@@ -222,29 +232,30 @@ fn printUsage(file: std.fs.File) void {
         \\  3  harness_error (includes flag/usage errors)
         \\
     ;
-    _ = file.write(msg) catch {};
+    file.writeStreamingAll(process_io.get(), msg) catch {};
 }
 
-fn writeLine(file: std.fs.File, line: []const u8) void {
-    _ = file.write(line) catch {};
-    _ = file.write("\n") catch {};
+fn writeLine(file: std.Io.File, line: []const u8) void {
+    const io = process_io.get();
+    file.writeStreamingAll(io, line) catch {};
+    file.writeStreamingAll(io, "\n") catch {};
 }
 
-/// Format into a 512-byte scratch buffer and write to stderr. Zig 0.15's
-/// `std.fs.File` has no `print`, so we bufPrint first. Oversized messages
+/// Format into a 512-byte scratch buffer and write to stderr.
+/// `std.Io.File` has no `print`, so we bufPrint first. Oversized messages
 /// fall back to the static format string so we never silently drop a line.
 fn reportFmt(comptime fmt: []const u8, args: anytype) void {
     var scratch: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&scratch, fmt, args) catch fmt;
-    _ = stderrFile().write(msg) catch {};
+    stderrFile().writeStreamingAll(process_io.get(), msg) catch {};
 }
 
-fn stdoutFile() std.fs.File {
-    return .{ .handle = std.posix.STDOUT_FILENO };
+fn stdoutFile() std.Io.File {
+    return std.Io.File.stdout();
 }
 
-fn stderrFile() std.fs.File {
-    return .{ .handle = std.posix.STDERR_FILENO };
+fn stderrFile() std.Io.File {
+    return std.Io.File.stderr();
 }
 
 // --- tests ------------------------------------------------------------------
