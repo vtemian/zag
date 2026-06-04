@@ -62,6 +62,12 @@ local PROTOCOL_VERSION = "2025-06-18"
 -- this is a stable placeholder rather than the binary's version.
 local CLIENT_VERSION = "0"
 
+-- The actionable error a 401 surfaces, shared by the Streamable arm and the
+-- legacy-SSE 401 mapper so the two transports speak with one voice.
+local NEEDS_AUTH_MESSAGE =
+  "needs auth: server requires authorization (401). Set auth = \"oauth\" "
+  .. "to run the OAuth flow, or a bearer_token/bearer_token_env."
+
 -- ---------------------------------------------------------------------------
 -- Clock seam: route every os.time() read through M._now so tests can pin it.
 -- ---------------------------------------------------------------------------
@@ -632,9 +638,7 @@ function http_send_request(srv, msg, deadline, retried)
     srv.needs_auth_info = stream:header("www-authenticate") or "401 (no WWW-Authenticate header)"
     stream:close()
     srv.status = "needs-auth"
-    return nil,
-      "needs auth: server requires authorization (401). Set auth = \"oauth\" "
-      .. "to run the OAuth flow, or a bearer_token/bearer_token_env."
+    return nil, NEEDS_AUTH_MESSAGE
   elseif status == 404 and srv.session_id and not retried then
     -- Session expired: drop it, re-initialize once, retry the original once.
     stream:close()
@@ -993,6 +997,15 @@ local function default_browser_opener(url)
 end
 M._browser_opener = default_browser_opener
 
+-- Sanitize an untrusted callback string before embedding it in an error: drop
+-- control characters (so a malicious `error` cannot smuggle ANSI/newlines into
+-- the TUI) and clamp the length so it cannot flood a status line.
+local function clamp_untrusted(s)
+  local cleaned = tostring(s):gsub("[%c]", "")
+  if #cleaned > 200 then cleaned = cleaned:sub(1, 200) .. "..." end
+  return cleaned
+end
+
 -- Percent-encode one string for application/x-www-form-urlencoded. Unreserved
 -- characters (RFC 3986) pass through; everything else is %XX. Space is %20
 -- (not '+'), which every conformant decoder accepts.
@@ -1124,7 +1137,7 @@ end
 function map_sse_401(srv, www)
   srv.status = "needs-auth"
   srv.needs_auth_info = www or "401 (no WWW-Authenticate header)"
-  return "needs auth: server requires authorization (401)"
+  return NEEDS_AUTH_MESSAGE
 end
 
 -- Pull the resource_metadata URL out of a WWW-Authenticate header value.
@@ -1354,7 +1367,7 @@ local function oauth_authorization_code(srv)
   local code = params.code
   if type(code) ~= "string" or #code == 0 then
     if params.error then
-      return nil, "authorization denied: " .. tostring(params.error)
+      return nil, "authorization denied: " .. clamp_untrusted(params.error)
     end
     return nil, "authorization callback carried no code"
   end
@@ -2904,7 +2917,9 @@ M._test = {
   -- H OAuth internals + seams.
   set_home_dir = function(d) M._home_dir_override = d end,
   set_browser_opener = function(fn) M._browser_opener = fn end,
+  default_browser_opener = function(url) return default_browser_opener(url) end,
   require_https = function(u) return require_https(u) end,
+  clamp_untrusted = function(s) return clamp_untrusted(s) end,
   form_encode = function(p) return form_encode(p) end,
   canonical_resource = function(u) return canonical_resource(u) end,
   oauth_save_tokens = function(srv, bundle) return oauth_save_tokens(srv, bundle) end,

@@ -2280,6 +2280,10 @@ test "mcp oauth: auto-auth runs the PKCE flow and retries the 401 once" {
     // redirect. A short retry loop covers the bind-vs-fire race.
     try runLua(&engine,
         \\mcp._test.set_browser_opener(function(url)
+        \\  -- Stash the authorize URL so the test body can assert its PKCE +
+        \\  -- resource params (asserting here would be swallowed by the opener's
+        \\  -- pcall wrapper in oauth_authorization_code).
+        \\  _authorize_url = url
         \\  local state = url:match("[?&]state=([^&]+)")
         \\  local redirect = url:match("[?&]redirect_uri=([^&]+)")
         \\  -- redirect_uri is form-encoded; we only need the port/path, which
@@ -2310,6 +2314,12 @@ test "mcp oauth: auto-auth runs the PKCE flow and retries the 401 once" {
         \\  assert(srv.oauth_access_token == "tok-access", "access token stored, got " .. tostring(srv.oauth_access_token))
         \\  local tools, terr = mcp._test.list_tools(srv)
         \\  assert(tools and tools[1].name == "add", "tools/list after auth: " .. tostring(terr))
+        \\  -- The authorize URL the browser opened carried the PKCE challenge
+        \\  -- (S256) and the RFC 8707 resource indicator.
+        \\  assert(_authorize_url, "browser opener captured the authorize URL")
+        \\  assert(_authorize_url:find("resource=", 1, true), "authorize URL carries resource=")
+        \\  assert(_authorize_url:find("code_challenge=", 1, true), "authorize URL carries code_challenge=")
+        \\  assert(_authorize_url:find("code_challenge_method=S256", 1, true), "authorize URL carries S256")
         \\  mcp._test.disconnect(srv)
     );
 
@@ -2689,5 +2699,76 @@ test "mcp oauth: require_https accepts https anywhere and http only for loopback
         \\assert(err:find("http", 1, true), "error names the scheme: " .. tostring(err))
         \\assert(err:find("203.0.113.5", 1, true), "error names the host: " .. tostring(err))
         \\assert(not err:find("secret", 1, true), "error must not echo the query string")
+    );
+}
+
+test "mcp oauth: canonical_resource lowercases scheme+host and drops query/fragment" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local got = mcp._test.canonical_resource("HTTPS://Host.COM:443/Path?q#f")
+        \\assert(got == "https://host.com:443/Path",
+        \\  "canonical_resource normalized, got " .. tostring(got))
+    );
+}
+
+test "mcp oauth: form_encode percent-encodes space as %20 and plus as %2B" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local got = mcp._test.form_encode({ a = " +" })
+        \\assert(got == "a=%20%2B", "form_encode, got " .. tostring(got))
+    );
+}
+
+test "mcp oauth: clamp_untrusted strips control chars and clamps length" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local cu = mcp._test.clamp_untrusted
+        \\-- Control chars (CR/LF/ESC) are dropped so a callback `error` cannot
+        \\-- smuggle ANSI or newlines into a status line.
+        \\local got = cu("access_denied\r\n\27[31mboom\27[0m")
+        \\assert(not got:find("\n", 1, true), "newline stripped")
+        \\assert(not got:find("\27", 1, true), "escape stripped")
+        \\assert(got:find("access_denied", 1, true), "visible text kept")
+        \\-- Overlong input is clamped.
+        \\local long = cu(string.rep("x", 500))
+        \\assert(#long <= 203, "clamped to 200 + ellipsis, got " .. tostring(#long))
+        \\assert(long:sub(-3) == "...", "clamp adds an ellipsis")
+    );
+}
+
+test "mcp oauth: default_browser_opener tries open then xdg-open" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Shadow zag.cmd.spawn to capture the argv of each launch attempt. The
+    // first call returns nil (open absent), so the opener must fall back to
+    // xdg-open with the same URL.
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\_spawned = {}
+        \\zag.cmd.spawn = function(argv)
+        \\  _spawned[#_spawned + 1] = { argv[1], argv[2] }
+        \\  if argv[1] == "open" then return nil end
+        \\  return { wait = function() end }
+        \\end
+        \\mcp._test.default_browser_opener("https://auth.example/authorize")
+        \\assert(#_spawned == 2, "two launch attempts, got " .. tostring(#_spawned))
+        \\assert(_spawned[1][1] == "open" and _spawned[1][2] == "https://auth.example/authorize",
+        \\  "first attempt is {open, url}")
+        \\assert(_spawned[2][1] == "xdg-open" and _spawned[2][2] == "https://auth.example/authorize",
+        \\  "fallback attempt is {xdg-open, url}")
     );
 }
