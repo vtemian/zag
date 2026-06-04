@@ -407,6 +407,17 @@ pub fn formatAgentErrorMessage(
             "Context window exceeded after compaction. The conversation is too large to send. " ++
                 "Try /clear to start fresh, raise zag.compact.set_reserve_tokens, or switch to a model with a larger window.",
         ),
+        // Forced structured-output failures (subagent runs). The agent loop
+        // wrote a descriptive message naming the schema violation (or the
+        // missing tool call) into the detail slot; surface it instead of the
+        // bare error name so the orchestration script and transcript see why
+        // the child failed. Falls back to the error name when no detail wired.
+        error.StructuredOutputInvalid, error.StructuredOutputMissing => blk: {
+            if (detail_opt) |d| {
+                if (d.take()) |bytes| break :blk bytes;
+            }
+            break :blk allocator.dupe(u8, @errorName(err));
+        },
         else => allocator.dupe(u8, @errorName(err)),
     };
 }
@@ -2381,6 +2392,30 @@ test "formatAgentErrorMessage falls back to error name for unhinted errors" {
     const msg = try formatAgentErrorMessage(error.MalformedResponse, "openai-oauth", allocator, null);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("MalformedResponse", msg);
+}
+
+test "formatAgentErrorMessage surfaces structured-output detail naming the violation" {
+    const allocator = std.testing.allocator;
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    detail.setOwned(try allocator.dupe(
+        u8,
+        "subagent structured output failed schema validation: EnumMismatch",
+    ));
+    const msg = try formatAgentErrorMessage(error.StructuredOutputInvalid, "stub", allocator, &detail);
+    defer allocator.free(msg);
+    // The descriptive detail wins over the bare error name.
+    try std.testing.expectEqualStrings(
+        "subagent structured output failed schema validation: EnumMismatch",
+        msg,
+    );
+}
+
+test "formatAgentErrorMessage falls back to error name when no structured-output detail wired" {
+    const allocator = std.testing.allocator;
+    const msg = try formatAgentErrorMessage(error.StructuredOutputMissing, "stub", allocator, null);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("StructuredOutputMissing", msg);
 }
 
 test "current_caller_pane_id threadlocal is per-thread" {
