@@ -1,0 +1,48 @@
+--- a/src/os/mach.zig	1970-01-01 02:00:00
++++ b/src/os/mach.zig	2026-06-04 14:08:55
+@@ -53,6 +53,11 @@
+         .free = free,
+     };
+ 
++    /// Zig 0.16 made `next_mmap_addr_hint` private to
++    /// `std.heap.PageAllocator`; keep our own hint, exactly as 0.16's
++    /// PageAllocator does internally.
++    var next_mmap_addr_hint: ?[*]align(std.heap.page_size_min) u8 = null;
++
+     fn alloc(context: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
+         _ = ra;
+         assert(n > 0);
+@@ -92,11 +97,11 @@
+             aligned_len
+         else
+             mem.alignForward(usize, aligned_len + max_drop_len, page_size);
+-        const hint = @atomicLoad(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, .unordered);
++        const hint = @atomicLoad(@TypeOf(next_mmap_addr_hint), &next_mmap_addr_hint, .unordered);
+         const slice = std.posix.mmap(
+             hint,
+             overalloc_len,
+-            std.posix.PROT.READ | std.posix.PROT.WRITE,
++            .{ .READ = true, .WRITE = true },
+             .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+             tag.make(),
+             0,
+@@ -110,7 +115,7 @@
+         const remaining_len = overalloc_len - drop_len;
+         if (remaining_len > aligned_len) std.posix.munmap(@alignCast(result_ptr[aligned_len..remaining_len]));
+         const new_hint: [*]align(std.heap.page_size_min) u8 = @alignCast(result_ptr + aligned_len);
+-        _ = @cmpxchgStrong(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, hint, new_hint, .monotonic, .monotonic);
++        _ = @cmpxchgStrong(@TypeOf(next_mmap_addr_hint), &next_mmap_addr_hint, hint, new_hint, .monotonic, .monotonic);
+         return result_ptr;
+     }
+ 
+--- a/src/terminal/kitty/graphics_image.zig	1970-01-01 02:00:00
++++ b/src/terminal/kitty/graphics_image.zig	2026-06-04 14:14:30
+@@ -182,7 +182,7 @@
+         var buf: [std.fs.max_path_bytes]u8 = undefined;
+         const pathz = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.InvalidData;
+ 
+-        const fd = std.c.shm_open(pathz, @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDONLY })), 0);
++        const fd = std.c.shm_open(pathz, @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDONLY })), @as(std.c.mode_t, 0));
+         switch (std.posix.errno(fd)) {
+             .SUCCESS => {},
+             else => |err| {
