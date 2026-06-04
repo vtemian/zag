@@ -876,6 +876,12 @@ pub const LuaEngine = struct {
         // live in lua/bindings/json.zig. Stack on entry/exit: [zag_table].
         @import("lua/bindings/json.zig").registerOn(lua);
 
+        // zag.crypto; sync `sha256`/`random_bytes`/`base64url` helpers
+        // (PKCE + metadata-cache hashing). Pure CPU, no yield. Bodies +
+        // `registerOn` live in lua/bindings/crypto.zig. Stack on
+        // entry/exit: [zag_table].
+        @import("lua/bindings/crypto.zig").registerOn(lua);
+
         // zag.layout; plain namespace table for window-tree inspection
         // and mutation. Requires a live window manager, which main.zig
         // wires via `engine.window_manager`. Headless runs leave the
