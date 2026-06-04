@@ -51,6 +51,79 @@ fn runCoroutineToDone(engine: *LuaEngine, nargs: i32) !void {
     if (engine.tasks.count() > 0) return error.CoroutineTimedOut;
 }
 
+/// Run a Lua body (a sequence of statements) inside a coroutine, wrapping it
+/// in pcall so an `assert`/error inside the coroutine is captured rather than
+/// lost. The body runs in a context where it can yield on the async runtime.
+/// On a Lua-side failure this returns `error.LuaCoroutineFailed` after
+/// printing the captured message, so a fixture mismatch shows up as a test
+/// failure with the real reason.
+fn runCoroutineBody(engine: *LuaEngine, body: [:0]const u8) !void {
+    // Define a wrapper that records ok/err into globals, then spawn it.
+    var buf: [8192]u8 = undefined;
+    const wrapped = try std.fmt.bufPrintZ(&buf,
+        \\function _mcp_co()
+        \\  _mcp_ok, _mcp_err = pcall(function()
+        \\{s}
+        \\  end)
+        \\end
+    , .{body});
+    try runLua(engine, wrapped);
+    _ = try engine.lua.getGlobal("_mcp_co");
+    try runCoroutineToDone(engine, 0);
+
+    _ = try engine.lua.getGlobal("_mcp_ok");
+    const ok = engine.lua.toBoolean(-1);
+    engine.lua.pop(1);
+    if (!ok) {
+        _ = engine.lua.getGlobal("_mcp_err") catch {};
+        std.debug.print("\nmcp coroutine failed: {s}\n", .{engine.lua.toStringEx(-1)});
+        engine.lua.pop(1);
+        return error.LuaCoroutineFailed;
+    }
+}
+
+/// Write the canned fake-MCP stdio server to a temp file and return the
+/// absolute path (owned by `tmp`'s dir; valid until cleanup). The server
+/// replies to initialize / tools/list / tools/call and silently consumes
+/// notifications.
+const fake_mcp_sh =
+    \\#!/bin/sh
+    \\while IFS= read -r line; do
+    \\  case "$line" in
+    \\    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"0"}}}' ;;
+    \\    *'"notifications/initialized"'*) ;;
+    \\    *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"add","description":"adds","inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}}]}}' ;;
+    \\    *'"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"3"}],"isError":false}}' ;;
+    \\  esac
+    \\done
+    \\
+;
+
+// A variant that, after the initialize request, emits a stray notification
+// line BEFORE the initialize response, proving the client matches on id and
+// skips notifications rather than mistaking the first line for its answer.
+const fake_mcp_interleave_sh =
+    \\#!/bin/sh
+    \\while IFS= read -r line; do
+    \\  case "$line" in
+    \\    *'"initialize"'*)
+    \\      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"hi"}}'
+    \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"0"}}}' ;;
+    \\    *'"notifications/initialized"'*) ;;
+    \\    *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"add","description":"adds","inputSchema":{"type":"object"}}]}}' ;;
+    \\  esac
+    \\done
+    \\
+;
+
+fn writeFixture(tmp: *std.testing.TmpDir, name: []const u8, contents: []const u8, abs_buf: []u8) ![]const u8 {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = contents });
+    // realPathFile returns the byte count written into abs_buf.
+    const dir_len = try tmp.dir.realPathFile(std.testing.io, ".", abs_buf);
+    const tail = try std.fmt.bufPrint(abs_buf[dir_len..], "/{s}", .{name});
+    return abs_buf[0 .. dir_len + tail.len];
+}
+
 // ---------------------------------------------------------------------------
 // E1: skeleton, config normalization, env interpolation
 // ---------------------------------------------------------------------------
@@ -181,5 +254,109 @@ test "mcp .mcp.json merges under Lua-declared servers" {
         \\assert(servers.foo.command[1] == "from-lua", "Lua-declared foo wins over .mcp.json")
         \\assert(servers.bar ~= nil, ".mcp.json bar merged in")
         \\assert(servers.bar.command[1] == "bar-cmd", "bar from json")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E2: JSON-RPC stdio client
+// ---------------------------------------------------------------------------
+
+/// Stand up an engine with the async runtime and a `fake` stdio server whose
+/// command runs `sh <fixture>`. The fixture path is registered as the
+/// server's `command` via a Lua global `_fixture_path`.
+fn setupFakeServer(engine: *LuaEngine, tmp: *std.testing.TmpDir, fixture: []const u8, abs_buf: []u8) !void {
+    const path = try writeFixture(tmp, "fake-mcp.sh", fixture, abs_buf);
+    _ = engine.lua.pushString(path);
+    engine.lua.setGlobal("_fixture_path");
+    try runLua(engine,
+        \\mcp = require("zag.mcp")
+        \\fake = mcp._test.normalize_server("fake", { command = { "sh", _fixture_path } })
+    );
+}
+
+test "mcp stdio: connect handshake, list_tools, call_tool" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupFakeServer(&engine, &tmp, fake_mcp_sh, &abs_buf);
+
+    try runCoroutineBody(&engine,
+        \\  local ok, err = mcp._test.connect(fake)
+        \\  assert(ok, "connect: " .. tostring(err))
+        \\  assert(fake.status == "connected", "status connected")
+        \\  local tools, terr = mcp._test.list_tools(fake)
+        \\  assert(tools, "list_tools: " .. tostring(terr))
+        \\  assert(#tools == 1, "one tool, got " .. #tools)
+        \\  assert(tools[1].name == "add", "tool name add")
+        \\  local res, cerr = mcp._test.call_tool(fake, "add", { a = 1, b = 2 })
+        \\  assert(res, "call_tool: " .. tostring(cerr))
+        \\  assert(res.content[1].text == "3", "result text 3")
+        \\  mcp._test.disconnect_handle(fake)
+    );
+}
+
+test "mcp stdio: id-matching skips an interleaved notification" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupFakeServer(&engine, &tmp, fake_mcp_interleave_sh, &abs_buf);
+
+    // The fixture emits a notification line before the initialize response;
+    // a correct client skips it and still completes the handshake on id 1.
+    try runCoroutineBody(&engine,
+        \\  local ok, err = mcp._test.connect(fake)
+        \\  assert(ok, "connect should skip the stray notification: " .. tostring(err))
+        \\  local tools = mcp._test.list_tools(fake)
+        \\  assert(tools and tools[1].name == "add", "list after interleave")
+        \\  mcp._test.disconnect_handle(fake)
+    );
+}
+
+test "mcp stdio: per-request timeout fires when the server never replies" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // A server that connects (answers initialize) but then a later request
+    // gets no matching response: it echoes an unrelated line so the read
+    // loop wakes, checks the deadline, and reports "timeout".
+    const silent =
+        \\#!/bin/sh
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}' ;;
+        \\    *'"notifications/initialized"'*) ;;
+        \\    *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{}}' ;;
+        \\  esac
+        \\done
+        \\
+    ;
+    try setupFakeServer(&engine, &tmp, silent, &abs_buf);
+
+    try runCoroutineBody(&engine,
+        \\  assert(mcp._test.connect(fake), "connect")
+        \\  -- A zero-ms deadline plus the one stray notification line drives the
+        \\  -- between-lines deadline check immediately.
+        \\  local res, err = mcp._test.rpc_request(fake, "tools/list", {}, 0)
+        \\  assert(res == nil, "expected nil result on timeout")
+        \\  assert(err == "timeout", "expected timeout, got " .. tostring(err))
+        \\  mcp._test.disconnect_handle(fake)
     );
 }

@@ -58,6 +58,10 @@ local DEFAULT_REQUEST_TIMEOUT_MS = 60000
 -- handshake. Bump alongside the spec features we actually implement.
 local PROTOCOL_VERSION = "2025-06-18"
 
+-- Advertised in clientInfo. zag does not expose a build version to Lua, so
+-- this is a stable placeholder rather than the binary's version.
+local CLIENT_VERSION = "0"
+
 -- ---------------------------------------------------------------------------
 -- Clock seam: route every os.time() read through M._now so tests can pin it.
 -- ---------------------------------------------------------------------------
@@ -235,6 +239,189 @@ function M.ensure_config_loaded()
 end
 
 -- ---------------------------------------------------------------------------
+-- JSON-RPC stdio transport
+--
+-- Newline-delimited JSON-RPC 2.0 over the child's stdin/stdout. Requests are
+-- matched to responses by the monotonically increasing `id` THIS client
+-- sent; notifications and unrelated server messages on the wire are handled
+-- inline (ping answered, other server-initiated requests refused -32601,
+-- notifications skipped). A single `:lines()` iterator per handle is the only
+-- reader for the life of the connection (the primitive rejects a second one),
+-- so every request drains that one iterator until it sees its id.
+-- ---------------------------------------------------------------------------
+
+-- Serialize and write one JSON-RPC message followed by a newline.
+local function rpc_send(srv, msg)
+  local ok, encoded = pcall(zag.json.encode, msg)
+  if not ok then return nil, "encode failed: " .. tostring(encoded) end
+  srv.handle:write(encoded .. "\n")
+  return true
+end
+
+-- Send a JSON-RPC notification (no id, no response expected).
+local function rpc_notify(srv, method, params)
+  return rpc_send(srv, { jsonrpc = "2.0", method = method, params = params })
+end
+
+-- Reply to a server-initiated request. `id` is the server's request id.
+local function rpc_reply(srv, id, result, err)
+  local msg = { jsonrpc = "2.0", id = id }
+  if err then msg.error = err else msg.result = result or {} end
+  return rpc_send(srv, msg)
+end
+
+-- Cooperative per-server mutex. Coroutines are scheduled cooperatively on the
+-- main thread, so a plain flag with yields in between is an effective lock:
+-- the read-test-set sequence is atomic between yield points.
+local function acquire_busy(srv)
+  while srv.busy do zag.sleep(10) end
+  srv.busy = true
+end
+
+local function release_busy(srv)
+  srv.busy = false
+end
+
+-- Forward declarations for the connect/disconnect pair (they reference each
+-- other).
+local connect, disconnect_handle
+
+-- Issue a request and block (yielding on each line) until the response with
+-- our id arrives. Returns (result_table, nil) or (nil, err_string). Handles
+-- interleaved notifications / server-initiated requests inline.
+local function rpc_request(srv, method, params, timeout_ms)
+  acquire_busy(srv)
+  -- pcall the whole body so a mid-flight error (write EPIPE, decode failure)
+  -- always clears the busy flag; a stuck flag would wedge the server.
+  local ok, result, err = pcall(function()
+    srv.next_id = srv.next_id + 1
+    local id = srv.next_id
+
+    local sent, send_err = rpc_send(srv, {
+      jsonrpc = "2.0", id = id, method = method, params = params,
+    })
+    if not sent then return nil, send_err end
+
+    timeout_ms = timeout_ms or srv.request_timeout_ms or DEFAULT_REQUEST_TIMEOUT_MS
+    local deadline = M._now() + math.ceil(timeout_ms / 1000)
+
+    -- Drain the single per-handle line iterator until our id shows up.
+    for line in srv.line_iter do
+      if line ~= nil and #line > 0 then
+        local msg, derr = zag.json.decode(line)
+        if not msg then
+          zag.log.warn("zag.mcp[%s]: undecodable line: %s", srv.name, tostring(derr))
+        elseif msg.id == id then
+          -- Our response.
+          if msg.error then
+            return nil, "rpc error: " .. tostring(msg.error.message or msg.error.code)
+          end
+          return msg.result or {}, nil
+        elseif msg.method ~= nil and msg.id ~= nil then
+          -- Server-initiated request. Answer ping; refuse everything else.
+          if msg.method == "ping" then
+            rpc_reply(srv, msg.id, {})
+          else
+            rpc_reply(srv, msg.id, nil,
+              { code = -32601, message = "method not found: " .. tostring(msg.method) })
+          end
+        else
+          -- A notification (method, no id) or an unrelated response: skip.
+        end
+      end
+      -- Deadline is enforced between lines only; see module header.
+      if M._now() >= deadline then
+        return nil, "timeout"
+      end
+    end
+    -- Iterator returned nil -> child closed stdout (EOF).
+    return nil, "connection closed"
+  end)
+
+  release_busy(srv)
+
+  if not ok then
+    -- `result` holds the pcall error message here.
+    return nil, "rpc internal error: " .. tostring(result)
+  end
+  return result, err
+end
+
+-- Spawn the stdio server, store the handle/iterator, run the initialize
+-- handshake. Returns (true, nil) on success or (nil, err) on failure.
+function connect(srv)
+  if srv.status == "connected" and srv.handle then return true end
+
+  if srv.transport ~= "stdio" then
+    -- HTTP transports land in Milestone G.
+    return nil, "transport not supported yet: " .. tostring(srv.transport)
+  end
+  if type(srv.command) ~= "table" or #srv.command == 0 then
+    return nil, "server has no command argv"
+  end
+
+  local h, err = zag.cmd.spawn(srv.command, {
+    capture_stdout = true,
+    capture_stdin = true,
+    env_extra = srv.env,
+    cwd = srv.cwd,
+  })
+  if not h then return nil, "spawn failed: " .. tostring(err) end
+
+  srv.handle = h
+  srv.line_iter = h:lines()  -- the one and only reader for this handle
+  srv.next_id = 0
+  srv.busy = false
+
+  -- initialize handshake.
+  local init_result, init_err = rpc_request(srv, "initialize", {
+    protocolVersion = PROTOCOL_VERSION,
+    capabilities = { tools = {} },
+    clientInfo = { name = "zag", version = CLIENT_VERSION },
+  })
+  if not init_result then
+    disconnect_handle(srv)
+    return nil, "initialize failed: " .. tostring(init_err)
+  end
+
+  rpc_notify(srv, "notifications/initialized", nil)
+
+  srv.status = "connected"
+  srv.last_used = M._now()
+  return true
+end
+
+-- Tear down a server's child without waiting (used on handshake failure).
+-- The polite disconnect path lands in E5.
+function disconnect_handle(srv)
+  if srv.handle then
+    pcall(function() srv.handle:close_stdin() end)
+    pcall(function() srv.handle:kill("TERM") end)
+  end
+  srv.handle = nil
+  srv.line_iter = nil
+  srv.status = "disconnected"
+end
+
+-- ---------------------------------------------------------------------------
+-- MCP method wrappers
+-- ---------------------------------------------------------------------------
+
+-- tools/list. Single page (pagination added in E3). Returns the tools array
+-- or (nil, err).
+local function list_tools(srv)
+  local result, err = rpc_request(srv, "tools/list", {})
+  if not result then return nil, err end
+  return result.tools or {}, nil
+end
+
+-- tools/call. Returns the raw result table (`{ content = {...}, isError }`)
+-- or (nil, err).
+local function call_tool(srv, name, args)
+  return rpc_request(srv, "tools/call", { name = name, arguments = args or {} })
+end
+
+-- ---------------------------------------------------------------------------
 -- Test export: internals exercised by mcp_test.zig.
 -- ---------------------------------------------------------------------------
 
@@ -248,6 +435,14 @@ M._test = {
   set_now = function(t) M._now_override = t end,
   servers = function() return M._servers end,
   settings = function() return M._settings end,
+  -- E2 transport internals.
+  connect = function(srv) return connect(srv) end,
+  disconnect_handle = function(srv) return disconnect_handle(srv) end,
+  rpc_request = function(srv, method, params, timeout_ms)
+    return rpc_request(srv, method, params, timeout_ms)
+  end,
+  list_tools = function(srv) return list_tools(srv) end,
+  call_tool = function(srv, name, args) return call_tool(srv, name, args) end,
 }
 
 return M
