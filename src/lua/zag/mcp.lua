@@ -818,6 +818,10 @@ function sse_connect(srv)
   srv.sse_endpoint = nil
   srv.sse_dead = false
 
+  -- KNOWN LIMITATION: zag.http.stream()'s receiveHead runs on the main thread,
+  -- so a server that wedges during this GET's connection setup stalls the event
+  -- loop and is not covered by scope cancellation (same note as the Streamable
+  -- HTTP section header).
   local stream, err = zag.http.stream(srv.url, {
     method = "GET",
     headers = (function()
