@@ -249,18 +249,58 @@ function M.ensure_config_loaded()
 end
 
 -- ---------------------------------------------------------------------------
--- JSON-RPC stdio transport
+-- JSON-RPC transport layer
 --
--- Newline-delimited JSON-RPC 2.0 over the child's stdin/stdout. Requests are
--- matched to responses by the monotonically increasing `id` THIS client
--- sent; notifications and unrelated server messages on the wire are handled
--- inline (ping answered, other server-initiated requests refused -32601,
--- notifications skipped). A single `:lines()` iterator per handle is the only
--- reader for the life of the connection (the primitive rejects a second one),
--- so every request drains that one iterator until it sees its id.
+-- Newline-delimited JSON-RPC 2.0 with three back-ends behind one seam:
+--   * "stdio"     — over the child's stdin/stdout (Milestone E).
+--   * Streamable   HTTP (2025-03-26+) — every request is its own POST; the
+--                  response is either a single JSON object or an SSE stream
+--                  (Milestone G2).
+--   * legacy SSE   — a long-lived GET event stream plus POSTed requests
+--                  (Milestone G3).
+--
+-- The method wrappers (initialize / tools/list / tools/call / ...) call
+-- `rpc_request` / `rpc_notify` / `rpc_reply` and never branch on transport.
+-- Those three route through `transport_send_request` / `_notification` /
+-- `_reply`, which is the ONLY place that knows which back-end is in play.
+-- Requests are matched to responses by the monotonically increasing `id`
+-- THIS client sent; interleaved notifications are skipped, server `ping`
+-- requests are answered with `{}`, and other server-initiated requests are
+-- refused with -32601.
 -- ---------------------------------------------------------------------------
 
--- Serialize and write one JSON-RPC message followed by a newline.
+-- Forward declarations: the http/sse back-ends, connect/disconnect, and the
+-- per-server reader coroutine reference each other.
+local connect, disconnect_handle, http_connect
+local http_send_request, http_send_notification, http_send_reply
+local http_reinitialize
+local sse_send_request, sse_send_notification, sse_send_reply
+local sse_connect
+-- The SSE line parser (sse_new/sse_feed) is defined in its own section below
+-- but referenced here by http_consume_sse; forward-declare so the transport
+-- layer binds to the same locals the parser section assigns.
+local sse_new, sse_feed
+
+-- Resolve the Authorization header value for a server, or nil when none
+-- applies. Milestone H extends this: when `srv.auth == "oauth"` it will hand
+-- back a stored/refreshed access token here. Today it covers the static
+-- bearer-token forms only (`bearer_token` literal or `bearer_token_env`).
+local function auth_header(srv)
+  if srv.bearer_token and #srv.bearer_token > 0 then
+    return "Bearer " .. srv.bearer_token
+  end
+  if srv.bearer_token_env then
+    local tok = os.getenv(srv.bearer_token_env)
+    if tok and #tok > 0 then return "Bearer " .. tok end
+  end
+  -- srv.oauth_access_token is populated by Milestone H once the flow runs.
+  if srv.oauth_access_token and #srv.oauth_access_token > 0 then
+    return "Bearer " .. srv.oauth_access_token
+  end
+  return nil
+end
+
+-- Serialize and write one JSON-RPC message followed by a newline (stdio).
 local function rpc_send(srv, msg)
   local ok, encoded = pcall(zag.json.encode, msg)
   if not ok then return nil, "encode failed: " .. tostring(encoded) end
@@ -268,16 +308,31 @@ local function rpc_send(srv, msg)
   return true
 end
 
--- Send a JSON-RPC notification (no id, no response expected).
-local function rpc_notify(srv, method, params)
-  return rpc_send(srv, { jsonrpc = "2.0", method = method, params = params })
-end
-
 -- Reply to a server-initiated request. `id` is the server's request id.
+-- Routed through the transport so HTTP can POST the reply back.
 local function rpc_reply(srv, id, result, err)
   local msg = { jsonrpc = "2.0", id = id }
   if err then msg.error = err else msg.result = result or {} end
-  return rpc_send(srv, msg)
+  if srv.transport == "stdio" then
+    return rpc_send(srv, msg)
+  elseif srv.transport_mode == "sse" then
+    return sse_send_reply(srv, msg)
+  else
+    return http_send_reply(srv, msg)
+  end
+end
+
+-- Send a JSON-RPC notification (no id, no response expected). Routed through
+-- the transport: stdio writes a line; HTTP POSTs and expects 202.
+local function rpc_notify(srv, method, params)
+  local msg = { jsonrpc = "2.0", method = method, params = params }
+  if srv.transport == "stdio" then
+    return rpc_send(srv, msg)
+  elseif srv.transport_mode == "sse" then
+    return sse_send_notification(srv, msg)
+  else
+    return http_send_notification(srv, msg)
+  end
 end
 
 -- Cooperative per-server mutex. Coroutines are scheduled cooperatively on the
@@ -292,13 +347,60 @@ local function release_busy(srv)
   srv.busy = false
 end
 
--- Forward declarations for the connect/disconnect pair (they reference each
--- other).
-local connect, disconnect_handle
+-- stdio receive: drain the single per-handle line iterator until the response
+-- carrying `id` arrives. Returns (result_table, nil) or (nil, err_string).
+-- Handles interleaved notifications / server-initiated requests inline.
+local function stdio_recv_response(srv, id, deadline)
+  for line in srv.line_iter do
+    if line ~= nil and #line > 0 then
+      local msg, derr = zag.json.decode(line)
+      if not msg then
+        zag.log.warn("zag.mcp[%s]: undecodable line: %s", srv.name, tostring(derr))
+      elseif msg.id == id then
+        if msg.error then
+          return nil, "rpc error: " .. tostring(msg.error.message or msg.error.code)
+        end
+        return msg.result or {}, nil
+      elseif msg.method ~= nil and msg.id ~= nil then
+        -- Server-initiated request. Answer ping; refuse everything else.
+        if msg.method == "ping" then
+          rpc_reply(srv, msg.id, {})
+        else
+          rpc_reply(srv, msg.id, nil,
+            { code = -32601, message = "method not found: " .. tostring(msg.method) })
+        end
+      else
+        -- A notification (method, no id) or an unrelated response: skip.
+      end
+    end
+    -- Deadline is enforced between lines only; see module header.
+    if M._now() >= deadline then
+      return nil, "timeout"
+    end
+  end
+  -- Iterator returned nil -> child closed stdout (EOF).
+  return nil, "connection closed"
+end
 
--- Issue a request and block (yielding on each line) until the response with
--- our id arrives. Returns (result_table, nil) or (nil, err_string). Handles
--- interleaved notifications / server-initiated requests inline.
+-- The transport seam for a request. `msg` is the full JSON-RPC request
+-- object (jsonrpc/id/method/params). Returns (result_table, nil) or
+-- (nil, err_string).
+local function transport_send_request(srv, msg, deadline)
+  if srv.transport == "stdio" then
+    local sent, send_err = rpc_send(srv, msg)
+    if not sent then return nil, send_err end
+    return stdio_recv_response(srv, msg.id, deadline)
+  elseif srv.transport_mode == "sse" then
+    return sse_send_request(srv, msg, deadline)
+  else
+    return http_send_request(srv, msg, deadline)
+  end
+end
+
+-- Issue a request and block until its response arrives. Returns
+-- (result_table, nil) or (nil, err_string). The busy mutex, id allocation,
+-- deadline, and exactly-once busy release are transport-agnostic; the wire
+-- work happens in `transport_send_request`.
 local function rpc_request(srv, method, params, timeout_ms)
   acquire_busy(srv)
   -- pcall the whole body so a mid-flight error (write EPIPE, decode failure)
@@ -307,45 +409,12 @@ local function rpc_request(srv, method, params, timeout_ms)
     srv.next_id = srv.next_id + 1
     local id = srv.next_id
 
-    local sent, send_err = rpc_send(srv, {
-      jsonrpc = "2.0", id = id, method = method, params = params,
-    })
-    if not sent then return nil, send_err end
-
     timeout_ms = timeout_ms or srv.request_timeout_ms or DEFAULT_REQUEST_TIMEOUT_MS
     local deadline = M._now() + math.ceil(timeout_ms / 1000)
 
-    -- Drain the single per-handle line iterator until our id shows up.
-    for line in srv.line_iter do
-      if line ~= nil and #line > 0 then
-        local msg, derr = zag.json.decode(line)
-        if not msg then
-          zag.log.warn("zag.mcp[%s]: undecodable line: %s", srv.name, tostring(derr))
-        elseif msg.id == id then
-          -- Our response.
-          if msg.error then
-            return nil, "rpc error: " .. tostring(msg.error.message or msg.error.code)
-          end
-          return msg.result or {}, nil
-        elseif msg.method ~= nil and msg.id ~= nil then
-          -- Server-initiated request. Answer ping; refuse everything else.
-          if msg.method == "ping" then
-            rpc_reply(srv, msg.id, {})
-          else
-            rpc_reply(srv, msg.id, nil,
-              { code = -32601, message = "method not found: " .. tostring(msg.method) })
-          end
-        else
-          -- A notification (method, no id) or an unrelated response: skip.
-        end
-      end
-      -- Deadline is enforced between lines only; see module header.
-      if M._now() >= deadline then
-        return nil, "timeout"
-      end
-    end
-    -- Iterator returned nil -> child closed stdout (EOF).
-    return nil, "connection closed"
+    return transport_send_request(srv, {
+      jsonrpc = "2.0", id = id, method = method, params = params,
+    }, deadline)
   end)
 
   release_busy(srv)
@@ -357,14 +426,215 @@ local function rpc_request(srv, method, params, timeout_ms)
   return result, err
 end
 
--- Spawn the stdio server, store the handle/iterator, run the initialize
--- handshake. Returns (true, nil) on success or (nil, err) on failure.
-function connect(srv)
-  if srv.status == "connected" and srv.handle then return true end
+-- ---------------------------------------------------------------------------
+-- Streamable HTTP transport (Milestone G2)
+--
+-- Every JSON-RPC message is a POST to `srv.url` with
+--   Accept: application/json, text/event-stream
+-- plus `MCP-Protocol-Version` once initialize has set it, `Mcp-Session-Id`
+-- when the server handed one out, and `Authorization: Bearer ...` when a
+-- token resolves. The response is one of:
+--   * 200 application/json   -> a single JSON-RPC object (read all lines,
+--                               concat, decode).
+--   * 200 text/event-stream  -> an SSE stream; the JSON-RPC response rides
+--                               an event's `data`. Embedded server requests
+--                               (e.g. ping) are answered with a follow-up
+--                               POST.
+--   * 202                    -> notification accepted (no body).
+--   * 401                    -> the server demands auth; surfaced as a
+--                               needs-auth error (Milestone H wires the flow).
+--   * 404 (session held)     -> the session expired; drop it, re-initialize
+--                               once, retry the original request once.
+--
+-- KNOWN LIMITATION: `zag.http.stream()`'s receiveHead runs on the main thread,
+-- so a server that wedges during connection setup stalls the event loop at
+-- request time; scope cancellation does not cover that init window.
+-- ---------------------------------------------------------------------------
 
+-- Build the request headers common to every Streamable-HTTP POST.
+local function http_headers(srv, accept)
+  local h = {
+    Accept = accept or "application/json, text/event-stream",
+  }
+  if srv.protocol_version then h["MCP-Protocol-Version"] = srv.protocol_version end
+  if srv.session_id then h["Mcp-Session-Id"] = srv.session_id end
+  local a = auth_header(srv)
+  if a then h["Authorization"] = a end
+  return h
+end
+
+-- Capture a session id and (post-initialize) the negotiated protocol version
+-- off a streaming-response handle. The session header only appears on the
+-- initialize response in practice, but reading it on every response is cheap
+-- and tolerant of servers that echo it back.
+local function http_capture_session(srv, stream)
+  local sid = stream:header("mcp-session-id")
+  if sid and #sid > 0 then srv.session_id = sid end
+end
+
+-- Read every line of a streaming handle into one string (for JSON responses,
+-- which the stream primitive delivers as its single unterminated tail line).
+local function http_read_all(stream)
+  local parts = {}
+  for line in stream:lines() do
+    parts[#parts + 1] = line
+  end
+  return table.concat(parts)
+end
+
+-- POST `msg` to the server and return the open stream handle (status/headers
+-- already available) or (nil, err). `accept` overrides the default Accept.
+local function http_post_message(srv, msg, accept)
+  local stream, err = zag.http.stream(srv.url, {
+    method = "POST",
+    body = msg,
+    content_type = "application/json",
+    headers = http_headers(srv, accept),
+  })
+  if not stream then return nil, "http error: " .. tostring(err) end
+  return stream
+end
+
+-- Drive an SSE response stream until the event carrying our `id` arrives.
+-- Embedded server-initiated requests are answered with a follow-up POST.
+-- Returns (result_table, nil) or (nil, err).
+local function http_consume_sse(srv, stream, id, deadline)
+  local parser = sse_new()
+  for line in stream:lines() do
+    local ev = sse_feed(parser, line)
+    if ev and ev.data and #ev.data > 0 then
+      local msg = zag.json.decode(ev.data)
+      if type(msg) == "table" then
+        if msg.id == id then
+          if msg.error then
+            return nil, "rpc error: " .. tostring(msg.error.message or msg.error.code)
+          end
+          return msg.result or {}, nil
+        elseif msg.method ~= nil and msg.id ~= nil then
+          -- Embedded server-initiated request: answer over a follow-up POST.
+          if msg.method == "ping" then
+            rpc_reply(srv, msg.id, {})
+          else
+            rpc_reply(srv, msg.id, nil,
+              { code = -32601, message = "method not found: " .. tostring(msg.method) })
+          end
+        end
+      end
+    end
+    if M._now() >= deadline then
+      return nil, "timeout"
+    end
+  end
+  return nil, "connection closed"
+end
+
+-- Streamable-HTTP request seam. `retried` guards the single 404 reinit retry.
+function http_send_request(srv, msg, deadline, retried)
+  local stream, err = http_post_message(srv, msg)
+  if not stream then return nil, err end
+
+  local status = stream:status()
+  local ctype = stream:header("content-type") or ""
+  srv._last_http_status = status
+  http_capture_session(srv, stream)
+
+  if status == 200 then
+    if ctype:find("text/event-stream", 1, true) then
+      local result, rerr = http_consume_sse(srv, stream, msg.id, deadline)
+      stream:close()
+      return result, rerr
+    end
+    -- Default to JSON (application/json, or unspecified).
+    local body = http_read_all(stream)
+    stream:close()
+    if #body == 0 then return {}, nil end
+    local decoded, derr = zag.json.decode(body)
+    if type(decoded) ~= "table" then
+      return nil, "undecodable response: " .. tostring(derr)
+    end
+    if decoded.error then
+      return nil, "rpc error: " .. tostring(decoded.error.message or decoded.error.code)
+    end
+    return decoded.result or {}, nil
+  elseif status == 202 then
+    -- Accepted with no body (a server may answer a request with 202 if it
+    -- defers; nothing to return).
+    stream:close()
+    return {}, nil
+  elseif status == 401 then
+    srv.needs_auth_info = stream:header("www-authenticate") or "401 (no WWW-Authenticate header)"
+    stream:close()
+    srv.status = "needs-auth"
+    return nil,
+      "needs auth: server requires authorization (401). OAuth is not yet wired "
+      .. "(Milestone H); set a bearer_token/bearer_token_env for now."
+  elseif status == 404 and srv.session_id and not retried then
+    -- Session expired: drop it, re-initialize once, retry the original once.
+    stream:close()
+    srv.session_id = nil
+    local ok = http_reinitialize(srv, deadline)
+    if not ok then return nil, "session expired and re-initialize failed" end
+    return http_send_request(srv, msg, deadline, true)
+  else
+    stream:close()
+    return nil, string.format("http status %d", status)
+  end
+end
+
+-- Re-run the initialize handshake on an existing http server (used by the 404
+-- session-expiry retry). Reuses the same method wrappers; only re-sends the
+-- handshake, leaving the in-flight request to the caller's retry.
+function http_reinitialize(srv, deadline)
+  srv.next_id = srv.next_id + 1
+  local id = srv.next_id
+  local result = transport_send_request(srv, {
+    jsonrpc = "2.0", id = id, method = "initialize", params = {
+      protocolVersion = PROTOCOL_VERSION,
+      capabilities = { tools = {} },
+      clientInfo = { name = "zag", version = CLIENT_VERSION },
+    },
+  }, deadline)
+  if not result then return false end
+  srv.protocol_version = PROTOCOL_VERSION
+  http_send_notification(srv, { jsonrpc = "2.0", method = "notifications/initialized" })
+  return true
+end
+
+-- Notification over Streamable HTTP: POST, expect 202 (no response). A 200 is
+-- tolerated (some servers ack with an empty body).
+function http_send_notification(srv, msg)
+  local stream, err = http_post_message(srv, msg)
+  if not stream then return nil, err end
+  local status = stream:status()
+  srv._last_http_status = status
+  http_capture_session(srv, stream)
+  stream:close()
+  if status == 202 or status == 200 then return true end
+  return nil, string.format("http status %d", status)
+end
+
+-- Reply to a server-initiated request over Streamable HTTP: POST the reply,
+-- expect 202. Best-effort (the result is not awaited).
+function http_send_reply(srv, msg)
+  return http_send_notification(srv, msg)
+end
+
+-- ---------------------------------------------------------------------------
+-- Connect / disconnect
+-- ---------------------------------------------------------------------------
+
+-- Spawn the stdio server (or open the http handshake), then run the
+-- initialize / notifications-initialized exchange. Returns (true, nil) or
+-- (nil, err). The handshake reuses the shared method wrappers for every
+-- transport; only `transport_send_request` differs.
+function connect(srv)
+  if srv.status == "connected" then return true end
+
+  if srv.transport == "http" then
+    return http_connect(srv)
+  end
   if srv.transport ~= "stdio" then
-    -- HTTP transports land in Milestone G.
-    return nil, "transport not supported yet: " .. tostring(srv.transport)
+    return nil, "transport not supported: " .. tostring(srv.transport)
   end
   if type(srv.command) ~= "table" or #srv.command == 0 then
     return nil, "server has no command argv"
@@ -401,8 +671,45 @@ function connect(srv)
   return true
 end
 
--- Tear down a server's child without waiting (used on handshake failure).
--- The polite disconnect path lands in E5.
+-- HTTP connect: try Streamable HTTP first. The initialize POST tells us which
+-- dialect the server speaks — a 4xx/405 on it (other than the auth/expiry
+-- cases the request seam already handles) means a legacy SSE server, so we
+-- fall back to the long-lived GET-stream transport.
+function http_connect(srv)
+  if not srv.url or #srv.url == 0 then
+    return nil, "http server has no url"
+  end
+  srv.transport_mode = "streamable"
+  srv.next_id = 0
+  srv.busy = false
+  srv.session_id = nil
+  srv.protocol_version = nil
+
+  local init_result, init_err = rpc_request(srv, "initialize", {
+    protocolVersion = PROTOCOL_VERSION,
+    capabilities = { tools = {} },
+    clientInfo = { name = "zag", version = CLIENT_VERSION },
+  })
+
+  if not init_result then
+    -- A 405 (or generic 4xx that is not 401/404) on the initialize POST is
+    -- the signal to fall back to the legacy SSE transport.
+    local s = srv._last_http_status
+    if s == 405 or (type(s) == "number" and s >= 400 and s < 500 and s ~= 401) then
+      return sse_connect(srv)
+    end
+    return nil, "initialize failed: " .. tostring(init_err)
+  end
+
+  srv.protocol_version = PROTOCOL_VERSION
+  rpc_notify(srv, "notifications/initialized", nil)
+  srv.status = "connected"
+  srv.last_used = M._now()
+  return true
+end
+
+-- Tear down a server's child / streams without waiting (used on handshake
+-- failure). The polite disconnect path lands in E5.
 function disconnect_handle(srv)
   if srv.handle then
     pcall(function() srv.handle:close_stdin() end)
@@ -432,7 +739,7 @@ end
 -- exactly one leading space stripped after the colon, per spec.
 -- ---------------------------------------------------------------------------
 
-local function sse_new()
+function sse_new()
   return { data = nil, event = nil, id = nil }
 end
 
@@ -446,7 +753,7 @@ end
 -- Feed one line into the parser. Returns an event table
 -- `{ event = <name>, data = <string>, id = <string|nil> }` when a blank line
 -- dispatches a buffered event, otherwise nil.
-local function sse_feed(parser, line)
+function sse_feed(parser, line)
   -- Blank line: dispatch if we have buffered data.
   if line == "" then
     if parser.data == nil then
@@ -981,10 +1288,46 @@ end
 -- Lifecycle: disconnect, idle reaper, keep-alive reconnect, maintenance loop
 -- ---------------------------------------------------------------------------
 
+-- Tear down the HTTP side of a server: DELETE the session (best effort,
+-- Streamable HTTP shutdown) and cancel + clear the legacy SSE reader.
+local function http_disconnect(srv)
+  if srv.session_id then
+    -- DELETE the session with the session header. Best effort: the server
+    -- may not support it, and we are tearing down regardless.
+    pcall(function()
+      local stream = zag.http.stream(srv.url, {
+        method = "DELETE",
+        headers = http_headers(srv, "application/json"),
+      })
+      if stream then stream:close() end
+    end)
+  end
+  -- Cancel the legacy SSE reader coroutine if one is running.
+  if srv.sse_reader then
+    pcall(function() srv.sse_reader:cancel() end)
+    srv.sse_reader = nil
+  end
+  if srv.sse_stream then
+    pcall(function() srv.sse_stream:close() end)
+    srv.sse_stream = nil
+  end
+  srv.session_id = nil
+  srv.protocol_version = nil
+  srv.transport_mode = nil
+  srv.sse_endpoint = nil
+  srv.sse_pending = nil
+  srv.status = "disconnected"
+end
+
 -- Polite disconnect: close the child's stdin (EOF is the MCP stdio shutdown
 -- signal), then escalate to TERM and reap with :wait(). Mirrors the __gc
 -- escalation order without the busy-spin. Skipped while a call is in flight.
+-- HTTP servers DELETE the session and tear down any SSE reader instead.
 local function disconnect(srv)
+  if srv.transport == "http" then
+    http_disconnect(srv)
+    return
+  end
   if not srv.handle then
     srv.status = "disconnected"
     return
@@ -1431,6 +1774,9 @@ M._test = {
   -- G1 SSE parser internals.
   sse_new = function() return sse_new() end,
   sse_feed = function(parser, line) return sse_feed(parser, line) end,
+  -- G2/G3 transport internals.
+  auth_header = function(srv) return auth_header(srv) end,
+  http_headers = function(srv, accept) return http_headers(srv, accept) end,
 }
 
 return M
