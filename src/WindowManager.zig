@@ -1899,22 +1899,17 @@ fn lastSubagentLink(conv: *Conversation) ?*Conversation.Node {
     return null;
 }
 
-/// Open a new tile pane displaying the child Conversation referenced by
-/// a `.subagent_link` node. The child is borrowed from
-/// `parent_pane.conversation.subagents`; the new pane is read-only
-/// (no runner, no session handle) and is marked `is_subagent_view`
-/// so closing it leaves the underlying transcript intact.
-///
-/// Threading policy: the `subagent_link` node is appended at spawn time,
-/// so the user CAN drill into a still-running subagent. The drill-down
-/// pane renders a snapshot of the child's tree as of the most recent
-/// UI frame; the parent's agent thread continues mutating
-/// `child.tree` from inside `runChild` while the pane is open. The
-/// rendered pane is NOT live (no event subscription on the child's
-/// BufferSink) and reads of `child.tree` are unsynchronized. See the
-/// threading-policy note on `Conversation.tree` for the rationale and
-/// future work (seqlock / restrict-drill-in-until-joined / live event
-/// subscription).
+/// Placement target for `attachSubagentView`: a tiled split beside the
+/// parent, or an overlay float. Both produce a borrowed-Conversation
+/// pane flagged `is_subagent_view`; only the geometry differs.
+pub const AttachDest = enum { split, float };
+
+/// Drill into the focused pane's most recent subagent (keybind path).
+/// Thin wrapper over `attachSubagentView` preserving the legacy
+/// behavior: a focus-stealing tiled split beside the caller. New
+/// callers (Lua, the workflow-panes plugin) go through
+/// `attachSubagentView` directly so they can opt out of focus theft and
+/// pick a float.
 ///
 /// Errors:
 ///   * `error.NotASubagentLink`:    `node.node_type != .subagent_link`.
@@ -1929,68 +1924,281 @@ pub fn enterSubagent(
 ) !void {
     if (node.node_type != .subagent_link) return error.NotASubagentLink;
     const parent_conv = parent_pane.conversation orelse return error.NoConversation;
-    if (node.subagent_index >= parent_conv.subagents.items.len) return error.StaleSubagentIndex;
-    const child = parent_conv.subagents.items[node.subagent_index];
+    _ = try self.attachSubagentView(parent_conv, node.subagent_index, .split, true);
+}
 
-    const parent_handle = parent_pane.handle orelse return error.ParentLeafMissing;
-    const parent_node = self.node_registry.resolve(parent_handle) catch return error.ParentLeafMissing;
-    if (parent_node.* != .leaf) return error.ParentLeafMissing;
+/// Open a pane displaying the child Conversation at `child_index` in
+/// `parent_conv.subagents`. The child is borrowed (not owned): the pane
+/// carries no runner and no session handle, is flagged
+/// `is_subagent_view`, and every teardown path skips Conversation
+/// cleanup for it so closing the view leaves the underlying transcript
+/// (owned by the parent's `subagents` list) intact.
+///
+/// `dest` picks the geometry: `.split` tiles a pane beside the parent's
+/// leaf; `.float` overlays it via `openFloatPane`. `take_focus` controls
+/// whether the new pane grabs focus: `true` mirrors the legacy
+/// drill-down keybind (focus follows into the view); `false` leaves the
+/// focused leaf untouched so a plugin can attach a view mid-typing
+/// without stealing the user's input pane.
+///
+/// Dedup: if a live `is_subagent_view` pane already borrows this exact
+/// child (tile or float), its existing handle is returned and no second
+/// view is minted. A backgrounded tile (leaf closed on a prior switch)
+/// is re-tiled; a live one is optionally re-focused under `take_focus`.
+///
+/// Liveness: the borrowed view is LIVE for ChildAgent / workflow
+/// children. Those children are mutated ON MAIN (the orchestrator drains
+/// registered child runners via `ChildRunnerRegistry.drainAll` ->
+/// `drainEvents` -> `sink.push`, the same thread that renders this pane),
+/// so the generic version-driven dirty model (`EventOrchestrator`'s
+/// per-pane `Viewport.isDirty(buffer.contentVersion())`, where
+/// contentVersion is the child's own `tree.generation`) streams the
+/// child's transcript into this pane race-free with no extra event
+/// subscription. (The earlier "snapshot, not live, unsynchronized"
+/// policy described the legacy `runChild`-on-the-parent-thread flow,
+/// which no longer exists.)
+///
+/// Errors:
+///   * `error.StaleSubagentIndex`:  `child_index` out of bounds.
+///   * `error.ParentLeafMissing`:   no live layout leaf for the parent
+///                                     conversation to split (split dest).
+pub fn attachSubagentView(
+    self: *WindowManager,
+    parent_conv: *Conversation,
+    child_index: usize,
+    dest: AttachDest,
+    take_focus: bool,
+) !NodeRegistry.Handle {
+    if (child_index >= parent_conv.subagents.items.len) return error.StaleSubagentIndex;
+    const child = parent_conv.subagents.items[child_index];
 
-    // Build the borrowed-Conversation pane shell. The child's buf/view
-    // accessors return interfaces backed by the heap-allocated child;
-    // we do NOT take ownership of the Conversation itself.
-    const pane: Pane = .{
-        .buffer = child.buf(),
-        .view = child.view(),
-        .conversation = child,
-        .runner = null,
-        .wm = self,
-    };
+    // Dedup first: one live view per child. A second attach re-shows the
+    // existing pane (mirrors findSessionPane / showSessionPane) rather
+    // than minting a duplicate borrow.
+    if (self.findSubagentView(child)) |found| {
+        switch (found.kind) {
+            .tile => {
+                if (take_focus) return self.showSessionPane(&found.entry.pane);
+                // Non-focusing re-show: if the tile was backgrounded
+                // (leaf closed on a prior switch) re-tile it without
+                // grabbing focus; otherwise hand back its live handle.
+                if (found.entry.pane.handle) |h| {
+                    if (self.node_registry.resolve(h)) |n| {
+                        if (n.* == .leaf) return h;
+                    } else |_| {}
+                }
+                return self.attachBorrowedSplit(found.entry, false);
+            },
+            .float => {
+                const h = found.entry.pane.handle orelse return error.ParentLeafMissing;
+                if (take_focus) self.layout.focused_float = h;
+                self.compositor.layout_dirty = true;
+                return h;
+            },
+        }
+    }
 
-    const entry = try self.allocator.create(PaneEntry);
-    errdefer self.allocator.destroy(entry);
-    entry.* = .{ .pane = pane, .is_subagent_view = true };
+    switch (dest) {
+        .split => {
+            // Resolve the parent's live leaf so the split nests beside it.
+            const parent_handle = self.paneHandleForConversation(parent_conv) orelse return error.ParentLeafMissing;
+            const parent_node = self.node_registry.resolve(parent_handle) catch return error.ParentLeafMissing;
+            if (parent_node.* != .leaf) return error.ParentLeafMissing;
 
-    try self.extra_panes.append(self.allocator, entry);
-    errdefer _ = self.extra_panes.pop();
+            const entry = try self.allocator.create(PaneEntry);
+            errdefer self.allocator.destroy(entry);
+            // Build the borrowed-Conversation pane shell. The child's
+            // buf/view accessors return interfaces backed by the
+            // heap-allocated child; we do NOT take ownership.
+            entry.* = .{ .pane = .{
+                .buffer = child.buf(),
+                .view = child.view(),
+                .conversation = child,
+                .runner = null,
+                .wm = self,
+            }, .is_subagent_view = true };
 
-    // Split the parent's leaf so the new pane lives next to its caller.
-    // Mirrors `splitById`'s temporary refocus pattern: doSplitWithBuffer
-    // reads `layout.focused`, so we redirect focus, do the split, and
-    // (because doSplitWithBuffer leaves focus on the new leaf) leave
-    // the layout focus on the freshly-opened drill-down pane.
-    const prev_focus = self.layout.focused;
-    self.layout.focused = parent_node;
-    errdefer self.layout.focused = prev_focus;
+            try self.extra_panes.append(self.allocator, entry);
+            errdefer _ = self.extra_panes.pop();
 
-    const surface: Layout.Surface = .{
-        .buffer = pane.buffer,
-        .view = pane.view,
+            // Split the parent's leaf so the view lives next to its
+            // caller. doSplit reads `layout.focused`, so redirect focus
+            // to the parent leaf for the duration of the split, then
+            // either keep focus on the new leaf (take_focus) or restore
+            // the user's original focus (non-focusing attach).
+            const prev_focus = self.layout.focused;
+            self.layout.focused = parent_node;
+            errdefer self.layout.focused = prev_focus;
+
+            // Placement: the focus-stealing legacy keybind keeps `.second`
+            // (byte-identical drill-down to the right of the caller). The
+            // non-focusing plugin attach anchors `.first` (root side, the
+            // sessions-sidebar column) so the live child view reads as a
+            // sidebar rather than nesting inside the parent's own slot.
+            const side: Layout.Side = if (take_focus) .second else .first;
+            try self.layout.splitVerticalSide(0.5, .{
+                .buffer = entry.pane.buffer,
+                .view = entry.pane.view,
+                .viewport = &entry.pane.viewport,
+            }, side);
+
+            // `splitFocused` leaves focus on the freshly-registered new
+            // leaf. Stamp its handle onto the entry, then settle focus.
+            const new_leaf = self.layout.focused;
+            if (new_leaf) |leaf| {
+                if (self.handleForNode(leaf)) |handle| {
+                    entry.pane.handle = handle;
+                } else |err| {
+                    log.warn("subagent leaf missing from registry: {}", .{err});
+                }
+            }
+
+            const new_handle = entry.pane.handle orelse return error.ParentLeafMissing;
+
+            if (take_focus) {
+                self.layout.recalculate(self.screen.width, self.screen.height);
+                self.compositor.layout_dirty = true;
+                self.notifyLeafRects();
+                // Parent is no longer focused; the new leaf is. Fire
+                // onFocus via the same swap helper used by `doSplit`.
+                const parent_leaf: ?*Layout.LayoutNode.Leaf = switch (parent_node.*) {
+                    .leaf => &parent_node.leaf,
+                    .split => null,
+                };
+                self.notifyFocusSwap(parent_leaf, self.layout.getFocusedLeaf());
+            } else {
+                // Restore the user's focus; the view is attached but the
+                // input pane is unchanged. No focus swap fires (prev ==
+                // next), so no onFocus / PaneFocused churn.
+                self.layout.focused = prev_focus;
+                self.layout.recalculate(self.screen.width, self.screen.height);
+                self.compositor.layout_dirty = true;
+                self.notifyLeafRects();
+            }
+
+            return new_handle;
+        },
+        .float => return self.attachBorrowedFloat(child, take_focus),
+    }
+}
+
+/// Re-tile a backgrounded borrowed-view tile (its leaf was closed on a
+/// prior switch). Mirrors `attachPaneAsSplit` but anchors the view on
+/// the root side and, when `take_focus` is false, restores the caller's
+/// prior focus so the re-show does not steal input.
+fn attachBorrowedSplit(self: *WindowManager, entry: *PaneEntry, take_focus: bool) !NodeRegistry.Handle {
+    const prev_focus = self.layout.getFocusedLeaf();
+    try self.layout.splitVerticalSide(0.5, .{
+        .buffer = entry.pane.buffer,
+        .view = entry.pane.view,
         .viewport = &entry.pane.viewport,
-    };
-    try self.layout.splitVertical(0.5, surface);
+    }, .first);
 
-    // The freshly-split leaf is now focused. Stamp its handle onto the
-    // entry so draft-change hooks (and any future pane-by-id lookup)
-    // see a non-null id.
     if (self.layout.focused) |new_leaf| {
         if (self.handleForNode(new_leaf)) |handle| {
             entry.pane.handle = handle;
         } else |err| {
-            log.warn("subagent leaf missing from registry: {}", .{err});
+            log.warn("re-shown subagent leaf missing from registry: {}", .{err});
         }
     }
+    const new_handle = entry.pane.handle orelse return error.ParentLeafMissing;
 
+    if (!take_focus) {
+        if (prev_focus) |pf| {
+            // Restore prior focus: `getFocusedLeaf` handed back a *Leaf,
+            // but `layout.focused` is a *LayoutNode. The prior focused
+            // node stays live across the split (splitFocused only adds a
+            // new leaf + wrapping split), so recover its node by leaf
+            // identity and point focus back at it.
+            if (self.nodeForLeaf(pf)) |n| self.layout.focused = n;
+        }
+    }
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
     self.notifyLeafRects();
-    // Parent is no longer focused; the new leaf is. Fire onFocus
-    // notifications via the same swap helper used by `doSplit`.
-    const parent_leaf: ?*Layout.LayoutNode.Leaf = switch (parent_node.*) {
-        .leaf => &parent_node.leaf,
-        .split => null,
-    };
-    self.notifyFocusSwap(parent_leaf, self.layout.getFocusedLeaf());
+    if (take_focus) self.notifyFocusSwap(prev_focus, self.layout.getFocusedLeaf());
+    return new_handle;
+}
+
+/// Open a borrowed-Conversation FLOAT view of `child`. Routes through
+/// `openFloatPane` (which always builds a null-conversation float), then
+/// patches the resulting entry to borrow `child` and flag it
+/// `is_subagent_view` so the close guard in `closeFloatById` skips
+/// freeing the borrowed transcript. `take_focus` maps to the float's
+/// `enter` (whether the float grabs keyboard focus).
+fn attachBorrowedFloat(self: *WindowManager, child: *Conversation, take_focus: bool) !NodeRegistry.Handle {
+    const seed: Layout.Rect = .{ .x = 0, .y = 0, .width = self.screen.width, .height = self.screen.height };
+    const handle = try self.openFloatPane(
+        .{ .buffer = child.buf(), .view = child.view() },
+        seed,
+        .{ .enter = take_focus },
+    );
+    // Patch the freshly-created float entry to borrow the child and carry
+    // the subagent-view flag. openFloatPane leaves `conversation = null`;
+    // locate the entry by the float's buffer pointer (same lookup
+    // closeFloatById uses) and rewrite it in place.
+    for (self.extra_floats.items) |entry| {
+        if (entry.pane.buffer.ptr == child.buf().ptr) {
+            entry.pane.conversation = child;
+            entry.is_subagent_view = true;
+            break;
+        }
+    }
+    return handle;
+}
+
+/// Result of `findSubagentView`: the borrowed-view `PaneEntry` plus
+/// which list it lives on (tile vs float), so callers route re-show
+/// through the right path.
+const SubagentViewMatch = struct {
+    entry: *PaneEntry,
+    kind: enum { tile, float },
+};
+
+/// Find the single live borrowed-view pane (tile or float) displaying
+/// `child`, or null when no view exists yet. Backs the one-view-per-child
+/// dedup invariant in `attachSubagentView`.
+fn findSubagentView(self: *WindowManager, child: *Conversation) ?SubagentViewMatch {
+    for (self.extra_panes.items) |entry| {
+        if (!entry.is_subagent_view) continue;
+        if (entry.pane.conversation == child) return .{ .entry = entry, .kind = .tile };
+    }
+    for (self.extra_floats.items) |entry| {
+        if (!entry.is_subagent_view) continue;
+        if (entry.pane.conversation == child) return .{ .entry = entry, .kind = .float };
+    }
+    return null;
+}
+
+/// Resolve a leaf back to its owning `*LayoutNode` by walking the tree
+/// for the node whose `.leaf` is `target`. Used when only a `*Leaf`
+/// (from `getFocusedLeaf`) is in hand but a `*LayoutNode` is needed to
+/// set `layout.focused`.
+fn nodeForLeaf(self: *WindowManager, target: *Layout.LayoutNode.Leaf) ?*Layout.LayoutNode {
+    var leaves: [64]*Layout.LayoutNode = undefined;
+    var count: usize = 0;
+    self.layout.visibleLeaves(&leaves, &count);
+    for (leaves[0..count]) |node| {
+        if (&node.leaf == target) return node;
+    }
+    return null;
+}
+
+/// Resolve the live layout handle for the leaf displaying `conv`'s
+/// buffer, scanning the root pane and every extra (tiled) pane. Returns
+/// null when the conversation has no live tile (headless, or a
+/// backgrounded pane whose leaf was closed). Read-only; no behavior
+/// change to the layout.
+pub fn paneHandleForConversation(self: *WindowManager, conv: *Conversation) ?NodeRegistry.Handle {
+    if (self.root_pane.conversation == conv) {
+        if (self.root_pane.handle) |h| return h;
+    }
+    for (self.extra_panes.items) |entry| {
+        if (entry.pane.conversation == conv) {
+            if (entry.pane.handle) |h| return h;
+        }
+    }
+    return null;
 }
 
 /// Try to create and attach a session to a pane. Returns the handle or
@@ -4393,6 +4601,189 @@ test "enter_subagent action is a no-op on a Conversation without subagent_link n
     // panic, and must not open a new pane.
     try wm.executeAction(.enter_subagent);
     try std.testing.expectEqual(@as(usize, 0), wm.extra_panes.items.len);
+}
+
+/// Live-screen WindowManager fixture for the subagent-view tests. Unlike
+/// `PickerFixture` (screen/compositor `undefined`), `attachSubagentView`
+/// splits the layout and calls `recalculate` / `notifyLeafRects`, so a
+/// real Screen + Compositor must exist. The root conversation, runner,
+/// and layout are owned here; the test drives `wm` and the helper tears
+/// everything down in dependency order.
+const SubagentViewFixture = struct {
+    allocator: std.mem.Allocator,
+    screen: Screen,
+    theme: @import("Theme.zig"),
+    compositor: Compositor,
+    layout: Layout,
+    root_conv: Conversation,
+    runner: AgentRunner,
+    session_mgr: ?Session.SessionManager,
+    command_registry: CommandRegistry,
+    root_viewport: Viewport,
+    wm: WindowManager,
+
+    fn deinit(self: *SubagentViewFixture) void {
+        self.wm.deinit();
+        self.command_registry.deinit();
+        self.runner.deinit();
+        self.root_conv.deinit();
+        self.layout.deinit();
+        self.compositor.deinit();
+        self.screen.deinit();
+    }
+};
+
+/// Build a `SubagentViewFixture` in place. The caller MUST keep `f`
+/// pinned (it is referenced by borrowed pointers all over the WM) and
+/// call `f.deinit()` exactly once. Mirrors the inline scaffold the
+/// original `enterSubagent` test used, factored out so the C1/C2 tests
+/// don't each re-stamp 40 lines of setup.
+fn buildSubagentViewFixture(allocator: std.mem.Allocator, f: *SubagentViewFixture) !void {
+    f.allocator = allocator;
+    f.screen = try Screen.init(allocator, 80, 24);
+    errdefer f.screen.deinit();
+    f.theme = @import("Theme.zig").defaultTheme();
+    f.compositor = Compositor.init(&f.screen, allocator, &f.theme);
+    errdefer f.compositor.deinit();
+    f.layout = Layout.init(allocator);
+    errdefer f.layout.deinit();
+    f.root_conv = try Conversation.init(allocator, 0, "root");
+    errdefer f.root_conv.deinit();
+    f.runner = AgentRunner.init(allocator, TestNullSink.sink(), &f.root_conv);
+    errdefer f.runner.deinit();
+    f.session_mgr = null;
+    f.command_registry = try testCommandRegistry(allocator);
+    errdefer f.command_registry.deinit();
+    f.root_viewport = .{};
+
+    f.wm = .{
+        .allocator = allocator,
+        .screen = &f.screen,
+        .layout = &f.layout,
+        .compositor = &f.compositor,
+        .root_pane = .{ .buffer = f.root_conv.buf(), .view = f.root_conv.view(), .conversation = &f.root_conv, .runner = &f.runner },
+        .provider = undefined,
+        .session_mgr = &f.session_mgr,
+        .lua_engine = null,
+        .wake_write_fd = 0,
+        .node_registry = NodeRegistry.init(allocator),
+        .buffer_registry = BufferRegistry.init(allocator),
+        .command_registry = &f.command_registry,
+    };
+
+    try f.wm.attachLayoutRegistry();
+    try f.layout.setRoot(.{ .buffer = f.root_conv.buf(), .view = f.root_conv.view(), .viewport = &f.root_viewport });
+    f.layout.recalculate(f.screen.width, f.screen.height);
+    // Re-walk after setRoot so the root_pane's handle is stamped; the
+    // attach path resolves the parent leaf via the conversation pointer.
+    try f.wm.attachLayoutRegistry();
+}
+
+test "attachSubagentView attaches a borrowed view and returns its handle" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    const child = try f.root_conv.spawnSubagent("codereview", "");
+
+    const handle = try f.wm.attachSubagentView(&f.root_conv, 0, .split, true);
+
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+    const entry = f.wm.extra_panes.items[0];
+    try std.testing.expect(entry.is_subagent_view);
+    try std.testing.expectEqual(child, entry.pane.conversation.?);
+    try std.testing.expectEqual(@as(?*AgentRunner, null), entry.pane.runner);
+    try std.testing.expectEqual(handle, entry.pane.handle.?);
+}
+
+test "attachSubagentView dedups: a second attach of the same child reuses the handle" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    _ = try f.root_conv.spawnSubagent("codereview", "");
+
+    const first = try f.wm.attachSubagentView(&f.root_conv, 0, .split, false);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+
+    // A second attach of the SAME child must hand back the existing
+    // handle and add no second entry (one live view per child).
+    const second = try f.wm.attachSubagentView(&f.root_conv, 0, .split, false);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+}
+
+test "attachSubagentView with take_focus=false leaves the focused leaf unchanged" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    _ = try f.root_conv.spawnSubagent("codereview", "");
+
+    // The root leaf is focused before the attach; a non-focusing attach
+    // must leave that leaf focused (the borrowed view never steals input).
+    const before = f.wm.layout.getFocusedLeaf();
+    try std.testing.expect(before != null);
+
+    _ = try f.wm.attachSubagentView(&f.root_conv, 0, .split, false);
+
+    const after = f.wm.layout.getFocusedLeaf();
+    try std.testing.expectEqual(before, after);
+    // The focused pane is still the root conversation, not the view.
+    try std.testing.expectEqual(&f.root_conv, f.wm.getFocusedPanePtr().conversation.?);
+}
+
+test "attachSubagentView with take_focus=true moves focus onto the new view" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    const child = try f.root_conv.spawnSubagent("codereview", "");
+
+    const before = f.wm.layout.getFocusedLeaf();
+    _ = try f.wm.attachSubagentView(&f.root_conv, 0, .split, true);
+    const after = f.wm.layout.getFocusedLeaf();
+
+    // Focus-stealing attach: focus follows into the borrowed view.
+    try std.testing.expect(before != after);
+    try std.testing.expectEqual(child, f.wm.getFocusedPanePtr().conversation.?);
+}
+
+test "attachSubagentView float dest carries is_subagent_view on the float entry" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    const child = try f.root_conv.spawnSubagent("codereview", "");
+
+    const handle = try f.wm.attachSubagentView(&f.root_conv, 0, .float, false);
+
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_floats.items.len);
+    const entry = f.wm.extra_floats.items[0];
+    try std.testing.expect(entry.is_subagent_view);
+    try std.testing.expectEqual(child, entry.pane.conversation.?);
+    try std.testing.expect(Layout.isFloatHandle(handle));
+
+    // Dedup also spans the float list: re-attaching the same child as a
+    // float returns the existing handle with no second float.
+    const again = try f.wm.attachSubagentView(&f.root_conv, 0, .float, false);
+    try std.testing.expectEqual(handle, again);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_floats.items.len);
+}
+
+test "attachSubagentView rejects an out-of-range child index" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    // No subagents spawned: index 0 is out of bounds.
+    try std.testing.expectError(error.StaleSubagentIndex, f.wm.attachSubagentView(&f.root_conv, 0, .split, false));
 }
 
 test "executeAction lua_callback runs the Lua function via the engine" {
