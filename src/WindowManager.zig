@@ -2000,10 +2000,21 @@ pub fn attachSubagentView(
 
     switch (dest) {
         .split => {
-            // Resolve the parent's live leaf so the split nests beside it.
-            const parent_handle = self.paneHandleForConversation(parent_conv) orelse return error.ParentLeafMissing;
-            const parent_node = self.node_registry.resolve(parent_handle) catch return error.ParentLeafMissing;
-            if (parent_node.* != .leaf) return error.ParentLeafMissing;
+            // Resolve the leaf to split beside. Prefer the parent's own
+            // tile (drill-down beside the caller); when the parent has no
+            // live tile (it is a float, or backgrounded), fall back to the
+            // currently focused leaf so a plugin can still anchor a view.
+            const parent_node = blk: {
+                if (self.paneHandleForConversation(parent_conv)) |h| {
+                    if (self.node_registry.resolve(h)) |node| {
+                        if (node.* == .leaf) break :blk node;
+                    } else |_| {}
+                }
+                if (self.layout.focused) |f| {
+                    if (f.* == .leaf) break :blk f;
+                }
+                return error.ParentLeafMissing;
+            };
 
             const entry = try self.allocator.create(PaneEntry);
             errdefer self.allocator.destroy(entry);
@@ -2199,6 +2210,95 @@ pub fn paneHandleForConversation(self: *WindowManager, conv: *Conversation) ?Nod
         }
     }
     return null;
+}
+
+/// True when `view_conv` is `dying` itself or a (possibly nested)
+/// subagent descendant of `dying`. Walks the child's `parent` backlinks
+/// up to the root; any step landing on `dying` is a match. Backs the
+/// divorce guard: a borrowed view of any node in `dying`'s subtree must
+/// close before `dying.deinit` recursively frees that subtree.
+fn isDescendantOf(view_conv: *Conversation, dying: *Conversation) bool {
+    var cur: ?*Conversation = view_conv;
+    while (cur) |c| {
+        if (c == dying) return true;
+        cur = c.parent;
+    }
+    return false;
+}
+
+/// Divorce guard: close every borrowed `is_subagent_view` pane whose
+/// conversation lives in `dying`'s subtree, BEFORE `dying.deinit`
+/// recursively frees that subtree. Without this sweep a child-view pane
+/// keeps a dangling borrow into freed memory the moment its (grand)parent
+/// conversation is torn down -- the recurring divorce/UAF family.
+///
+/// Floats are closed via `closeFloatById` (the clean detach-and-free
+/// path; the close guard already skips freeing the borrowed child).
+/// Tiles detach their layout leaf (`closeById` semantics) and the entry
+/// is removed from `extra_panes` and freed; because it is a
+/// subagent-view, its borrowed Conversation is left alone for `dying` to
+/// own. Both lists are swept by collected handle / reverse index so the
+/// in-loop mutation (orderedRemove) never invalidates the walk.
+fn closeSubagentViewsUnder(self: *WindowManager, dying: *Conversation) void {
+    // Floats first: collect matching handles, then close each. Closing
+    // mutates `extra_floats`, so we cannot hold a slice iterator across
+    // the calls.
+    var float_handles: [64]NodeRegistry.Handle = undefined;
+    var float_count: usize = 0;
+    for (self.extra_floats.items) |entry| {
+        if (!entry.is_subagent_view) continue;
+        const view_conv = entry.pane.conversation orelse continue;
+        if (!isDescendantOf(view_conv, dying)) continue;
+        if (entry.pane.handle) |h| {
+            if (float_count < float_handles.len) {
+                float_handles[float_count] = h;
+                float_count += 1;
+            }
+        }
+    }
+    for (float_handles[0..float_count]) |h| {
+        self.closeFloatById(h) catch |err| {
+            log.warn("divorce sweep: closing subagent-view float failed: {}", .{err});
+        };
+    }
+
+    // Tiles: walk back-to-front so orderedRemove keeps the unscanned
+    // prefix indices stable. Detach the layout leaf (if still live) then
+    // drop and free the entry. The borrowed Conversation is NOT freed
+    // here (is_subagent_view); `dying.deinit` owns it.
+    var i: usize = self.extra_panes.items.len;
+    while (i > 0) {
+        i -= 1;
+        const entry = self.extra_panes.items[i];
+        if (!entry.is_subagent_view) continue;
+        const view_conv = entry.pane.conversation orelse continue;
+        if (!isDescendantOf(view_conv, dying)) continue;
+
+        if (entry.pane.handle) |h| {
+            // Detach the leaf from the tiled tree. closeById rejects the
+            // active pane, so guard: if this view holds focus, move focus
+            // off it first (to the root leaf) so the close is allowed.
+            if (self.node_registry.resolve(h)) |node| {
+                if (node.* == .leaf) {
+                    if (self.layout.focused == node) {
+                        if (self.root_pane.handle) |rh| {
+                            self.focusById(rh) catch {};
+                        }
+                    }
+                    self.closeById(h, null) catch |err| {
+                        log.warn("divorce sweep: detaching subagent-view tile failed: {}", .{err});
+                    };
+                }
+            } else |_| {}
+        }
+
+        _ = self.extra_panes.orderedRemove(i);
+        // Borrowed view: no conversation / runner / session / sink to
+        // free (attachSubagentView never allocates them). Just release
+        // the entry shell.
+        self.allocator.destroy(entry);
+    }
+    self.compositor.layout_dirty = true;
 }
 
 /// Try to create and attach a session to a pane. Returns the handle or
@@ -2461,6 +2561,11 @@ pub fn closeFloatById(self: *WindowManager, handle: NodeRegistry.Handle) !void {
         // parent's `subagents` list owns the underlying child.
         if (!entry.is_subagent_view) {
             if (entry.pane.conversation) |v| {
+                // Divorce guard: this owned conversation is about to be
+                // freed (recursively, with its subagents). Close any
+                // borrowed child-view panes pointing into its subtree
+                // FIRST so none keep a dangling borrow afterward.
+                self.closeSubagentViewsUnder(v);
                 v.deinit();
                 self.allocator.destroy(v);
             }
@@ -4784,6 +4889,121 @@ test "attachSubagentView rejects an out-of-range child index" {
 
     // No subagents spawned: index 0 is out of bounds.
     try std.testing.expectError(error.StaleSubagentIndex, f.wm.attachSubagentView(&f.root_conv, 0, .split, false));
+}
+
+/// Open a WM-owned-conversation float fronting `owned`. `openFloatPane`
+/// always builds a null-conversation float; this stamps the heap-owned
+/// parent conversation onto the entry (leaving `is_subagent_view`
+/// false) so `closeFloatById` will recursively free it -- the
+/// mid-lifetime owned-conversation free that the divorce guard must
+/// fence. Returns the float handle.
+fn openOwnedConversationFloat(wm: *WindowManager, owned: *Conversation) !NodeRegistry.Handle {
+    const handle = try wm.openFloatPane(
+        .{ .buffer = owned.buf(), .view = owned.view() },
+        .{ .x = 0, .y = 0, .width = 40, .height = 12 },
+        .{},
+    );
+    for (wm.extra_floats.items) |entry| {
+        if (entry.pane.buffer.ptr == owned.buf().ptr) {
+            entry.pane.conversation = owned;
+            break;
+        }
+    }
+    return handle;
+}
+
+test "closing an owned-conversation float sweeps borrowed child views before freeing the child (no UAF)" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    // Heap-allocate a parent conversation owned by a float pane. Closing
+    // the float recursively frees this parent AND its subagents; a child
+    // view borrowing one of those subagents would dangle without the
+    // divorce sweep. Under std.testing.allocator that dangle surfaces as
+    // a leak/UAF -- the test is RED without `closeSubagentViewsUnder`.
+    const parent = try allocator.create(Conversation);
+    parent.* = try Conversation.init(allocator, 1, "parent");
+    // No defer-free: the float now owns `parent`; closeFloatById frees it.
+
+    const child = try parent.spawnSubagent("codereview", "");
+
+    const float_handle = try openOwnedConversationFloat(&f.wm, parent);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_floats.items.len);
+
+    // Attach a borrowed TILE view of the child off the parent.
+    _ = try f.wm.attachSubagentView(parent, 0, .split, false);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+    try std.testing.expect(f.wm.extra_panes.items[0].is_subagent_view);
+    try std.testing.expectEqual(child, f.wm.extra_panes.items[0].pane.conversation.?);
+
+    // Close the owning float. The divorce sweep must close the borrowed
+    // child-view tile FIRST, then the parent (and its subagents) frees.
+    try f.wm.closeFloatById(float_handle);
+
+    // The borrowed view is gone (swept), the float is gone, and no
+    // dangling borrow remains for the renderer to deref.
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_panes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_floats.items.len);
+}
+
+test "divorce sweep handles a nested grandchild view borrowed from a dying ancestor" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    const parent = try allocator.create(Conversation);
+    parent.* = try Conversation.init(allocator, 1, "parent");
+
+    // parent -> child -> grandchild; the view borrows the grandchild.
+    const child = try parent.spawnSubagent("mid", "");
+    const grandchild = try child.spawnSubagent("leaf", "");
+
+    const float_handle = try openOwnedConversationFloat(&f.wm, parent);
+
+    // Borrow the GRANDCHILD as a float view (different list than the
+    // dying float, exercises the float sweep arm).
+    _ = try f.wm.attachSubagentView(child, 0, .float, false);
+    // extra_floats now holds: [owned-parent-float, grandchild-view-float]
+    try std.testing.expectEqual(@as(usize, 2), f.wm.extra_floats.items.len);
+    try std.testing.expectEqual(grandchild, f.wm.extra_floats.items[1].pane.conversation.?);
+
+    // Closing the parent float must sweep the grandchild view (a
+    // depth-2 descendant) before parent.deinit recursively frees it.
+    try f.wm.closeFloatById(float_handle);
+
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_floats.items.len);
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_panes.items.len);
+}
+
+test "divorce sweep leaves unrelated subagent views untouched" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    // A view borrowed off the ROOT conversation (owned by the fixture,
+    // freed at WM deinit, NOT by the float close) must survive closing
+    // an unrelated owned-conversation float.
+    const root_child = try f.root_conv.spawnSubagent("root-child", "");
+    _ = try f.wm.attachSubagentView(&f.root_conv, 0, .split, false);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+
+    const parent = try allocator.create(Conversation);
+    parent.* = try Conversation.init(allocator, 2, "other-parent");
+    _ = try parent.spawnSubagent("other-child", "");
+    const float_handle = try openOwnedConversationFloat(&f.wm, parent);
+    _ = try f.wm.attachSubagentView(parent, 0, .float, false);
+
+    // Closing `parent`'s float sweeps only `parent`'s subtree views; the
+    // root-borrowed view stays put.
+    try f.wm.closeFloatById(float_handle);
+
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+    try std.testing.expectEqual(root_child, f.wm.extra_panes.items[0].pane.conversation.?);
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_floats.items.len);
 }
 
 test "executeAction lua_callback runs the Lua function via the engine" {
