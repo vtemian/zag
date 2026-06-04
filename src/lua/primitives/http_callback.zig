@@ -188,6 +188,18 @@ pub const HttpCallbackListener = struct {
                 return;
             }
 
+            // A socket shutdown (cancel OR teardown) must wind the helper down
+            // even when the OS does not surface it as a poll wake: shutting a
+            // LISTENING socket down does not reliably return POLLHUP/POLLIN
+            // (notably on macOS), so a poll-only exit would block until the
+            // deadline. Observe the shutdown flag directly so teardown's join
+            // completes within one poll interval. (`postErr` is a no-op under
+            // `tearing_down`, so the teardown path drops the post and exits.)
+            if (self.shutdown_done.load(.acquire)) {
+                self.postErr(.cancelled);
+                return;
+            }
+
             const remaining_ms: i32 = blk: {
                 const d = deadline_ms orelse break :blk 200; // cap a single poll so we re-check cancel
                 const left = d - clock.milliTimestamp();
@@ -220,7 +232,7 @@ pub const HttpCallbackListener = struct {
 
             // Handle this connection. A matching path completes the
             // listener; a non-match writes 404 and the loop continues.
-            if (self.handleConnection(conn)) return;
+            if (self.handleConnection(conn, deadline_ms)) return;
         }
     }
 
@@ -229,9 +241,18 @@ pub const HttpCallbackListener = struct {
     /// caller to stop (return true). Non-matching paths get a 404 and we
     /// return false so the wait continues. The connection is always
     /// closed before return.
-    fn handleConnection(self: *HttpCallbackListener, conn: Io.net.Stream) bool {
+    ///
+    /// The read honors the overall `deadline_ms` (the same budget the
+    /// accept loop polls against): a client that connects but never
+    /// completes the request line must not wedge the helper past the
+    /// deadline. When the budget elapses mid-read, post `.timeout` and
+    /// return true so the helper winds down (and `shutdownAndCleanup`'s
+    /// join completes instead of blocking on a stuck `readVec`).
+    fn handleConnection(self: *HttpCallbackListener, conn: Io.net.Stream, deadline_ms: ?i64) bool {
         const io = process_io.get();
         defer conn.close(io);
+
+        const conn_fd = conn.socket.handle;
 
         // Read up to the end of the request line (we only need the first
         // line: `GET <path>?<query> HTTP/1.1`). Browsers send the full
@@ -240,6 +261,33 @@ pub const HttpCallbackListener = struct {
         var buf: [8192]u8 = undefined;
         var total: usize = 0;
         while (total < buf.len) {
+            // A cancel/teardown shuts the LISTENING socket down, not this conn,
+            // so re-check both on the poll cadence (mirrors the accept loop):
+            // observe `shutdown_done` directly since the conn poll won't see
+            // the listener's shutdown.
+            if (self.scope.isCancelled() or self.shutdown_done.load(.acquire)) {
+                self.postErr(.cancelled);
+                return true;
+            }
+
+            const wait_ms: i32 = blk: {
+                const d = deadline_ms orelse break :blk 200; // cap so cancel is re-checked
+                const left = d - clock.milliTimestamp();
+                if (left <= 0) {
+                    self.postErr(.timeout);
+                    return true;
+                }
+                break :blk @intCast(@min(left, 200));
+            };
+
+            var pfd = [_]posix.pollfd{.{ .fd = conn_fd, .events = posix.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&pfd, wait_ms) catch |err| {
+                log.debug("await_callback conn poll: {s}", .{@errorName(err)});
+                self.postErr(.io_error);
+                return true;
+            };
+            if (ready == 0) continue; // nothing yet; loop re-checks deadline + cancel
+
             var reader = conn.reader(io, &.{});
             var data: [1][]u8 = .{buf[total..]};
             const n = reader.interface.readVec(&data) catch |err| switch (err) {
@@ -577,6 +625,44 @@ test "await_callback posts timeout when no request arrives" {
     }
 
     const listener = try HttpCallbackListener.init(alloc, &completions, scope, 0, "/callback", 100, 9);
+
+    const job = blk: {
+        const start = clock.milliTimestamp();
+        while (clock.milliTimestamp() - start < 3000) {
+            if (completions.pop()) |j| break :blk j;
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+        listener.shutdownAndCleanup();
+        return error.NoCompletion;
+    };
+    defer alloc.destroy(job);
+    listener.shutdownAndCleanup();
+
+    try testing.expect(job.err_tag != null);
+    try testing.expectEqual(job_mod.ErrTag.timeout, job.err_tag.?);
+}
+
+test "await_callback times out a connection that never sends a request" {
+    std.testing.log_level = .err;
+    const alloc = testing.allocator;
+    const scope = try Scope.init(alloc, null);
+    defer scope.deinit();
+
+    var completions = try completion_queue.Queue.init(alloc, 16);
+    defer {
+        while (completions.pop()) |j| alloc.destroy(j);
+        completions.deinit();
+    }
+
+    // Short budget so the deadline trips well inside the poll window below.
+    const listener = try HttpCallbackListener.init(alloc, &completions, scope, 0, "/callback", 200, 13);
+    const port = test_net.boundPort(&listener.server);
+
+    // Connect but send nothing: the helper accepts the connection, then its
+    // per-connection read must honor the overall deadline instead of blocking
+    // in recv forever. Hold the stream open until the listener gives up.
+    const conn = try test_net.connectLoopback(port);
+    defer conn.close(std.testing.io);
 
     const job = blk: {
         const start = clock.milliTimestamp();
