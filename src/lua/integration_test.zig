@@ -1065,6 +1065,33 @@ test "a SubagentSpawn hook that raises does not break the drain; the child still
     );
 }
 
+test "workflow_panes plugin stays inert on a headless engine (no window manager)" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Load the plugin into a headless engine: no window_manager is bound, so
+    // every zag.pane.* / zag.layout.* call raises. The plugin must subscribe
+    // its hooks and survive a spawn/end fire without raising and without
+    // opening a view (parent_pane is the empty string in headless mode).
+    try runLua(&engine, "_G.wp = require('zag.builtin.workflow_panes')");
+
+    // Fire a spawn then an end exactly as the registry sink would, but with the
+    // headless empty-string parent_pane. fireHook must not propagate any error.
+    var spawn: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "alpha", .index = 1, .parent_pane = "" } };
+    _ = try engine.fireHook(&spawn);
+    var end: Hooks.HookPayload = .{ .subagent_end = .{ .name = "alpha", .index = 1, .parent_pane = "", .is_error = false } };
+    _ = try engine.fireHook(&end);
+
+    // The plugin tracked nothing: no view pane id, no parent pane.
+    try runLua(&engine,
+        \\local s = _G.wp._state_for_test()
+        \\assert(s.view_pane == nil, "headless: no view pane must be opened")
+        \\assert(s.current_index == nil, "headless: nothing should be tracked")
+    );
+}
+
 // -- zag.task binding misuse guards (Milestone E1) --------------------------
 
 test "zag.task is installed and raises when called outside a coroutine" {

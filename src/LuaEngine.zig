@@ -276,6 +276,13 @@ pub const LuaEngine = struct {
     /// is the orthogonal hard backstop. Tuned by `zag.workflow.set_max_fanout`
     /// against provider rate limits; defaults to 8.
     workflow_max_fanout: u32 = 8,
+    /// Whether the `zag.builtin.workflow_panes` plugin should open a live
+    /// borrowed child-view pane while a workflow runs. A single bool read live
+    /// by the plugin's `SubagentSpawn` handler via `zag.workflow.panes()` and
+    /// toggled by `zag.workflow.set_panes(enabled)`. Defaults to on; the plugin
+    /// is the only reader, so flipping it false makes every spawn handler a
+    /// no-op without unloading the plugin.
+    workflow_panes_enabled: bool = true,
     /// Borrowed registry of in-flight child agents, owned by the
     /// `EventOrchestrator` and wired in `create`. Null in headless / test paths
     /// with no orchestrator. Workflow children are registered here with a

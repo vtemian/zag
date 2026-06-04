@@ -5041,6 +5041,28 @@ fn rootPaneHandleString(allocator: std.mem.Allocator, wm: *WindowManager) ![]u8 
     return NodeRegistry.formatId(allocator, h);
 }
 
+/// A LIVE borrowed view is a subagent-view entry whose handle still resolves
+/// to a tiled leaf. Retargeting (close + reattach) leaves the closed entry in
+/// `extra_panes` as a detached shell (tile `closeById` never pops the entry),
+/// so `extra_panes.items.len` overcounts; this helper measures what the user
+/// actually sees. Returns the count of live views and the conversation of the
+/// single live one (null when zero or more than one is live).
+const LiveViews = struct { count: usize, single: ?*Conversation };
+fn liveSubagentViews(wm: *WindowManager) LiveViews {
+    var count: usize = 0;
+    var single: ?*Conversation = null;
+    for (wm.extra_panes.items) |entry| {
+        if (!entry.is_subagent_view) continue;
+        const h = entry.pane.handle orelse continue;
+        const node = wm.node_registry.resolve(h) catch continue;
+        if (node.* != .leaf) continue;
+        count += 1;
+        single = entry.pane.conversation;
+    }
+    if (count != 1) single = null;
+    return .{ .count = count, .single = single };
+}
+
 test "zag.pane.subagents enumerates children with 1-based index, name, and status" {
     const allocator = std.testing.allocator;
     var f: SubagentViewFixture = undefined;
@@ -5155,6 +5177,110 @@ test "zag.pane.attach_subagent raises cleanly on an out-of-range child index" {
         \\assert(not ok, "out-of-range index must raise")
         \\assert(tostring(err):find("attach_subagent"), "error must name the binding: " .. tostring(err))
     );
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_panes.items.len);
+}
+
+// -- zag.builtin.workflow_panes plugin (Milestone D1) ------------------------
+
+test "workflow_panes opens exactly one borrowed view on spawn without stealing focus" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    // Load just the plugin: its require-time body registers the SubagentSpawn /
+    // SubagentEnd hooks, the /workflow-panes command, and the <C-t> keymap.
+    try engine.lua.doString("require('zag.builtin.workflow_panes')");
+
+    // Two children on the root conversation; the plugin will borrow a view of
+    // whichever index a spawn payload names.
+    _ = try f.root_conv.spawnSubagent("alpha", "");
+    _ = try f.root_conv.spawnSubagent("beta", "");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+
+    // Focus before any spawn: the borrowed view must never move it.
+    const focus_before = f.wm.layout.getFocusedLeaf();
+
+    // Fire two SubagentSpawn hooks (index 1 then 2) through the real dispatch,
+    // exactly as the registry lifecycle sink does on main. parent_pane carries
+    // the root pane handle so the plugin's attach targets the live tile.
+    var spawn1: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "alpha", .index = 1, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn1);
+    var spawn2: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "beta", .index = 2, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn2);
+
+    // Exactly one LIVE borrowed view pane exists despite two spawns (retarget =
+    // close + reattach; never one pane per child). The first spawn's entry is
+    // detached but lingers in extra_panes, so count live leaves, not raw len.
+    try std.testing.expectEqual(@as(usize, 1), liveSubagentViews(&f.wm).count);
+
+    // Focus is unchanged: the view never stole input.
+    try std.testing.expectEqual(focus_before, f.wm.layout.getFocusedLeaf());
+    try std.testing.expectEqual(&f.root_conv, f.wm.getFocusedPanePtr().conversation.?);
+}
+
+test "workflow_panes retargets the view onto the most recently spawned child" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    try engine.lua.doString("require('zag.builtin.workflow_panes')");
+
+    _ = try f.root_conv.spawnSubagent("alpha", "");
+    const beta = try f.root_conv.spawnSubagent("beta", "");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+
+    var spawn1: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "alpha", .index = 1, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn1);
+    var spawn2: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "beta", .index = 2, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn2);
+
+    // The single live view now borrows the SECOND child (beta): the pane
+    // follows the most recently spawned child. The first child's view was
+    // closed (detached) on the retarget; only beta's leaf is live.
+    const live = liveSubagentViews(&f.wm);
+    try std.testing.expectEqual(@as(usize, 1), live.count);
+    try std.testing.expectEqual(beta, live.single.?);
+}
+
+test "workflow_panes opens no pane when the knob is off" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    try engine.lua.doString("require('zag.builtin.workflow_panes')");
+    // Disable the feature via the public knob; the spawn handler must bail.
+    try engine.lua.doString("zag.workflow.set_panes(false)");
+
+    _ = try f.root_conv.spawnSubagent("alpha", "");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+
+    var spawn1: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "alpha", .index = 1, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn1);
+
     try std.testing.expectEqual(@as(usize, 0), f.wm.extra_panes.items.len);
 }
 
