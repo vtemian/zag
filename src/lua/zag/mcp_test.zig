@@ -11,6 +11,7 @@ const zlua = @import("zlua");
 const Lua = zlua.Lua;
 const testing = std.testing;
 const clock = @import("../../clock.zig");
+const test_net = @import("../../test_net.zig");
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const Hooks = @import("../../Hooks.zig");
 
@@ -91,6 +92,38 @@ fn runCoroutineBody(engine: *LuaEngine, body: [:0]const u8) !void {
     try runLua(engine, wrapped);
     _ = try engine.lua.getGlobal("_mcp_co");
     try runCoroutineToDone(engine, 0);
+
+    _ = try engine.lua.getGlobal("_mcp_ok");
+    const ok = engine.lua.toBoolean(-1);
+    engine.lua.pop(1);
+    if (!ok) {
+        _ = engine.lua.getGlobal("_mcp_err") catch {};
+        std.debug.print("\nmcp coroutine failed: {s}\n", .{engine.lua.toStringEx(-1)});
+        engine.lua.pop(1);
+        return error.LuaCoroutineFailed;
+    }
+}
+
+/// Like `runCoroutineBody`, but pumps until the body coroutine signals done
+/// via the `_mcp_co_done` global rather than waiting for EVERY task to retire.
+/// Use when the body legitimately leaves a background coroutine parked (e.g.
+/// the legacy-SSE per-server reader loop, which only retires when the stream
+/// closes).
+fn runCoroutineBodyTolerant(engine: *LuaEngine, body: [:0]const u8) !void {
+    var buf: [8192]u8 = undefined;
+    const wrapped = try std.fmt.bufPrintZ(&buf,
+        \\_mcp_co_done = false
+        \\function _mcp_co()
+        \\  _mcp_ok, _mcp_err = pcall(function()
+        \\{s}
+        \\  end)
+        \\  _mcp_co_done = true
+        \\end
+    , .{body});
+    try runLua(engine, wrapped);
+    _ = try engine.lua.getGlobal("_mcp_co");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(engine, "_mcp_co_done");
 
     _ = try engine.lua.getGlobal("_mcp_ok");
     const ok = engine.lua.toBoolean(-1);
@@ -1181,4 +1214,734 @@ test "mcp command: reconnect exercises disconnect then connect" {
         engine.lua.pop(1);
         return error.ReconnectBodyFailed;
     }
+}
+
+// ---------------------------------------------------------------------------
+// G1: incremental SSE event parser (pure Lua, no I/O)
+// ---------------------------------------------------------------------------
+
+test "mcp sse: single-line data dispatches on empty line" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\-- A data line accumulates; the event only fires on the blank line.
+        \\assert(mcp._test.sse_feed(p, "data: hello") == nil, "no dispatch mid-event")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev ~= nil, "blank line dispatches")
+        \\assert(ev.event == "message", "default event name")
+        \\assert(ev.data == "hello", "data captured, got " .. tostring(ev.data))
+        \\assert(ev.id == nil, "no id set")
+    );
+}
+
+test "mcp sse: multi-line data joins with newline" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\mcp._test.sse_feed(p, "data: line one")
+        \\mcp._test.sse_feed(p, "data: line two")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev.data == "line one\nline two", "multi-line join, got " .. tostring(ev.data))
+    );
+}
+
+test "mcp sse: event and id fields are captured" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\mcp._test.sse_feed(p, "event: endpoint")
+        \\mcp._test.sse_feed(p, "id: 42")
+        \\mcp._test.sse_feed(p, "data: /messages?session=abc")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev.event == "endpoint", "named event, got " .. tostring(ev.event))
+        \\assert(ev.id == "42", "id captured, got " .. tostring(ev.id))
+        \\assert(ev.data == "/messages?session=abc", "data, got " .. tostring(ev.data))
+    );
+}
+
+test "mcp sse: comments and value formatting" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\-- A comment line (leading colon) is ignored entirely.
+        \\assert(mcp._test.sse_feed(p, ": this is a keep-alive comment") == nil, "comment ignored")
+        \\-- A field with no leading space after the colon keeps its value verbatim.
+        \\mcp._test.sse_feed(p, "data:no-space")
+        \\-- A field with no colon at all is treated as field name with empty value.
+        \\mcp._test.sse_feed(p, "data")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\-- Two data lines: "no-space" then "" -> joined with newline.
+        \\assert(ev.data == "no-space\n", "no-space + empty join, got " .. tostring(ev.data))
+    );
+}
+
+test "mcp sse: blank line with no data does not dispatch" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\-- A blank line before any field is a no-op (no event to dispatch).
+        \\assert(mcp._test.sse_feed(p, "") == nil, "blank with no buffered data")
+        \\-- An event-only field with no data line also does not dispatch (SSE
+        \\-- spec: an event with an empty data buffer is not dispatched).
+        \\mcp._test.sse_feed(p, "event: ping")
+        \\assert(mcp._test.sse_feed(p, "") == nil, "event with no data does not dispatch")
+        \\-- After a non-dispatching blank line the buffer resets, so a fresh
+        \\-- data line starts clean.
+        \\mcp._test.sse_feed(p, "data: real")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev.data == "real", "fresh event after reset, got " .. tostring(ev.data))
+        \\assert(ev.event == "message", "event name reset to default")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G2: Streamable HTTP transport
+//
+// A configurable MCP-over-HTTP fixture server. Each MCP request is a fresh
+// connection (the stream primitive runs keep_alive=false), so the server
+// accepts in a loop until `stop` flips. It identifies the JSON-RPC method by
+// substring (same trick as the stdio fixtures) and responds per `scenario`.
+// Shared observations (session echoed back, request count) are recorded on
+// the context so the test can assert them after teardown.
+// ---------------------------------------------------------------------------
+
+const HttpScenario = enum {
+    /// initialize -> 200 JSON + Mcp-Session-Id; tools/list -> 200 JSON.
+    json,
+    /// initialize -> 200 JSON + session; tools/list -> 200 text/event-stream
+    /// carrying the response as one SSE event.
+    sse,
+    /// initialize -> 200 JSON + session; a notification POST -> 202.
+    notification_202,
+    /// initialize -> 200 JSON + session; FIRST tools/list -> 404; client must
+    /// re-initialize (server hands a new session) then the retry -> 200.
+    reinit_404,
+    /// initialize -> 401 with WWW-Authenticate.
+    needs_auth_401,
+};
+
+const HttpFixture = struct {
+    server: std.Io.net.Server,
+    scenario: HttpScenario,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// True once a non-initialize request arrived carrying the session id we
+    /// handed out on the initialize response.
+    session_echoed: std.atomic.Value(bool) = .init(false),
+    /// Count of tools/list requests seen (drives the 404-then-200 sequence).
+    list_count: std.atomic.Value(u32) = .init(0),
+
+    const SESSION_ID = "sess-abc-123";
+
+    fn run(ctx: *HttpFixture) void {
+        while (!ctx.stop.load(.acquire)) {
+            const conn = ctx.server.accept(std.testing.io) catch return;
+            ctx.handleConn(conn);
+            conn.close(std.testing.io);
+        }
+    }
+
+    fn handleConn(ctx: *HttpFixture, conn: std.Io.net.Stream) void {
+        var buf: [8192]u8 = undefined;
+        var total: usize = 0;
+        var header_end: ?usize = null;
+        var content_length: usize = 0;
+        while (total < buf.len) {
+            const n = test_net.streamRead(conn, buf[total..]) catch return;
+            if (n == 0) break;
+            total += n;
+            if (header_end == null) {
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |idx| {
+                    header_end = idx + 4;
+                    if (findHeaderValue(buf[0..idx], "content-length")) |cl| {
+                        content_length = std.fmt.parseInt(usize, std.mem.trim(u8, cl, " "), 10) catch 0;
+                    }
+                }
+            }
+            if (header_end) |he| {
+                if (total - he >= content_length) break;
+            }
+        }
+        const request = buf[0..total];
+        const headers = if (header_end) |he| buf[0 .. he - 4] else request;
+        const body = if (header_end) |he| buf[he..total] else "";
+
+        // Record whether a non-initialize request echoed the session id.
+        const is_initialize = std.mem.indexOf(u8, body, "\"initialize\"") != null;
+        if (!is_initialize) {
+            if (findHeaderValue(headers, "mcp-session-id")) |sid| {
+                if (std.mem.eql(u8, std.mem.trim(u8, sid, " "), SESSION_ID)) {
+                    ctx.session_echoed.store(true, .release);
+                }
+            }
+        }
+
+        const reqid = jsonRpcId(body) orelse "1";
+        ctx.respond(conn, request, body, is_initialize, reqid);
+    }
+
+    fn respond(
+        ctx: *HttpFixture,
+        conn: std.Io.net.Stream,
+        request: []const u8,
+        body: []const u8,
+        is_initialize: bool,
+        reqid: []const u8,
+    ) void {
+        var out: [4096]u8 = undefined;
+
+        if (is_initialize) {
+            switch (ctx.scenario) {
+                .needs_auth_401 => {
+                    const resp =
+                        "HTTP/1.1 401 Unauthorized\r\n" ++
+                        "WWW-Authenticate: Bearer resource_metadata=\"https://auth.example/meta\"\r\n" ++
+                        "Content-Length: 0\r\n\r\n";
+                    test_net.streamWriteAll(conn, resp) catch {};
+                    return;
+                },
+                else => {
+                    const init_body = std.fmt.bufPrint(&out,
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"http-fake\",\"version\":\"0\"}}}}}}", .{reqid}) catch return;
+                    ctx.writeJson(conn, init_body, true);
+                    return;
+                },
+            }
+        }
+
+        // notifications/initialized (a notification: no id) -> 202.
+        if (std.mem.indexOf(u8, body, "notifications/initialized") != null) {
+            const resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+            test_net.streamWriteAll(conn, resp) catch {};
+            return;
+        }
+
+        const is_list = std.mem.indexOf(u8, body, "\"tools/list\"") != null;
+        if (is_list) {
+            const seq = ctx.list_count.fetchAdd(1, .acq_rel);
+            const list_body = std.fmt.bufPrint(&out,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
+            switch (ctx.scenario) {
+                .json, .notification_202 => ctx.writeJson(conn, list_body, false),
+                .sse => ctx.writeSse(conn, list_body),
+                .reinit_404 => {
+                    if (seq == 0) {
+                        const resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                        test_net.streamWriteAll(conn, resp) catch {};
+                    } else {
+                        ctx.writeJson(conn, list_body, false);
+                    }
+                },
+                .needs_auth_401 => {},
+            }
+            return;
+        }
+
+        // A standalone notification (e.g. tools-call test sends one) -> 202.
+        if (jsonRpcId(body) == null) {
+            const resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+            test_net.streamWriteAll(conn, resp) catch {};
+            return;
+        }
+
+        _ = request;
+        // Anything else: empty 200 JSON ok.
+        const empty = std.fmt.bufPrint(&out,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{reqid}) catch return;
+        ctx.writeJson(conn, empty, false);
+    }
+
+    fn writeJson(ctx: *HttpFixture, conn: std.Io.net.Stream, json: []const u8, with_session: bool) void {
+        _ = ctx;
+        var out: [4608]u8 = undefined;
+        const session_hdr = if (with_session)
+            "Mcp-Session-Id: " ++ SESSION_ID ++ "\r\n"
+        else
+            "";
+        const resp = std.fmt.bufPrint(&out,
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "{s}" ++
+            "Content-Length: {d}\r\n\r\n{s}", .{ session_hdr, json.len, json }) catch return;
+        test_net.streamWriteAll(conn, resp) catch {};
+    }
+
+    fn writeSse(ctx: *HttpFixture, conn: std.Io.net.Stream, json: []const u8) void {
+        _ = ctx;
+        var out: [4608]u8 = undefined;
+        // One SSE event whose data carries the JSON-RPC response, then a blank
+        // line to dispatch it, then EOF (chunked-less: rely on connection close
+        // for the legacy reader, but here Content-Length frames it).
+        const event = std.fmt.bufPrint(out[2048..], "event: message\ndata: {s}\n\n", .{json}) catch return;
+        const resp = std.fmt.bufPrint(out[0..2048],
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Content-Length: {d}\r\n\r\n", .{event.len}) catch return;
+        test_net.streamWriteAll(conn, resp) catch {};
+        test_net.streamWriteAll(conn, event) catch {};
+    }
+
+    // Case-insensitive header lookup over a raw header block.
+    fn findHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+        var it = std.mem.splitSequence(u8, headers, "\r\n");
+        while (it.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name)) {
+                return line[colon + 1 ..];
+            }
+        }
+        return null;
+    }
+
+    // Extract the JSON-RPC id integer from a request body as a string slice,
+    // or null when the body carries no `"id":` (a notification).
+    fn jsonRpcId(body: []const u8) ?[]const u8 {
+        const marker = "\"id\":";
+        const at = std.mem.indexOf(u8, body, marker) orelse return null;
+        var i = at + marker.len;
+        while (i < body.len and (body[i] == ' ')) i += 1;
+        const start = i;
+        while (i < body.len and body[i] >= '0' and body[i] <= '9') i += 1;
+        if (i == start) return null;
+        return body[start..i];
+    }
+};
+
+/// Stand up the HTTP fixture and configure a `web` http server in Lua pointing
+/// at it. Returns the started fixture (caller stops it). The Lua global `web`
+/// holds the normalized server entry.
+fn startHttpFixture(engine: *LuaEngine, ctx: *HttpFixture, scenario: HttpScenario) !std.Thread {
+    ctx.* = .{ .server = try test_net.listenLoopback(), .scenario = scenario };
+    const port = test_net.boundPort(&ctx.server);
+    const thread = try std.Thread.spawn(.{}, HttpFixture.run, .{ctx});
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/mcp", .{port});
+    _ = engine.lua.pushString(url);
+    engine.lua.setGlobal("_http_url");
+    try runLua(engine,
+        \\mcp = require("zag.mcp")
+        \\web = mcp._test.normalize_server("web", { url = _http_url })
+    );
+    return thread;
+}
+
+test "mcp http: streamable JSON response, session id echoed" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: HttpFixture = undefined;
+    const thread = try startHttpFixture(&engine, &ctx, .json);
+    defer {
+        ctx.stop.store(true, .release);
+        // Unblock the accept loop with one final connection.
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    try runCoroutineBody(&engine,
+        \\  local ok, err = mcp._test.connect(web)
+        \\  assert(ok, "http connect: " .. tostring(err))
+        \\  assert(web.status == "connected", "status connected")
+        \\  assert(web.session_id == "sess-abc-123", "session captured, got " .. tostring(web.session_id))
+        \\  local tools, terr = mcp._test.list_tools(web)
+        \\  assert(tools, "list_tools: " .. tostring(terr))
+        \\  assert(#tools == 1 and tools[1].name == "add", "tool add")
+    );
+
+    try testing.expect(ctx.session_echoed.load(.acquire));
+}
+
+test "mcp http: streamable SSE response carries the result" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: HttpFixture = undefined;
+    const thread = try startHttpFixture(&engine, &ctx, .sse);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    try runCoroutineBody(&engine,
+        \\  assert(mcp._test.connect(web), "http connect")
+        \\  local tools, terr = mcp._test.list_tools(web)
+        \\  assert(tools, "list_tools over SSE: " .. tostring(terr))
+        \\  assert(#tools == 1 and tools[1].name == "add", "tool add via SSE")
+    );
+}
+
+test "mcp http: notification POST is accepted (202)" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: HttpFixture = undefined;
+    const thread = try startHttpFixture(&engine, &ctx, .notification_202);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // connect() sends initialize (200) then notifications/initialized (202).
+    // A clean connect proves the 202 notification path works end to end.
+    try runCoroutineBody(&engine,
+        \\  local ok, err = mcp._test.connect(web)
+        \\  assert(ok, "connect must accept the 202 initialized notification: " .. tostring(err))
+        \\  assert(web.status == "connected", "connected")
+    );
+}
+
+test "mcp http: 404 on a held session re-initializes once and retries" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: HttpFixture = undefined;
+    const thread = try startHttpFixture(&engine, &ctx, .reinit_404);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    try runCoroutineBody(&engine,
+        \\  assert(mcp._test.connect(web), "connect")
+        \\  -- First tools/list -> 404; the transport drops the session,
+        \\  -- re-initializes, and retries -> 200 with the tool.
+        \\  local tools, terr = mcp._test.list_tools(web)
+        \\  assert(tools, "list_tools after 404 reinit: " .. tostring(terr))
+        \\  assert(#tools == 1 and tools[1].name == "add", "tool add after reinit")
+    );
+}
+
+test "mcp http: 401 marks needs-auth with an actionable error" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: HttpFixture = undefined;
+    const thread = try startHttpFixture(&engine, &ctx, .needs_auth_401);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    try runCoroutineBody(&engine,
+        \\  local ok, err = mcp._test.connect(web)
+        \\  assert(not ok, "401 must fail the connect")
+        \\  assert(web.status == "needs-auth", "status needs-auth, got " .. tostring(web.status))
+        \\  assert(err:find("auth", 1, true), "error mentions auth: " .. tostring(err))
+        \\  assert(err:find("H", 1, true), "error references Milestone H: " .. tostring(err))
+        \\  assert(web.needs_auth_info ~= nil, "discovery info captured from WWW-Authenticate")
+    );
+}
+
+test "mcp http: resolve_endpoint handles absolute, abs-path, and relative" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local r = mcp._test.resolve_endpoint
+        \\assert(r("https://h/sse", "https://h/messages?s=1") == "https://h/messages?s=1", "absolute")
+        \\assert(r("https://h/sse", "/messages?s=1") == "https://h/messages?s=1", "abs path, got " .. r("https://h/sse", "/messages?s=1"))
+        \\assert(r("https://h/api/sse", "msg?s=1") == "https://h/api/msg?s=1", "relative, got " .. r("https://h/api/sse", "msg?s=1"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G3: legacy SSE transport fallback
+//
+// Fixture for the 2024-11-05 HTTP+SSE transport. It splits client->server and
+// server->client across connections:
+//   * POST <url>       -> 405 (streamable rejected, triggers fallback) when
+//                         `reject_streamable` is set.
+//   * GET <url>        -> a long-lived text/event-stream: first an `endpoint`
+//                         event naming the POST target (/messages), then it
+//                         pushes a `message` SSE event for each queued response.
+//   * POST /messages   -> read the request, queue the matching JSON-RPC
+//                         response onto the shared queue, return 202.
+// The GET handler and POST handlers coordinate through a mutex-guarded queue.
+// ---------------------------------------------------------------------------
+
+const LegacySseFixture = struct {
+    server: std.Io.net.Server,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Whether a POST to the base url 405s (drives the streamable->legacy
+    /// fallback). When false the base url is GET-only (no streamable attempt).
+    reject_streamable: bool,
+    /// Whether the GET handler should close the stream immediately after the
+    /// endpoint event (drives the reader-death failure path).
+    die_after_endpoint: bool = false,
+
+    /// Tiny CAS spinlock guarding the queue (0.16 dropped std.Thread.Mutex and
+    /// std.Io.Mutex needs an io handle; a spinlock is plenty for a test).
+    lock: std.atomic.Value(bool) = .init(false),
+    /// Pending server->client JSON lines to push on the GET stream.
+    queue: [16][512]u8 = undefined,
+    queue_len: [16]usize = [_]usize{0} ** 16,
+    queue_count: usize = 0,
+    /// The GET-stream handler thread (one per test). Joined in teardown so the
+    /// thread cannot outlive the stack-allocated fixture it references.
+    sse_thread: ?std.Thread = null,
+
+    fn acquire(ctx: *LegacySseFixture) void {
+        while (ctx.lock.swap(true, .acquire)) {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    fn release(ctx: *LegacySseFixture) void {
+        ctx.lock.store(false, .release);
+    }
+
+    fn run(ctx: *LegacySseFixture) void {
+        // The GET handler is long-lived; hand it to its own thread so the
+        // accept loop keeps servicing the POSTs the client interleaves.
+        while (!ctx.stop.load(.acquire)) {
+            const conn = ctx.server.accept(std.testing.io) catch return;
+            ctx.handleConn(conn);
+        }
+    }
+
+    fn enqueue(ctx: *LegacySseFixture, json: []const u8) void {
+        ctx.acquire();
+        defer ctx.release();
+        if (ctx.queue_count >= ctx.queue.len) return;
+        const slot = ctx.queue_count;
+        @memcpy(ctx.queue[slot][0..json.len], json);
+        ctx.queue_len[slot] = json.len;
+        ctx.queue_count += 1;
+    }
+
+    fn handleConn(ctx: *LegacySseFixture, conn: std.Io.net.Stream) void {
+        var buf: [8192]u8 = undefined;
+        var total: usize = 0;
+        var header_end: ?usize = null;
+        var content_length: usize = 0;
+        while (total < buf.len) {
+            const n = test_net.streamRead(conn, buf[total..]) catch break;
+            if (n == 0) break;
+            total += n;
+            if (header_end == null) {
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |idx| {
+                    header_end = idx + 4;
+                    if (HttpFixture.findHeaderValue(buf[0..idx], "content-length")) |cl| {
+                        content_length = std.fmt.parseInt(usize, std.mem.trim(u8, cl, " "), 10) catch 0;
+                    }
+                }
+            }
+            if (header_end) |he| {
+                if (total - he >= content_length) break;
+            }
+        }
+        const request = buf[0..total];
+        const body = if (header_end) |he| buf[he..total] else "";
+        const is_get = std.mem.startsWith(u8, request, "GET ");
+        const is_post = std.mem.startsWith(u8, request, "POST ");
+        const to_messages = std.mem.indexOf(u8, request, "POST /messages") != null;
+
+        if (is_get) {
+            // Long-lived: own thread, so the accept loop keeps running. The
+            // thread is joined in teardown (recorded on the fixture) so it
+            // can't outlive the stack-allocated ctx it borrows.
+            ctx.sse_thread = std.Thread.spawn(.{}, serveSse, .{ ctx, conn }) catch {
+                conn.close(std.testing.io);
+                return;
+            };
+            return;
+        } else if (is_post and to_messages) {
+            ctx.serveMessage(conn, body);
+        } else if (is_post and ctx.reject_streamable) {
+            // POST to the base url: reject so the client falls back to legacy.
+            const resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+            test_net.streamWriteAll(conn, resp) catch {};
+        } else {
+            const resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            test_net.streamWriteAll(conn, resp) catch {};
+        }
+        conn.close(std.testing.io);
+    }
+
+    fn serveSse(ctx: *LegacySseFixture, conn: std.Io.net.Stream) void {
+        defer conn.close(std.testing.io);
+        // Chunked stream, open-ended. Send the endpoint event first.
+        const head =
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Transfer-Encoding: chunked\r\n\r\n";
+        test_net.streamWriteAll(conn, head) catch return;
+        writeChunk(conn, "event: endpoint\ndata: /messages?session=s1\n\n") catch return;
+
+        if (ctx.die_after_endpoint) {
+            // Close immediately (the chunked terminator) so the reader sees EOF.
+            test_net.streamWriteAll(conn, "0\r\n\r\n") catch {};
+            return;
+        }
+
+        // Pump the response queue as message events until stop flips.
+        var pushed: usize = 0;
+        const deadline = clock.milliTimestamp() + 5000;
+        while (!ctx.stop.load(.acquire) and clock.milliTimestamp() < deadline) {
+            ctx.acquire();
+            const have = ctx.queue_count;
+            ctx.release();
+            while (pushed < have) {
+                var frame: [640]u8 = undefined;
+                const json = ctx.queue[pushed][0..ctx.queue_len[pushed]];
+                const event = std.fmt.bufPrint(&frame, "event: message\ndata: {s}\n\n", .{json}) catch return;
+                writeChunk(conn, event) catch return;
+                pushed += 1;
+            }
+            clock.sleep(2 * std.time.ns_per_ms);
+        }
+        test_net.streamWriteAll(conn, "0\r\n\r\n") catch {};
+    }
+
+    fn writeChunk(conn: std.Io.net.Stream, data: []const u8) !void {
+        var size_buf: [16]u8 = undefined;
+        const size_line = try std.fmt.bufPrint(&size_buf, "{x}\r\n", .{data.len});
+        try test_net.streamWriteAll(conn, size_line);
+        try test_net.streamWriteAll(conn, data);
+        try test_net.streamWriteAll(conn, "\r\n");
+    }
+
+    fn serveMessage(ctx: *LegacySseFixture, conn: std.Io.net.Stream, body: []const u8) void {
+        const reqid = HttpFixture.jsonRpcId(body) orelse "1";
+        var out: [512]u8 = undefined;
+        if (std.mem.indexOf(u8, body, "\"initialize\"") != null) {
+            const json = std.fmt.bufPrint(&out,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"legacy\",\"version\":\"0\"}}}}}}", .{reqid}) catch return;
+            ctx.enqueue(json);
+        } else if (std.mem.indexOf(u8, body, "\"tools/list\"") != null) {
+            const json = std.fmt.bufPrint(&out,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
+            ctx.enqueue(json);
+        }
+        // notifications/initialized and anything else: nothing to enqueue.
+        const resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+        test_net.streamWriteAll(conn, resp) catch {};
+    }
+};
+
+fn startLegacyFixture(engine: *LuaEngine, ctx: *LegacySseFixture, opts: struct { die: bool = false }) !std.Thread {
+    ctx.* = .{
+        .server = try test_net.listenLoopback(),
+        .reject_streamable = true,
+        .die_after_endpoint = opts.die,
+    };
+    const port = test_net.boundPort(&ctx.server);
+    const thread = try std.Thread.spawn(.{}, LegacySseFixture.run, .{ctx});
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sse", .{port});
+    _ = engine.lua.pushString(url);
+    engine.lua.setGlobal("_legacy_url");
+    try runLua(engine,
+        \\mcp = require("zag.mcp")
+        \\legacy = mcp._test.normalize_server("legacy", { url = _legacy_url })
+    );
+    return thread;
+}
+
+test "mcp legacy SSE: fallback on 405, endpoint event, full round-trip" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: LegacySseFixture = undefined;
+    const thread = try startLegacyFixture(&engine, &ctx, .{});
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        if (ctx.sse_thread) |t| t.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    try runCoroutineBodyTolerant(&engine,
+        \\  -- connect() POSTs initialize to /sse first (streamable attempt);
+        \\  -- the 405 triggers the legacy GET-stream fallback. The endpoint
+        \\  -- event names /messages; initialize round-trips over it.
+        \\  local ok, err = mcp._test.connect(legacy)
+        \\  assert(ok, "legacy connect: " .. tostring(err))
+        \\  assert(legacy.transport_mode == "sse", "fell back to sse mode, got " .. tostring(legacy.transport_mode))
+        \\  assert(legacy.status == "connected", "connected")
+        \\  assert(legacy.sse_endpoint ~= nil, "endpoint captured")
+        \\  -- A real request round-trips: POST to /messages, response on the GET stream.
+        \\  local tools, terr = mcp._test.list_tools(legacy)
+        \\  assert(tools, "list_tools over legacy SSE: " .. tostring(terr))
+        \\  assert(#tools == 1 and tools[1].name == "add", "tool add via legacy SSE")
+        \\  mcp._test.disconnect(legacy)
+    );
+}
+
+test "mcp legacy SSE: reader death fails pending requests" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var ctx: LegacySseFixture = undefined;
+    const thread = try startLegacyFixture(&engine, &ctx, .{ .die = true });
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        if (ctx.sse_thread) |t| t.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // The GET stream closes right after the endpoint event, so initialize
+    // never gets a response: the reader dies (EOF) -> server marked
+    // disconnected -> the pending initialize request fails, connect errors.
+    try runCoroutineBody(&engine,
+        \\  local ok, err = mcp._test.connect(legacy)
+        \\  assert(not ok, "connect must fail when the reader dies")
+        \\  assert(err ~= nil, "an error is surfaced")
+        \\  assert(legacy.status == "disconnected", "server marked disconnected, got " .. tostring(legacy.status))
+    );
 }
