@@ -3,7 +3,8 @@
 //! context for the artifacts layer (phase 4) to surface the failing step.
 
 const std = @import("std");
-const clock = @import("../clock.zig");
+const clock = @import("clock");
+const process_io = @import("process_io");
 const Dsl = @import("Dsl.zig");
 const Args = @import("Args.zig");
 const Runner = @import("Runner.zig").Runner;
@@ -46,7 +47,7 @@ pub fn runFile(
     path: []const u8,
     opts: RunOptions,
 ) !RunResult {
-    const src = try std.fs.cwd().readFileAlloc(alloc, path, max_scenario_bytes);
+    const src = try std.Io.Dir.cwd().readFileAlloc(process_io.get(), path, alloc, .limited(max_scenario_bytes));
     defer alloc.free(src);
     return runSourceImpl(alloc, src, opts, path);
 }
@@ -95,7 +96,7 @@ fn runSourceImpl(
     defer {
         r.writeCrashReportIfBad(opts.artifacts) catch {};
         if (r.env.get("HOME")) |home| opts.artifacts.tailZagLog(home) catch {};
-        const cwd = std.process.getCwdAlloc(alloc) catch null;
+        const cwd = std.Io.Dir.cwd().realPathFileAlloc(process_io.get(), ".", alloc) catch null;
         if (cwd) |p| {
             defer alloc.free(p);
             opts.artifacts.copyNewestSession(p) catch {};
@@ -180,7 +181,7 @@ fn classify(e: anyerror) Outcome {
 // --- tests ------------------------------------------------------------------
 
 fn tmpArtifacts(tmp: *std.testing.TmpDir) !*Artifacts {
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(path);
     return Artifacts.create(std.testing.allocator, path);
 }

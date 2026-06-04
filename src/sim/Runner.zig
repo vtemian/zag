@@ -9,7 +9,9 @@
 //! through the `Outcome` enum.
 
 const std = @import("std");
-const clock = @import("../clock.zig");
+const clock = @import("clock");
+const process_io = @import("process_io");
+const env_mod = @import("env");
 const posix = std.posix;
 const Spawn = @import("Spawn.zig");
 const Grid = @import("Grid.zig");
@@ -28,7 +30,7 @@ pub const Runner = struct {
     alloc: std.mem.Allocator,
     child: ?Spawn.Spawned = null,
     grid: *Grid,
-    env: std.process.EnvMap,
+    env: std.process.Environ.Map,
     /// Raw waitpid status from the most recent reap. `null` until the child
     /// is reaped (either via wait_exit or by `deinit`'s SIGKILL fallback).
     child_status: ?u32 = null,
@@ -45,7 +47,7 @@ pub const Runner = struct {
         return .{
             .alloc = alloc,
             .grid = try Grid.create(alloc, 80, 24),
-            .env = try std.process.getEnvMap(alloc),
+            .env = try env_mod.dupeMap(alloc),
         };
     }
 
@@ -53,9 +55,8 @@ pub const Runner = struct {
         if (self.child) |sp| {
             self.was_killed_by_harness = true;
             _ = posix.kill(sp.pid, posix.SIG.KILL) catch {};
-            const r = posix.waitpid(sp.pid, 0);
-            self.child_status = r.status;
-            posix.close(sp.pty.master);
+            self.child_status = Spawn.waitPid(sp.pid);
+            std.Io.Threaded.closeFd(sp.pty.master);
             self.child = null;
         }
         self.grid.destroy();
@@ -68,9 +69,8 @@ pub const Runner = struct {
     /// mismatches the actual cause of death.
     fn reapExitedChild(self: *Runner) void {
         const sp = self.child orelse return;
-        const r = posix.waitpid(sp.pid, 0);
-        self.child_status = r.status;
-        posix.close(sp.pty.master);
+        self.child_status = Spawn.waitPid(sp.pid);
+        std.Io.Threaded.closeFd(sp.pty.master);
         self.child = null;
     }
 
@@ -88,7 +88,7 @@ pub const Runner = struct {
                     break :blk std.mem.asBytes(&buf);
                 },
             };
-            _ = try posix.write(sp.pty.master, bytes);
+            if (std.c.write(sp.pty.master, bytes.ptr, bytes.len) < 0) return error.WriteFailed;
         }
     }
 
@@ -172,9 +172,10 @@ pub const Runner = struct {
         defer self.alloc.free(sub);
         const path = try artifacts.pathFor(sub);
         defer self.alloc.free(path);
-        const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(dump);
+        const io = process_io.get();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, dump);
     }
 
     pub fn executeWaitExit(self: *Runner, raw: []const u8, default_timeout_ms: u32) !void {
@@ -221,9 +222,10 @@ pub const Runner = struct {
 
         const out_path = try artifacts.pathFor("crash.txt");
         defer self.alloc.free(out_path);
-        const file = try std.fs.createFileAbsolute(out_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(body.items);
+        const io = process_io.get();
+        const file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, body.items);
     }
 
     pub fn executeSetEnv(self: *Runner, raw: []const u8) !void {
@@ -314,6 +316,9 @@ fn describeStatus(status: u32, was_killed_by_harness: bool) ?CrashDescription {
     return null;
 }
 
+/// Signal type as surfaced by `posix.W.TERMSIG` (an enum on Zig 0.16).
+const Sig = @TypeOf(posix.SIG.KILL);
+
 fn formatExit(code: u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "exit {d}", .{code}) catch "exit ?";
 }
@@ -322,7 +327,7 @@ fn formatExit(code: u8, buf: []u8) []const u8 {
 /// vary across platforms, so we resolve via `posix.SIG.*` rather than
 /// hardcoding integers. Covers the signals a child is most likely to die
 /// from in this harness; unknowns fall back to a numeric rendering.
-const signal_table = [_]struct { sig: u32, name: []const u8 }{
+const signal_table = [_]struct { sig: Sig, name: []const u8 }{
     .{ .sig = posix.SIG.ABRT, .name = "SIGABRT" },
     .{ .sig = posix.SIG.SEGV, .name = "SIGSEGV" },
     .{ .sig = posix.SIG.BUS, .name = "SIGBUS" },
@@ -338,13 +343,13 @@ const signal_table = [_]struct { sig: u32, name: []const u8 }{
     .{ .sig = posix.SIG.USR2, .name = "SIGUSR2" },
 };
 
-fn formatSignal(sig: u32, buf: []u8) []const u8 {
+fn formatSignal(sig: Sig, buf: []u8) []const u8 {
     for (signal_table) |entry| {
         if (entry.sig == sig) {
-            return std.fmt.bufPrint(buf, "{s} ({d})", .{ entry.name, sig }) catch "signal ?";
+            return std.fmt.bufPrint(buf, "{s} ({d})", .{ entry.name, @intFromEnum(sig) }) catch "signal ?";
         }
     }
-    return std.fmt.bufPrint(buf, "signal {d}", .{sig}) catch "signal ?";
+    return std.fmt.bufPrint(buf, "signal {d}", .{@intFromEnum(sig)}) catch "signal ?";
 }
 
 test "executeWaitText finds echoed literal within timeout" {
@@ -417,7 +422,7 @@ test "executeExpectText fails when pattern absent and passes when present" {
 test "executeSnapshot writes grid dump to artifacts dir" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
@@ -428,7 +433,7 @@ test "executeSnapshot writes grid dump to artifacts dir" {
     r.grid.feed("snapshot body");
     try r.executeSnapshot("shot1", artifacts);
 
-    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "shot1.grid", 64 * 1024);
+    const contents = try tmp.dir.readFileAlloc(std.testing.io, "shot1.grid", std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "snapshot body") != null);
 }
@@ -436,7 +441,7 @@ test "executeSnapshot writes grid dump to artifacts dir" {
 test "writeCrashReportIfBad writes crash.txt for non-zero exit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
@@ -456,7 +461,7 @@ test "writeCrashReportIfBad writes crash.txt for non-zero exit" {
     };
 
     try r.writeCrashReportIfBad(artifacts);
-    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "crash.txt", 64 * 1024);
+    const contents = try tmp.dir.readFileAlloc(std.testing.io, "crash.txt", std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "exit 42") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "zag-sim crash report") != null);
@@ -472,13 +477,13 @@ test "formatSignal decodes known signals to SIGNAME (n)" {
 test "formatSignal falls back to numeric for unknown signals" {
     // 99 is outside the signal_table; verify we still produce a sensible string.
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("signal 99", formatSignal(99, &buf));
+    try std.testing.expectEqualStrings("signal 99", formatSignal(@enumFromInt(99), &buf));
 }
 
 test "writeCrashReportIfBad records SIGABRT name when child aborts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
@@ -497,7 +502,7 @@ test "writeCrashReportIfBad records SIGABRT name when child aborts" {
     };
 
     try r.writeCrashReportIfBad(artifacts);
-    const contents = try tmp.dir.readFileAlloc(std.testing.allocator, "crash.txt", 64 * 1024);
+    const contents = try tmp.dir.readFileAlloc(std.testing.io, "crash.txt", std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "SIGABRT") != null);
 }
@@ -505,7 +510,7 @@ test "writeCrashReportIfBad records SIGABRT name when child aborts" {
 test "writeCrashReportIfBad is a noop on clean exit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
@@ -519,7 +524,7 @@ test "writeCrashReportIfBad is a noop on clean exit" {
     try r.executeWaitExit("", 2000);
 
     try r.writeCrashReportIfBad(artifacts);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("crash.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "crash.txt", .{}));
 }
 
 test "executeWaitExit returns when child exits cleanly" {

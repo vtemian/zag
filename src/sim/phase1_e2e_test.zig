@@ -9,7 +9,7 @@
 //! cross-module dependency explicit.
 
 const std = @import("std");
-const clock = @import("../clock.zig");
+const clock = @import("clock");
 const posix = std.posix;
 const Spawn = @import("Spawn.zig");
 const Grid = @import("Grid.zig");
@@ -20,14 +20,15 @@ test "cat round-trip: send SGR'd bytes, grid sees the plain text" {
     const sp = try Spawn.spawn(&argv, &envp, 80, 24);
     defer {
         _ = posix.kill(sp.pid, posix.SIG.KILL) catch {};
-        _ = posix.waitpid(sp.pid, 0);
-        posix.close(sp.pty.master);
+        _ = Spawn.waitPid(sp.pid);
+        std.Io.Threaded.closeFd(sp.pty.master);
     }
 
     const g = try Grid.create(std.testing.allocator, 80, 24);
     defer g.destroy();
 
-    _ = try posix.write(sp.pty.master, "\x1b[1mZAG\x1b[0m\n");
+    const sgr_bytes = "\x1b[1mZAG\x1b[0m\n";
+    try std.testing.expect(std.c.write(sp.pty.master, sgr_bytes, sgr_bytes.len) > 0);
 
     // Read with a 1s deadline.
     var buf: [256]u8 = undefined;
