@@ -909,6 +909,269 @@ test "zag.task with a schema returns a decoded output table the script branches 
     try testing.expect(child_registry.isEmpty());
 }
 
+// -- zag.task soft-refusal arms through the real binding (FIX 4a) ------------
+
+/// Test-only binding: cancel the calling coroutine's workflow scope, so the
+/// next `zag.task` in the same script hits the `task.scope.isCancelled()`
+/// refusal arm synchronously (no pump-timing race). Mirrors `testSpawnChild`'s
+/// fixture-free shape; reads the task off the coroutine and cancels its scope.
+fn testCancelSelf(co: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(co);
+    const task = engine.taskForCoroutine(co) orelse {
+        co.raiseErrorStr("no task for this coroutine", .{});
+    };
+    task.scope.cancel("test cancel") catch {
+        co.raiseErrorStr("scope cancel failed", .{});
+    };
+    return 0;
+}
+
+test "zag.task in a cancelled scope returns (nil, cancelled) through the real binding" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "UNREACHED" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    engine.lua.pushFunction(zlua.wrap(testCancelSelf));
+    engine.lua.setGlobal("_test_cancel_self");
+
+    // The script cancels its own scope, then calls zag.task: the binding's
+    // cancelled-scope arm hands back (nil, "cancelled") without spawning a
+    // child. The script returns the captured reason string.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\_test_cancel_self()
+        \\local r, err = zag.task{ prompt = "should not spawn" }
+        \\return tostring(r) .. ":" .. tostring(err)
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    // A cancelled workflow completes via the error path; the script's returned
+    // string carries the (nil, "cancelled") the binding produced.
+    try testing.expect(std.mem.indexOf(u8, result, "nil:cancelled") != null);
+
+    // No child was ever spawned: registry empty, no live tasks.
+    try testing.expect(child_registry.isEmpty());
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
+test "zag.task at the depth cap returns (nil, depth error) through the real binding" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "UNREACHED" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    // task_depth already at the hard backstop: the binding must refuse before
+    // spawning a child that would exceed it.
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = ChildAgent.max_task_depth,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\local r, err = zag.task{ prompt = "too deep" }
+        \\return tostring(r) .. ":" .. tostring(err)
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "nil:") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "depth exceeded") != null);
+
+    try testing.expect(child_registry.isEmpty());
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
+test "zag.task without a child registry returns the orchestrator refusal" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "UNREACHED" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    // No child_registry: the headless / no-orchestrator path. The binding must
+    // refuse rather than spawn a child no main-thread drainer would ever drain.
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\local r, err = zag.task{ prompt = "no drainer" }
+        \\return tostring(r) .. ":" .. tostring(err)
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    // No child registry to drain; pump only services completions + done.
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "nil:") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "orchestrator") != null);
+
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
+test "zag.task with a malformed tools entry raises without leaking" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "UNREACHED" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // A non-string `tools` entry trips parseSpec's BadToolEntry, which raises
+    // AFTER cleaning up the partial spec arena + heap slot. pcall catches the
+    // raise so the workflow returns normally; testing.allocator catches a leak.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\local ok, err = pcall(function()
+        \\  return zag.task{ prompt = "x", tools = { 123 } }
+        \\end)
+        \\return tostring(ok) .. ":" .. tostring(err)
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    // pcall reported failure (false) and the raise text names the bad entry.
+    try testing.expect(std.mem.indexOf(u8, result, "false:") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "tools[i] must be a string") != null);
+
+    // The refused spawn never created a child; no leak (testing.allocator).
+    try testing.expect(child_registry.isEmpty());
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
 test "startWorkflowScript completes with is_error on a compile error" {
     const allocator = testing.allocator;
 
@@ -1258,8 +1521,12 @@ test "workflow tool cancel returns promptly with is_error and cancels in-flight 
     const t = try std.Thread.spawn(.{}, Runner.go, .{ &worker, &done });
 
     // Pump until the child is registered + actually in-flight (the gated stub
-    // is spinning), then fire the tool-side cancel.
-    const arm_deadline = clock.milliTimestamp() + 2000;
+    // is spinning), then fire the tool-side cancel. The deadline is a liveness
+    // ceiling only (the loop exits the instant the child registers); it is NOT
+    // a correctness timing assertion, so keep it generous (30s, matching the
+    // concurrency-test convention) so a loaded machine that schedules the
+    // worker thread late cannot flake the `!isEmpty` check below.
+    const arm_deadline = clock.milliTimestamp() + 30_000;
     while (child_registry.isEmpty() and clock.milliTimestamp() < arm_deadline) {
         AgentRunner.dispatchHookRequests(&queue, &engine, null);
         clock.sleep(2 * std.time.ns_per_ms);

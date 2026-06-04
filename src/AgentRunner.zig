@@ -2490,6 +2490,49 @@ test "drainPendingRoundTrips signals done and stamps shutdown reason" {
     );
 }
 
+test "serviceRoundTripEvent fails a workflow_request with no engine on the driver" {
+    // A driver with no LuaEngine (e.g. boot failed) cannot run a workflow.
+    // The round-trip service must complete the request with is_error so the
+    // parked tool thread unwinds instead of hanging on `done`.
+    const alloc = std.testing.allocator;
+    var req: LuaEngine.WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = alloc,
+    };
+
+    const serviced = serviceRoundTripEvent(.{ .workflow_request = &req }, null, null);
+    try std.testing.expect(serviced);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer alloc.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "no engine") != null);
+}
+
+test "drainPendingRoundTrips fails a parked workflow_request during shutdown" {
+    // The shutdown-time drain must release a parked workflow tool thread by
+    // failing its request, not leave it waiting on a `done` that never fires.
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req: LuaEngine.WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = alloc,
+    };
+    try queue.push(.{ .workflow_request = &req });
+
+    drainPendingRoundTrips(&queue, alloc);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer alloc.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "shutdown") != null);
+}
+
 test "handleAgentEvent .done keeps a failed turn's status, does not settle to idle" {
     const allocator = std.testing.allocator;
 

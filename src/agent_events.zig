@@ -1428,6 +1428,50 @@ test "freeOwned signals lua_tool_request done with error_name" {
     try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
 }
 
+test "freeOwned fails a dropped workflow_request with is_error and a message" {
+    // The queue-full drop arm: a workflow request that loses the push race
+    // must be completed via failDropped so the parked tool thread unblocks
+    // instead of hanging on a `done` that would otherwise never fire.
+    // failDropped never dereferences `ctx`, so a stub pointer is enough here.
+    var req: WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = std.testing.allocator,
+    };
+    const ev: AgentEvent = .{ .workflow_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned();
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "queue full") != null);
+}
+
+test "tryPush onto a full queue drops a workflow_request through failDropped" {
+    // Drive the real drop path: a capacity-1 queue already holding one event
+    // rejects the workflow request, and tryPush routes it through freeOwned ->
+    // failDropped. No hang, no leak (testing.allocator catches a leaked dupe).
+    var queue = try EventQueue.initBounded(std.testing.allocator, 1);
+    defer queue.deinit();
+
+    try queue.push(.done);
+
+    var req: WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = std.testing.allocator,
+    };
+    queue.tryPush(.{ .workflow_request = &req });
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "queue full") != null);
+    try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.monotonic));
+}
+
 test "push and drain lua_tool_request event" {
     var queue = try EventQueue.initBounded(std.testing.allocator, 16);
     defer queue.deinit();
