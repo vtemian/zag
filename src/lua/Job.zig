@@ -193,6 +193,33 @@ pub const HttpStreamLineDoneSpec = struct {
     line: ?[]const u8,
 };
 
+/// One decoded query parameter from an OAuth redirect. Both `name` and
+/// `value` are URL-decoded and heap-allocated on the engine allocator;
+/// `pushJobResultOntoStack` frees them after copying into Lua.
+pub const HttpCallbackParam = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Completion payload for `zag.http.await_callback`. The helper thread
+/// that owns the one-shot loopback listener fills `params` with the
+/// URL-decoded query of the single matching request, or posts the job
+/// with `err_tag` (timeout / cancelled) and no params. The outer slice
+/// and each param's name/value are heap-allocated on the engine
+/// allocator; `pushJobResultOntoStack` frees all three after the table
+/// is built in Lua.
+pub const HttpCallbackDoneSpec = struct {
+    params: []const HttpCallbackParam = &.{},
+    /// Opaque pointer to the `HttpCallbackListener` that produced this
+    /// completion. The engine casts it back and calls
+    /// `shutdownAndCleanup` (join helper + free) after consuming the
+    /// completion — exactly once, on the main thread, so the scope
+    /// aborter that references the listener is gone before the free.
+    /// Kept opaque so Job.zig stays a leaf with no primitive import.
+    /// Null only in unit tests that drive the listener directly.
+    listener: ?*anyopaque = null,
+};
+
 /// Entry kind surfaced to Lua for fs.list and fs.stat. Maps
 /// `std.Io.File.Kind` onto the four buckets we expose: file, dir,
 /// symlink, other. Everything that isn't a regular file, directory,
@@ -382,6 +409,12 @@ pub const JobKind = union(enum) {
     /// EOF. Not pool-submitted; the helper thread synthesises these
     /// directly onto the completion queue.
     http_stream_line_done: HttpStreamLineDoneSpec,
+    /// Posted by the `zag.http.await_callback` helper thread once the
+    /// one-shot loopback listener has captured a matching request (or
+    /// hit its deadline / been cancelled). Resumes the coroutine with
+    /// the URL-decoded params table or `(nil, err)`. Not pool-submitted;
+    /// the helper synthesises it directly onto the completion queue.
+    http_callback_done: HttpCallbackDoneSpec,
     /// Filesystem primitives backed by std.fs.cwd() on a worker thread.
     /// Worker code lives in `primitives/fs.zig`. Each variant either
     /// fills a matching `JobResult` arm or `err_tag` + `err_detail`.

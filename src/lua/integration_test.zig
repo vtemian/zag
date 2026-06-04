@@ -31,6 +31,7 @@ const sync = @import("../sync.zig");
 const agent_events = @import("../agent_events.zig");
 const workflow_tool = @import("../tools/workflow.zig");
 const AgentRunner = @import("../AgentRunner.zig");
+const test_net = @import("../test_net.zig");
 
 // 0.16 made the process environment non-global: production code reads env
 // through `env_mod` over a captured `Environ.Map` rather than libc, and the
@@ -4025,6 +4026,82 @@ test "zag.fs.write with a mode option stamps the created file 0600" {
 
     const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode())) & 0o777);
+}
+
+test "zag.http.await_callback resolves with URL-decoded params via the real binding" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // Probe a free loopback port, then hand it to await_callback. The
+    // listener uses reuse_address, so the tiny close→rebind gap is safe.
+    var probe = try test_net.listenLoopback();
+    const port = test_net.boundPort(&probe);
+    probe.deinit(std.testing.io);
+
+    engine.lua.pushInteger(@intCast(port));
+    engine.lua.setGlobal("_cb_port");
+    try engine.lua.doString(
+        \\_cb_done = false
+        \\_cb_code = nil
+        \\_cb_state = nil
+        \\_cb_err = nil
+        \\function test_await_callback()
+        \\  local params, err = zag.http.await_callback{ port = _cb_port, path = "/callback", timeout_ms = 5000 }
+        \\  if params then
+        \\    _cb_code = params.code
+        \\    _cb_state = params.state
+        \\  else
+        \\    _cb_err = err
+        \\  end
+        \\  _cb_done = true
+        \\end
+    );
+    _ = try engine.lua.getGlobal("test_await_callback");
+    _ = try engine.spawnCoroutine(0, null);
+
+    // The coroutine has yielded inside await_callback; the listener is
+    // bound. Fire the redirect GET from this thread, then pump until the
+    // completion resumes the coroutine.
+    const conn = try test_net.connectLoopback(port);
+    {
+        defer conn.close(std.testing.io);
+        var req_buf: [256]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET /callback?code=abc123&state=s%2F1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{});
+        try test_net.streamWriteAll(conn, req);
+        var resp: [512]u8 = undefined;
+        _ = test_net.streamRead(conn, &resp) catch {};
+    }
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (clock.milliTimestamp() < deadline) {
+        engine.pumpCompletions();
+        _ = try engine.lua.getGlobal("_cb_done");
+        const done = engine.lua.toBoolean(-1);
+        engine.lua.pop(1);
+        if (done) break;
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+
+    _ = try engine.lua.getGlobal("_cb_done");
+    try testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("_cb_code") catch {};
+    const code = engine.lua.toString(-1) catch "";
+    try testing.expectEqualStrings("abc123", code);
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("_cb_state") catch {};
+    const state = engine.lua.toString(-1) catch "";
+    // state was %2F-encoded "s/1"; the binding URL-decodes it.
+    try testing.expectEqualStrings("s/1", state);
+    engine.lua.pop(1);
 }
 
 test {

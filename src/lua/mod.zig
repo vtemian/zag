@@ -16,6 +16,7 @@ test {
     _ = @import("primitives/cmd_handle.zig");
     _ = @import("primitives/http.zig");
     _ = @import("primitives/http_stream.zig");
+    _ = @import("primitives/http_callback.zig");
     _ = @import("primitives/fs.zig");
     _ = @import("bindings/json.zig");
     _ = @import("bindings/crypto.zig");

@@ -37,6 +37,7 @@ const async_scope = @import("lua/Scope.zig");
 const async_job = @import("lua/Job.zig");
 const cmd_handle_mod = @import("lua/primitives/cmd_handle.zig");
 const http_stream_mod = @import("lua/primitives/http_stream.zig");
+const http_callback_mod = @import("lua/primitives/http_callback.zig");
 const job_result_mod = @import("lua/job_result.zig");
 const hook_registry_mod = @import("lua/hook_registry.zig");
 const lua_json = @import("lua/lua_json.zig");
@@ -2870,6 +2871,17 @@ pub const LuaEngine = struct {
             switch (job.kind) {
                 .cmd_read_line_done => |r| if (r.line) |l| self.allocator.free(l),
                 .http_stream_line_done => |r| if (r.line) |l| self.allocator.free(l),
+                .http_callback_done => |r| {
+                    for (r.params) |p| {
+                        self.allocator.free(p.name);
+                        self.allocator.free(p.value);
+                    }
+                    if (r.params.len > 0) self.allocator.free(r.params);
+                    if (r.listener) |l| {
+                        const listener: *http_callback_mod.HttpCallbackListener = @ptrCast(@alignCast(l));
+                        listener.shutdownAndCleanup();
+                    }
+                },
                 else => {},
             }
             self.allocator.destroy(job);
@@ -2877,9 +2889,20 @@ pub const LuaEngine = struct {
         };
         task.pending_job = null;
 
+        // The await_callback listener owns a helper thread + listening
+        // socket that must be torn down on the main thread after the
+        // single completion is consumed. Capture the pointer before the
+        // Job is freed; clean up after pushing the result.
+        const callback_listener: ?*http_callback_mod.HttpCallbackListener = switch (job.kind) {
+            .http_callback_done => |r| if (r.listener) |l| @ptrCast(@alignCast(l)) else null,
+            else => null,
+        };
+
         const num_values = job_result_mod.pushJobResultOntoStack(self.allocator, task.co, job);
         const err_detail = job.err_detail;
         self.allocator.destroy(job);
+
+        if (callback_listener) |l| l.shutdownAndCleanup();
 
         // Result strings have been copied onto the coroutine stack; the
         // per-task primitive arena (argv/cwd/url/headers) is safe to free

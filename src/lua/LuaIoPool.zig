@@ -175,6 +175,7 @@ fn executeJob(alloc: Allocator, job: *Job) void {
         .cmd_write_done => std.debug.panic("executeJob: cmd_write_done should not reach the pool", .{}),
         .cmd_close_stdin_done => std.debug.panic("executeJob: cmd_close_stdin_done should not reach the pool", .{}),
         .http_stream_line_done => std.debug.panic("executeJob: http_stream_line_done should not reach the pool", .{}),
+        .http_callback_done => std.debug.panic("executeJob: http_callback_done should not reach the pool", .{}),
     }
 }
 

@@ -13,6 +13,7 @@ const Lua = zlua.Lua;
 const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const async_job = @import("../Job.zig");
 const http_stream_mod = @import("../primitives/http_stream.zig");
+const http_callback_mod = @import("../primitives/http_callback.zig");
 const lua_json = @import("../lua_json.zig");
 
 /// `zag.http.get(url, opts?)`: synchronous-looking HTTP GET. Yields
@@ -522,6 +523,121 @@ fn httpStreamGc(lua: *Lua) i32 {
     return 0;
 }
 
+/// `zag.http.await_callback{ port = 19876, path = "/callback",
+/// timeout_ms = 300000 }`: bind a one-shot loopback listener, yield the
+/// coroutine, and resume with `(params_table, nil)` once a single GET on
+/// `path` arrives (query params URL-decoded into a string->string table),
+/// or `(nil, "timeout" | "cancelled" | err)` on failure. Purpose-built
+/// for the OAuth redirect leg.
+///
+/// `port` is required (the OAuth `redirect_uri` pins it); `path`
+/// defaults to "/callback"; `timeout_ms` defaults to 300000 (5 min).
+/// A bind failure (port in use) surfaces synchronously as `(nil, err)`
+/// before the coroutine yields.
+fn zagHttpAwaitCallbackFn(co: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(co);
+
+    if (!co.isYieldable()) {
+        co.raiseErrorStr("zag.http.await_callback must be called inside zag.async/hook/keymap", .{});
+    }
+    if (!co.isTable(1)) {
+        co.raiseErrorStr("zag.http.await_callback: arg 1 must be an opts table", .{});
+    }
+
+    // port (required, 1..65535).
+    _ = co.getField(1, "port");
+    if (!co.isInteger(-1)) {
+        co.raiseErrorStr("zag.http.await_callback: opts.port (integer) is required", .{});
+    }
+    const port_raw = co.toInteger(-1) catch 0;
+    co.pop(1);
+    if (port_raw < 1 or port_raw > 65535) {
+        co.raiseErrorStr("zag.http.await_callback: opts.port must be in 1..65535", .{});
+    }
+    const port: u16 = @intCast(port_raw);
+
+    // path (optional, default "/callback"). Copied below into the
+    // listener's own allocation, so a transient stack/Lua string is fine.
+    var path: []const u8 = http_callback_mod.DEFAULT_PATH;
+    _ = co.getField(1, "path");
+    if (co.isString(-1)) {
+        path = co.toString(-1) catch http_callback_mod.DEFAULT_PATH;
+    }
+    // Leave the path string on the stack until after init copies it.
+
+    // timeout_ms (optional, default 5 min). 0 disables the timeout.
+    var timeout_ms: u64 = 300_000;
+    _ = co.getField(1, "timeout_ms");
+    if (co.isInteger(-1)) {
+        const v = co.toInteger(-1) catch 300_000;
+        timeout_ms = if (v < 0) 0 else @intCast(v);
+    }
+    co.pop(1);
+
+    const runtime = engine.async_runtime orelse {
+        co.pop(1); // path
+        co.raiseErrorStr("zag.http.await_callback: async runtime not initialized", .{});
+    };
+    const completions = runtime.completions;
+
+    const task = engine.taskForCoroutine(co) orelse {
+        co.pop(1); // path
+        co.raiseErrorStr("zag.http.await_callback: no task for this coroutine", .{});
+    };
+
+    // Bind synchronously (before any yield) so a port-in-use error is a
+    // clean (nil, err) tuple rather than a deferred surprise. The
+    // listener owns its own copy of `path`.
+    const listener = http_callback_mod.HttpCallbackListener.init(
+        engine.allocator,
+        completions,
+        task.scope,
+        port,
+        path,
+        timeout_ms,
+        task.thread_ref,
+    ) catch |err| {
+        co.pop(1); // path
+        co.pushNil();
+        _ = co.pushString(switch (err) {
+            error.AddressInUse => "address_in_use",
+            error.BindFailed => "bind_failed",
+            error.SpawnFailed => "io_error: spawn failed",
+            error.OutOfMemory => "io_error: oom",
+        });
+        return 2;
+    };
+    co.pop(1); // path (init copied it)
+
+    // Register a scope abort-carrier so a turn cancel shuts the listener
+    // socket down promptly. The listener takes ownership of the Job and
+    // unregisters + frees it in shutdownAndCleanup (main thread).
+    const abort_job = engine.allocator.create(async_job.Job) catch {
+        // The listener thread is already running; tear it down so we
+        // don't leak the helper, then surface OOM.
+        listener.shutdownAndCleanup();
+        co.raiseErrorStr("zag.http.await_callback: abort job alloc failed", .{});
+    };
+    abort_job.* = .{
+        .kind = .{ .sleep = .{ .ms = 0 } }, // carrier only; never executed
+        .thread_ref = task.thread_ref,
+        .scope = task.scope,
+        .aborter = listener.aborter(),
+    };
+    task.scope.registerJob(abort_job) catch {
+        engine.allocator.destroy(abort_job);
+        listener.shutdownAndCleanup();
+        co.raiseErrorStr("zag.http.await_callback: abort job register failed", .{});
+    };
+    listener.attachAbortJob(abort_job);
+
+    // If the scope was already cancelled before we registered, the
+    // helper's first isCancelled() check posts `cancelled` promptly; no
+    // special-case needed here.
+    co.yield(0);
+    // yield is noreturn on Lua 5.4.
+}
+
 /// Build the plain `zag.http` namespace table (with `get`, `post`,
 /// `stream`) and attach it to the Lua state's `zag` table. Caller has
 /// the `zag` table at stack top; on return the `zag` table is still at
@@ -537,6 +653,8 @@ pub fn registerOn(lua: *Lua) void {
     lua.setField(-2, "post"); // zag.http.post = fn; [zag_table, http_table]
     lua.pushFunction(zlua.wrap(zagHttpStreamFn));
     lua.setField(-2, "stream"); // zag.http.stream = fn; [zag_table, http_table]
+    lua.pushFunction(zlua.wrap(zagHttpAwaitCallbackFn));
+    lua.setField(-2, "await_callback"); // zag.http.await_callback = fn
     lua.setField(-2, "http"); // zag.http = http_table; [zag_table]
 }
 
