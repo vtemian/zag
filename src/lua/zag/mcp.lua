@@ -921,6 +921,11 @@ end
 -- One maintenance pass over every server. Disconnects idle non-keep-alive
 -- servers; reconnects dead keep-alive servers. Exposed for deterministic
 -- testing (the real loop calls this between sleeps).
+--
+-- INVARIANT: `M._servers` is immutable after `ensure_config_loaded` (entries
+-- are only added at config load and the one-shot .mcp.json merge), so the
+-- yields inside disconnect/connect below cannot race a table mutation
+-- mid-pairs(). Revisit if servers ever become add/removable at runtime.
 local function maintenance_tick()
   for _, srv in pairs(M._servers) do
     local idle_s = (srv.idle_timeout_min or M._settings.idle_timeout_min or 10) * 60
@@ -1168,8 +1173,10 @@ local function mode_call(tool_name, args_json, server_override)
 
   -- Lazy connect if the tool isn't in the (cached) view yet but a server is
   -- named, or to refresh after connecting.
+  local refreshed = false
   if srv and not tool_meta then
     local ok = ensure_connected_and_fresh(srv)
+    refreshed = ok
     if ok then tool_meta = find_tool(metadata_for(srv), tool_name) end
   end
 
@@ -1189,10 +1196,14 @@ local function mode_call(tool_name, args_json, server_override)
     args = args_json
   end
 
-  -- Connect if needed for the actual call.
-  local ok, cerr = ensure_connected_and_fresh(srv)
-  if not ok and srv.status ~= "connected" then
-    return string.format('Failed to connect to "%s": %s', srv.name, tostring(cerr))
+  -- Connect if needed for the actual call. Skip when the lazy-connect
+  -- above already connected and refreshed this server during this call;
+  -- a second pass would re-run the full metadata fetch for nothing.
+  if not refreshed then
+    local ok, cerr = ensure_connected_and_fresh(srv)
+    if not ok and srv.status ~= "connected" then
+      return string.format('Failed to connect to "%s": %s', srv.name, tostring(cerr))
+    end
   end
 
   srv.in_flight = (srv.in_flight or 0) + 1
