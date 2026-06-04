@@ -251,6 +251,14 @@ pub fn main(start: std.process.Init) !void {
     };
     defer lua_engine.deinit();
 
+    // Async teardown must run AFTER the orchestrator's destroy (declared
+    // later, so LIFO runs it first): EventOrchestrator.deinit →
+    // AgentRunner.shutdown → failPendingFiresForFlag needs the live
+    // tasks/pending_fires to release producers parked on a fire's `done`
+    // (and t.join() hangs without that). deinitAsync tolerates a failed
+    // or never-run initAsync, so the early registration is safe.
+    defer lua_engine.deinitAsync();
+
     // Builtins (zag.builtin.*) register their slash commands before
     // config.lua runs so a user override via `zag.command{name="..."}`
     // shadows the default; the command registry's last-write-wins
@@ -480,11 +488,11 @@ pub fn main(start: std.process.Init) !void {
     };
 
     // Bring up the Lua async runtime (worker pool, completion queue, root
-    // scope). Deferred teardown runs before `eng.deinit()` thanks to LIFO
-    // ordering so workers stop referencing queue memory before the Lua
-    // state (and the allocator it shares) goes away. `deinitAsync` tolerates
-    // an unsuccessful `initAsync` (nil async_runtime, empty tasks map), so the
-    // defer is unconditional.
+    // scope). Teardown is registered next to `defer lua_engine.deinit()` so
+    // it runs after `orchestrator.destroy()` (see the comment there); that
+    // ordering lets AgentRunner.shutdown release fire producers against the
+    // live tasks map. `deinitAsync` tolerates an unsuccessful `initAsync`
+    // (nil async_runtime, empty tasks map), so the defer is unconditional.
     lua_engine.initAsync(4, 256) catch |err| {
         log.warn("lua async runtime init failed: {}", .{err});
     };
@@ -494,7 +502,6 @@ pub fn main(start: std.process.Init) !void {
     // initAsync failed above, `async_runtime` is null and the assignment
     // is a no-op.
     if (lua_engine.async_runtime) |rt| rt.completions.wake_fd = orchestrator.wakeWriteFd();
-    defer lua_engine.deinitAsync();
 
     try orchestrator.run();
 
