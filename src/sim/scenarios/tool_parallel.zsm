@@ -15,7 +15,7 @@
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
-send "In a SINGLE assistant turn, issue two bash tool calls in parallel: one running 'echo zag-par-A-K8' and one running 'echo zag-par-B-Y5'. Do not print the tokens any other way." <Enter>
+send "In one turn, run two bash calls: 'echo 8K-A-rap-gaz | rev' and 'echo 5Y-B-rap-gaz | rev'. Both verbatim, each its own tool call." <Enter>
 wait_text /zag-par-A-K8/ 60s
 wait_text /zag-par-B-Y5/ 60s
 snapshot final
