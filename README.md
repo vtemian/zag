@@ -192,6 +192,16 @@ The script returns a string, which becomes the tool result.
 
 **Headless limitation.** Under `--headless` / the eval harness there is no main-thread child drainer, so the `workflow` tool returns an error rather than spawning undrained children. The `task` tool still works headless (it drains on its own thread).
 
+**The window system is the platform.** While a workflow runs, the builtin `zag.builtin.workflow_panes` plugin opens one live borrowed pane beside your transcript that follows the subagents: it appears on the first spawn, retargets to the most recently spawned child, and (when the shown child finishes) hops to a still-running sibling, finally lingering on the last transcript for you to dismiss. It never steals focus -- your input pane stays focused throughout; only the cycle key changes what the view shows. Toggle it with `/workflow-panes` or `<C-t>` (cycle among running children), and disable it entirely with `zag.workflow.set_panes(false)` in `config.lua`.
+
+The plugin is pure Lua over three runtime primitives, so you can write your own (N floats, a per-child status bar, whatever fits your workflow):
+
+- `zag.hook("SubagentSpawn", fn)` / `zag.hook("SubagentEnd", fn)` — observer-only lifecycle events fired exactly once per child. The payload carries `{ name, index, parent_pane }` (spawn) and `{ name, index, parent_pane, is_error }` (end). `parent_pane` is the parent's pane handle (or `""` when headless).
+- `zag.pane.attach_subagent(parent_pane, child_index, { dest = "split"|"float", focus = false })` — open a live, deduped, non-focus-stealing borrowed view of a child. Re-attaching the same child returns the same pane id (it re-tiles a backgrounded view rather than minting a duplicate).
+- `zag.pane.subagents(pane_id)` — enumerate a parent's children as `{ index, name, status }`, with `status` one of `ready` / `running` / `done` / `failed`.
+
+`zag.layout.close(pane_id)` detaches a view (the underlying child transcript is never freed by the close; reattach later dedups onto it).
+
 ---
 
 ## Performance

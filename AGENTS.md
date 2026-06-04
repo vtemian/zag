@@ -313,7 +313,10 @@ subagent can spawn its own children or run its own workflow. Two orthogonal
 limits keep this bounded: the per-level fan-out window (`max_fanout`) caps
 concurrent siblings, and a hard depth backstop of 8 (`ChildAgent.max_task_depth`)
 caps the delegation chain. Hand a subagent a narrower `tools` list to force a
-leaf.
+leaf. Subagents do not carry the screen-driving tools (`layout_tree`,
+`layout_focus`, `layout_split`, `layout_close`, `layout_resize`, `pane_read`)
+even when inheriting all of the caller's tools; the `zag.builtin.workflow_panes`
+plugin renders them in a live borrowed pane instead.
 
 **Headless limitation.** Under `claude --headless` / the eval `Harness` there is
 no main-thread child drainer, so the `workflow` tool returns an error
