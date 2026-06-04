@@ -1723,7 +1723,9 @@ test "mcp http: 401 marks needs-auth with an actionable error" {
         \\  assert(not ok, "401 must fail the connect")
         \\  assert(web.status == "needs-auth", "status needs-auth, got " .. tostring(web.status))
         \\  assert(err:find("auth", 1, true), "error mentions auth: " .. tostring(err))
-        \\  assert(err:find("H", 1, true), "error references Milestone H: " .. tostring(err))
+        \\  -- This server is not configured auth = "oauth", so auto-auth never
+        \\  -- runs; the actionable error points the user at the fix.
+        \\  assert(err:find("oauth", 1, true), "error suggests oauth: " .. tostring(err))
         \\  assert(web.needs_auth_info ~= nil, "discovery info captured from WWW-Authenticate")
     );
 }
@@ -2039,5 +2041,470 @@ test "mcp legacy SSE: death before the endpoint event disconnects and clears the
         \\  assert(legacy.status == "disconnected", "server marked disconnected, got " .. tostring(legacy.status))
         \\  assert(legacy.sse_reader == nil, "reader coroutine cleared (no leak)")
         \\  assert(legacy.sse_stream == nil, "GET stream cleared (no leak)")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H: OAuth 2.1 (discovery, PKCE authorization_code, dynamic registration,
+// refresh, client_credentials, auto-auth retry)
+//
+// One fixture HTTP server routes by path to play every role the flow touches:
+//   * GET /.well-known/oauth-protected-resource  -> { authorization_servers }
+//   * GET /.well-known/oauth-authorization-server -> RFC 8414 endpoints
+//   * POST /register   -> RFC 7591 dynamic registration -> { client_id, ... }
+//   * POST /token      -> the token endpoint; ASSERTS code_verifier + resource
+//                         present and x-www-form-urlencoded. Handles
+//                         authorization_code / refresh_token / client_credentials.
+//   * POST /mcp        -> the MCP endpoint: 401 (+ WWW-Authenticate carrying
+//                         resource_metadata) until a Bearer token arrives, then
+//                         the normal initialize/tools-list responses.
+//
+// The browser is never spawned: the test injects an opener via
+// M._test.set_browser_opener that captures the authorize URL and (in a
+// detached worker) GETs the await_callback URL itself, standing in for the
+// user's browser redirect.
+// ---------------------------------------------------------------------------
+
+const OAuthFixture = struct {
+    server: std.Io.net.Server,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Observations the tests assert after teardown.
+    token_saw_code_verifier: std.atomic.Value(bool) = .init(false),
+    token_saw_resource: std.atomic.Value(bool) = .init(false),
+    token_form_encoded: std.atomic.Value(bool) = .init(false),
+    register_hits: std.atomic.Value(u32) = .init(0),
+    refresh_grant_seen: std.atomic.Value(bool) = .init(false),
+    client_credentials_seen: std.atomic.Value(bool) = .init(false),
+    /// base url ("http://127.0.0.1:<port>") so metadata can advertise itself.
+    base_buf: [48]u8 = undefined,
+    base_len: usize = 0,
+
+    fn base(ctx: *const OAuthFixture) []const u8 {
+        return ctx.base_buf[0..ctx.base_len];
+    }
+
+    fn run(ctx: *OAuthFixture) void {
+        while (!ctx.stop.load(.acquire)) {
+            const conn = ctx.server.accept(std.testing.io) catch return;
+            ctx.handleConn(conn);
+            conn.close(std.testing.io);
+        }
+    }
+
+    fn handleConn(ctx: *OAuthFixture, conn: std.Io.net.Stream) void {
+        var buf: [8192]u8 = undefined;
+        var total: usize = 0;
+        var header_end: ?usize = null;
+        var content_length: usize = 0;
+        while (total < buf.len) {
+            const n = test_net.streamRead(conn, buf[total..]) catch return;
+            if (n == 0) break;
+            total += n;
+            if (header_end == null) {
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |idx| {
+                    header_end = idx + 4;
+                    if (HttpFixture.findHeaderValue(buf[0..idx], "content-length")) |cl| {
+                        content_length = std.fmt.parseInt(usize, std.mem.trim(u8, cl, " "), 10) catch 0;
+                    }
+                }
+            }
+            if (header_end) |he| {
+                if (total - he >= content_length) break;
+            }
+        }
+        const request = buf[0..total];
+        const headers = if (header_end) |he| buf[0 .. he - 4] else request;
+        const body = if (header_end) |he| buf[he..total] else "";
+
+        if (std.mem.indexOf(u8, request, "/.well-known/oauth-protected-resource") != null) {
+            var out: [256]u8 = undefined;
+            const json = std.fmt.bufPrint(&out,
+                "{{\"resource\":\"{s}/mcp\",\"authorization_servers\":[\"{s}\"]}}", .{ ctx.base(), ctx.base() }) catch return;
+            ctx.writeJson(conn, json);
+            return;
+        }
+        if (std.mem.indexOf(u8, request, "/.well-known/oauth-authorization-server") != null) {
+            var out: [512]u8 = undefined;
+            const json = std.fmt.bufPrint(&out,
+                "{{\"issuer\":\"{s}\"," ++
+                "\"authorization_endpoint\":\"{s}/authorize\"," ++
+                "\"token_endpoint\":\"{s}/token\"," ++
+                "\"registration_endpoint\":\"{s}/register\"," ++
+                "\"code_challenge_methods_supported\":[\"S256\"]}}", .{ ctx.base(), ctx.base(), ctx.base(), ctx.base() }) catch return;
+            ctx.writeJson(conn, json);
+            return;
+        }
+        if (std.mem.indexOf(u8, request, "POST /register") != null) {
+            _ = ctx.register_hits.fetchAdd(1, .acq_rel);
+            const json =
+                "{\"client_id\":\"dyn-client-1\",\"client_secret\":\"dyn-secret\"," ++
+                "\"redirect_uris\":[\"http://127.0.0.1:19876/callback\"]}";
+            ctx.writeJson(conn, json);
+            return;
+        }
+        if (std.mem.indexOf(u8, request, "POST /token") != null) {
+            // The token request body is application/x-www-form-urlencoded.
+            if (HttpFixture.findHeaderValue(headers, "content-type")) |ct| {
+                if (std.mem.indexOf(u8, ct, "application/x-www-form-urlencoded") != null) {
+                    ctx.token_form_encoded.store(true, .release);
+                }
+            }
+            if (std.mem.indexOf(u8, body, "code_verifier=") != null) {
+                ctx.token_saw_code_verifier.store(true, .release);
+            }
+            if (std.mem.indexOf(u8, body, "resource=") != null) {
+                ctx.token_saw_resource.store(true, .release);
+            }
+            if (std.mem.indexOf(u8, body, "grant_type=refresh_token") != null) {
+                ctx.refresh_grant_seen.store(true, .release);
+            }
+            if (std.mem.indexOf(u8, body, "grant_type=client_credentials") != null) {
+                ctx.client_credentials_seen.store(true, .release);
+            }
+            const json =
+                "{\"access_token\":\"tok-access\",\"token_type\":\"Bearer\"," ++
+                "\"refresh_token\":\"tok-refresh\",\"expires_in\":3600,\"scope\":\"read\"}";
+            ctx.writeJson(conn, json);
+            return;
+        }
+        if (std.mem.indexOf(u8, request, "POST /mcp") != null) {
+            const has_bearer = HttpFixture.findHeaderValue(headers, "authorization") != null;
+            if (!has_bearer) {
+                var out: [256]u8 = undefined;
+                const resp = std.fmt.bufPrint(&out,
+                    "HTTP/1.1 401 Unauthorized\r\n" ++
+                    "WWW-Authenticate: Bearer resource_metadata=\"{s}/.well-known/oauth-protected-resource\"\r\n" ++
+                    "Content-Length: 0\r\n\r\n", .{ctx.base()}) catch return;
+                test_net.streamWriteAll(conn, resp) catch {};
+                return;
+            }
+            // Authenticated MCP traffic: initialize, notifications, tools/list.
+            const reqid = HttpFixture.jsonRpcId(body) orelse "1";
+            if (std.mem.indexOf(u8, body, "notifications/initialized") != null) {
+                test_net.streamWriteAll(conn, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n") catch {};
+                return;
+            }
+            var out: [512]u8 = undefined;
+            if (std.mem.indexOf(u8, body, "\"initialize\"") != null) {
+                const json = std.fmt.bufPrint(&out,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}}}}}}", .{reqid}) catch return;
+                ctx.writeJson(conn, json);
+                return;
+            }
+            if (std.mem.indexOf(u8, body, "\"tools/list\"") != null) {
+                const json = std.fmt.bufPrint(&out,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
+                ctx.writeJson(conn, json);
+                return;
+            }
+            const empty = std.fmt.bufPrint(&out,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{reqid}) catch return;
+            ctx.writeJson(conn, empty);
+            return;
+        }
+        test_net.streamWriteAll(conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n") catch {};
+    }
+
+    fn writeJson(ctx: *OAuthFixture, conn: std.Io.net.Stream, json: []const u8) void {
+        _ = ctx;
+        var out: [4096]u8 = undefined;
+        const resp = std.fmt.bufPrint(&out,
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n\r\n{s}", .{ json.len, json }) catch return;
+        test_net.streamWriteAll(conn, resp) catch {};
+    }
+};
+
+/// Stand up the OAuth fixture and point an http server entry at its /mcp
+/// endpoint with `auth = "oauth"`. The cache dir is pinned at `tmp` and the
+/// HOME override routes token storage into `tmp` too. Returns the thread.
+fn startOAuthFixture(
+    engine: *LuaEngine,
+    ctx: *OAuthFixture,
+    tmp: *std.testing.TmpDir,
+    abs_buf: []u8,
+) !std.Thread {
+    ctx.* = .{ .server = try test_net.listenLoopback() };
+    const port = test_net.boundPort(&ctx.server);
+    ctx.base_len = (try std.fmt.bufPrint(&ctx.base_buf, "http://127.0.0.1:{d}", .{port})).len;
+    const thread = try std.Thread.spawn(.{}, OAuthFixture.run, .{ctx});
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/mcp", .{port});
+    _ = engine.lua.pushString(url);
+    engine.lua.setGlobal("_oauth_url");
+
+    // HOME override routes the token file under tmp; cache dir likewise.
+    const dir_len = try tmp.dir.realPathFile(std.testing.io, ".", abs_buf);
+    _ = engine.lua.pushString(abs_buf[0..dir_len]);
+    engine.lua.setGlobal("_home_dir");
+
+    try runLua(engine,
+        \\mcp = require("zag.mcp")
+        \\mcp._test.set_home_dir(_home_dir)
+        \\mcp._test.set_cache_dir(_home_dir)
+    );
+    return thread;
+}
+
+test "mcp oauth: auto-auth runs the PKCE flow and retries the 401 once" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ctx: OAuthFixture = undefined;
+    const thread = try startOAuthFixture(&engine, &ctx, &tmp, &abs_buf);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // The injected browser opener stands in for the user: it captures the
+    // authorize URL, pulls the state out, and (detached) GETs the
+    // await_callback URL with a matching state + a code, simulating the
+    // redirect. A short retry loop covers the bind-vs-fire race.
+    try runLua(&engine,
+        \\mcp._test.set_browser_opener(function(url)
+        \\  local state = url:match("[?&]state=([^&]+)")
+        \\  local redirect = url:match("[?&]redirect_uri=([^&]+)")
+        \\  -- redirect_uri is form-encoded; we only need the port/path, which
+        \\  -- is fixed at 19876/callback, so build the callback URL directly.
+        \\  zag.detach(function()
+        \\    local cb = "http://127.0.0.1:19876/callback?code=testcode&state=" .. state
+        \\    for _ = 1, 200 do
+        \\      local resp = zag.http.get(cb)
+        \\      if resp and (resp.status == 200) then return end
+        \\      zag.sleep(10)
+        \\    end
+        \\  end)
+        \\end)
+    );
+
+    try runCoroutineBodyTolerant(&engine,
+        \\  -- auto_auth is a settings default applied by setup(); these tests
+        \\  -- build servers directly, so seed it to mirror a configured engine.
+        \\  mcp._test.settings().auto_auth = true
+        \\  local srv = mcp._test.normalize_server("auth", { url = _oauth_url, auth = "oauth" })
+        \\  mcp._test.servers().auth = srv
+        \\  -- connect() POSTs initialize -> 401 needs-auth; auto-auth runs the
+        \\  -- PKCE flow (discovery, registration, browser sim, token exchange),
+        \\  -- then retries -> 200. settings.auto_auth defaults true.
+        \\  local ok, err = mcp._test.connect(srv)
+        \\  assert(ok, "auto-auth connect: " .. tostring(err))
+        \\  assert(srv.status == "connected", "connected after auto-auth, got " .. tostring(srv.status))
+        \\  assert(srv.oauth_access_token == "tok-access", "access token stored, got " .. tostring(srv.oauth_access_token))
+        \\  local tools, terr = mcp._test.list_tools(srv)
+        \\  assert(tools and tools[1].name == "add", "tools/list after auth: " .. tostring(terr))
+        \\  mcp._test.disconnect(srv)
+    );
+
+    try testing.expect(ctx.token_form_encoded.load(.acquire));
+    try testing.expect(ctx.token_saw_code_verifier.load(.acquire));
+    try testing.expect(ctx.token_saw_resource.load(.acquire));
+    try testing.expect(ctx.register_hits.load(.acquire) >= 1);
+}
+
+test "mcp oauth: state mismatch on the callback is rejected" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ctx: OAuthFixture = undefined;
+    const thread = try startOAuthFixture(&engine, &ctx, &tmp, &abs_buf);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // The opener returns a DELIBERATELY WRONG state, so the flow's CSRF check
+    // must reject the callback and never reach the token endpoint.
+    try runLua(&engine,
+        \\mcp._test.set_browser_opener(function(url)
+        \\  zag.detach(function()
+        \\    local cb = "http://127.0.0.1:19876/callback?code=testcode&state=WRONGSTATE"
+        \\    for _ = 1, 200 do
+        \\      local resp = zag.http.get(cb)
+        \\      if resp and (resp.status == 200) then return end
+        \\      zag.sleep(10)
+        \\    end
+        \\  end)
+        \\end)
+    );
+
+    try runCoroutineBodyTolerant(&engine,
+        \\  local srv = mcp._test.normalize_server("auth", { url = _oauth_url, auth = "oauth" })
+        \\  mcp._test.servers().auth = srv
+        \\  -- The authorize() flow itself must fail on the state mismatch.
+        \\  local ok, err = mcp._test.oauth_authorize(srv)
+        \\  assert(not ok, "state mismatch must fail the flow")
+        \\  assert(err:find("state", 1, true), "error names the state mismatch: " .. tostring(err))
+    );
+
+    // The token endpoint was never reached (CSRF rejection precedes exchange).
+    try testing.expect(!ctx.token_saw_code_verifier.load(.acquire));
+}
+
+test "mcp oauth: client_credentials grant skips the browser entirely" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ctx: OAuthFixture = undefined;
+    const thread = try startOAuthFixture(&engine, &ctx, &tmp, &abs_buf);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // A browser opener that fails the test if it is ever called: the
+    // client_credentials grant must not open a browser.
+    try runLua(&engine,
+        \\mcp._test.set_browser_opener(function() error("browser must not open for client_credentials") end)
+    );
+
+    try runCoroutineBodyTolerant(&engine,
+        \\  local srv = mcp._test.normalize_server("cc", {
+        \\    url = _oauth_url, auth = "oauth",
+        \\    oauth = { grant_type = "client_credentials",
+        \\      client_id = "svc-id", client_secret = "svc-secret", scope = "read" },
+        \\  })
+        \\  mcp._test.servers().cc = srv
+        \\  local ok, err = mcp._test.oauth_authorize(srv)
+        \\  assert(ok, "client_credentials authorize: " .. tostring(err))
+        \\  assert(srv.oauth_access_token == "tok-access", "token stored")
+    );
+
+    try testing.expect(ctx.client_credentials_seen.load(.acquire));
+    try testing.expect(ctx.token_form_encoded.load(.acquire));
+    // No dynamic registration is needed when client_id is configured.
+    try testing.expect(ctx.register_hits.load(.acquire) == 0);
+}
+
+test "mcp oauth: token file is written 0600 with the documented shape" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPathFile(std.testing.io, ".", &abs_buf);
+    _ = engine.lua.pushString(abs_buf[0..dir_len]);
+    engine.lua.setGlobal("_home_dir");
+
+    try runLua(&engine,
+        \\mcp = require("zag.mcp")
+        \\mcp._test.set_home_dir(_home_dir)
+    );
+
+    // Persist a token bundle, then stat the file from Zig for mode + content.
+    try runCoroutineBody(&engine,
+        \\  local srv = mcp._test.normalize_server("store", { url = "https://api.example/mcp", auth = "oauth" })
+        \\  mcp._test.oauth_save_tokens(srv, {
+        \\    tokens = { access_token = "A", refresh_token = "R", expires_at = 123, scope = "read" },
+        \\    client_info = { client_id = "C", client_secret = "S",
+        \\      redirect_uri = "http://127.0.0.1:19876/callback" },
+        \\    server_url = "https://api.example/mcp",
+        \\  })
+    );
+
+    // The path is HOME/.config/zag/mcp-oauth/store/tokens.json.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const token_path = try std.fmt.bufPrint(&path_buf, "{s}/.config/zag/mcp-oauth/store/tokens.json", .{abs_buf[0..dir_len]});
+    const st = try std.Io.Dir.cwd().statFile(std.testing.io, token_path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode())) & 0o777);
+
+    // Reload it and confirm the round-trip.
+    try runCoroutineBody(&engine,
+        \\  local srv = mcp._test.normalize_server("store", { url = "https://api.example/mcp", auth = "oauth" })
+        \\  local bundle = mcp._test.oauth_load_tokens(srv)
+        \\  assert(bundle, "token bundle loads back")
+        \\  assert(bundle.tokens.access_token == "A", "access token round-trips")
+        \\  assert(bundle.client_info.client_id == "C", "client info round-trips")
+    );
+}
+
+test "mcp oauth: an expired token is refreshed before a request" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ctx: OAuthFixture = undefined;
+    const thread = try startOAuthFixture(&engine, &ctx, &tmp, &abs_buf);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // Seed an already-expired token bundle on disk (expires_at well in the
+    // past relative to the pinned clock), then ensure-token must refresh it.
+    try runCoroutineBody(&engine,
+        \\  mcp._test.set_now(1000000)
+        \\  local srv = mcp._test.normalize_server("auth", { url = _oauth_url, auth = "oauth" })
+        \\  mcp._test.servers().auth = srv
+        \\  mcp._test.oauth_save_tokens(srv, {
+        \\    tokens = { access_token = "stale", refresh_token = "tok-refresh",
+        \\      expires_at = 1000000 - 100, scope = "read" },
+        \\    client_info = { client_id = "dyn-client-1", client_secret = "dyn-secret",
+        \\      redirect_uri = "http://127.0.0.1:19876/callback" },
+        \\    server_url = _oauth_url,
+        \\  })
+        \\  -- ensure_token sees expires_at - 60 < now and refreshes via the
+        \\  -- refresh_token grant; the fixture returns a fresh access token.
+        \\  local ok, err = mcp._test.oauth_ensure_token(srv)
+        \\  assert(ok, "refresh: " .. tostring(err))
+        \\  assert(srv.oauth_access_token == "tok-access", "refreshed token applied, got " .. tostring(srv.oauth_access_token))
+    );
+
+    try testing.expect(ctx.refresh_grant_seen.load(.acquire));
+}
+
+test "mcp oauth: legacy SSE 401 maps to needs-auth with discovery info" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // sse_post 401 mapping is pure: build a fake server and a 401 response and
+    // confirm the mapper sets needs-auth + captures WWW-Authenticate.
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local srv = mcp._test.normalize_server("legacy", { url = "https://h/sse", auth = "oauth" })
+        \\local mapped = mcp._test.map_sse_401(srv,
+        \\  'Bearer resource_metadata="https://h/.well-known/oauth-protected-resource"')
+        \\assert(mapped, "401 is mapped to a needs-auth error")
+        \\assert(srv.status == "needs-auth", "status needs-auth, got " .. tostring(srv.status))
+        \\assert(srv.needs_auth_info ~= nil, "WWW-Authenticate captured")
+        \\assert(srv.needs_auth_info:find("resource_metadata", 1, true), "carries resource_metadata")
     );
 }

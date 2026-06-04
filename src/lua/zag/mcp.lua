@@ -109,6 +109,19 @@ end
 -- Server entry normalization
 -- ---------------------------------------------------------------------------
 
+-- Normalize a server's `oauth` config to a clean table of the four supported
+-- knobs (client_id, client_secret, scope, grant_type), or nil when absent.
+-- `auth = "oauth"` is the switch that turns OAuth on; this table only tunes it.
+local function normalize_oauth(raw_oauth)
+  if type(raw_oauth) ~= "table" then return nil end
+  return {
+    client_id = raw_oauth.client_id,
+    client_secret = raw_oauth.client_secret,
+    scope = raw_oauth.scope,
+    grant_type = raw_oauth.grant_type,
+  }
+end
+
 -- Fill defaults and interpolate env/headers on a single server entry. `name`
 -- is the server's config key; `raw` is the user-declared table. Returns the
 -- normalized entry (a fresh table; runtime fields like `handle`/`status` are
@@ -127,6 +140,10 @@ local function normalize_server(name, raw)
     auth = raw.auth,                  -- "oauth" | "bearer" | false | nil
     bearer_token = raw.bearer_token,
     bearer_token_env = raw.bearer_token_env,
+    -- OAuth 2.1 config (only consulted when auth == "oauth"). A normalized
+    -- copy of the four supported knobs; everything else (PKCE, discovery,
+    -- dynamic registration, the loopback callback) is automatic.
+    oauth = normalize_oauth(raw.oauth),
     -- Lifecycle / behavior.
     lifecycle = raw.lifecycle or "lazy",
     idle_timeout_min = raw.idle_timeout_min,
@@ -305,11 +322,19 @@ local sse_connect
 -- but referenced here by http_consume_sse; forward-declare so the transport
 -- layer binds to the same locals the parser section assigns.
 local sse_new, sse_feed
+-- OAuth 2.1 (Milestone H). `oauth_ensure_token` loads/refreshes a stored token
+-- before a request; `oauth_authorize` runs the full interactive (or
+-- client_credentials) flow. Both are defined in the OAuth section below but
+-- called from rpc_request (auto-auth retry) and connect (pre-request token
+-- load), which appear above that section. `map_sse_401` is the legacy-SSE
+-- 401 -> needs-auth mapper.
+local oauth_ensure_token, oauth_authorize, map_sse_401
 
 -- Resolve the Authorization header value for a server, or nil when none
--- applies. Milestone H extends this: when `srv.auth == "oauth"` it will hand
--- back a stored/refreshed access token here. Today it covers the static
--- bearer-token forms only (`bearer_token` literal or `bearer_token_env`).
+-- applies. Three precedence tiers: a static `bearer_token` literal, a
+-- `bearer_token_env` lookup, then the OAuth access token. The OAuth tier is
+-- populated by `oauth_ensure_token` (load/refresh before a request) or by the
+-- auto-auth flow (`oauth_authorize`), both in the OAuth section.
 local function auth_header(srv)
   if srv.bearer_token and #srv.bearer_token > 0 then
     return "Bearer " .. srv.bearer_token
@@ -318,7 +343,6 @@ local function auth_header(srv)
     local tok = os.getenv(srv.bearer_token_env)
     if tok and #tok > 0 then return "Bearer " .. tok end
   end
-  -- srv.oauth_access_token is populated by Milestone H once the flow runs.
   if srv.oauth_access_token and #srv.oauth_access_token > 0 then
     return "Bearer " .. srv.oauth_access_token
   end
@@ -426,7 +450,14 @@ end
 -- (result_table, nil) or (nil, err_string). The busy mutex, id allocation,
 -- deadline, and exactly-once busy release are transport-agnostic; the wire
 -- work happens in `transport_send_request`.
-local function rpc_request(srv, method, params, timeout_ms)
+--
+-- Auto-auth: when a request lands on `needs-auth` (a 401 the transport mapped),
+-- `settings.auto_auth` is on, and the server is an OAuth server, run the OAuth
+-- flow once and retry the request once. `_retried` guards the single retry so a
+-- server that keeps 401ing after a successful flow does not loop. The OAuth
+-- flow runs OUTSIDE the busy lock (released first), so its own HTTP calls do
+-- not deadlock on this server's mutex.
+local function rpc_request(srv, method, params, timeout_ms, _retried)
   acquire_busy(srv)
   -- pcall the whole body so a mid-flight error (write EPIPE, decode failure)
   -- always clears the busy flag; a stuck flag would wedge the server.
@@ -447,6 +478,17 @@ local function rpc_request(srv, method, params, timeout_ms)
   if not ok then
     -- `result` holds the pcall error message here.
     return nil, "rpc internal error: " .. tostring(result)
+  end
+
+  if not result and not _retried and srv.auth == "oauth"
+      and srv.status == "needs-auth" and M._settings.auto_auth then
+    local authed = oauth_authorize(srv)
+    if authed then
+      -- Clear the needs-auth latch so the retry's own 401 (if any) is seen
+      -- fresh rather than short-circuiting back into another flow.
+      srv.status = "disconnected"
+      return rpc_request(srv, method, params, timeout_ms, true)
+    end
   end
   return result, err
 end
@@ -591,8 +633,8 @@ function http_send_request(srv, msg, deadline, retried)
     stream:close()
     srv.status = "needs-auth"
     return nil,
-      "needs auth: server requires authorization (401). OAuth is not yet wired "
-      .. "(Milestone H); set a bearer_token/bearer_token_env for now."
+      "needs auth: server requires authorization (401). Set auth = \"oauth\" "
+      .. "to run the OAuth flow, or a bearer_token/bearer_token_env."
   elseif status == 404 and srv.session_id and not retried then
     -- Session expired: drop it, re-initialize once, retry the original once.
     stream:close()
@@ -765,6 +807,13 @@ local function sse_post(srv, msg)
   if not resp then return nil, "http error: " .. tostring(err) end
   -- 202 Accepted is the spec answer; 200 is tolerated.
   if resp.status == 202 or resp.status == 200 then return true end
+  if resp.status == 401 then
+    -- Mirror the Streamable arm: mark needs-auth and capture whatever auth
+    -- challenge is available. One-shot zag.http.post does not surface response
+    -- headers in v1, so fall back to a generic marker when absent.
+    local www = resp.headers and resp.headers["www-authenticate"]
+    return nil, map_sse_401(srv, www)
+  end
   return nil, string.format("http status %d", resp.status)
 end
 
@@ -818,6 +867,13 @@ function sse_connect(srv)
   srv.sse_endpoint = nil
   srv.sse_dead = false
 
+  -- For OAuth servers, load/refresh a stored token before the GET so the
+  -- stream carries Authorization. Missing token -> the GET 401s and is mapped
+  -- to needs-auth for the caller's auto-auth retry.
+  if srv.auth == "oauth" then
+    pcall(oauth_ensure_token, srv)
+  end
+
   -- KNOWN LIMITATION: zag.http.stream()'s receiveHead runs on the main thread,
   -- so a server that wedges during this GET's connection setup stalls the event
   -- loop and is not covered by scope cancellation (same note as the Streamable
@@ -834,6 +890,11 @@ function sse_connect(srv)
   if not stream then return nil, "sse connect failed: " .. tostring(err) end
   if stream:status() ~= 200 then
     local s = stream:status()
+    if s == 401 then
+      local www = stream:header("www-authenticate")
+      stream:close()
+      return nil, map_sse_401(srv, www)
+    end
     stream:close()
     return nil, string.format("sse connect: http status %d", s)
   end
@@ -875,6 +936,426 @@ function sse_connect(srv)
   rpc_notify(srv, "notifications/initialized", nil)
   srv.status = "connected"
   srv.last_used = M._now()
+  return true
+end
+
+-- ---------------------------------------------------------------------------
+-- OAuth 2.1 (Milestone H)
+--
+-- Port of pi's flow, trimmed to what the spec requires:
+--   * Discovery (RFC 9728 + RFC 8414): the 401's WWW-Authenticate carries
+--     resource_metadata=...; GET that protected-resource metadata to find the
+--     authorization server, then GET its /.well-known/oauth-authorization-server
+--     for the authorize/token/registration endpoints.
+--   * PKCE S256 (RFC 7636): verifier = base64url(random_bytes(32)); challenge =
+--     base64url(sha256(verifier)); state = base64url(random_bytes(16)).
+--   * Dynamic client registration (RFC 7591) when no client_id is configured;
+--     token_endpoint_auth_method = "none".
+--   * authorization_code: open the browser, await the loopback callback, verify
+--     state (CSRF), exchange the code (form-encoded, with code_verifier AND
+--     resource=<canonical server url> per RFC 8707, REQUIRED by the 2025-06-18
+--     spec). client_credentials skips the browser/listener entirely.
+--   * Tokens persist to HOME/.config/zag/mcp-oauth/<server>/tokens.json (0600),
+--     refreshed (grant_type=refresh_token) when expires_at - 60 < now.
+--
+-- SECURITY: tokens, codes, and verifiers are NEVER logged and never embedded
+-- in error strings. Errors carry only kind + endpoint context.
+-- ---------------------------------------------------------------------------
+
+local OAUTH_CALLBACK_PORT = 19876
+local OAUTH_CALLBACK_PATH = "/callback"
+local OAUTH_REFRESH_SKEW_S = 60
+
+-- Test seam: HOME for the token directory. os.getenv reads libc directly, so a
+-- test cannot mutate it; production leaves this nil and falls back to $HOME.
+M._home_dir_override = nil
+local function home_dir()
+  if M._home_dir_override then return M._home_dir_override end
+  return os.getenv("HOME") or "."
+end
+
+-- Test seam: the browser opener. Production opens the URL with `open` then
+-- `xdg-open`; tests swap in a capture function so no real browser launches.
+local function default_browser_opener(url)
+  -- Try macOS `open`, then Linux `xdg-open`; no platform detection, just a
+  -- fallback on spawn error. The launcher returns immediately; we reap it so
+  -- it does not linger as a zombie.
+  local h = zag.cmd.spawn({ "open", url })
+  if not h then
+    h = zag.cmd.spawn({ "xdg-open", url })
+  end
+  if h then pcall(function() h:wait() end) end
+  return h ~= nil
+end
+M._browser_opener = default_browser_opener
+
+-- Percent-encode one string for application/x-www-form-urlencoded. Unreserved
+-- characters (RFC 3986) pass through; everything else is %XX. Space is %20
+-- (not '+'), which every conformant decoder accepts.
+local function url_encode(s)
+  return (tostring(s):gsub("[^%w%-%.%_%~]", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end))
+end
+
+-- Build an application/x-www-form-urlencoded body from a string->string map.
+-- Keys are emitted in sorted order for deterministic output (tests + caching).
+local function form_encode(params)
+  local keys = {}
+  for k in pairs(params) do keys[#keys + 1] = k end
+  table.sort(keys)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    parts[#parts + 1] = url_encode(k) .. "=" .. url_encode(params[k])
+  end
+  return table.concat(parts, "&")
+end
+
+-- Canonical resource indicator (RFC 8707): scheme://host[:port][/path], no
+-- query, no fragment, scheme + host lowercased. This is the `resource` value
+-- the token request must carry.
+local function canonical_resource(url)
+  local scheme, rest = url:match("^([%a][%w+.-]*)://(.*)$")
+  if not scheme then return url end
+  -- Strip fragment then query.
+  rest = rest:gsub("#.*$", ""):gsub("%?.*$", "")
+  local authority, path = rest:match("^([^/]*)(.*)$")
+  authority = authority:lower()
+  return scheme:lower() .. "://" .. authority .. (path or "")
+end
+
+-- The token file path for a server: HOME/.config/zag/mcp-oauth/<server>/tokens.json.
+local function oauth_token_path(srv)
+  return home_dir() .. "/.config/zag/mcp-oauth/" .. srv.name .. "/tokens.json"
+end
+
+-- Persist a token bundle (tokens + client_info + server_url) as JSON, 0600.
+-- The directory is created first; the file mode is stamped on write.
+local function oauth_save_tokens(srv, bundle)
+  local dir = home_dir() .. "/.config/zag/mcp-oauth/" .. srv.name
+  local ok_mk, mk_err = zag.fs.mkdir(dir, { parents = true })
+  if not ok_mk and not zag.fs.exists(dir) then
+    return nil, "token dir mkdir failed: " .. tostring(mk_err)
+  end
+  local encoded = zag.json.encode(bundle)
+  local ok_w, w_err = zag.fs.write(oauth_token_path(srv), encoded, { mode = tonumber("600", 8) })
+  if not ok_w then return nil, "token write failed: " .. tostring(w_err) end
+  return true
+end
+
+-- Load a server's token bundle, or nil when none exists / is unreadable.
+local function oauth_load_tokens(srv)
+  local path = oauth_token_path(srv)
+  if not zag.fs.exists(path) then return nil end
+  local raw = zag.fs.read(path)
+  if not raw then return nil end
+  local decoded = zag.json.decode(raw)
+  if type(decoded) ~= "table" then return nil end
+  return decoded
+end
+
+-- Map a legacy-SSE 401 to the same needs-auth shape the Streamable arm uses:
+-- set status, capture the WWW-Authenticate challenge, return the actionable
+-- error string. `www` may be nil (one-shot POST surfaces no headers in v1).
+function map_sse_401(srv, www)
+  srv.status = "needs-auth"
+  srv.needs_auth_info = www or "401 (no WWW-Authenticate header)"
+  return "needs auth: server requires authorization (401)"
+end
+
+-- Pull the resource_metadata URL out of a WWW-Authenticate header value.
+local function parse_resource_metadata(www)
+  if type(www) ~= "string" then return nil end
+  return www:match('resource_metadata%s*=%s*"([^"]+)"')
+end
+
+-- A small typed GET that returns the decoded JSON body for a 2xx, else nil+err.
+-- zag.http.get returns { status, body } for any status; we check status here.
+local function oauth_get_json(url)
+  local resp, err = zag.http.get(url)
+  if not resp then return nil, "http error: " .. tostring(err) end
+  if resp.status < 200 or resp.status >= 300 then
+    return nil, string.format("http status %d", resp.status)
+  end
+  local decoded = zag.json.decode(resp.body or "")
+  if type(decoded) ~= "table" then return nil, "undecodable metadata" end
+  return decoded
+end
+
+-- Discover the authorization-server endpoints for `srv`. Uses the
+-- resource_metadata URL from the stored WWW-Authenticate when present, else the
+-- conventional /.well-known/oauth-protected-resource on the server origin.
+-- Returns { authorization_endpoint, token_endpoint, registration_endpoint } or
+-- (nil, err).
+local function oauth_discover(srv)
+  local rm = parse_resource_metadata(srv.needs_auth_info)
+  if not rm then
+    -- Fall back to the well-known path on the server's origin.
+    local scheme, host = srv.url:match("^(https?://)([^/]+)")
+    if not scheme then return nil, "cannot derive resource metadata url" end
+    rm = scheme .. host .. "/.well-known/oauth-protected-resource"
+  end
+
+  local prm, perr = oauth_get_json(rm)
+  if not prm then return nil, "protected-resource metadata: " .. tostring(perr) end
+  local servers = prm.authorization_servers
+  if type(servers) ~= "table" or not servers[1] then
+    return nil, "no authorization_servers in protected-resource metadata"
+  end
+  local as_base = servers[1]:gsub("/+$", "")
+
+  local asm, aerr = oauth_get_json(as_base .. "/.well-known/oauth-authorization-server")
+  if not asm then return nil, "authorization-server metadata: " .. tostring(aerr) end
+  if not asm.token_endpoint then
+    return nil, "authorization-server metadata missing token_endpoint"
+  end
+  return {
+    authorization_endpoint = asm.authorization_endpoint,
+    token_endpoint = asm.token_endpoint,
+    registration_endpoint = asm.registration_endpoint,
+  }
+end
+
+-- Dynamic client registration (RFC 7591). Returns { client_id, client_secret? }
+-- or (nil, err). token_endpoint_auth_method "none" (public client + PKCE).
+local function oauth_register(srv, endpoints, redirect_uri)
+  if not endpoints.registration_endpoint then
+    return nil, "server has no registration_endpoint and no client_id configured"
+  end
+  local body = {
+    client_name = "zag",
+    redirect_uris = { redirect_uri },
+    grant_types = { "authorization_code", "refresh_token" },
+    response_types = { "code" },
+    token_endpoint_auth_method = "none",
+  }
+  if srv.oauth and srv.oauth.scope then body.scope = srv.oauth.scope end
+  local resp, err = zag.http.post(endpoints.registration_endpoint, {
+    body = body,  -- table -> JSON (registration is JSON, not form-encoded)
+    content_type = "application/json",
+  })
+  if not resp then return nil, "registration http error: " .. tostring(err) end
+  if resp.status < 200 or resp.status >= 300 then
+    return nil, string.format("registration http status %d", resp.status)
+  end
+  local decoded = zag.json.decode(resp.body or "")
+  if type(decoded) ~= "table" or not decoded.client_id then
+    return nil, "registration response missing client_id"
+  end
+  return { client_id = decoded.client_id, client_secret = decoded.client_secret }
+end
+
+-- POST the token endpoint with a form-encoded body. Returns the decoded token
+-- response table or (nil, err). Never logs/returns token material.
+local function oauth_token_request(endpoints, params)
+  local resp, err = zag.http.post(endpoints.token_endpoint, {
+    body = form_encode(params),
+    content_type = "application/x-www-form-urlencoded",
+  })
+  if not resp then return nil, "token http error: " .. tostring(err) end
+  if resp.status < 200 or resp.status >= 300 then
+    return nil, string.format("token http status %d", resp.status)
+  end
+  local decoded = zag.json.decode(resp.body or "")
+  if type(decoded) ~= "table" or not decoded.access_token then
+    return nil, "token response missing access_token"
+  end
+  return decoded
+end
+
+-- Fold a token-endpoint response into a stored token bundle and apply the
+-- access token to the live server. Computes expires_at from expires_in.
+local function oauth_apply_tokens(srv, token_resp, client_info, server_url)
+  local expires_at = nil
+  if type(token_resp.expires_in) == "number" then
+    expires_at = M._now() + math.floor(token_resp.expires_in)
+  end
+  local bundle = {
+    tokens = {
+      access_token = token_resp.access_token,
+      refresh_token = token_resp.refresh_token,
+      expires_at = expires_at,
+      scope = token_resp.scope,
+    },
+    client_info = client_info,
+    server_url = server_url,
+  }
+  srv.oauth_access_token = token_resp.access_token
+  srv.oauth_refresh_token = token_resp.refresh_token
+  srv.oauth_expires_at = expires_at
+  oauth_save_tokens(srv, bundle)
+  return bundle
+end
+
+-- The client_credentials grant: a straight token POST (with the configured
+-- secret), no browser, no listener. Returns (true, nil) or (nil, err).
+local function oauth_client_credentials(srv)
+  local endpoints, derr = oauth_discover(srv)
+  if not endpoints then return nil, derr end
+  local oc = srv.oauth or {}
+  local params = {
+    grant_type = "client_credentials",
+    resource = canonical_resource(srv.url),
+  }
+  if oc.client_id then params.client_id = oc.client_id end
+  if oc.client_secret then params.client_secret = oc.client_secret end
+  if oc.scope then params.scope = oc.scope end
+  local token_resp, terr = oauth_token_request(endpoints, params)
+  if not token_resp then return nil, terr end
+  oauth_apply_tokens(srv, token_resp, { client_id = oc.client_id }, srv.url)
+  return true
+end
+
+-- The interactive authorization_code + PKCE flow. Returns (true, nil) or
+-- (nil, err). Steps: discover, resolve/register a client, build the authorize
+-- URL with the PKCE challenge + state, open the browser, await the loopback
+-- callback, verify state (CSRF), exchange the code (form-encoded, with
+-- code_verifier + resource), persist tokens.
+local function oauth_authorization_code(srv)
+  local endpoints, derr = oauth_discover(srv)
+  if not endpoints then return nil, derr end
+  if not endpoints.authorization_endpoint then
+    return nil, "authorization-server metadata missing authorization_endpoint"
+  end
+
+  local redirect_uri = "http://127.0.0.1:" .. OAUTH_CALLBACK_PORT .. OAUTH_CALLBACK_PATH
+  local oc = srv.oauth or {}
+
+  -- Resolve a client: configured client_id, a stored one, or register fresh.
+  local client_info
+  if oc.client_id then
+    client_info = { client_id = oc.client_id, client_secret = oc.client_secret }
+  else
+    local stored = oauth_load_tokens(srv)
+    if stored and stored.client_info and stored.client_info.client_id then
+      client_info = stored.client_info
+    else
+      local reg, rerr = oauth_register(srv, endpoints, redirect_uri)
+      if not reg then return nil, rerr end
+      reg.redirect_uri = redirect_uri
+      client_info = reg
+    end
+  end
+
+  -- PKCE + state.
+  local verifier = zag.crypto.base64url(zag.crypto.random_bytes(32))
+  local challenge = zag.crypto.base64url(zag.crypto.sha256(verifier))
+  local state = zag.crypto.base64url(zag.crypto.random_bytes(16))
+
+  -- Build the authorize URL.
+  local auth_params = {
+    response_type = "code",
+    client_id = client_info.client_id,
+    redirect_uri = redirect_uri,
+    code_challenge = challenge,
+    code_challenge_method = "S256",
+    state = state,
+    resource = canonical_resource(srv.url),
+  }
+  if oc.scope then auth_params.scope = oc.scope end
+  local sep = endpoints.authorization_endpoint:find("?", 1, true) and "&" or "?"
+  local authorize_url = endpoints.authorization_endpoint .. sep .. form_encode(auth_params)
+
+  -- Open the browser (or the injected opener), then await the callback. The
+  -- listener binds synchronously inside await_callback before yielding.
+  local opened_ok = pcall(M._browser_opener, authorize_url)
+  if not opened_ok then
+    return nil, "could not open a browser for authorization"
+  end
+  local params, cb_err = zag.http.await_callback({
+    port = OAUTH_CALLBACK_PORT,
+    path = OAUTH_CALLBACK_PATH,
+    timeout_ms = 300000,
+  })
+  if not params then return nil, "authorization callback: " .. tostring(cb_err) end
+
+  -- CSRF: the callback's state MUST equal the one we sent. Callback params are
+  -- untrusted, so compare exactly and reject on any mismatch.
+  if params.state ~= state then
+    return nil, "authorization state mismatch (possible CSRF); rejected"
+  end
+  local code = params.code
+  if type(code) ~= "string" or #code == 0 then
+    if params.error then
+      return nil, "authorization denied: " .. tostring(params.error)
+    end
+    return nil, "authorization callback carried no code"
+  end
+
+  -- Exchange the code (form-encoded; code_verifier + resource REQUIRED).
+  local token_params = {
+    grant_type = "authorization_code",
+    code = code,
+    redirect_uri = redirect_uri,
+    client_id = client_info.client_id,
+    code_verifier = verifier,
+    resource = canonical_resource(srv.url),
+  }
+  if client_info.client_secret then token_params.client_secret = client_info.client_secret end
+  local token_resp, terr = oauth_token_request(endpoints, token_params)
+  if not token_resp then return nil, terr end
+
+  oauth_apply_tokens(srv, token_resp, {
+    client_id = client_info.client_id,
+    client_secret = client_info.client_secret,
+    redirect_uri = redirect_uri,
+  }, srv.url)
+  return true
+end
+
+-- Run the OAuth flow for `srv`: client_credentials when configured, else the
+-- interactive authorization_code flow. Returns (true, nil) or (nil, err).
+function oauth_authorize(srv)
+  local grant = srv.oauth and srv.oauth.grant_type
+  if grant == "client_credentials" then
+    return oauth_client_credentials(srv)
+  end
+  return oauth_authorization_code(srv)
+end
+
+-- Refresh an expiring token via the refresh_token grant. Returns (true, nil)
+-- on success or (nil, err); a missing refresh token is a soft failure.
+local function oauth_refresh(srv, bundle)
+  local refresh = bundle.tokens and bundle.tokens.refresh_token
+  if not refresh then return nil, "no refresh token" end
+  local endpoints, derr = oauth_discover(srv)
+  if not endpoints then return nil, derr end
+  local oc = srv.oauth or {}
+  local params = {
+    grant_type = "refresh_token",
+    refresh_token = refresh,
+    resource = canonical_resource(srv.url),
+  }
+  local client_info = bundle.client_info or {}
+  if client_info.client_id then params.client_id = client_info.client_id end
+  if client_info.client_secret then params.client_secret = client_info.client_secret end
+  if oc.scope then params.scope = oc.scope end
+  local token_resp, terr = oauth_token_request(endpoints, params)
+  if not token_resp then return nil, terr end
+  -- A refresh response may omit refresh_token (keep the existing one).
+  if not token_resp.refresh_token then token_resp.refresh_token = refresh end
+  oauth_apply_tokens(srv, token_resp, client_info, bundle.server_url or srv.url)
+  return true
+end
+
+-- Ensure a usable access token is loaded into srv before a request: load the
+-- stored bundle, refresh it when it is within OAUTH_REFRESH_SKEW_S of expiry,
+-- and apply the access token to the live server. A missing/unusable token is a
+-- soft (nil, err); the caller's request then 401s and auto-auth runs the flow.
+function oauth_ensure_token(srv)
+  local bundle = oauth_load_tokens(srv)
+  if not bundle or not bundle.tokens or not bundle.tokens.access_token then
+    return nil, "no stored token"
+  end
+  local expires_at = bundle.tokens.expires_at
+  if type(expires_at) == "number" and (expires_at - OAUTH_REFRESH_SKEW_S) < M._now() then
+    local ok, rerr = oauth_refresh(srv, bundle)
+    if not ok then return nil, "refresh failed: " .. tostring(rerr) end
+    return true
+  end
+  srv.oauth_access_token = bundle.tokens.access_token
+  srv.oauth_refresh_token = bundle.tokens.refresh_token
+  srv.oauth_expires_at = expires_at
   return true
 end
 
@@ -943,6 +1424,13 @@ function http_connect(srv)
   srv.busy = false
   srv.session_id = nil
   srv.protocol_version = nil
+
+  -- For OAuth servers, load (and refresh if near-expiry) any stored token so
+  -- the initialize POST carries Authorization from the start. A missing token
+  -- is fine: the request 401s and the auto-auth retry runs the flow.
+  if srv.auth == "oauth" then
+    pcall(oauth_ensure_token, srv)
+  end
 
   local init_result, init_err = rpc_request(srv, "initialize", {
     protocolVersion = PROTOCOL_VERSION,
@@ -2300,6 +2788,17 @@ M._test = {
   auth_header = function(srv) return auth_header(srv) end,
   http_headers = function(srv, accept) return http_headers(srv, accept) end,
   resolve_endpoint = function(base, ep) return resolve_endpoint(base, ep) end,
+  -- H OAuth internals + seams.
+  set_home_dir = function(d) M._home_dir_override = d end,
+  set_browser_opener = function(fn) M._browser_opener = fn end,
+  form_encode = function(p) return form_encode(p) end,
+  canonical_resource = function(u) return canonical_resource(u) end,
+  oauth_save_tokens = function(srv, bundle) return oauth_save_tokens(srv, bundle) end,
+  oauth_load_tokens = function(srv) return oauth_load_tokens(srv) end,
+  oauth_token_path = function(srv) return oauth_token_path(srv) end,
+  oauth_authorize = function(srv) return oauth_authorize(srv) end,
+  oauth_ensure_token = function(srv) return oauth_ensure_token(srv) end,
+  map_sse_401 = function(srv, www) return map_sse_401(srv, www) end,
 }
 
 return M
