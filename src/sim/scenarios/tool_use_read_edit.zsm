@@ -11,6 +11,10 @@ wait_idle 500ms
 send "Run one bash command: rm -rf /tmp/zag-sim-read-edit && mkdir -p /tmp/zag-sim-read-edit && (echo 3Q7-erofeb=ahpla | rev; echo em-peek=ateb | rev) > /tmp/zag-sim-read-edit/note.txt && cat /tmp/zag-sim-read-edit/note.txt" <Enter>
 wait_text /alpha=before-7Q3/ 45s
 wait_text /beta=keep-me/ 5s
+# The tool result lands on the grid before the turn finishes; an Enter
+# typed mid-turn never submits. Settle on idle (small window, long
+# deadline) so the next send starts a real turn.
+wait_idle 2s 60s
 send "Use the edit tool on /tmp/zag-sim-read-edit/note.txt to replace 'alpha=before-7Q3' with 'alpha=after-9F2'. Leave the second line alone. Then run bash: cat /tmp/zag-sim-read-edit/note.txt | tr a-z A-Z" <Enter>
 wait_text /ALPHA=AFTER-9F2/ 60s
 wait_text /BETA=KEEP-ME/ 5s
