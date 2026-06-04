@@ -265,6 +265,13 @@ pub const SpawnDeps = struct {
     /// child for main-thread draining. Null disables registration (the task
     /// tool then drains on its own thread with no engine).
     child_registry: ?*ChildRunnerRegistry = null,
+    /// Forced structured-output schema for a delegated child run. When set, the
+    /// run forces a single synthetic `emit` tool whose validated input becomes
+    /// the run's result (see `agent.runLoopStreaming`). Borrowed: the caller
+    /// (ChildAgent, whose `spec.output_schema` lives in `spec_arena`) keeps it
+    /// alive for the run's duration. Null disables forced output (top-level
+    /// turns and free-form subagent runs).
+    output_schema: ?[]const u8 = null,
 };
 
 /// Spawn an agent thread for this runner. Assumes `submitInput` has
@@ -343,6 +350,7 @@ pub fn submit(
         if (deps.subagents != null) &self.task_ctx else null,
         &self.turn_in_progress,
         deps.session_id,
+        deps.output_schema,
     });
 }
 
@@ -454,6 +462,7 @@ fn threadMain(
     task_ctx: ?*const tools.TaskContext,
     turn_in_progress: *std.atomic.Value(bool),
     session_id: []const u8,
+    output_schema: ?[]const u8,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -505,6 +514,7 @@ fn threadMain(
         model_spec,
         session_id,
         &detail,
+        output_schema,
     ) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the

@@ -47,8 +47,10 @@ pub const ChildSpec = struct {
     /// Optional provider/model override string; null = inherit parent.
     /// Carried but unused in this milestone; wired in a later one.
     model: ?[]const u8 = null,
-    /// Optional JSON schema for forced structured output. Carried but
-    /// unused in this milestone; wired in a later one.
+    /// Optional JSON schema for forced structured output. When set, the child
+    /// run forces a single synthetic `emit` tool whose validated input becomes
+    /// the result (see `agent.runLoopStreaming`); null = free-form prose
+    /// summary (today's behavior). Threaded into the run via `submit`.
     output_schema: ?[]const u8 = null,
     /// Display name for the `subagent_link` tree node (observability).
     name: []const u8 = "subagent",
@@ -218,6 +220,11 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
         .subagents = ctx.subagents,
         .session_id = child_session_id,
         .child_registry = ctx.child_registry,
+        // When the spec declares a schema, the child run is forced to emit a
+        // single matching tool whose validated input is the result (the
+        // forced-output path in `agent.runLoopStreaming`). The schema string
+        // lives in `spec_arena`, which outlives the run.
+        .output_schema = self.spec.output_schema,
     });
 }
 

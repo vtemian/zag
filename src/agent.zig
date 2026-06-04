@@ -14,6 +14,7 @@ const prompt = @import("prompt.zig");
 const skills_mod = @import("skills.zig");
 const LuaEngine = @import("LuaEngine.zig");
 const Metrics = @import("Metrics.zig");
+const json_schema = @import("json_schema.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.agent);
@@ -98,9 +99,28 @@ pub fn runLoopStreaming(
     /// loop error. Tests that don't care about the friendly detail pass
     /// `null`; writers then silently drop the detail.
     error_detail_out: ?*llm.error_detail.ErrorDetail,
+    /// Forced structured-output schema for a delegated child run. When set,
+    /// the run advertises a single synthetic `emit` tool whose `input_schema`
+    /// is this JSON, forces `tool_choice` to it, and treats the resulting
+    /// `tool_use` as a TERMINAL turn: the validated input becomes the run's
+    /// result (an assistant text node) and the loop ends without executing a
+    /// tool, appending a tool_result, or iterating. Null (the default for
+    /// every non-structured run) leaves the loop's behavior unchanged.
+    output_schema: ?[]const u8,
 ) !void {
     const tool_defs = try registry.definitions(allocator);
     defer allocator.free(tool_defs);
+
+    // Forced structured-output mode advertises a single synthetic `emit` tool
+    // and forces the model to call it. The schema string is borrowed from the
+    // caller (the child's spec_arena) for the whole run.
+    const emit_tool_defs: [1]types.ToolDefinition = .{.{
+        .name = "emit",
+        .description = "Emit the final structured result.",
+        .input_schema_json = output_schema orelse "{}",
+    }};
+    const forced_tool_choice: llm.ToolChoice =
+        if (output_schema != null) .{ .tool = "emit" } else .auto;
 
     // Built-in prompt layers (identity, skills catalog, tool list,
     // guidelines) live on a single registry shared across every turn
@@ -399,17 +419,24 @@ pub fn runLoopStreaming(
         // semantic contract is "what the LLM can see," not "what the
         // process can run." A model that requests a hidden tool falls
         // through to the registry's existing unknown-tool error path.
-        const turn_tool_defs, const filtered_owned = try gateToolDefs(
-            lua_engine,
-            layer_ctx.model.model_id,
-            tool_defs,
-            allocator,
-            queue,
-            cancel,
-        );
+        // Forced structured-output runs advertise ONLY the synthetic `emit`
+        // tool and skip the tool gate entirely: the forced choice makes every
+        // other tool unreachable, so there is nothing to gate. Free-form runs
+        // take the normal gate path.
+        const turn_tool_defs, const filtered_owned = if (output_schema != null)
+            .{ emit_tool_defs[0..], null }
+        else
+            try gateToolDefs(
+                lua_engine,
+                layer_ctx.model.model_id,
+                tool_defs,
+                allocator,
+                queue,
+                cancel,
+            );
         defer if (filtered_owned) |d| allocator.free(d);
 
-        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out);
+        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, forced_tool_choice, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out);
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
@@ -432,6 +459,53 @@ pub fn runLoopStreaming(
 
         const tool_calls = try collectToolCalls(response.content, allocator);
         defer allocator.free(tool_calls);
+
+        // Forced structured-output mode: the forced `emit` tool_use is a
+        // TERMINAL turn. Harvest its input, validate it against the schema,
+        // and finish the run with the validated JSON as an assistant text node
+        // (pushed through the SAME `.text_delta` queue path normal assistant
+        // text uses, so `childFinalSummaryForTask` returns it naturally). The
+        // tool is NEVER executed, no tool_result is appended, and no further
+        // turn runs — so the forced tool_use is never projected as an unpaired
+        // tool_call node (the recurring wire-pairing hazard).
+        if (output_schema) |schema| {
+            const emit_call = findEmitCall(tool_calls);
+            if (emit_call) |call| {
+                json_schema.validate(allocator, schema, call.input_raw) catch |err| {
+                    if (error_detail_out) |d| d.set(
+                        "subagent structured output failed schema validation: {s}",
+                        .{@errorName(err)},
+                    ) catch {};
+                    turn_in_progress.store(false, .release);
+                    return error.StructuredOutputInvalid;
+                };
+                // Emit the validated JSON as assistant text via the streaming
+                // queue path. The child's sink turns this into an
+                // `assistant_text` node, which is what the summary reads.
+                const duped = agent_events.OwnedPayload.dupe(allocator, call.input_raw) catch {
+                    turn_in_progress.store(false, .release);
+                    return error.OutOfMemory;
+                };
+                queue.pushWithBackpressure(.{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
+
+                var turn_end_forced: Hooks.HookPayload = .{ .turn_end = .{
+                    .turn_num = turn_num,
+                    .stop_reason = @tagName(response.stop_reason),
+                    .input_tokens = response.input_tokens,
+                    .output_tokens = response.output_tokens,
+                } };
+                fireLifecycleHook(lua_engine, &turn_end_forced, queue, cancel);
+                turn_in_progress.store(false, .release);
+                return;
+            }
+            // Forced choice but no tool_use: the model refused the contract.
+            if (error_detail_out) |d| d.set(
+                "subagent produced no structured output despite a forced tool choice",
+                .{},
+            ) catch {};
+            turn_in_progress.store(false, .release);
+            return error.StructuredOutputMissing;
+        }
 
         if (tool_calls.len > 0) {
             const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine, tools.current_caller_pane_id);
@@ -792,6 +866,9 @@ pub fn callLlm(
     system_volatile: []const u8,
     messages: []const types.Message,
     tool_defs: []const types.ToolDefinition,
+    /// Forced/allowed tool choice for this request. `.auto` (the default for
+    /// every free-form turn) emits no wire key; `.tool` forces the named tool.
+    tool_choice: llm.ToolChoice,
     allocator: Allocator,
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
@@ -828,6 +905,7 @@ pub fn callLlm(
         .system_volatile = system_volatile,
         .messages = messages,
         .tool_definitions = tool_defs,
+        .tool_choice = tool_choice,
         .allocator = allocator,
         .callback = callback,
         .cancel = cancel,
@@ -874,6 +952,7 @@ pub fn callLlm(
                 .system_volatile = system_volatile,
                 .messages = messages,
                 .tool_definitions = tool_defs,
+                .tool_choice = tool_choice,
                 .allocator = allocator,
                 .thinking_effort = thinking_effort,
                 .error_detail_out = error_detail_out,
@@ -900,6 +979,17 @@ pub fn callLlm(
             break :outer fallback;
         };
     };
+}
+
+/// Find the forced structured-output `emit` tool_use among collected calls.
+/// Returns the first match or null. Forced mode advertises only `emit`, but a
+/// provider could still echo extra prose blocks; we key on the tool name so a
+/// stray block never masks the real result.
+fn findEmitCall(calls: []const types.ContentBlock.ToolUse) ?types.ContentBlock.ToolUse {
+    for (calls) |c| {
+        if (std.mem.eql(u8, c.name, "emit")) return c;
+    }
+    return null;
 }
 
 /// Extract tool_use blocks from a response into an owned slice.
