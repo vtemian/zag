@@ -138,7 +138,7 @@ pub const definition = types.ToolDefinition{
     .name = "workflow",
     .description = "Orchestrate subagents by writing a Lua script. The script runs as a coroutine; " ++
         "call zag.task{ prompt=, system=, tools=, model=, schema=, name= } to spawn a subagent " ++
-        "(returns {summary, is_error}), and zag.workflow.parallel(fns) / " ++
+        "(returns {summary, is_error}; with schema= also output, the decoded result table), and zag.workflow.parallel(fns) / " ++
         "zag.workflow.pipeline(items, stage1, ...) to fan out (bounded by zag.workflow.max_fanout()). " ++
         "Return a string; it becomes the tool result.",
     .prompt_snippet = "Orchestrate subagents via a Lua script (zag.task spawn + zag.workflow.parallel/pipeline)",
