@@ -28,10 +28,8 @@ pub const entries = [_]Entry{
     .{ .name = "zag.providers.ollama", .code = @embedFile("zag/providers/ollama.lua") },
     .{ .name = "zag.builtin.model_picker", .code = @embedFile("zag/builtin/model_picker.lua") },
     .{ .name = "zag.builtin.sessions", .code = @embedFile("zag/builtin/sessions.lua") },
-    .{ .name = "zag.builtin.subagents", .code = @embedFile("zag/builtin/subagents.lua") },
     .{ .name = "zag.diagrams", .code = @embedFile("zag/diagrams.lua") },
     .{ .name = "zag.tools.render_diagram", .code = @embedFile("zag/tools/render_diagram.lua") },
-    .{ .name = "zag.subagents.filesystem", .code = @embedFile("zag/subagents/filesystem.lua") },
     .{ .name = "zag.layers.env", .code = @embedFile("zag/layers/env.lua") },
     .{ .name = "zag.layers.agents_md", .code = @embedFile("zag/layers/agents_md.lua") },
     .{ .name = "zag.jit.agents_md", .code = @embedFile("zag/jit/agents_md.lua") },
@@ -58,7 +56,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 28), entries.len);
+    try std.testing.expectEqual(@as(usize, 26), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {

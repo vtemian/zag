@@ -406,9 +406,6 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     lua_engine.registerTools(&registry) catch |err| {
         log.warn("failed to register lua tools: {}", .{err});
     };
-    tools.registerTaskTool(&registry, lua_engine.subagentRegistry()) catch |err| {
-        log.warn("failed to register task tool: {}", .{err});
-    };
 
     var session_mgr = if (!mode.no_session)
         Session.SessionManager.init(gpa) catch |err| blk: {
@@ -521,7 +518,6 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         .provider = deps.provider.*,
         .model_spec = spec,
         .registry = deps.registry,
-        .subagents = if (deps.lua_engine) |eng| eng.subagentRegistry() else null,
         .session_id = deps.session_id,
     });
 
@@ -558,6 +554,11 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         // even when no agent events arrive.
         if (deps.runner.lua_engine) |eng| {
             eng.cancelTriggeredFires();
+            // Symmetric with the interactive driver. Headless refuses workflows
+            // (no child drainer), so this is a no-op here, but keeping the two
+            // tick pumps identical avoids a "works interactively only" surprise
+            // if headless ever gains a child registry.
+            eng.cancelInFlightWorkflowChildren();
             eng.pumpCompletions();
         }
 
@@ -725,6 +726,12 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                 .tool_gate_request,
                 .loop_detect_request,
                 .compact_request,
+                // The workflow tool refuses to dispatch headless (its
+                // ctx.child_registry == null guard fires before any push), so
+                // this arm is unreachable in practice; route it through the
+                // shared servicer for exhaustiveness and a clean error if ever
+                // hit (no child drainer means the request fails fast).
+                .workflow_request,
                 => {
                     _ = AgentRunner.serviceRoundTripEvent(ev, deps.runner.lua_engine, deps.runner.window_manager);
                 },

@@ -1,21 +1,19 @@
-//! Task tool: delegate a sub-problem to a registered subagent.
+//! Task tool: spawn one inline subagent and return its result.
 //!
-//! The tool is only advertised when at least one subagent has been
-//! registered via `zag.subagent.register{...}`; `tools.registerTaskTool`
-//! gates registration on `SubagentRegistry.entries.items.len`.
+//! The tool is always advertised. Its input is an inline spec, not a lookup
+//! against a named catalog: the caller hands it a `prompt` and, optionally, a
+//! `system` persona, a `tools` allowlist, a `model` (carried but inert in v1),
+//! a `schema` for forced structured output, and a display `name`. `execute`
+//! builds a `ChildAgent.ChildSpec` directly from those args and drives a
+//! blocking, park-mode `ChildAgent` to completion.
 //!
 //! v1 simplifications:
 //!
-//!   * TODO(#4): per-subagent provider override; child currently inherits
-//!     the parent's provider regardless of `subagent.model`. Tracked at
-//!     https://github.com/vtemian/zag/issues/4.
+//!   * `model` is carried on the spec but not yet wired to provider
+//!     resolution: the child inherits the parent's provider regardless.
 //!   * The child shares the parent's session handle. `task_start` and
 //!     `task_end` audit rows interleave with the parent's JSONL so a
 //!     single-file replay sees the delegation in order.
-//!   * TODO(#5): task_end token+turn metrics; metrics captured in
-//!     `task_end` are limited to the final summary text until the
-//!     child's token usage is threaded back through the runner.
-//!     Tracked at https://github.com/vtemian/zag/issues/5.
 
 const std = @import("std");
 const sync = @import("../sync.zig");
@@ -24,51 +22,26 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.task_tool);
 const types = @import("../types.zig");
 const tools = @import("../tools.zig");
-const subagents_types = @import("../subagents.zig");
 const Conversation = @import("../Conversation.zig");
 const Session = @import("../Session.zig");
-const AgentRunner = @import("../AgentRunner.zig");
-const BufferSink = @import("../sinks/BufferSink.zig").BufferSink;
-const llm = @import("../llm.zig");
+const ChildAgent = @import("../ChildAgent.zig");
 
-/// Maximum nested `task` invocations on a single runner. Picked to
-/// match the plan's recursion cap; keeps runaway delegation loops from
-/// blowing the stack or eating the token budget.
-const max_task_depth: u8 = 8;
+/// The hard backstop on delegation depth. Single owner lives on `ChildAgent`;
+/// both spawn surfaces (this tool and the `zag.task` Lua binding) read it.
+const max_task_depth = ChildAgent.max_task_depth;
 
-/// Process-wide latch: set to true the first time `task.execute` runs
-/// against a registry whose subagents declared a `model` frontmatter
-/// field. The v1 task tool ignores `model` and always reuses the
-/// parent's provider, so we surface the gap once instead of silently
-/// dropping it. Flipped via `swap(true, .acquire_release)` so a concurrent
-/// caller still sees exactly one warn.
-var warned_about_ignored_model = std.atomic.Value(bool).init(false);
-
-const SubagentRegistry = subagents_types.SubagentRegistry;
-
-fn warnAboutIgnoredModelOnce(registry: *const SubagentRegistry) void {
-    if (warned_about_ignored_model.swap(true, .acq_rel)) return;
-    var ignored: usize = 0;
-    var first_name: ?[]const u8 = null;
-    for (registry.entries.items) |sa| {
-        if (sa.model != null) {
-            if (first_name == null) first_name = sa.name;
-            ignored += 1;
-        }
-    }
-    if (ignored == 0) return;
-    log.warn(
-        "{d} registered subagent(s) declare a `model` frontmatter field, " ++
-            "but the v1 task tool ignores it and uses the parent's provider. " ++
-            "First example: '{s}'. Track follow-up at " ++
-            "https://github.com/vtemian/zag/issues/4 (per-subagent providers).",
-        .{ ignored, first_name orelse "" },
-    );
-}
-
+/// Inline spec parsed from the tool call. Mirrors `ChildAgent.ChildSpec` minus
+/// the defaults the parser fills in. `tools`/`model`/`schema`/`system`/`name`
+/// are optional; only `prompt` is required.
 const TaskInput = struct {
-    agent: []const u8,
     prompt: []const u8,
+    system: ?[]const u8 = null,
+    tools: ?[]const []const u8 = null,
+    /// Carried onto the spec but inert in v1 (the child inherits the parent's
+    /// provider; see module doc).
+    model: ?[]const u8 = null,
+    schema: ?[]const u8 = null,
+    name: ?[]const u8 = null,
 };
 
 /// Execute the `task` tool.
@@ -94,33 +67,26 @@ pub fn execute(
 
     const ctx = tools.task_context orelse {
         return .{
-            .content = "error: task tool invoked without a bound TaskContext (no subagents registered or test harness)",
+            .content = "error: task tool invoked without a bound TaskContext (test harness)",
             .is_error = true,
             .owned = false,
         };
     };
 
-    warnAboutIgnoredModelOnce(ctx.subagents);
-
-    const sa = ctx.subagents.lookup(parsed.value.agent) orelse {
-        const msg = formatUnknownAgent(allocator, parsed.value.agent, ctx.subagents) catch return types.oomResult();
-        return .{ .content = msg, .is_error = true };
-    };
-
     if (ctx.task_depth >= max_task_depth) {
         const msg = std.fmt.allocPrint(
             allocator,
-            "error: task recursion limit reached ({d}); refusing to spawn agent '{s}'",
-            .{ max_task_depth, parsed.value.agent },
+            "error: task recursion limit reached ({d}); refusing to spawn subagent",
+            .{max_task_depth},
         ) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     }
 
-    return runChild(allocator, cancel, ctx, sa, parsed.value.prompt) catch |err| {
+    return runChild(allocator, cancel, ctx, parsed.value) catch |err| {
         const msg = std.fmt.allocPrint(
             allocator,
-            "error: subagent '{s}' failed: {s}",
-            .{ parsed.value.agent, @errorName(err) },
+            "error: subagent failed: {s}",
+            .{@errorName(err)},
         ) catch return types.oomResult();
         return .{ .content = msg, .is_error = true };
     };
@@ -134,175 +100,103 @@ fn runChild(
     allocator: Allocator,
     parent_cancel: ?*std.atomic.Value(bool),
     ctx: *const tools.TaskContext,
-    sa: *const subagents_types.Subagent,
-    prompt: []const u8,
+    input: TaskInput,
 ) !types.ToolResult {
-    // Build a fresh one-tool-registry view for the child. `runLoopStreaming`
-    // takes a `*const Registry`, not a Subset; the cleanest shim is a new
-    // Registry that mirrors only the subset-visible tools from the parent.
-    var child_registry = try buildChildRegistry(allocator, ctx.registry, sa.tools);
-    defer child_registry.deinit();
+    // Heap-allocate the ChildAgent so its address is stable: the
+    // ChildRunnerRegistry keys entries on `&child.child_runner` by pointer
+    // identity, so the struct must not move after `start`.
+    const child = try allocator.create(ChildAgent);
+    defer allocator.destroy(child);
 
-    // Persist `task_start` with JSON-encoded inputs so replay tooling can
-    // reconstruct what was delegated. Failure is logged but non-fatal; the
-    // subagent still runs.
-    var task_start_id: ?@import("../ulid.zig").Ulid = null;
-    if (ctx.session_handle) |sh| {
-        const start_payload = formatStartPayload(allocator, sa.name, prompt) catch |err| blk: {
-            log.warn("task_start payload format failed: {}", .{err});
-            break :blk null;
-        };
-        if (start_payload) |payload| {
-            defer allocator.free(payload);
-            task_start_id = sh.appendEntry(.{
-                .entry_type = .task_start,
-                .content = payload,
-                .timestamp = clock.milliTimestamp(),
-            }) catch |err| outer: {
-                log.warn("task_start persist failed: {}", .{err});
-                break :outer null;
-            };
-        }
-    }
-
-    // Spawn a child Conversation under the parent. The child is owned
-    // by the parent's `subagents` list; we do NOT destroy it here. The
-    // parent's `deinit` walks subagents and frees the slot. The
-    // parent's tree gains a `subagent_link` node referencing the new
-    // index.
-    const parent_conv = ctx.parent_conv;
-    const child_conv = try parent_conv.spawnSubagent(sa.name, prompt);
-    // Pre-seed the child's persistence chain off the task_start ULID so
-    // the child's first persisted event chains into the delegation scope.
-    child_conv.last_persisted_id = task_start_id;
-
-    // Compose the child's first user prompt: subagent system prompt
-    // prefix, blank line, the caller's prompt.
-    const initial_text = try std.fmt.allocPrint(
-        allocator,
-        "{s}\n\n{s}",
-        .{ sa.prompt, prompt },
-    );
-    defer allocator.free(initial_text);
-
-    // Wire a BufferSink to the child Conversation. Events from the
-    // child runner flow through here into the child's tree (assistant
-    // text, tool_call/tool_result, thinking, errors). The sink owns
-    // its node-correlation state (call_id map, current assistant node)
-    // and is reset on `.run_end`. Heap-allocated would also work; a
-    // stack instance is fine because runChild is the sole owner and
-    // the runner's thread is joined before this function returns.
-    var child_sink = BufferSink.init(allocator, child_conv);
-    defer child_sink.deinit();
-
-    // Construct the child runner. Its wire_arena, event_queue, and
-    // sink are all child-scoped; the agent thread sees a fully
-    // isolated runtime keyed off the child Conversation.
-    var child_runner = AgentRunner.init(allocator, child_sink.sink(), child_conv);
-    defer child_runner.deinit();
-    child_runner.wake_fd = ctx.wake_fd;
-    // The child gets the real Lua engine ONLY when a child_registry is present,
-    // because the engine is safe to wire iff the MAIN thread drains the child's
-    // queue (dispatchHookRequests must run on the main thread, never this agent
-    // thread). With a registry, the orchestrator drains the child on the main
-    // thread; without one (orchestrator-less harness / headless), we fall back
-    // to draining on this thread, which is only safe with a null engine. Tying
-    // the engine to the registry makes the unsafe "engine without a main-thread
-    // drainer" combination impossible by construction rather than by comment.
-    const child_engine = if (ctx.child_registry != null) ctx.lua_engine else null;
-    child_runner.lua_engine = child_engine;
-    // No window_manager wired: subagents do not mutate the window
-    // tree. Layout requests get serviced as errors via the round-trip
-    // dispatcher's no-WM branch, which matches the legacy collector
-    // behaviour ("subagent_unsupported" surfaced as is_error to the
-    // child agent thread).
-    child_runner.task_depth = ctx.task_depth + 1;
-
-    // Submit the user turn: persists a tagged user_message JSONL entry
-    // (subagent_id stamped via the parent backlink) and pushes
-    // `run_start` to the child sink, which appends a user_message
-    // node to the child's tree. The next `submit` projects the tree
-    // into the wire-format messages the agent thread reads.
-    try child_runner.submitInput(initial_text);
-
-    // Subagents inherit the parent's `provider_name` and `model_id` so
-    // their `runLoopStreaming` drives the same per-model prompt pack as
-    // the parent. The compact threshold is intentionally suppressed
-    // here: the strategy socket is a parent-loop concern, and a child
-    // run that hits its model's ceiling surfaces as a normal `MaxTokens`
-    // stop. Building a fresh spec with `context_window = 0` keeps that
-    // contract while keeping the prompt-pack identity intact.
-    const child_model_spec: llm.ModelSpec = .{
-        .provider_name = ctx.model_spec.provider_name,
-        .model_id = ctx.model_spec.model_id,
-        .context_window = 0,
+    // The parsed JSON's strings are borrowed from `parsed` (freed when
+    // `execute` returns), but the child run outlives this call when it round-
+    // trips through the main-thread drainer. Dupe the spec into the child's
+    // own `spec_arena` so every spec string outlives the run — the same
+    // ownership discipline the `zag.task` binding uses. Initialise the arena
+    // before any dupe and release it on the failed-start path.
+    child.spec_arena = std.heap.ArenaAllocator.init(allocator);
+    const spec_arena = child.spec_arena.allocator();
+    const spec = buildSpec(spec_arena, input) catch {
+        child.spec_arena.deinit();
+        return error.OutOfMemory;
     };
 
-    // Inherit the parent's session_id so subagent telemetry lines stay
-    // grouped under the same session in the timeline log.
-    const child_session_id: []const u8 = if (ctx.session_handle) |sh|
-        sh.id[0..sh.id_len]
-    else
-        "";
+    child.* = .{
+        .allocator = allocator,
+        .child_registry = undefined,
+        .child_sink = undefined,
+        .child_runner = undefined,
+        .child_conv = undefined,
+        .task_start_id = null,
+        .session_handle = ctx.session_handle,
+        .spec = spec,
+        // Keep the arena we already initialised + duped into.
+        .spec_arena = child.spec_arena,
+    };
 
-    try child_runner.submit(.{
-        .allocator = ctx.allocator,
-        .wake_write_fd = ctx.wake_fd orelse 0,
-        .lua_engine = child_engine,
-        .provider = ctx.provider,
-        .model_spec = child_model_spec,
-        .registry = &child_registry,
-        .skills = null,
-        .subagents = ctx.subagents,
-        .session_id = child_session_id,
-        .child_registry = ctx.child_registry,
-    });
+    // Build + spawn the child (registry, task_start, spawnSubagent, sink,
+    // runner init/submit). `start` is self-unwinding for everything it builds;
+    // the caller-owned `spec_arena` is the one exception, released here on the
+    // failed-start path. On error we MUST NOT call `deinit` — the outer
+    // `defer` only destroys the (now-clean) heap slot.
+    child.start(ctx) catch |err| {
+        child.spec_arena.deinit();
+        return err;
+    };
+    // `start` succeeded: from here `deinit` is the caller's responsibility.
+    // Run it unconditionally on every exit (success or any later error). The
+    // agent thread is always joined before deinit runs (the drain/park joins
+    // it), and the `retired` latch makes deinit idempotent, so this single
+    // defer guarantees the runner's wire arena + event queue, the sink, the
+    // registry, and the spec arena are released exactly once on every path.
+    defer child.deinit();
 
     // Hand the child off to the main thread for draining. The main thread is
     // the only thread allowed to call into the Lua VM, so it (not this agent
     // thread) services the child's hook / prompt / gate / compact round-trips
-    // and pumps content events through `child_sink` into the child's tree. We
-    // park here until the main thread reports the child finished.
+    // and pumps content events through the child sink into the child's tree.
+    // We park here until the main thread reports the child finished.
     //
     // When `ctx.child_registry` is null (test harness / headless with no
-    // orchestrator), fall back to draining on this thread. The child engine was
-    // forced to null above in that case, so the fallback drain is Zig-only and
+    // orchestrator), fall back to draining on this thread. `start` forced the
+    // child engine to null in that case, so the fallback drain is Zig-only and
     // never touches the VM off the main thread.
     if (ctx.child_registry) |registry| {
         var child_done: sync.ResetEvent = .{};
-        try registry.register(.{ .runner = &child_runner, .done = &child_done });
+        try registry.register(.{ .runner = &child.child_runner, .on_done = .{ .park = &child_done } });
         // No errdefer-remove needed: registration cannot fail after this
         // point, and the main thread always removes the entry on the child's
         // `.done` (threadMain guarantees a `.done` even on error).
         while (true) {
             if (parent_cancel) |pc| {
-                if (pc.load(.acquire)) child_runner.cancelAgent();
+                if (pc.load(.acquire)) child.child_runner.cancelAgent();
             }
             if (child_done.timedWait(50 * std.time.ns_per_ms)) |_| break else |_| {}
         }
     } else {
         // Orchestrator-less fallback: drain on this thread. The child engine is
-        // null here (forced above when child_registry is null), so the round-
-        // trip Lua arms no-op and nothing touches the VM off the main thread.
+        // null here (forced in `start` when child_registry is null), so the
+        // round-trip Lua arms no-op and nothing touches the VM off the main
+        // thread.
         while (true) {
             if (parent_cancel) |pc| {
-                if (pc.load(.acquire)) child_runner.cancelAgent();
+                if (pc.load(.acquire)) child.child_runner.cancelAgent();
             }
-            const r = child_runner.drainEvents();
+            const r = child.child_runner.drainEvents();
             if (r.finished) break;
             if (!r.any_drained) clock.sleep(5 * std.time.ns_per_ms);
         }
     }
 
-    // Derive the final summary from the child's tree. The same helper
-    // backs `toWireMessages` projection of `subagent_link`, so the
-    // tool_result the parent's LLM sees and the JSONL `task_end`
-    // content stay in lockstep.
+    // Derive the final summary from the child's tree. The same helper backs
+    // `toWireMessages` projection of `subagent_link`, so the tool_result the
+    // parent's LLM sees and the JSONL `task_end` content stay in lockstep.
+    // When the spec carried a schema, this is the validated structured output
+    // surfaced as the child's final assistant text.
     var summary_arena = std.heap.ArenaAllocator.init(allocator);
     defer summary_arena.deinit();
-    const summary = try Conversation.childFinalSummaryForTask(summary_arena.allocator(), child_conv);
-    const is_err = Conversation.childErroredForTask(child_conv);
-    const owned = try allocator.dupe(u8, summary);
+    const res = try child.result(summary_arena.allocator());
+    const owned = try allocator.dupe(u8, res.summary);
     errdefer allocator.free(owned);
 
     if (ctx.session_handle) |sh| {
@@ -310,96 +204,59 @@ fn runChild(
             .entry_type = .task_end,
             .content = owned,
             .timestamp = clock.milliTimestamp(),
-            .parent_id = task_start_id,
+            .parent_id = child.task_start_id,
         }) catch |err| log.warn("task_end persist failed: {}", .{err});
     }
 
-    return .{ .content = owned, .is_error = is_err, .owned = true };
+    // Teardown (child.deinit then allocator.destroy) runs via the two defers
+    // above, deepest-first: runner, sink, registry, spec arena, then the heap
+    // slot.
+    return .{ .content = owned, .is_error = res.is_error, .owned = true };
 }
 
-/// Build a fresh Registry that exposes only the tools visible through
-/// `parent.subset(allowlist)`. `runLoopStreaming` needs a concrete
-/// `*const Registry` rather than a `Subset`, so we materialise one here
-/// and hand back the copy. The caller deinits it after the child
-/// finishes.
-fn buildChildRegistry(
-    allocator: Allocator,
-    parent: *const tools.Registry,
-    allowlist: ?[]const []const u8,
-) !tools.Registry {
-    var child = tools.Registry.init(allocator);
-    errdefer child.deinit();
-
-    if (allowlist) |list| {
-        for (list) |name| {
-            if (parent.get(name)) |t| try child.register(t);
-        }
-        return child;
+/// Dupe the inline `TaskInput` strings into `arena` and assemble a
+/// `ChildSpec`. The arena is the child's `spec_arena`, which outlives the run;
+/// the parsed JSON's borrowed bytes die when `execute` returns.
+fn buildSpec(arena: Allocator, input: TaskInput) !ChildAgent.ChildSpec {
+    var tools_list: ?[]const []const u8 = null;
+    if (input.tools) |list| {
+        const dup = try arena.alloc([]const u8, list.len);
+        for (list, 0..) |name, i| dup[i] = try arena.dupe(u8, name);
+        tools_list = dup;
     }
 
-    // Null allowlist inherits every parent tool verbatim.
-    var it = parent.tools.iterator();
-    while (it.next()) |entry| {
-        try child.register(entry.value_ptr.*);
-    }
-    return child;
+    return .{
+        .system_prompt = if (input.system) |s| try arena.dupe(u8, s) else "",
+        .prompt = try arena.dupe(u8, input.prompt),
+        .tools = tools_list,
+        .model = if (input.model) |m| try arena.dupe(u8, m) else null,
+        .output_schema = if (input.schema) |s| try arena.dupe(u8, s) else null,
+        .name = if (input.name) |n| try arena.dupe(u8, n) else "subagent",
+    };
 }
 
-/// Allocate the `task_start` JSON payload. The previous implementation
-/// formatted into a 2 KiB stack buffer and silently fell back to `"{}"`
-/// on overflow, which collapsed any non-trivial subagent prompt to an
-/// empty audit row. The caller owns the returned slice and must free
-/// it with `allocator`.
-fn formatStartPayload(allocator: Allocator, agent_name: []const u8, prompt: []const u8) ![]u8 {
-    var aw = std.Io.Writer.Allocating.init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll("{\"agent\":");
-    try types.writeJsonString(w, agent_name);
-    try w.writeAll(",\"prompt\":");
-    try types.writeJsonString(w, prompt);
-    try w.writeAll("}");
-    return aw.toOwnedSlice();
-}
-
-fn formatUnknownAgent(
-    allocator: Allocator,
-    name: []const u8,
-    subagents: *const @import("../subagents.zig").SubagentRegistry,
-) ![]u8 {
-    var aw = std.Io.Writer.Allocating.init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-    try w.print("error: unknown subagent '{s}'. Registered: ", .{name});
-    if (subagents.entries.items.len == 0) {
-        try w.writeAll("(none)");
-    } else {
-        for (subagents.entries.items, 0..) |entry, i| {
-            if (i > 0) try w.writeAll(", ");
-            try w.writeAll(entry.name);
-        }
-    }
-    return aw.toOwnedSlice();
-}
-
-/// JSON schema and metadata sent to the LLM. The `agent` enum is built
-/// by `SubagentRegistry.taskInputSchemaJson` and patched onto this
-/// definition by `tools.registerTaskTool` before any provider serializes
-/// the tool list. The fallback schema below is deliberately permissive
-/// (string + string) for the unusual case where a caller registers the
-/// raw `task_tool.tool` without going through `registerTaskTool`.
+/// JSON schema and metadata sent to the LLM. A fixed inline schema: the model
+/// spawns one subagent by describing it inline, not by naming a catalog entry.
 pub const definition = types.ToolDefinition{
     .name = "task",
-    .description = "Delegate a sub-problem to a named subagent. Returns the subagent's final summary as the tool result.",
-    .prompt_snippet = "Delegate to a registered subagent by name with a prompt",
+    .description = "Spawn one subagent to handle a self-contained sub-problem and return its result. " ++
+        "Describe the subagent inline: give it a `prompt` (the task), optionally a `system` persona, " ++
+        "a `tools` allowlist (a subset of your tools; omit to inherit all of them), and a `name` for the " ++
+        "transcript. The call blocks until the subagent finishes; it returns the subagent's final summary, " ++
+        "or, when you pass a JSON `schema`, the subagent's validated JSON output as the tool result.",
+    .prompt_snippet = "Spawn an inline subagent with a prompt (and optional system/tools/schema)",
     .input_schema_json =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "agent":  { "type": "string", "description": "Name of a registered subagent." },
-    \\    "prompt": { "type": "string", "description": "The task for the subagent." }
+    \\    "prompt": { "type": "string", "description": "The task for the subagent." },
+    \\    "system": { "type": "string", "description": "Optional system/persona prompt prepended to the task." },
+    \\    "tools":  { "type": "array", "items": { "type": "string" }, "description": "Optional allowlist of tool names the subagent may use; omit to inherit all of yours." },
+    \\    "model":  { "type": "string", "description": "Optional model override (carried but not yet honored; the subagent uses the parent's model)." },
+    \\    "schema": { "type": "string", "description": "Optional JSON schema string. When set, the subagent is forced to emit a single matching JSON object, returned as the validated tool result." },
+    \\    "name":   { "type": "string", "description": "Optional display name for the subagent in the transcript (default \"subagent\")." }
     \\  },
-    \\  "required": ["agent", "prompt"],
+    \\  "required": ["prompt"],
     \\  "additionalProperties": false
     \\}
     ,
@@ -417,90 +274,184 @@ test {
 }
 
 const testing = std.testing;
-const subagents_mod = subagents_types;
+const llm = @import("../llm.zig");
+const ChildRunnerRegistry = @import("../ChildRunnerRegistry.zig");
 
-test "task returns error for unknown agent" {
+/// Stub provider that streams a single assistant text delta then ends the
+/// turn. The streamed-accumulator fallback in the agent loop assembles the
+/// text from the delta into the child's tree, so the child's final summary is
+/// the delta text. Records the system prompt + tool list it was handed so a
+/// test can assert what the spec produced.
+const StubTextProvider = struct {
+    response_text: []const u8,
+    seen_tool_count: usize = 0,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "stub_text",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *StubTextProvider = @ptrCast(@alignCast(ptr));
+        self.seen_tool_count = req.tool_definitions.len;
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = self.response_text });
+        return .{
+            .content = &.{},
+            .stop_reason = .end_turn,
+            .input_tokens = 1,
+            .output_tokens = 1,
+        };
+    }
+
+    fn provider(self: *StubTextProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+const InlineHarness = struct {
+    parent_registry: tools.Registry,
+    parent_conv: Conversation,
+    ctx: tools.TaskContext,
+
+    fn init(allocator: Allocator, p: llm.Provider) !InlineHarness {
+        var parent_registry = tools.Registry.init(allocator);
+        errdefer parent_registry.deinit();
+        try parent_registry.register(@import("read.zig").tool);
+        try parent_registry.register(@import("write.zig").tool);
+
+        const parent_conv = try Conversation.init(allocator, 0, "test-parent");
+
+        return .{
+            .parent_registry = parent_registry,
+            .parent_conv = parent_conv,
+            .ctx = .{
+                .allocator = allocator,
+                .provider = p,
+                .provider_name = "stub_text",
+                .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+                .registry = undefined, // set after move; see bind()
+                .session_handle = null,
+                .lua_engine = null,
+                .task_depth = 0,
+                .wake_fd = null,
+                .parent_conv = undefined, // set after move; see bind()
+                // Null child_registry forces child_engine = null and the
+                // on-thread drain fallback, so execute() drains the child
+                // itself with no main-thread Lua dependency.
+                .child_registry = null,
+            },
+        };
+    }
+
+    /// Re-point the context's interior pointers at the moved-into-place fields
+    /// and install the threadlocal. Call after the harness lives at its final
+    /// address.
+    fn bind(self: *InlineHarness) void {
+        self.ctx.registry = &self.parent_registry;
+        self.ctx.parent_conv = &self.parent_conv;
+        tools.task_context = &self.ctx;
+    }
+
+    fn deinit(self: *InlineHarness) void {
+        tools.task_context = null;
+        self.parent_conv.deinit();
+        self.parent_registry.deinit();
+    }
+};
+
+test "task spawns an inline subagent with the default name and inherited tools" {
     const allocator = testing.allocator;
 
-    var subagent_registry: subagents_mod.SubagentRegistry = .{};
-    defer subagent_registry.deinit(allocator);
-    try subagent_registry.register(allocator, .{
-        .name = "reviewer",
-        .description = "Reviews diffs.",
-        .prompt = "You review.",
-    });
-
-    var parent_registry = tools.Registry.init(allocator);
-    defer parent_registry.deinit();
-
-    // Minimal context: provider and lua_engine can be zeroed; execute()
-    // short-circuits before touching them because the lookup fails.
-    const dummy_provider: @import("../llm.zig").Provider = undefined;
-    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
-    defer parent_conv.deinit();
-    const ctx: tools.TaskContext = .{
-        .allocator = allocator,
-        .subagents = &subagent_registry,
-        .provider = dummy_provider,
-        .provider_name = "test",
-        .model_spec = .{ .provider_name = "test", .model_id = "test" },
-        .registry = &parent_registry,
-        .session_handle = null,
-        .lua_engine = null,
-        .task_depth = 0,
-        .wake_fd = null,
-        .parent_conv = &parent_conv,
-    };
-    tools.task_context = &ctx;
-    defer tools.task_context = null;
+    var stub = StubTextProvider{ .response_text = "inline subagent summary" };
+    var harness = try InlineHarness.init(allocator, stub.provider());
+    defer harness.deinit();
+    harness.bind();
 
     const result = try execute(
-        "{\"agent\":\"ghost\",\"prompt\":\"hi\"}",
+        "{\"prompt\":\"do the thing\"}",
         allocator,
         null,
     );
     defer if (result.owned) allocator.free(result.content);
 
-    try testing.expect(result.is_error);
-    try testing.expect(std.mem.indexOf(u8, result.content, "ghost") != null);
-    try testing.expect(std.mem.indexOf(u8, result.content, "reviewer") != null);
+    try testing.expect(!result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.content, "inline subagent summary") != null);
+    // No allowlist: the child inherited both parent tools (read + write).
+    try testing.expectEqual(@as(usize, 2), stub.seen_tool_count);
+    // The default-named subagent lands on the parent tree.
+    try testing.expectEqual(@as(usize, 1), harness.parent_conv.subagents.items.len);
 }
 
-test "task hits recursion cap at max depth" {
+test "task restricts tools via the inline allowlist and applies the system prefix" {
     const allocator = testing.allocator;
 
-    var subagent_registry: subagents_mod.SubagentRegistry = .{};
-    defer subagent_registry.deinit(allocator);
-    try subagent_registry.register(allocator, .{
-        .name = "reviewer",
-        .description = "Reviews diffs.",
-        .prompt = "You review.",
-    });
-
-    var parent_registry = tools.Registry.init(allocator);
-    defer parent_registry.deinit();
-
-    const dummy_provider: @import("../llm.zig").Provider = undefined;
-    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
-    defer parent_conv.deinit();
-    const ctx: tools.TaskContext = .{
-        .allocator = allocator,
-        .subagents = &subagent_registry,
-        .provider = dummy_provider,
-        .provider_name = "test",
-        .model_spec = .{ .provider_name = "test", .model_id = "test" },
-        .registry = &parent_registry,
-        .session_handle = null,
-        .lua_engine = null,
-        .task_depth = max_task_depth,
-        .wake_fd = null,
-        .parent_conv = &parent_conv,
-    };
-    tools.task_context = &ctx;
-    defer tools.task_context = null;
+    var stub = StubTextProvider{ .response_text = "restricted summary" };
+    var harness = try InlineHarness.init(allocator, stub.provider());
+    defer harness.deinit();
+    harness.bind();
 
     const result = try execute(
-        "{\"agent\":\"reviewer\",\"prompt\":\"hi\"}",
+        "{\"prompt\":\"go\",\"system\":\"You are terse.\",\"tools\":[\"read\"],\"name\":\"scout\"}",
+        allocator,
+        null,
+    );
+    defer if (result.owned) allocator.free(result.content);
+
+    try testing.expect(!result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.content, "restricted summary") != null);
+    // Allowlist of one: only `read` was mirrored into the child registry.
+    try testing.expectEqual(@as(usize, 1), stub.seen_tool_count);
+}
+
+test "task returns the validated structured output when a schema is given" {
+    const allocator = testing.allocator;
+
+    // The stub emits a forced `emit` tool_use whose input matches the schema;
+    // the forced-output path harvests + validates it as the child's result.
+    var stub = StructuredStubProvider{ .emit_input = "{\"verdict\":\"approve\"}", .alloc = allocator };
+    defer stub.deinit();
+    var harness = try InlineHarness.init(allocator, stub.provider());
+    defer harness.deinit();
+    harness.bind();
+
+    const schema =
+        \\{"type":"object","properties":{"verdict":{"type":"string"}},"required":["verdict"],"additionalProperties":false}
+    ;
+    const input = try std.fmt.allocPrint(
+        allocator,
+        "{{\"prompt\":\"decide\",\"schema\":{f}}}",
+        .{std.json.fmt(schema, .{})},
+    );
+    defer allocator.free(input);
+
+    const result = try execute(input, allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+
+    try testing.expect(!result.is_error);
+    // The validated JSON object is surfaced as the tool result.
+    try testing.expect(std.mem.indexOf(u8, result.content, "\"verdict\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result.content, "approve") != null);
+}
+
+test "task hits the recursion cap at max depth" {
+    const allocator = testing.allocator;
+
+    var stub = StubTextProvider{ .response_text = "never runs" };
+    var harness = try InlineHarness.init(allocator, stub.provider());
+    defer harness.deinit();
+    harness.ctx.task_depth = max_task_depth;
+    harness.bind();
+
+    const result = try execute(
+        "{\"prompt\":\"hi\"}",
         allocator,
         null,
     );
@@ -510,44 +461,76 @@ test "task hits recursion cap at max depth" {
     try testing.expect(std.mem.indexOf(u8, result.content, "recursion") != null);
 }
 
-test "task_start payload survives prompts longer than 2KB" {
-    const allocator = testing.allocator;
-    var prompt_buf: [4096]u8 = undefined;
-    @memset(&prompt_buf, 'x');
-    const long_prompt = prompt_buf[0..];
-
-    const payload = try formatStartPayload(allocator, "reviewer", long_prompt);
-    defer allocator.free(payload);
-
-    try testing.expect(payload.len > 4000);
-    try testing.expect(std.mem.indexOf(u8, payload, "xxxxxxxxxxxxxxxxxxxxxxxx") != null);
-    try testing.expect(!std.mem.eql(u8, payload, "{}"));
-    try testing.expect(std.mem.indexOf(u8, payload, "\"agent\":\"reviewer\"") != null);
-}
-
-test "task_start payload escapes JSON special characters in prompt" {
+test "task without bound context returns tool error" {
     const allocator = testing.allocator;
 
-    const payload = try formatStartPayload(allocator, "reviewer", "say \"hi\"\nnew\\line");
-    defer allocator.free(payload);
+    // Ensure any leaked threadlocal from a previous test is cleared.
+    tools.task_context = null;
 
-    try testing.expect(std.mem.indexOf(u8, payload, "\\\"hi\\\"") != null);
-    try testing.expect(std.mem.indexOf(u8, payload, "\\n") != null);
-    try testing.expect(std.mem.indexOf(u8, payload, "\\\\line") != null);
+    const result = try execute(
+        "{\"prompt\":\"hi\"}",
+        allocator,
+        null,
+    );
+    defer if (result.owned) allocator.free(result.content);
+
+    try testing.expect(result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.content, "TaskContext") != null);
 }
 
-fn restoreCwdForTest(abs_path: []const u8) void {
-    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
-}
+/// Stub provider that returns a single forced `emit` tool_use carrying the
+/// configured input. Used to exercise the schema/structured-output path. The
+/// tool_use lives on `LlmResponse.content`, which is heap-owned and freed when
+/// the child runner releases the response, so it outlives the call.
+const StructuredStubProvider = struct {
+    emit_input: []const u8,
+    alloc: Allocator,
+    /// Heap-owned content slice handed back on the response. The agent loop
+    /// does not free `response.content`, so the stub owns it; freed in deinit.
+    content_buf: ?[]types.ContentBlock = null,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "structured_stub",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *StructuredStubProvider = @ptrCast(@alignCast(ptr));
+        _ = req;
+        const blocks = self.alloc.alloc(types.ContentBlock, 1) catch return error.OutOfMemory;
+        blocks[0] = .{ .tool_use = .{ .id = "emit_1", .name = "emit", .input_raw = self.emit_input } };
+        self.content_buf = blocks;
+        return .{
+            .content = blocks,
+            .stop_reason = .tool_use,
+            .input_tokens = 1,
+            .output_tokens = 1,
+        };
+    }
+
+    fn provider(self: *StructuredStubProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *StructuredStubProvider) void {
+        if (self.content_buf) |b| self.alloc.free(b);
+    }
+};
 
 test "child_history pre-seeded with task_start_id chains child events under the delegation" {
     // This is the small-piece sanity check that the design's parent_id
-    // chain works the way Step 2 of Task 15 promises: a fresh child
-    // Conversation whose `last_persisted_id` is set to the
-    // task_start ULID will auto-thread its first persisted event off
-    // task_start, and subsequent events off each other. The full
-    // happy-path through `runChild` (provider stub + agent thread) is
-    // covered by the manual smoke run from Task 14 / 15.
+    // chain works the way the persistence layer promises: a fresh child
+    // Conversation whose `last_persisted_id` is set to the task_start ULID
+    // will auto-thread its first persisted event off task_start, and
+    // subsequent events off each other.
     const allocator = testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -566,7 +549,7 @@ test "child_history pre-seeded with task_start_id chains child events under the 
     // Parent persists task_start directly (mirroring runChild).
     const task_start_id = try handle.appendEntry(.{
         .entry_type = .task_start,
-        .content = "{\"agent\":\"reviewer\",\"prompt\":\"go\"}",
+        .content = "{\"agent\":\"subagent\",\"prompt\":\"go\"}",
         .timestamp = 100,
     });
 
@@ -633,63 +616,6 @@ test "child_history pre-seeded with task_start_id chains child events under the 
     try testing.expectEqualSlices(u8, &loaded[1].id, &loaded[5].parent_id.?);
 }
 
-test "task without bound context returns tool error" {
-    const allocator = testing.allocator;
-
-    // Ensure any leaked threadlocal from a previous test is cleared.
-    tools.task_context = null;
-
-    const result = try execute(
-        "{\"agent\":\"any\",\"prompt\":\"hi\"}",
-        allocator,
-        null,
-    );
-    defer if (result.owned) allocator.free(result.content);
-
-    try testing.expect(result.is_error);
-    try testing.expect(std.mem.indexOf(u8, result.content, "TaskContext") != null);
-}
-
-test "warnAboutIgnoredModelOnce skips when no subagent has model" {
-    const allocator = testing.allocator;
-
-    // Reset the latch so this test is order-independent.
-    warned_about_ignored_model.store(false, .release);
-
-    var registry: subagents_mod.SubagentRegistry = .{};
-    defer registry.deinit(allocator);
-    try registry.register(allocator, .{
-        .name = "plain",
-        .description = "no model declared",
-        .prompt = "p",
-    });
-
-    warnAboutIgnoredModelOnce(&registry);
-    // The latch still flips (we ran the scan). What matters is no warn
-    // fired; we cannot intercept std.log here, so the contract is a
-    // smoke check that the call returns without crashing on an empty
-    // ignored count.
-    try testing.expect(warned_about_ignored_model.load(.acquire));
-}
-
-test "warnAboutIgnoredModelOnce fires at most once" {
-    const allocator = testing.allocator;
-
-    warned_about_ignored_model.store(false, .release);
-
-    var registry: subagents_mod.SubagentRegistry = .{};
-    defer registry.deinit(allocator);
-    try registry.register(allocator, .{
-        .name = "with-model",
-        .description = "declares a model",
-        .prompt = "p",
-        .model = "anthropic/claude-haiku-4-5",
-    });
-
-    warnAboutIgnoredModelOnce(&registry);
-    try testing.expect(warned_about_ignored_model.load(.acquire));
-
-    // Second call must short-circuit: the latch is already set.
-    warnAboutIgnoredModelOnce(&registry);
-    try testing.expect(warned_about_ignored_model.load(.acquire));
+fn restoreCwdForTest(abs_path: []const u8) void {
+    std.process.setCurrentPath(std.testing.io, abs_path) catch {};
 }

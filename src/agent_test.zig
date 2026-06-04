@@ -96,7 +96,7 @@ test "callLlm threads telemetry handle through StreamRequest into provider" {
     });
     defer handle.deinit();
 
-    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, handle, null, null);
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, handle, null, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);
@@ -119,7 +119,7 @@ test "callLlm leaves StreamRequest.telemetry null when caller passes null" {
     defer capture.deinit();
     const p = capture.provider();
 
-    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     defer response.deinit(allocator);
 
     try std.testing.expectEqual(@as(u32, 1), capture.call_count);
@@ -196,7 +196,7 @@ test "callLlm dupes thinking_effort so providers get an owned copy, not the LuaE
     defer capture.deinit();
     const p = capture.provider();
 
-    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, &engine, null);
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, &engine, null);
     defer response.deinit(allocator);
 
     try std.testing.expect(capture.captured_present);
@@ -251,6 +251,7 @@ test "runLoopStreaming constructs Telemetry per turn with session_id and provide
         &turn_in_progress,
         spec,
         "sess-runloop",
+        null,
         null,
     );
 
@@ -2999,7 +3000,7 @@ test "RESIL-1: a fatal streaming error skips the non-streaming fallback" {
     var stub = FailingStreamProvider{ .streaming_err = error.LoginExpired };
     const p = stub.provider();
 
-    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     try std.testing.expectError(error.LoginExpired, result);
     // Fatal: the fallback non-streaming call must NOT have fired.
     try std.testing.expectEqual(@as(u32, 0), stub.call_count);
@@ -3017,7 +3018,7 @@ test "RESIL-1: a retryable streaming error fires the non-streaming fallback" {
     var stub = FailingStreamProvider{ .streaming_err = error.SseLineTooLong };
     const p = stub.provider();
 
-    const response = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const response = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     defer response.deinit(allocator);
     // Retryable: the fallback ran exactly once and produced the response.
     try std.testing.expectEqual(@as(u32, 1), stub.call_count);
@@ -3040,7 +3041,7 @@ test "RESIL-6: fatal streaming error after partial text emits reset_assistant_te
     var stub = FailingStreamProvider{ .streaming_err = error.NotLoggedIn, .emit_text_delta = true };
     const p = stub.provider();
 
-    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     try std.testing.expectError(error.NotLoggedIn, result);
     try std.testing.expectEqual(@as(u32, 0), stub.call_count);
 
@@ -3095,7 +3096,7 @@ test "callLlm retries a pre-first-token ReadTimeout and recovers on a fresh atte
     var cancel = agent_events.CancelFlag.init(false);
     var stub = FlakyStreamProvider{ .fail_attempts = 1 };
     const p = stub.provider();
-    const resp = try agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const resp = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     defer resp.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 2), stub.attempt);
     try std.testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
@@ -3145,7 +3146,7 @@ test "callLlm does not retry a ReadTimeout once content was emitted" {
     var cancel = agent_events.CancelFlag.init(false);
     var stub = EmitThenStallProvider{};
     const p = stub.provider();
-    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     try std.testing.expectError(error.ReadTimeout, result);
     try std.testing.expectEqual(@as(u32, 1), stub.attempt);
 }
@@ -3160,7 +3161,7 @@ test "callLlm gives up after the pre-first-token retry budget is exhausted" {
     var cancel = agent_events.CancelFlag.init(false);
     var stub = FlakyStreamProvider{ .fail_attempts = 99 };
     const p = stub.provider();
-    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     try std.testing.expectError(error.ReadTimeout, result);
     try std.testing.expectEqual(@as(u32, 1 + agent.max_prestream_retries), stub.attempt);
 }
@@ -3175,7 +3176,268 @@ test "callLlm does not retry a ReadTimeout when the turn was cancelled" {
     var cancel = agent_events.CancelFlag.init(true);
     var stub = FlakyStreamProvider{ .fail_attempts = 99 };
     const p = stub.provider();
-    const result = agent.callLlm(p, "", "", &.{}, &.{}, allocator, &queue, &cancel, null, null, null);
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     try std.testing.expectError(error.ReadTimeout, result);
     try std.testing.expectEqual(@as(u32, 1), stub.attempt);
+}
+
+// ============================================================================
+// Structured output via forced terminal tool_use (Milestone G)
+// ============================================================================
+
+/// Stub provider for the forced-output path. Captures the request's
+/// `tool_choice` and advertised tool definitions, then returns a single `emit`
+/// tool_use whose raw JSON input is `emit_input`. The tool_use lives on the
+/// `LlmResponse.content`, which is where `collectToolCalls` reads, so the agent
+/// loop sees the forced call without the stub pushing a sink `.tool_use` event
+/// (mirroring the terminal forced turn: the tool_use is never projected as a
+/// tool_call node). When `emit_input` is null the stub returns prose only,
+/// exercising the defensive "model emitted no structured output" path.
+const ForcedEmitProvider = struct {
+    emit_input: ?[]const u8,
+    captured_tool_choice: llm.ToolChoice = .auto,
+    captured_tool_names: std.ArrayList([]u8) = .empty,
+    snapshot_alloc: std.mem.Allocator,
+    /// Heap-owned content slice handed back on the response; freed in deinit.
+    content_buf: ?[]types.ContentBlock = null,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "forced_emit",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *ForcedEmitProvider = @ptrCast(@alignCast(ptr));
+        self.captured_tool_choice = req.tool_choice;
+        for (req.tool_definitions) |def| {
+            const name = self.snapshot_alloc.dupe(u8, def.name) catch return error.OutOfMemory;
+            self.captured_tool_names.append(self.snapshot_alloc, name) catch return error.OutOfMemory;
+        }
+        if (self.emit_input) |raw| {
+            const blocks = self.snapshot_alloc.alloc(types.ContentBlock, 1) catch return error.OutOfMemory;
+            blocks[0] = .{ .tool_use = .{ .id = "emit_1", .name = "emit", .input_raw = raw } };
+            self.content_buf = blocks;
+            return .{
+                .content = blocks,
+                .stop_reason = .tool_use,
+                .input_tokens = 1,
+                .output_tokens = 1,
+            };
+        }
+        // Prose-only: stream some text, return no tool_use.
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = "no structured output here" });
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+
+    fn provider(self: *ForcedEmitProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *ForcedEmitProvider) void {
+        for (self.captured_tool_names.items) |n| self.snapshot_alloc.free(n);
+        self.captured_tool_names.deinit(self.snapshot_alloc);
+        if (self.content_buf) |b| self.snapshot_alloc.free(b);
+    }
+};
+
+const forced_output_schema =
+    \\{"type":"object","required":["status","count"],"additionalProperties":false,"properties":{"status":{"type":"string","enum":["ok","fail"]},"count":{"type":"integer"}}}
+;
+
+/// Drive one forced-output `runLoopStreaming` run against `stub`, returning
+/// the loop's result (void or error). Drains the queue into `out_events` (caller
+/// frees each via `freeOwned`) so callers can inspect the emitted assistant text.
+fn runForcedOutput(
+    allocator: Allocator,
+    stub: *ForcedEmitProvider,
+    out_events: *std.ArrayList(agent_events.AgentEvent),
+) !void {
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    // A real tool present in the registry so we can prove the forced turn
+    // advertises ONLY `emit`, not this one.
+    try registry.register(@import("tools/read.zig").tool);
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer queue.deinit();
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer messages.deinit(allocator);
+
+    const spec: llm.ModelSpec = .{ .provider_name = "forced_emit", .model_id = "stub-1", .context_window = 0 };
+
+    const run_result = agent.runLoopStreaming(
+        &messages,
+        &registry,
+        stub.provider(),
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-forced",
+        &detail,
+        forced_output_schema,
+    );
+
+    // Drain whatever landed on the queue so the caller can assert on it.
+    var buf: [64]agent_events.AgentEvent = undefined;
+    while (true) {
+        const n = queue.drain(&buf);
+        if (n == 0) break;
+        for (buf[0..n]) |ev| try out_events.append(allocator, ev);
+    }
+
+    return run_result;
+}
+
+test "forced output: request carries forced tool_choice and only the emit tool def" {
+    const allocator = std.testing.allocator;
+
+    var stub = ForcedEmitProvider{
+        .emit_input =
+        \\{"status":"ok","count":3}
+        ,
+        .snapshot_alloc = allocator,
+    };
+    defer stub.deinit();
+
+    var events: std.ArrayList(agent_events.AgentEvent) = .empty;
+    defer {
+        for (events.items) |ev| ev.freeOwned();
+        events.deinit(allocator);
+    }
+
+    try runForcedOutput(allocator, &stub, &events);
+
+    // Forced choice = the single synthetic tool.
+    try std.testing.expect(stub.captured_tool_choice == .tool);
+    try std.testing.expectEqualStrings("emit", stub.captured_tool_choice.tool);
+    // ONLY `emit` is advertised; the real `read` tool is hidden this turn.
+    try std.testing.expectEqual(@as(usize, 1), stub.captured_tool_names.items.len);
+    try std.testing.expectEqualStrings("emit", stub.captured_tool_names.items[0]);
+}
+
+test "forced output: valid input ends the run with the JSON as assistant text and no tool execution" {
+    const allocator = std.testing.allocator;
+
+    const emit =
+        \\{"status":"ok","count":3}
+    ;
+    var stub = ForcedEmitProvider{ .emit_input = emit, .snapshot_alloc = allocator };
+    defer stub.deinit();
+
+    var events: std.ArrayList(agent_events.AgentEvent) = .empty;
+    defer {
+        for (events.items) |ev| ev.freeOwned();
+        events.deinit(allocator);
+    }
+
+    try runForcedOutput(allocator, &stub, &events);
+
+    // The provider was called exactly once: the forced turn is terminal.
+    // No tool_result was ever appended (no execution), and the validated JSON
+    // reached the tree as an assistant text_delta — the SAME mechanism normal
+    // assistant text uses. No tool_call / tool_use sink event was emitted, so
+    // wire projection stays pairing-free.
+    var saw_emit_text = false;
+    var saw_tool_call = false;
+    var saw_tool_result = false;
+    for (events.items) |ev| {
+        switch (ev) {
+            .text_delta => |t| {
+                if (std.mem.indexOf(u8, t.bytes, "\"status\":\"ok\"") != null) saw_emit_text = true;
+            },
+            .tool_start => saw_tool_call = true,
+            .tool_result => saw_tool_result = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_emit_text);
+    try std.testing.expect(!saw_tool_call);
+    try std.testing.expect(!saw_tool_result);
+}
+
+test "forced output: input violating the schema fails the run, detail names the violation" {
+    const allocator = std.testing.allocator;
+
+    // `status` is not in the enum and an extra key is present.
+    const bad =
+        \\{"status":"bogus","count":3}
+    ;
+    var stub = ForcedEmitProvider{ .emit_input = bad, .snapshot_alloc = allocator };
+    defer stub.deinit();
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(@import("tools/read.zig").tool);
+
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer messages.deinit(allocator);
+
+    const spec: llm.ModelSpec = .{ .provider_name = "forced_emit", .model_id = "stub-1", .context_window = 0 };
+
+    const run_result = agent.runLoopStreaming(
+        &messages,
+        &registry,
+        stub.provider(),
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-forced",
+        &detail,
+        forced_output_schema,
+    );
+    try std.testing.expectError(error.StructuredOutputInvalid, run_result);
+
+    // The detail slot names the validation failure so the child error message
+    // is actionable.
+    const msg = detail.take() orelse return error.TestUnexpectedResult;
+    defer allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "EnumMismatch") != null);
+}
+
+test "forced output: no tool_use despite forced choice fails the run defensively" {
+    const allocator = std.testing.allocator;
+
+    // emit_input null -> prose only, no tool_use.
+    var stub = ForcedEmitProvider{ .emit_input = null, .snapshot_alloc = allocator };
+    defer stub.deinit();
+
+    var events: std.ArrayList(agent_events.AgentEvent) = .empty;
+    defer {
+        for (events.items) |ev| ev.freeOwned();
+        events.deinit(allocator);
+    }
+
+    const run_result = runForcedOutput(allocator, &stub, &events);
+    try std.testing.expectError(error.StructuredOutputMissing, run_result);
 }

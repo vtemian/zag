@@ -22,7 +22,6 @@ const Theme = @import("Theme.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
-const subagents_mod = @import("subagents.zig");
 const frontmatter_mod = @import("frontmatter.zig");
 const prompt = @import("prompt.zig");
 const Instruction = @import("Instruction.zig");
@@ -45,6 +44,8 @@ const lua_message = @import("lua/lua_message.zig");
 const IoBackend = @import("lua/IoBackend.zig").IoBackend;
 const embedded = @import("lua/embedded.zig");
 const sync = @import("sync.zig");
+const ChildAgent = @import("ChildAgent.zig");
+const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 const provider_bindings = @import("lua/bindings/provider.zig");
 const prompt_bindings = @import("lua/bindings/prompt.zig");
 const sockets_bindings = @import("lua/bindings/sockets.zig");
@@ -132,12 +133,6 @@ pub const LuaEngine = struct {
     /// a full-schema Lua declaration always wins. Read at startup by
     /// `llm.createProviderFromLuaConfig` through a borrowed pointer.
     providers_registry: llm.Registry,
-    /// Registry of subagents declared via `zag.subagent.register{...}`.
-    /// Starts empty; each `register` call deep-copies strings into
-    /// `allocator` so the registry outlives the Lua snippet that
-    /// produced the entry. The `task` tool and future inspection
-    /// bindings read through `subagentRegistry()`.
-    subagents: subagents_mod.SubagentRegistry = .{},
     /// System-prompt layer registry shared across turns. Built-in layers
     /// (identity, skills catalog, tool list, guidelines) are seeded at
     /// `init`. Lua plugins append more via `zag.prompt.layer{...}`; each
@@ -274,6 +269,19 @@ pub const LuaEngine = struct {
     current_event_queue: ?*@import("agent_events.zig").EventQueue = null,
     /// Root scope (parent of all agent/hook scopes).
     root_scope: ?*async_scope.Scope = null,
+    /// Per-fan-out-level concurrency bound for workflow combinators. A single
+    /// scalar (not a scope-keyed structure — YAGNI) read live by the Lua
+    /// `zag.workflow.parallel`/`pipeline` sliding window. The depth-8 task cap
+    /// is the orthogonal hard backstop. Tuned by `zag.workflow.set_max_fanout`
+    /// against provider rate limits; defaults to 8.
+    workflow_max_fanout: u32 = 8,
+    /// Borrowed registry of in-flight child agents, owned by the
+    /// `EventOrchestrator` and wired in `create`. Null in headless / test paths
+    /// with no orchestrator. Workflow children are registered here with a
+    /// `OnDone.workflow` handle; teardown (`retireTask` / `deinitAsync`) drives
+    /// it to join + free a child whose awaiting coroutine is force-retired,
+    /// keeping the registry+drain loop the single owner of join+deinit.
+    child_runner_registry: ?*ChildRunnerRegistry = null,
 
     /// Per-tool-name JIT context handler. The map key aliases
     /// `tool_name` so insert/remove operates on a single owned slice
@@ -335,6 +343,92 @@ pub const LuaEngine = struct {
         /// resume so a no-yield coroutine that retires inside the spawn still
         /// decrements `outstanding` via `retireTask`.
         pending_fire: ?*PendingFire = null,
+        /// Non-null while this coroutine is suspended awaiting a delegated
+        /// child agent (the `zag.task` workflow path). The child is registered
+        /// in the `ChildRunnerRegistry`; when it finishes, the registry's
+        /// workflow completion path calls `onChildRetiredOnMain`, which clears
+        /// this field, pushes the child's result onto `co`, and resumes. The
+        /// engine OWNS the `ChildAgent` heap slot via this field: it is freed
+        /// either by `onChildRetiredOnMain` (normal completion) or by the
+        /// retire/shutdown teardown arms. Like `taskHandleJoin`'s yield, a
+        /// task may be parked here with neither `pending_job` nor
+        /// `pending_fire` set; nothing asserts otherwise.
+        pending_child: ?*ChildAgent = null,
+        /// Non-null while this coroutine runs inside a workflow script: the
+        /// borrowed `TaskContext` the `zag.task` binding reads for
+        /// provider/model/parent_conv/child_registry/wake_fd/task_depth. The
+        /// orchestration coroutine runs on the MAIN thread, so the
+        /// agent-thread `tools.task_context` threadlocal is NOT available to
+        /// it; this field carries the equivalent context explicitly.
+        ///
+        /// LIFETIME: the pointer borrows the workflow tool's parked
+        /// agent-thread frame (the `WorkflowRequest.ctx`), which stays alive
+        /// until the orchestration coroutine retires (park-until-retire, the
+        /// same stack-lifetime argument runChild relies on). Set by
+        /// `startWorkflowScript`; inherited onto child coroutines spawned via
+        /// `zag.spawn`/`zag.detach` so combinator workers can call `zag.task`.
+        workflow_ctx: ?*const tools_mod.TaskContext = null,
+        /// Non-null only on the top-level workflow-script coroutine: the
+        /// request whose `result`/`done` the script's return value fills.
+        /// `resumeTask`'s `.ok` arm reads the coroutine's returned string into
+        /// `req.result` and fires `req.done`; the resume-error and
+        /// retire/cancel paths complete it with `is_error = true`. Nulled when
+        /// completed (exactly-once). Borrowed; the parked agent thread owns the
+        /// `WorkflowRequest`.
+        workflow_request: ?*WorkflowRequest = null,
+    };
+
+    /// A workflow-script run requested by a parked agent thread (the future
+    /// `workflow` tool). The agent thread round-trips this to the main thread,
+    /// which compiles the script and spawns it as a result-capturing coroutine
+    /// (`startWorkflowScript`), then parks on `done` while the main loop pumps
+    /// the coroutine + drains its children. When the coroutine retires its
+    /// returned string is duped into `allocator` as `result`; on compile error,
+    /// runtime error, or cancellation `is_error` is set with a message.
+    ///
+    /// Lifetime: the requester owns this struct (it lives on the parked agent
+    /// thread's frame) and keeps it alive until `done` fires. The coroutine's
+    /// `Task.workflow_ctx` borrows `ctx` and `Task.workflow_request` borrows
+    /// this struct; both stay valid for the park-until-retire window. `result`
+    /// is owned by `allocator` and freed by the requester after it reads it.
+    pub const WorkflowRequest = struct {
+        /// The Lua source to compile + run. Borrowed for the call duration.
+        script: []const u8,
+        /// Context the script's `zag.task` calls borrow (provider, parent_conv,
+        /// child_registry, wake_fd, task_depth, ...). Borrowed; outlives `done`.
+        ctx: *const tools_mod.TaskContext,
+        /// Fired exactly once when the run completes (success or error).
+        done: sync.ResetEvent = .{},
+        /// The script's returned string on success; null on error or a script
+        /// that returned nil. Owned by `allocator`; the requester frees it.
+        result: ?[]u8 = null,
+        /// True when the run failed (compile error, runtime error, or cancel).
+        /// `result` then holds the error message (owned by `allocator`).
+        is_error: bool = false,
+        /// Allocator the requester wants `result` duped into.
+        allocator: std.mem.Allocator,
+        /// Set by the parked agent thread to request cancellation of the whole
+        /// workflow. The per-tick main-thread sweep
+        /// (`cancelInFlightWorkflowChildren`) observes it and cancels the
+        /// orchestration coroutine's scope ON MAIN, where the scope's lifetime
+        /// is controlled. The tool thread must never dereference the scope
+        /// itself: the main thread frees it in `retireTask` the instant the
+        /// coroutine retires, so an off-main `scope.cancel` races that free.
+        cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        /// Complete a request that was dropped or shut down before its
+        /// coroutine could be spawned (queue-full drop, shutdown drain): dupe
+        /// `message` into `allocator`, flag the error, and fire `done` so the
+        /// parked tool thread unblocks instead of hanging forever. Guarded
+        /// against a double-fire by `done.isSet` (the same exactly-once contract
+        /// `completeWorkflowRequestOwned` enforces); the agent_events drop arms
+        /// call this without reaching into the engine.
+        pub fn failDropped(self: *WorkflowRequest, message: []const u8) void {
+            if (self.done.isSet()) return;
+            self.result = self.allocator.dupe(u8, message) catch null;
+            self.is_error = true;
+            self.done.set();
+        }
     };
 
     /// One in-flight round-trip serviced asynchronously on the main thread.
@@ -529,13 +623,6 @@ pub const LuaEngine = struct {
         return &self.input_parser;
     }
 
-    /// Borrow a read-only view of the subagent registry. The `task`
-    /// tool and schema-emitters call through this handle; they must
-    /// not mutate the registry so the binding stays the single writer.
-    pub fn subagentRegistry(self: *const LuaEngine) *const subagents_mod.SubagentRegistry {
-        return &self.subagents;
-    }
-
     /// Resolve ~/.config/zag paths and load config.lua. All failures are
     /// logged and swallowed; missing config is not an error. The user-dir
     /// searcher that covers `~/.config/zag/lua/*.lua` is installed once in
@@ -557,12 +644,11 @@ pub const LuaEngine = struct {
     }
 
     /// Require every embedded `zag.builtin.*`, `zag.layers.*`,
-    /// `zag.jit.*`, `zag.loop.*`, `zag.compact.*`, the `zag.prompt`
-    /// dispatcher, and the `zag.subagents.filesystem` loader so the side
-    /// effects (slash command registrations, keymap bindings, prompt
-    /// layer registrations, JIT context handlers, loop detector handlers,
-    /// compaction strategy handlers, and filesystem-discovered subagents)
-    /// land in the engine's registries. Must be called before
+    /// `zag.jit.*`, `zag.loop.*`, `zag.compact.*`, and the `zag.prompt`
+    /// dispatcher so the side effects (slash command registrations, keymap
+    /// bindings, prompt layer registrations, JIT context handlers, loop
+    /// detector handlers, and compaction strategy handlers) land in the
+    /// engine's registries. Must be called before
     /// `loadUserConfig` so a user's
     /// overrides win via the command registry's last-write-wins
     /// semantics and so that stable-class prompt layers register before
@@ -587,8 +673,7 @@ pub const LuaEngine = struct {
             const is_loop = std.mem.startsWith(u8, entry.name, "zag.loop.");
             const is_compact = std.mem.startsWith(u8, entry.name, "zag.compact.");
             const is_prompt_dispatcher = std.mem.eql(u8, entry.name, "zag.prompt");
-            const is_subagent_loader = std.mem.eql(u8, entry.name, "zag.subagents.filesystem");
-            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_compact and !is_prompt_dispatcher and !is_subagent_loader) continue;
+            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_compact and !is_prompt_dispatcher) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
@@ -657,7 +742,6 @@ pub const LuaEngine = struct {
         }
         self.hook_dispatcher.deinit();
         self.providers_registry.deinit();
-        self.subagents.deinit(self.allocator);
         if (self.default_model) |m| self.allocator.free(m);
         if (self.thinking_effort) |e| self.allocator.free(e);
         // Release every Lua callback ref a keymap binding still holds.
@@ -753,6 +837,10 @@ pub const LuaEngine = struct {
         @import("lua/bindings/command.zig").registerOn(lua);
         // zag.set_*; bound from src/lua/bindings/setters.zig. [zag_table].
         @import("lua/bindings/setters.zig").registerOn(lua);
+        // zag.workflow; orchestration config subtable (set_max_fanout /
+        // max_fanout). The parallel/pipeline combinators are layered onto the
+        // same subtable by combinators.lua. Stack on entry/exit: [zag_table].
+        @import("lua/bindings/workflow.zig").registerOn(lua);
         // zag.provider; single sibling cfunction bound from
         // src/lua/bindings/provider.zig. Stack on entry/exit: [zag_table].
         provider_bindings.registerProviderFn(lua);
@@ -822,11 +910,10 @@ pub const LuaEngine = struct {
         lua.setField(-2, "get");
         lua.setField(-2, "mode"); // zag.mode = mode_table; [zag_table]
 
-        // zag.subagent; declarative registry for Lua-defined subagents.
-        // `register{}` validates and deep-copies the entry into the
-        // engine-owned SubagentRegistry so the `task` tool can dispatch
-        // to it later without chasing Lua-side lifetimes.
-        @import("lua/bindings/subagent.zig").registerOn(lua);
+        // zag.task; yielding spawn primitive for orchestration scripts. Spawns
+        // an inline ChildAgent and suspends the calling coroutine until it
+        // retires. Sibling cfunction on the zag table. Stack: [zag_table].
+        @import("lua/bindings/task.zig").registerOn(lua);
 
         // zag.prompt; system-prompt layer registration. `layer{}` appends
         // to the engine's shared `prompt.Registry`; the agent loop drives
@@ -1032,7 +1119,12 @@ pub const LuaEngine = struct {
         if (nargs < 0) co.raiseErrorStr("zag.spawn: missing fn", .{});
         if (!co.isFunction(1)) co.raiseErrorStr("zag.spawn: arg 1 must be function", .{});
 
-        const parent: ?*async_scope.Scope = if (engine.taskForCoroutine(co)) |t| t.scope else null;
+        // Inherit both the spawner's scope (so cancellation cascades) and its
+        // workflow context (so a combinator worker spawned inside a workflow
+        // script can itself call `zag.task`).
+        const parent_task = engine.taskForCoroutine(co);
+        const parent: ?*async_scope.Scope = if (parent_task) |t| t.scope else null;
+        const inherited_workflow_ctx: ?*const tools_mod.TaskContext = if (parent_task) |t| t.workflow_ctx else null;
 
         // spawnCoroutine operates on `engine.lua`'s stack. When zag.spawn
         // is called from inside another coroutine, [fn, args...] live on
@@ -1041,7 +1133,7 @@ pub const LuaEngine = struct {
             co.xMove(engine.lua, nargs + 1);
         }
 
-        const thread_ref = engine.spawnCoroutine(nargs, parent) catch |err| switch (err) {
+        const thread_ref = engine.spawnCoroutineInheriting(nargs, parent, inherited_workflow_ctx) catch |err| switch (err) {
             error.AsyncRuntimeNotReady => co.raiseErrorStr(
                 "zag.spawn: async runtime not ready (use it from a hook or tool, not at config top level)",
                 .{},
@@ -1072,10 +1164,16 @@ pub const LuaEngine = struct {
         if (nargs < 0) co.raiseErrorStr("zag.detach: missing fn", .{});
         if (!co.isFunction(1)) co.raiseErrorStr("zag.detach: arg 1 must be function", .{});
 
+        // Detach parents to root (independent lifetime), but still inherits the
+        // workflow context so a detached worker inside a workflow script can
+        // call `zag.task`.
+        const inherited_workflow_ctx: ?*const tools_mod.TaskContext =
+            if (engine.taskForCoroutine(co)) |t| t.workflow_ctx else null;
+
         if (co != engine.lua) {
             co.xMove(engine.lua, nargs + 1);
         }
-        _ = engine.spawnCoroutine(nargs, null) catch |err| switch (err) {
+        _ = engine.spawnCoroutineInheriting(nargs, null, inherited_workflow_ctx) catch |err| switch (err) {
             error.AsyncRuntimeNotReady => co.raiseErrorStr(
                 "zag.detach: async runtime not ready (use it from a hook or tool, not at config top level)",
                 .{},
@@ -2686,6 +2784,11 @@ pub const LuaEngine = struct {
             rt.deinit();
             self.async_runtime = null;
         }
+        // Cancel any in-flight workflow children up front so their agent
+        // threads start winding down before we force-retire the coroutines
+        // that await them. cancelAll is a no-op when no child is registered.
+        if (self.child_runner_registry) |reg| reg.cancelAll();
+
         // Retire any coroutine still parked at shutdown -- the common case
         // is a detached poller blocked in `zag.sleep`. Each parked task owns
         // a Scope still linked under `root_scope`; `retireTask` unlinks and
@@ -2694,6 +2797,8 @@ pub const LuaEngine = struct {
         // Drain by repeatedly retiring the first task, since retireTask
         // removes from `self.tasks` and may resume joiners that retire more;
         // a count ceiling guards against a pathological re-spawn loop.
+        // retireTask's pending_child arm cancels + ORPHANS (resume_thread_ref
+        // = -1) any awaited child, leaving it registered for the drain below.
         if (self.tasks.count() > 0) {
             std.log.scoped(.lua).warn("deinitAsync: retiring {d} task(s) still alive", .{self.tasks.count()});
         }
@@ -2702,11 +2807,42 @@ pub const LuaEngine = struct {
             var it = self.tasks.valueIterator();
             self.retireTask(it.next().?.*);
         }
+
+        // Drive any orphaned workflow children to completion: drainAll joins
+        // each finished child's agent thread and calls `onChildRetiredOnMain`,
+        // which (with the orphaned `resume_thread_ref`) takes the task-gone
+        // path — deinit + free the ChildAgent, no resume into a dead coroutine.
+        // UNBOUNDED fixed-point loop with cancelAll each pass (a child may not
+        // have observed cancellation yet). A bound here would be a leak: a child
+        // wedged in a long provider read (cancelAgent is only an atomic flag a
+        // blocked TLS read won't observe for up to read_ms) could outlive the
+        // guard, and proceeding to `tasks.deinit()` / `root_scope.deinit()`
+        // below would abandon a live agent thread against freed engine state.
+        // The agent loop's cancel poll guarantees termination once any in-flight
+        // read returns. Mirrors EventOrchestrator.drainChildrenToCompletion, but
+        // the engine owns this at shutdown because `deinitAsync` runs before the
+        // orchestrator drains and frees `self.tasks` here.
+        if (self.child_runner_registry) |reg| {
+            while (!reg.isEmpty()) {
+                reg.cancelAll();
+                reg.drainAll();
+                clock.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+
         self.tasks.deinit();
         if (self.root_scope) |s| {
             s.deinit();
             self.root_scope = null;
         }
+
+        // After engine teardown no drain may route into the engine: the
+        // registry is empty here (the loop above ran to a fixed point), but
+        // sever the borrowed pointer belt-and-braces so a later orchestrator
+        // `drainChildrenToCompletion` can never route a (re)registered child's
+        // resume_fn into the now-freed `self.tasks`. The registry itself is
+        // owned by the orchestrator and outlives the engine.
+        self.child_runner_registry = null;
     }
 
     /// Called by the orchestrator tick after a worker posts a completion.
@@ -2748,6 +2884,116 @@ pub const LuaEngine = struct {
         if (err_detail) |d| self.allocator.free(d);
     }
 
+    /// Push a finished child's result onto its awaiting coroutine's stack as
+    /// the `(result, err)` 2-tuple the binding convention expects. Mirrors the
+    /// `.llm_complete` arm of `pushJobResultOntoStack`: build a result table,
+    /// push `nil` for the error slot, return the value count.
+    ///
+    /// The orchestration script always reads `summary` / `is_error` off the
+    /// table. When the child ran in structured-output mode (`schema_mode`) and
+    /// succeeded, the `summary` IS the validated JSON, so we also decode it
+    /// onto an `output` field as a typed Lua table for `result.output.field`
+    /// access. A decode failure (pathologically deep JSON) leaves `output`
+    /// absent rather than failing the resume; the raw JSON is still on
+    /// `summary`.
+    fn pushChildResultOntoStack(self: *LuaEngine, co: *Lua, res: ChildAgent.ChildResult, schema_mode: bool) i32 {
+        co.newTable();
+        _ = co.pushString(res.summary);
+        co.setField(-2, "summary");
+        co.pushBoolean(res.is_error);
+        co.setField(-2, "is_error");
+        if (schema_mode and !res.is_error) {
+            if (lua_json.pushJsonAsTable(co, res.summary, self.allocator)) {
+                co.setField(-2, "output");
+            } else |err| {
+                log.warn("structured child output decode failed: {}", .{err});
+            }
+        }
+        co.pushNil();
+        return 2;
+    }
+
+    /// Adapter the `ChildRunnerRegistry` workflow completion path targets via
+    /// its `resume_fn` pointer. The registry stores the engine and the
+    /// `ChildAgent` as `*anyopaque` to avoid an import cycle; this casts them
+    /// back to their concrete types and calls `onChildRetiredOnMain`. Runs on
+    /// the main drain thread, with no registry lock held, after the child agent
+    /// thread is joined.
+    pub fn resumeWorkflowChild(ctx: *anyopaque, child_ptr: *anyopaque) void {
+        const self: *LuaEngine = @ptrCast(@alignCast(ctx));
+        const child: *ChildAgent = @ptrCast(@alignCast(child_ptr));
+        self.onChildRetiredOnMain(child);
+    }
+
+    /// Complete a finished workflow child: resume its awaiting coroutine with
+    /// the child's result, then free the child. The single entry the registry
+    /// calls when a `OnDone.workflow` child finishes. Runs on the MAIN thread,
+    /// post-join, post-remove (the registry removed the entry before calling).
+    ///
+    /// The engine OWNS the heap `ChildAgent` (referenced from `task.pending_child`),
+    /// so this is the one place outside teardown that frees it. Order mirrors
+    /// `resumeFromJob`: derive the result, tear the child down, THEN resume, so
+    /// a re-entrant resume can never observe a half-dead child.
+    ///
+    /// `task_end` is persisted UNCONDITIONALLY (D-3), even when the awaiting
+    /// coroutine is already gone (cancel / shutdown), so every `task_start`
+    /// pairs a `task_end` and the sidebar/transcript always close the row.
+    pub fn onChildRetiredOnMain(self: *LuaEngine, child: *ChildAgent) void {
+        const task = self.tasks.get(child.resume_thread_ref);
+
+        // Derive the result while the child is still live (the summary reads
+        // the child's conversation tree). Arena-scoped so the owned task_end
+        // copy is the only allocation that outlives this call.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const res = child.result(arena.allocator()) catch ChildAgent.ChildResult{
+            .summary = "internal error: failed to derive subagent result",
+            .is_error = true,
+        };
+
+        // Persist task_end before teardown so it is recorded on every path,
+        // including the task-gone (cancel/shutdown) one. Mirrors task.zig's
+        // task_end block: an owned copy chained back to the task_start ULID.
+        if (child.session_handle) |sh| {
+            const owned = self.allocator.dupe(u8, res.summary) catch null;
+            if (owned) |content| {
+                defer self.allocator.free(content);
+                _ = sh.appendEntry(.{
+                    .entry_type = .task_end,
+                    .content = content,
+                    .timestamp = clock.milliTimestamp(),
+                    .parent_id = child.task_start_id,
+                }) catch |err| log.warn("workflow task_end persist failed: {}", .{err});
+            }
+        }
+
+        if (task) |t| {
+            // Push the result onto the coroutine stack BEFORE freeing the
+            // child: the summary slice lives in `arena` (copied into Lua by
+            // pushString), so it must outlive the push but not the resume.
+            //
+            // Deliberate deviation from the `resumeFromJob` template (which
+            // deinits the per-task primitive_arena BEFORE `resumeTask`): the
+            // result `arena` is freed by the `defer` ABOVE, i.e. AFTER
+            // `resumeTask` returns. `pushChildResultOntoStack` already copied
+            // the summary into Lua via `pushString`, so the bytes are safe past
+            // the free, but deiniting earlier would buy nothing and risks a
+            // future edit reading `res.summary` after the arena is gone. Do not
+            // "fix" by deiniting the arena before the resume.
+            t.pending_child = null;
+            const n = self.pushChildResultOntoStack(t.co, res, child.spec.output_schema != null);
+            child.deinit();
+            self.allocator.destroy(child);
+            self.resumeTask(t, n);
+            return;
+        }
+
+        // Awaiting coroutine already retired (cancel / shutdown): tear down
+        // only. task_end was persisted above.
+        child.deinit();
+        self.allocator.destroy(child);
+    }
+
     /// Creates a coroutine for the Lua function + `nargs` arguments that are
     /// already on top of `self.lua`'s stack. Layout expected before call:
     /// `[fn, arg1, ..., argN]`. The stack is fully consumed; caller must
@@ -2782,7 +3028,22 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null);
+    }
+
+    /// Spawn a coroutine that inherits a workflow context from its spawner.
+    /// Used by `zag.spawn`/`zag.detach` when the spawning coroutine is itself
+    /// inside a workflow script: the child must carry `workflow_ctx` so its
+    /// own `zag.task` calls resolve a context. Set BEFORE the first resume so a
+    /// combinator worker that calls `zag.task` synchronously during its first
+    /// resume already sees the context.
+    fn spawnCoroutineInheriting(
+        self: *LuaEngine,
+        nargs: i32,
+        parent_scope: ?*async_scope.Scope,
+        workflow_ctx: ?*const tools_mod.TaskContext,
+    ) !i32 {
+        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, null);
     }
 
     /// Spawn a coroutine already bound to a `PendingFire`. The binding is set
@@ -2798,7 +3059,7 @@ pub const LuaEngine = struct {
         pf: *PendingFire,
     ) !i32 {
         pf.outstanding += 1;
-        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf) catch |err| {
+        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null) catch |err| {
             // The spawn never registered the task (so retireTask will not run
             // for it); undo the bump so the guard release still reaches 0.
             pf.outstanding -= 1;
@@ -2941,6 +3202,40 @@ pub const LuaEngine = struct {
         }
     }
 
+    /// Cancel the in-flight AgentRunner of any workflow child whose awaiting
+    /// coroutine's scope was cancelled. Without this, a worker suspended on a
+    /// `pending_child` only resumes when its child RETIRES, so a cancelled
+    /// workflow's in-flight children would run to natural completion (wasted
+    /// tokens, a slow Ctrl+C). `cancelAgent` is an idempotent atomic flag; the
+    /// child then unwinds, `drainAll` retires it, `onChildRetiredOnMain` resumes
+    /// the worker (which sees its scope cancelled and unwinds), and the workflow
+    /// completes via the error path.
+    ///
+    /// Called every tick (alongside `cancelTriggeredFires`) so it serves BOTH
+    /// the Ctrl+C path (turn cancel marks the scope; this propagates to the
+    /// children on the same/next tick) AND the workflow-tool path (the parked
+    /// tool thread sets `req.cancel_requested`; this sweep cancels the
+    /// orchestration scope ON MAIN, where the scope's lifetime is controlled,
+    /// then cancels the children). The tool thread never touches the scope
+    /// itself: `retireTask` frees it the instant the coroutine retires, so an
+    /// off-main `scope.cancel` would race that free. Cheap: only tasks with a
+    /// pending cancel request or a live `pending_child` do any work.
+    pub fn cancelInFlightWorkflowChildren(self: *LuaEngine) void {
+        var it = self.tasks.valueIterator();
+        while (it.next()) |task_ptr| {
+            const task = task_ptr.*;
+            if (task.workflow_request) |req| {
+                if (req.cancel_requested.load(.acquire) and !task.scope.isCancelled()) {
+                    task.scope.cancel("workflow cancelled") catch |err|
+                        log.warn("workflow scope cancel failed: {s}", .{@errorName(err)});
+                }
+            }
+            const child = task.pending_child orelse continue;
+            if (!task.scope.isCancelled()) continue;
+            child.child_runner.cancelAgent();
+        }
+    }
+
     /// Drain every completion a worker has posted, resuming the owning
     /// coroutine for each. The canonical per-tick pump shared by both agent
     /// drivers (the interactive `EventOrchestrator.tick` and the headless
@@ -2954,6 +3249,85 @@ pub const LuaEngine = struct {
         }
     }
 
+    /// Compile + run a workflow script as a result-capturing coroutine. MUST be
+    /// called on the MAIN thread: it touches the Lua VM (compile + spawn). The
+    /// future `workflow` tool's agent thread round-trips a `WorkflowRequest` to
+    /// main, which calls this; the agent thread then parks on `req.done` while
+    /// the main loop pumps the coroutine + drains its children to completion.
+    ///
+    /// The script runs as a `Task` whose scope parents to `root_scope`: the
+    /// workflow is its own cancellation domain, and children spawned inside it
+    /// (`zag.task`, `zag.spawn`) auto-parent to it so one cancel cascades.
+    ///
+    /// Completion is exactly-once: a compile error completes `req` here; a
+    /// successful run captures the coroutine's returned string in `resumeTask`'s
+    /// `.ok` arm; a runtime error / cancellation completes it via the resume
+    /// error branch or `retireTask`. Every path routes through
+    /// `completeWorkflowRequest`, which nulls `task.workflow_request`.
+    pub fn startWorkflowScript(self: *LuaEngine, req: *WorkflowRequest) void {
+        const script_z = self.allocator.dupeZ(u8, req.script) catch {
+            completeWorkflowRequestOwned(req, "internal error: workflow script dupe failed", true);
+            return;
+        };
+        defer self.allocator.free(script_z);
+
+        // Compile the chunk onto the main stack. A syntax error pushes a
+        // message we surface as the (error) tool result.
+        self.lua.loadString(script_z) catch |err| {
+            const msg = if (err == error.LuaSyntax) self.lua.toString(-1) catch "<unprintable>" else @errorName(err);
+            completeWorkflowRequestOwned(req, msg, true);
+            self.lua.setTop(0);
+            return;
+        };
+
+        // Spawn the compiled chunk as a coroutine parented to root, tagged with
+        // the workflow context (so its `zag.task` calls resolve) and the request
+        // (so its return value is captured). Both are set before the first
+        // resume inside spawnCoroutineFull, so even a no-yield script that
+        // returns immediately has its result captured.
+        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req) catch |err| {
+            // The spawn never registered a task (so retireTask cannot complete
+            // the request); complete it here. The chunk on the stack was either
+            // consumed by spawnCoroutineFull (on the xMove) or left on a failure
+            // before it; clear the stack to be safe.
+            self.lua.setTop(0);
+            completeWorkflowRequestOwned(req, @errorName(err), true);
+        };
+    }
+
+    /// Complete a `WorkflowRequest` exactly once: dupe `message`/result into
+    /// the requester's allocator, stamp `is_error`, and fire `done`. A second
+    /// call (e.g. retire after a normal completion) is a no-op because the
+    /// caller nulls `task.workflow_request` first; this guards the request's
+    /// own `done` against a double-fire via `done.isSet`.
+    fn completeWorkflowRequestOwned(req: *WorkflowRequest, message: []const u8, is_error: bool) void {
+        if (req.done.isSet()) return;
+        req.result = req.allocator.dupe(u8, message) catch null;
+        req.is_error = is_error;
+        req.done.set();
+    }
+
+    /// Capture a finished workflow coroutine's return value into its request.
+    /// Reads the top-of-stack return (a string, or nil) WITHOUT popping (the
+    /// caller pops after), dupes it into the requester's allocator, and fires
+    /// `done`. Called from `resumeTask`'s `.ok` arm.
+    ///
+    /// `was_cancelled` reflects the orchestration scope's cancellation at
+    /// retirement: a cancelled workflow completes via the error path (with the
+    /// returned value, if any, as the message) so a Ctrl+C / tool-cancel never
+    /// reports a misleading success — even when the script returned normally off
+    /// a cancelled child's partial result.
+    fn captureWorkflowReturn(req: *WorkflowRequest, co: *Lua, num_results: i32, was_cancelled: bool) void {
+        if (req.done.isSet()) return;
+        var text: []const u8 = if (was_cancelled) "cancelled" else "";
+        if (num_results >= 1 and co.isString(-1)) {
+            text = co.toString(-1) catch text;
+        }
+        req.result = req.allocator.dupe(u8, text) catch null;
+        req.is_error = was_cancelled;
+        req.done.set();
+    }
+
     fn spawnCoroutineFull(
         self: *LuaEngine,
         nargs: i32,
@@ -2961,6 +3335,8 @@ pub const LuaEngine = struct {
         hook_payload: ?*Hooks.HookPayload,
         compact_request: ?*agent_events.CompactRequest,
         pending_fire: ?*PendingFire,
+        workflow_ctx: ?*const tools_mod.TaskContext,
+        workflow_request: ?*WorkflowRequest,
     ) !i32 {
         // The async runtime must be up before a coroutine can be scheduled.
         // Internal callers (hooks, compaction) only run after `initAsync`,
@@ -2997,6 +3373,13 @@ pub const LuaEngine = struct {
             .started_at_ms = if (hook_payload != null) clock.milliTimestamp() else 0,
             .budget_ms = if (hook_payload != null) self.hook_dispatcher.hook_budget_ms else null,
             .pending_fire = pending_fire,
+            // Inherited from the spawner so combinator workers can call
+            // `zag.task`. Set before the first resume below.
+            .workflow_ctx = workflow_ctx,
+            // Set before the first resume so a no-yield workflow script that
+            // retires inside this spawn still has its return value captured by
+            // resumeTask's `.ok` arm.
+            .workflow_request = workflow_request,
         };
 
         // Stash the Task in the coroutine's extraspace for O(1) lookup in
@@ -3089,6 +3472,20 @@ pub const LuaEngine = struct {
                             break :blk .use_default;
                         };
                     }
+                } else if (task.workflow_request) |req| {
+                    // Workflow-script retire path. The script's returned string
+                    // (or nil) lives at the coroutine's stack top; capture it
+                    // into the request BEFORE the pop, then null the field so
+                    // retireTask's completion arm is a no-op (exactly-once).
+                    //
+                    // A cancelled scope means the workflow was aborted (Ctrl+C
+                    // or the tool thread's `req.cancel_requested`): its in-flight
+                    // children were cancelled and the script may have returned a
+                    // partial/garbage value off a cancelled child. Surface it as
+                    // an error regardless of the returned value so a cancelled
+                    // workflow never reports a misleading success.
+                    captureWorkflowReturn(req, task.co, num_results, task.scope.isCancelled());
+                    task.workflow_request = null;
                 }
                 task.co.pop(num_results);
                 self.retireTask(task);
@@ -3118,7 +3515,35 @@ pub const LuaEngine = struct {
             // task about to be destroyed; no need to null the field
         }
 
+        // A task retiring while it still awaits a workflow child means the
+        // coroutine is being torn down out from under a child whose agent
+        // thread may still be live. We MUST NOT deinit the child here: direct
+        // teardown of a child whose thread is unjoined is a UAF. Instead cancel
+        // its runner and orphan its resume target so the later drainAll-driven
+        // `onChildRetiredOnMain` joins it and takes the task-gone path (free,
+        // no resume into a dead coroutine). The registry + drain loop stay the
+        // single owner of join + deinit. The shutdown drain in `deinitAsync`
+        // (or the orchestrator's drain-to-completion) finishes the job.
+        if (task.pending_child) |child| {
+            child.child_runner.cancelAgent();
+            child.resume_thread_ref = -1;
+            task.pending_child = null;
+        }
+
         const was_cancelled = task.scope.isCancelled();
+
+        // A workflow-script coroutine reaching retire WITHOUT having captured
+        // its return (normal completion nulls `workflow_request` first) means it
+        // is being torn down by a runtime error or cancellation. Complete the
+        // request with an error so the parked agent thread unwinds instead of
+        // hanging on `done`. The message distinguishes cancel from a Lua error
+        // (already logged by the resume-error branch).
+        if (task.workflow_request) |req| {
+            const msg: []const u8 = if (was_cancelled) "cancelled" else "workflow script error";
+            completeWorkflowRequestOwned(req, msg, true);
+            task.workflow_request = null;
+        }
+
         // Capture the bound fire before the task is destroyed; the decrement
         // happens after teardown so finalize (which may wake the producer)
         // never races our own access to `task`.
@@ -6281,6 +6706,128 @@ test "zag.timeout passes through value when fn beats deadline" {
     eng.lua.pop(1);
 }
 
+test "zag.workflow.parallel caps concurrency and preserves input order" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // cap=2 over 6 sleep-based workers. Each worker bumps a shared in-flight
+    // counter on entry and decrements on exit, tracking a high-water mark; with
+    // the window capped at 2 the mark must never exceed 2. Results must land in
+    // input order (worker i writes results[i].value = i*10) regardless of the
+    // out-of-order sleeps.
+    try eng.lua.doString(
+        \\function test_parallel()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  _in_flight = 0
+        \\  _hwm = 0
+        \\  local fns = {}
+        \\  for i = 1, 6 do
+        \\    fns[i] = function()
+        \\      _in_flight = _in_flight + 1
+        \\      if _in_flight > _hwm then _hwm = _in_flight end
+        \\      zag.sleep((7 - i) * 3)
+        \\      _in_flight = _in_flight - 1
+        \\      return i * 10
+        \\    end
+        \\  end
+        \\  local r = zag.workflow.parallel(fns)
+        \\  _p_count = #r
+        \\  _p_ordered = true
+        \\  for i = 1, 6 do
+        \\    if r[i].value ~= i * 10 then _p_ordered = false end
+        \\  end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_parallel");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_p_count");
+    try std.testing.expectEqual(@as(i64, 6), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_p_ordered");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_hwm");
+    const hwm = try eng.lua.toInteger(-1);
+    eng.lua.pop(1);
+    try std.testing.expect(hwm >= 1); // at least one worker ran
+    try std.testing.expect(hwm <= 2); // never exceeded the cap
+}
+
+test "zag.workflow.pipeline threads stage outputs and respects the cap" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // cap=2 over 4 items, each run through two stages: +1 then *10. Item i
+    // (value i) becomes (i+1)*10. The same in-flight high-water tracking proves
+    // the window holds at most 2 item-workers concurrently across all stages
+    // (no inter-stage barrier). A sleep inside stage 1 forces overlap.
+    try eng.lua.doString(
+        \\function test_pipeline()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  _pl_in_flight = 0
+        \\  _pl_hwm = 0
+        \\  local stage1 = function(x)
+        \\    _pl_in_flight = _pl_in_flight + 1
+        \\    if _pl_in_flight > _pl_hwm then _pl_hwm = _pl_in_flight end
+        \\    zag.sleep(5)
+        \\    return x + 1
+        \\  end
+        \\  local stage2 = function(x)
+        \\    local r = x * 10
+        \\    _pl_in_flight = _pl_in_flight - 1
+        \\    return r
+        \\  end
+        \\  local r = zag.workflow.pipeline({ 1, 2, 3, 4 }, stage1, stage2)
+        \\  _pl_count = #r
+        \\  _pl_ordered = true
+        \\  for i = 1, 4 do
+        \\    if r[i].value ~= (i + 1) * 10 then _pl_ordered = false end
+        \\  end
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_pipeline");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_pl_count");
+    try std.testing.expectEqual(@as(i64, 4), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pl_ordered");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pl_hwm");
+    const hwm = try eng.lua.toInteger(-1);
+    eng.lua.pop(1);
+    try std.testing.expect(hwm >= 1);
+    try std.testing.expect(hwm <= 2);
+}
+
 test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
     var eng = try LuaEngine.init(std.testing.allocator);
     defer eng.deinit();
@@ -8756,107 +9303,6 @@ test "zag.keymap rejects a handle that doesn't live in the registry" {
     engine.lua.pop(1);
 }
 
-test "zag.subagent.register stores entries" {
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    try engine.lua.doString(
-        \\zag.subagent.register{
-        \\  name = "reviewer",
-        \\  description = "Review diffs",
-        \\  prompt = "You review.",
-        \\}
-        \\zag.subagent.register{
-        \\  name = "scout",
-        \\  description = "Scout codebase",
-        \\  prompt = "You scout.",
-        \\  model = "anthropic/claude-haiku-4-5",
-        \\  tools = {"read", "grep"},
-        \\}
-    );
-
-    const registry = engine.subagentRegistry();
-    try std.testing.expectEqual(@as(usize, 2), registry.entries.items.len);
-
-    const reviewer = registry.lookup("reviewer") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("reviewer", reviewer.name);
-    try std.testing.expectEqualStrings("Review diffs", reviewer.description);
-    try std.testing.expectEqualStrings("You review.", reviewer.prompt);
-    try std.testing.expect(reviewer.model == null);
-    try std.testing.expect(reviewer.tools == null);
-
-    const scout = registry.lookup("scout") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("scout", scout.name);
-    try std.testing.expectEqualStrings("anthropic/claude-haiku-4-5", scout.model.?);
-    try std.testing.expectEqual(@as(usize, 2), scout.tools.?.len);
-    try std.testing.expectEqualStrings("read", scout.tools.?[0]);
-    try std.testing.expectEqualStrings("grep", scout.tools.?[1]);
-}
-
-test "zag.subagent.register rejects duplicate" {
-    std.testing.log_level = .err;
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    try engine.lua.doString(
-        \\zag.subagent.register{
-        \\  name = "foo",
-        \\  description = "first",
-        \\  prompt = "p",
-        \\}
-        \\_ok, _err = pcall(function()
-        \\  zag.subagent.register{
-        \\    name = "foo",
-        \\    description = "second",
-        \\    prompt = "p",
-        \\  }
-        \\end)
-    );
-
-    _ = try engine.lua.getGlobal("_ok");
-    try std.testing.expect(!engine.lua.toBoolean(-1));
-    engine.lua.pop(1);
-
-    _ = try engine.lua.getGlobal("_err");
-    defer engine.lua.pop(1);
-    const err_msg = try engine.lua.toString(-1);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "duplicate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "foo") != null);
-
-    try std.testing.expectEqual(@as(usize, 1), engine.subagentRegistry().entries.items.len);
-}
-
-test "zag.subagent.register rejects invalid name" {
-    std.testing.log_level = .err;
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    try engine.lua.doString(
-        \\_ok, _err = pcall(function()
-        \\  zag.subagent.register{
-        \\    name = "Bad_Name",
-        \\    description = "nope",
-        \\    prompt = "p",
-        \\  }
-        \\end)
-    );
-
-    _ = try engine.lua.getGlobal("_ok");
-    try std.testing.expect(!engine.lua.toBoolean(-1));
-    engine.lua.pop(1);
-
-    _ = try engine.lua.getGlobal("_err");
-    defer engine.lua.pop(1);
-    const err_msg = try engine.lua.toString(-1);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "invalid name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "Bad_Name") != null);
-
-    try std.testing.expectEqual(@as(usize, 0), engine.subagentRegistry().entries.items.len);
-}
-
 fn fakePromptLayerContext() prompt.LayerContext {
     return .{
         .model = .{ .provider_name = "anthropic", .model_id = "claude-sonnet-4-5" },
@@ -9748,107 +10194,6 @@ test "zag.fs.read_file_sync and list_dir_sync" {
     _ = try engine.lua.getGlobal("_missing");
     try std.testing.expect(engine.lua.toBoolean(-1));
     engine.lua.pop(1);
-}
-
-test "zag.subagents.filesystem loads agents from tmpdir" {
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const reviewer_md =
-        \\---
-        \\name: reviewer
-        \\description: Review staged diffs.
-        \\model: anthropic/claude-haiku-4-5
-        \\tools: [read, grep]
-        \\---
-        \\You are a reviewer. Read the diff and return findings.
-    ;
-    try tmp.dir.createDirPath(std.testing.io, "agents");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/reviewer.md", .data = reviewer_md });
-
-    const scout_md =
-        \\---
-        \\name: scout
-        \\description: Scout the codebase.
-        \\---
-        \\You are a scout.
-    ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/scout.md", .data = scout_md });
-
-    // A sibling file without the right extension must be ignored.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/README", .data = "ignore me" });
-
-    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
-
-    _ = engine.lua.pushString(base);
-    engine.lua.setGlobal("_agents_dir");
-
-    try engine.lua.doString(
-        \\local fs = require("zag.subagents.filesystem")
-        \\fs.load_from(_agents_dir)
-    );
-
-    const registry = engine.subagentRegistry();
-    try std.testing.expectEqual(@as(usize, 2), registry.entries.items.len);
-
-    const reviewer = registry.lookup("reviewer") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("Review staged diffs.", reviewer.description);
-    try std.testing.expectEqualStrings(
-        "You are a reviewer. Read the diff and return findings.",
-        reviewer.prompt,
-    );
-    try std.testing.expectEqualStrings("anthropic/claude-haiku-4-5", reviewer.model.?);
-    try std.testing.expectEqual(@as(usize, 2), reviewer.tools.?.len);
-    try std.testing.expectEqualStrings("read", reviewer.tools.?[0]);
-    try std.testing.expectEqualStrings("grep", reviewer.tools.?[1]);
-
-    const scout = registry.lookup("scout") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("Scout the codebase.", scout.description);
-    try std.testing.expectEqualStrings("You are a scout.", scout.prompt);
-    try std.testing.expect(scout.model == null);
-    try std.testing.expect(scout.tools == null);
-}
-
-test "zag.subagents.filesystem skips malformed files with a warning" {
-    std.testing.log_level = .err;
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agents");
-    // Missing `name` field; must be skipped.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "agents/broken.md",
-        .data = "---\ndescription: no name\n---\nbody\n",
-    });
-    // Valid; must be loaded even though a sibling was malformed.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "agents/good.md",
-        .data = "---\nname: good\ndescription: ok\n---\nhi\n",
-    });
-
-    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
-
-    _ = engine.lua.pushString(base);
-    engine.lua.setGlobal("_agents_dir");
-
-    try engine.lua.doString(
-        \\local fs = require("zag.subagents.filesystem")
-        \\fs.load_from(_agents_dir)
-    );
-
-    const registry = engine.subagentRegistry();
-    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
-    try std.testing.expect(registry.lookup("good") != null);
 }
 
 test "zag.prompt.resolve maps known model ids to the right pack module" {
@@ -11520,35 +11865,6 @@ test "loadBuiltinPlugins eager-loads zag.loop.* entries" {
     engine.loadBuiltinPlugins();
     // The default detector module registers exactly one global handler.
     try std.testing.expect(engine.loopDetectHandler() != null);
-}
-
-test "loadBuiltinPlugins registers the default general subagent" {
-    const alloc = std.testing.allocator;
-    var engine = try LuaEngine.init(alloc);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    // Empty before bootstrap; the `task` tool would be gated off here.
-    try std.testing.expectEqual(@as(usize, 0), engine.subagentRegistry().entries.items.len);
-    engine.loadBuiltinPlugins();
-    // The shipped delegate makes delegation work with zero user config:
-    // a non-empty registry is what `tools.registerTaskTool` gates on.
-    try std.testing.expect(engine.subagentRegistry().lookup("general") != null);
-}
-
-test "loadBuiltinPlugins auto-requires the filesystem subagent loader" {
-    const alloc = std.testing.allocator;
-    var engine = try LuaEngine.init(alloc);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    engine.loadBuiltinPlugins();
-    // Without auto-load a user would have to `require` it before a dropped
-    // agent `.md` is discovered. Proof it ran: package.loaded is populated.
-    try engine.lua.doString("_fs_loaded = package.loaded['zag.subagents.filesystem'] ~= nil");
-    _ = try engine.lua.getGlobal("_fs_loaded");
-    defer engine.lua.pop(1);
-    try std.testing.expect(engine.lua.toBoolean(-1));
 }
 
 test "zag.loop.default does not act before the 5-call threshold" {

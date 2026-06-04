@@ -10,9 +10,14 @@
 //!
 //! Threading: `register` is called from agent/worker threads; the drain pass
 //! and removal happen on the main thread. All access is guarded by `mutex`.
-//! Entry storage points at `runChild` stack variables; the main thread removes
-//! an entry before signalling `done`, so a woken `runChild` can free its frame
-//! without leaving a dangling pointer in the registry.
+//! The main thread removes an entry before completing it, so a woken parent can
+//! free its frame (park mode) and a workflow resume never observes the child it
+//! is about to free still registered.
+//!
+//! Completion routing: a finished child either wakes a parked parent thread
+//! (`OnDone.park`, the legacy `task` tool) or resumes a suspended Lua coroutine
+//! (`OnDone.workflow`, dynamic workflows). Both run on the main drain thread,
+//! with no registry lock held, after the child agent thread is joined.
 
 const std = @import("std");
 const sync = @import("sync.zig");
@@ -27,11 +32,39 @@ const ChildRunnerRegistry = @This();
 /// EventOrchestrator.shutdown_runner_cap. Overflow defers to the next tick.
 const drain_runner_cap: usize = 32;
 
-/// One in-flight child. Both pointers reference `runChild` stack storage that
-/// stays alive until `done` is signalled.
+/// How a finished child reports completion. Mutually exclusive: a child is
+/// either parked (a thread blocks on a ResetEvent, the legacy `task` tool) or
+/// drives a workflow resume (a suspended Lua coroutine is resumed, no thread
+/// parked). The workflow arm carries opaque pointers and a resume function so
+/// this module never imports LuaEngine — that would form an import cycle
+/// (LuaEngine already reaches ChildAgent, which reaches this registry).
+pub const OnDone = union(enum) {
+    /// Legacy park: a parent agent thread blocks on this event until the main
+    /// thread signals the child finished. The event references parent-thread
+    /// stack storage that stays alive until `done` is set.
+    park: *sync.ResetEvent,
+    /// Workflow resume: a finished child resumes its awaiting coroutine. The
+    /// pointers are cast back to their concrete types inside `resume_fn`.
+    workflow: Workflow,
+
+    pub const Workflow = struct {
+        /// The LuaEngine that owns the awaiting coroutine.
+        ctx: *anyopaque,
+        /// The ChildAgent whose run just finished.
+        child: *anyopaque,
+        /// Resumes the coroutine with the child's result and tears the child
+        /// down. Runs on the main drain thread, with NO registry lock held,
+        /// AFTER the child agent thread is joined and the entry is removed.
+        resume_fn: *const fn (ctx: *anyopaque, child: *anyopaque) void,
+    };
+};
+
+/// One in-flight child. `runner` references storage that stays alive until the
+/// child finishes (parent-thread stack for park, the heap ChildAgent for
+/// workflow). `on_done` decides what happens when the child finishes.
 pub const Handle = struct {
     runner: *AgentRunner,
-    done: *sync.ResetEvent,
+    on_done: OnDone,
 };
 
 mutex: sync.Mutex = .{},
@@ -112,15 +145,21 @@ pub fn drainAll(self: *ChildRunnerRegistry) void {
     for (snapshot[0..len]) |handle| {
         const result = handle.runner.drainEvents();
         if (!result.finished) continue;
-        // Remove before signalling so a woken `runChild` cannot leave a
-        // dangling pointer in the registry. removeLocked scans by pointer
-        // identity, so it tolerates the entry having moved under concurrent
-        // register/remove while the lock was released; index-based removal
-        // would be wrong here.
+        // Remove before completing so a woken parent cannot leave a dangling
+        // pointer in the registry, and a workflow resume never observes a
+        // still-registered entry for the child it is about to free.
+        // removeLocked scans by pointer identity, so it tolerates the entry
+        // having moved under concurrent register/remove while the lock was
+        // released; index-based removal would be wrong here.
         self.mutex.lock();
         self.removeLocked(handle.runner);
         self.mutex.unlock();
-        handle.done.set();
+        // No lock held here, on the main thread, after the child thread was
+        // joined by drainEvents: the contract every completion path expects.
+        switch (handle.on_done) {
+            .park => |done| done.set(),
+            .workflow => |w| w.resume_fn(w.ctx, w.child),
+        }
     }
 }
 
@@ -149,8 +188,8 @@ test "register then remove by pointer empties the registry" {
     var done_b: sync.ResetEvent = .{};
 
     try testing.expect(reg.isEmpty());
-    try reg.register(.{ .runner = &runner_a, .done = &done_a });
-    try reg.register(.{ .runner = &runner_b, .done = &done_b });
+    try reg.register(.{ .runner = &runner_a, .on_done = .{ .park = &done_a } });
+    try reg.register(.{ .runner = &runner_b, .on_done = .{ .park = &done_b } });
     try testing.expect(!reg.isEmpty());
 
     reg.remove(&runner_a);
@@ -189,7 +228,9 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     //
     // Skipped: flaky under macOS CI runner thread contention; the 120s timeout
     // still deadlocks intermittently. The production code is correct (snapshot
-    // under lock, drain outside lock); coverage is from integration tests.
+    // under lock, drain outside lock); coverage is from integration tests. The
+    // commented body below is kept current with the Handle.on_done API so it
+    // compiles if revived.
     return error.SkipZigTest;
     // const testing = std.testing;
     // const allocator = testing.allocator;
@@ -217,7 +258,7 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     // defer registry.deinit();
     //
     // var child_done: sync.ResetEvent = .{};
-    // try registry.register(.{ .runner = &runner, .done = &child_done });
+    // try registry.register(.{ .runner = &runner, .on_done = .{ .park = &child_done } });
     //
     // // Drain thread: stalls inside drainEvents -> t.join() until the gate opens.
     // var drain_done: sync.ResetEvent = .{};
@@ -238,7 +279,7 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     // var registered: sync.ResetEvent = .{};
     // const Registrar = struct {
     //     fn run(reg: *ChildRunnerRegistry, r: *AgentRunner, d: *sync.ResetEvent, ack: *sync.ResetEvent) void {
-    //         reg.register(.{ .runner = r, .done = d }) catch unreachable;
+    //         reg.register(.{ .runner = r, .on_done = .{ .park = d } }) catch unreachable;
     //         ack.set();
     //     }
     // };
@@ -248,10 +289,8 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     // // Correctness comes from ordering, not magnitude: if the lock were held
     // // across the join, `registered` could only be set after `gate.set()` below,
     // // so any finite ceiling distinguishes "released the lock" from "deadlocked
-    // // behind the join". The ceiling is only a liveness backstop, so keep it
-    // // generous; a tight 2s value gets the test SIGKILL'd under heavy parallel
-    // // builds when the spawned threads cannot schedule in time. 30s proved too
-    // // tight on macOS CI runners under thread contention, so we use 120s.
+    // // behind the join". The ceiling is only a liveness backstop; 30s proved too
+    // // tight on macOS CI runners under thread contention, so use 120s.
     // try registered.timedWait(120 * std.time.ns_per_s);
     // registrar.join();
     // try testing.expect(!drain_done.isSet()); // drainAll genuinely still stalled
@@ -267,4 +306,77 @@ test "drainAll releases the mutex across drainEvents so concurrent register does
     // // The child registered after the snapshot remains for the next tick.
     // try testing.expectEqual(@as(usize, 1), registry.entries.items.len);
     // try testing.expect(registry.entries.items[0].runner == &other_runner);
+}
+
+test "a workflow handle invokes resume_fn once with the right pointers after the entry is removed" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var scb = try Conversation.init(allocator, 0, "test");
+    defer scb.deinit();
+    var runner = AgentRunner.init(allocator, NullSink.sink(), &scb);
+    defer runner.deinit();
+
+    // A child that finishes immediately: a trivial agent thread that exits at
+    // once (drainEvents joins it on `.done`) and one `.done` already queued, so
+    // drainEvents reports finished on the first pass.
+    runner.event_queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    runner.queue_active = true;
+    const Exit = struct {
+        fn run() void {}
+    };
+    runner.agent_thread = try std.Thread.spawn(.{}, Exit.run, .{});
+    try runner.event_queue.push(.done);
+
+    var registry = ChildRunnerRegistry.init(allocator);
+    defer registry.deinit();
+
+    // The resume callback records what it saw so we can assert it ran exactly
+    // once, with the pointers we registered, and that the registry entry was
+    // already removed by the time it fired (no lock held, no live entry).
+    const Capture = struct {
+        registry: *ChildRunnerRegistry,
+        seen_ctx: ?*anyopaque = null,
+        seen_child: ?*anyopaque = null,
+        calls: u32 = 0,
+        empty_at_call: bool = false,
+
+        fn onResume(ctx: *anyopaque, child: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen_ctx = ctx;
+            self.seen_child = child;
+            self.calls += 1;
+            // The finished entry must be gone before resume_fn runs.
+            self.empty_at_call = self.registry.isEmpty();
+        }
+    };
+
+    // A distinct heap object stands in for the ChildAgent; the registry treats
+    // it as opaque and never dereferences it.
+    const child_marker = try allocator.create(u8);
+    defer allocator.destroy(child_marker);
+
+    var capture = Capture{ .registry = &registry };
+    try registry.register(.{
+        .runner = &runner,
+        .on_done = .{ .workflow = .{
+            .ctx = &capture,
+            .child = child_marker,
+            .resume_fn = Capture.onResume,
+        } },
+    });
+
+    registry.drainAll();
+
+    try testing.expectEqual(@as(u32, 1), capture.calls);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&capture)), capture.seen_ctx);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(child_marker)), capture.seen_child);
+    try testing.expect(capture.empty_at_call);
+    try testing.expect(registry.isEmpty());
+    try testing.expect(runner.agent_thread == null);
+    try testing.expect(!runner.queue_active);
+
+    // A second drain pass must not re-fire: the entry is gone.
+    registry.drainAll();
+    try testing.expectEqual(@as(u32, 1), capture.calls);
 }

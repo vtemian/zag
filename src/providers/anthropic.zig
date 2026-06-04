@@ -93,7 +93,7 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking, req.thinking_effort);
-        const body = try buildRequestBody(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, thinking, req.allocator);
+        const body = try serializeRequest(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, false, default_max_tokens, thinking, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -119,7 +119,7 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking, req.thinking_effort);
-        const body = try buildStreamingRequestBody(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, thinking, req.allocator);
+        const body = try serializeRequest(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, true, default_max_tokens, thinking, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -167,7 +167,7 @@ pub fn buildRequestBody(
     thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_stable, system_volatile, messages, tool_definitions, false, default_max_tokens, thinking, allocator);
+    return serializeRequest(model, system_stable, system_volatile, messages, tool_definitions, false, default_max_tokens, thinking, .auto, allocator);
 }
 
 /// Same as buildRequestBody but with "stream": true.
@@ -180,7 +180,7 @@ pub fn buildStreamingRequestBody(
     thinking: ?llm.ThinkingConfig,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_stable, system_volatile, messages, tool_definitions, true, default_max_tokens, thinking, allocator);
+    return serializeRequest(model, system_stable, system_volatile, messages, tool_definitions, true, default_max_tokens, thinking, .auto, allocator);
 }
 
 /// Serializes a full Anthropic Messages API request into JSON.
@@ -194,6 +194,7 @@ fn serializeRequest(
     stream: bool,
     max_tokens: u32,
     thinking: ?llm.ThinkingConfig,
+    tool_choice: llm.ToolChoice,
     allocator: Allocator,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -210,6 +211,15 @@ fn serializeRequest(
     try writeSystem(system_stable, system_volatile, w);
 
     try writeToolDefinitions(tool_definitions, w);
+    switch (tool_choice) {
+        .auto => {},
+        .none => try w.writeAll(",\"tool_choice\":{\"type\":\"none\"}"),
+        .tool => |name| {
+            try w.writeAll(",\"tool_choice\":{\"type\":\"tool\",\"name\":");
+            try std.json.Stringify.value(name, .{}, w);
+            try w.writeAll("}");
+        },
+    }
     try w.writeAll(",");
 
     // Drop `.thinking` / `.redacted_thinking` blocks from prior-turn
@@ -1283,6 +1293,50 @@ test "buildStreamingRequestBody includes stream:true" {
     try std.testing.expect(root.get("stream").?.bool == true);
 }
 
+test "anthropic serializes forced tool_choice" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    // Raw-substring check pins the exact on-the-wire shape: Anthropic wants
+    // a flat `name` under `type:"tool"`. Strict gateways reject any other shape.
+    const body = try serializeRequest(
+        "claude-sonnet-4-20250514",
+        "system",
+        "",
+        &messages,
+        &.{},
+        false,
+        default_max_tokens,
+        null,
+        .{ .tool = "emit" },
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"tool\",\"name\":\"emit\"}") != null);
+}
+
+test "anthropic omits tool_choice when auto" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try serializeRequest(
+        "claude-sonnet-4-20250514",
+        "system",
+        "",
+        &messages,
+        &.{},
+        false,
+        default_max_tokens,
+        null,
+        .auto,
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
+}
+
 test "processSseEvent handles text_delta" {
     const allocator = std.testing.allocator;
 
@@ -1794,7 +1848,7 @@ test "processSseEvent captures redacted_thinking ciphertext inline" {
 
 test "anthropic body emits stable-only system as single-element array with cache_control" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, false, 128, null, .auto, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1820,6 +1874,7 @@ test "anthropic body emits 2-part system array when both halves are non-empty" {
         false,
         128,
         null,
+        .auto,
         testing.allocator,
     );
     defer testing.allocator.free(body);
@@ -1845,7 +1900,7 @@ test "anthropic body emits 2-part system array when both halves are non-empty" {
 
 test "anthropic body falls back to plain string system when only volatile is set" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "", "ephemeral context", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "", "ephemeral context", &.{}, &.{}, false, 128, null, .auto, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1860,7 +1915,7 @@ test "anthropic body falls back to plain string system when only volatile is set
 
 test "anthropic body omits system field entirely when both halves are empty" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "", "", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "", "", &.{}, &.{}, false, 128, null, .auto, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1874,7 +1929,7 @@ test "anthropic wraps tool as bare object" {
         .{ .name = "t", .description = "d", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try serializeRequest("m", "sys", "", &.{}, &tool_defs, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &tool_defs, false, 128, null, .auto, testing.allocator);
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"name\":\"t\",") != null);
@@ -1884,7 +1939,7 @@ test "anthropic wraps tool as bare object" {
 
 test "anthropic emits empty tools array" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, false, 128, null, .auto, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1895,14 +1950,14 @@ test "anthropic emits empty tools array" {
 
 test "streaming flag is included when requested" {
     const testing = std.testing;
-    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, true, 128, null, testing.allocator);
+    const body = try serializeRequest("m", "sys", "", &.{}, &.{}, true, 128, null, .auto, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
 }
 
 test "serializeRequest omits thinking when null" {
     const testing = std.testing;
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, null, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, null, .auto, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
     try testing.expect(std.mem.indexOf(u8, body, "\"output_config\"") == null);
@@ -1911,7 +1966,7 @@ test "serializeRequest omits thinking when null" {
 test "serializeRequest omits thinking when .disabled" {
     const testing = std.testing;
     const cfg: ?llm.ThinkingConfig = .disabled;
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, .auto, testing.allocator);
     defer testing.allocator.free(body);
     try testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
 }
@@ -1919,7 +1974,7 @@ test "serializeRequest omits thinking when .disabled" {
 test "serializeRequest emits thinking with enabled budget" {
     const testing = std.testing;
     const cfg: ?llm.ThinkingConfig = .{ .enabled = .{ .budget_tokens = 4096 } };
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, .auto, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
@@ -1934,7 +1989,7 @@ test "serializeRequest emits thinking with enabled budget" {
 test "serializeRequest emits adaptive thinking and sibling output_config" {
     const testing = std.testing;
     const cfg: ?llm.ThinkingConfig = .{ .adaptive = .{ .effort = .medium } };
-    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, testing.allocator);
+    const body = try serializeRequest("claude-sonnet-4-20250514", "sys", "", &.{}, &.{}, false, 128, cfg, .auto, testing.allocator);
     defer testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});

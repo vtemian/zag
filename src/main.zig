@@ -478,12 +478,6 @@ pub fn main(start: std.process.Init) !void {
     lua_engine.registerTools(&registry) catch |err| {
         log.warn("failed to register lua tools: {}", .{err});
     };
-    // Advertise the built-in `task` tool only when the user
-    // declared at least one subagent. A no-op registry would
-    // emit a tool the model cannot usefully call.
-    tools.registerTaskTool(&registry, lua_engine.subagentRegistry()) catch |err| {
-        log.warn("failed to register task tool: {}", .{err});
-    };
 
     // Bring up the Lua async runtime (worker pool, completion queue, root
     // scope). Deferred teardown runs before `eng.deinit()` thanks to LIFO
@@ -536,7 +530,6 @@ test {
     _ = @import("ulid.zig");
     _ = @import("frontmatter.zig");
     _ = @import("skills.zig");
-    _ = @import("subagents.zig");
     _ = @import("Harness.zig");
     _ = @import("prompt.zig");
     _ = @import("Instruction.zig");

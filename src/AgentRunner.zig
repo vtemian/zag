@@ -29,7 +29,6 @@ const prompt_mod = @import("prompt.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
-const subagents_mod = @import("subagents.zig");
 const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
@@ -250,10 +249,6 @@ pub const SpawnDeps = struct {
     /// Optional skill registry to advertise via the
     /// `builtin.skills_catalog` prompt layer. Null skips the layer.
     skills: ?*const skills_mod.SkillRegistry = null,
-    /// Optional subagent registry consulted by the built-in `task`
-    /// tool. Null disables delegation (the `task` tool surfaces a
-    /// "no TaskContext bound" error when invoked).
-    subagents: ?*const subagents_mod.SubagentRegistry = null,
     /// Stable session identifier surfaced in per-turn `Telemetry`
     /// timeline lines and artifact files. Borrowed; the caller
     /// (main.zig for the TUI, the headless harness for
@@ -265,6 +260,13 @@ pub const SpawnDeps = struct {
     /// child for main-thread draining. Null disables registration (the task
     /// tool then drains on its own thread with no engine).
     child_registry: ?*ChildRunnerRegistry = null,
+    /// Forced structured-output schema for a delegated child run. When set, the
+    /// run forces a single synthetic `emit` tool whose validated input becomes
+    /// the run's result (see `agent.runLoopStreaming`). Borrowed: the caller
+    /// (ChildAgent, whose `spec.output_schema` lives in `spec_arena`) keeps it
+    /// alive for the run's duration. Null disables forced output (top-level
+    /// turns and free-form subagent runs).
+    output_schema: ?[]const u8 = null,
 };
 
 /// Spawn an agent thread for this runner. Assumes `submitInput` has
@@ -308,26 +310,24 @@ pub fn submit(
     self.output_tokens.store(0, .release);
 
     // Populate the TaskContext the agent thread publishes into the
-    // threadlocal slot so the built-in `task` tool can reach back to
-    // our provider, subagent registry, session handle, and depth
-    // counter. Missing a subagent registry means task delegation is
-    // disabled; the tool surfaces a tool-result error when called.
-    if (deps.subagents) |subs| {
-        self.task_ctx = .{
-            .allocator = deps.allocator,
-            .subagents = subs,
-            .provider = deps.provider,
-            .provider_name = deps.model_spec.provider_name,
-            .model_spec = deps.model_spec,
-            .registry = deps.registry,
-            .session_handle = self.conversation.session_handle,
-            .lua_engine = deps.lua_engine,
-            .task_depth = self.task_depth,
-            .wake_fd = deps.wake_write_fd,
-            .parent_conv = self.conversation,
-            .child_registry = deps.child_registry,
-        };
-    }
+    // threadlocal slot so the always-on `task` and `workflow` spawn
+    // primitives can reach back to our provider, session handle, and depth
+    // counter. Published unconditionally: both tools are always advertised,
+    // so the context must always be available (the tools gate themselves at
+    // runtime when a child drainer is absent).
+    self.task_ctx = .{
+        .allocator = deps.allocator,
+        .provider = deps.provider,
+        .provider_name = deps.model_spec.provider_name,
+        .model_spec = deps.model_spec,
+        .registry = deps.registry,
+        .session_handle = self.conversation.session_handle,
+        .lua_engine = deps.lua_engine,
+        .task_depth = self.task_depth,
+        .wake_fd = deps.wake_write_fd,
+        .parent_conv = self.conversation,
+        .child_registry = deps.child_registry,
+    };
 
     self.agent_thread = try std.Thread.spawn(.{}, threadMain, .{
         deps.provider,
@@ -340,9 +340,10 @@ pub fn submit(
         deps.model_spec,
         self.pane_handle_packed,
         deps.skills orelse self.skills,
-        if (deps.subagents != null) &self.task_ctx else null,
+        &self.task_ctx,
         &self.turn_in_progress,
         deps.session_id,
+        deps.output_schema,
     });
 }
 
@@ -399,6 +400,17 @@ pub fn formatAgentErrorMessage(
             "Context window exceeded after compaction. The conversation is too large to send. " ++
                 "Try /clear to start fresh, raise zag.compact.set_reserve_tokens, or switch to a model with a larger window.",
         ),
+        // Forced structured-output failures (subagent runs). The agent loop
+        // wrote a descriptive message naming the schema violation (or the
+        // missing tool call) into the detail slot; surface it instead of the
+        // bare error name so the orchestration script and transcript see why
+        // the child failed. Falls back to the error name when no detail wired.
+        error.StructuredOutputInvalid, error.StructuredOutputMissing => blk: {
+            if (detail_opt) |d| {
+                if (d.take()) |bytes| break :blk bytes;
+            }
+            break :blk allocator.dupe(u8, @errorName(err));
+        },
         else => allocator.dupe(u8, @errorName(err)),
     };
 }
@@ -454,6 +466,7 @@ fn threadMain(
     task_ctx: ?*const tools.TaskContext,
     turn_in_progress: *std.atomic.Value(bool),
     session_id: []const u8,
+    output_schema: ?[]const u8,
 ) void {
     // Bind the queue so worker threads can round-trip Lua tool calls and
     // hooks back to the main thread for serialised execution.
@@ -505,6 +518,7 @@ fn threadMain(
         model_spec,
         session_id,
         &detail,
+        output_schema,
     ) catch |err| {
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
@@ -742,6 +756,22 @@ pub fn serviceRoundTripEvent(
             if (!deferred) req.done.set();
             return true;
         },
+        .workflow_request => |req| {
+            // startWorkflowScript only SPAWNS the orchestration coroutine and
+            // returns; it does NOT block on completion. We therefore do NOT
+            // fire req.done here — the coroutine's retire path (normal return,
+            // runtime error, or cancellation) completes the request and fires
+            // done later, while the tool thread parks on it and the main loop
+            // pumps the coroutine + drains its children. With no engine the
+            // workflow cannot run; fail the request so the tool thread unwinds
+            // (the headless guard in the tool already prevents this path).
+            if (engine) |eng| {
+                eng.startWorkflowScript(req);
+            } else {
+                req.failDropped("workflow request: no engine on this driver");
+            }
+            return true;
+        },
         else => return false,
     }
 }
@@ -822,6 +852,7 @@ fn isRoundTripEvent(event: agent_events.AgentEvent) bool {
         .tool_gate_request,
         .loop_detect_request,
         .compact_request,
+        .workflow_request,
         => true,
         else => false,
     };
@@ -833,7 +864,7 @@ comptime {
     // Round-trip variants need to be added to the switch below so a
     // worker parked on req.done.wait() unblocks during shutdown.
     const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
-    if (variant_count != 21) {
+    if (variant_count != 22) {
         @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
     }
 }
@@ -895,6 +926,7 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
                 r.error_name = "drained_during_shutdown";
                 r.done.set();
             },
+            .workflow_request => |r| r.failDropped("workflow request drained during shutdown"),
             // Payload-bearing events stay in the ring; the post-join
             // drain in `shutdown` calls `freeOwned` on each.
             .text_delta,
@@ -1193,6 +1225,7 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) void
         .tool_gate_request,
         .loop_detect_request,
         .compact_request,
+        .workflow_request,
         => unreachable,
     }
 }
@@ -2241,7 +2274,7 @@ test "ChildRunnerRegistry.drainAll finishes a child, signals done, removes entry
     defer registry.deinit();
 
     var child_done: sync.ResetEvent = .{};
-    try registry.register(.{ .runner = &runner, .done = &child_done });
+    try registry.register(.{ .runner = &runner, .on_done = .{ .park = &child_done } });
 
     // Worker thread parks on `done`, exactly as runChild would. It must wake
     // only after the test thread's drainAll() finishes the child.
@@ -2354,6 +2387,30 @@ test "formatAgentErrorMessage falls back to error name for unhinted errors" {
     try std.testing.expectEqualStrings("MalformedResponse", msg);
 }
 
+test "formatAgentErrorMessage surfaces structured-output detail naming the violation" {
+    const allocator = std.testing.allocator;
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    detail.setOwned(try allocator.dupe(
+        u8,
+        "subagent structured output failed schema validation: EnumMismatch",
+    ));
+    const msg = try formatAgentErrorMessage(error.StructuredOutputInvalid, "stub", allocator, &detail);
+    defer allocator.free(msg);
+    // The descriptive detail wins over the bare error name.
+    try std.testing.expectEqualStrings(
+        "subagent structured output failed schema validation: EnumMismatch",
+        msg,
+    );
+}
+
+test "formatAgentErrorMessage falls back to error name when no structured-output detail wired" {
+    const allocator = std.testing.allocator;
+    const msg = try formatAgentErrorMessage(error.StructuredOutputMissing, "stub", allocator, null);
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("StructuredOutputMissing", msg);
+}
+
 test "current_caller_pane_id threadlocal is per-thread" {
     // Sanity check that assigning to `tools.current_caller_pane_id` in a
     // child thread does not bleed into the parent thread and vice versa.
@@ -2431,6 +2488,49 @@ test "drainPendingRoundTrips signals done and stamps shutdown reason" {
         "drained_during_shutdown",
         fake_req.error_name orelse "",
     );
+}
+
+test "serviceRoundTripEvent fails a workflow_request with no engine on the driver" {
+    // A driver with no LuaEngine (e.g. boot failed) cannot run a workflow.
+    // The round-trip service must complete the request with is_error so the
+    // parked tool thread unwinds instead of hanging on `done`.
+    const alloc = std.testing.allocator;
+    var req: LuaEngine.WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = alloc,
+    };
+
+    const serviced = serviceRoundTripEvent(.{ .workflow_request = &req }, null, null);
+    try std.testing.expect(serviced);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer alloc.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "no engine") != null);
+}
+
+test "drainPendingRoundTrips fails a parked workflow_request during shutdown" {
+    // The shutdown-time drain must release a parked workflow tool thread by
+    // failing its request, not leave it waiting on a `done` that never fires.
+    const alloc = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(alloc, 16);
+    defer queue.deinit();
+
+    var req: LuaEngine.WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = alloc,
+    };
+    try queue.push(.{ .workflow_request = &req });
+
+    drainPendingRoundTrips(&queue, alloc);
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer alloc.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "shutdown") != null);
 }
 
 test "handleAgentEvent .done keeps a failed turn's status, does not settle to idle" {

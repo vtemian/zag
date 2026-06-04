@@ -85,7 +85,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.thinking_effort, req.allocator);
+        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.thinking_effort, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -112,7 +112,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.thinking_effort, req.allocator);
+        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.thinking_effort, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -154,9 +154,10 @@ fn buildRequestBody(
     tool_definitions: []const types.ToolDefinition,
     reasoning: llm.Endpoint.ReasoningConfig,
     thinking_effort: ?[]const u8,
+    tool_choice: llm.ToolChoice,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, reasoning, thinking_effort, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, false, default_max_tokens, reasoning, thinking_effort, tool_choice, allocator);
 }
 
 fn buildStreamingRequestBody(
@@ -166,9 +167,10 @@ fn buildStreamingRequestBody(
     tool_definitions: []const types.ToolDefinition,
     reasoning: llm.Endpoint.ReasoningConfig,
     thinking_effort: ?[]const u8,
+    tool_choice: llm.ToolChoice,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, reasoning, thinking_effort, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, default_max_tokens, reasoning, thinking_effort, tool_choice, allocator);
 }
 
 fn serializeRequest(
@@ -180,6 +182,7 @@ fn serializeRequest(
     max_tokens: u32,
     reasoning: llm.Endpoint.ReasoningConfig,
     thinking_effort: ?[]const u8,
+    tool_choice: llm.ToolChoice,
     allocator: Allocator,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -209,6 +212,16 @@ fn serializeRequest(
     if (tool_definitions.len > 0) {
         try w.writeAll(",");
         try writeToolDefinitions(tool_definitions, w);
+    }
+
+    switch (tool_choice) {
+        .auto => {},
+        .none => try w.writeAll(",\"tool_choice\":\"none\""),
+        .tool => |name| {
+            try w.writeAll(",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":");
+            try std.json.Stringify.value(name, .{}, w);
+            try w.writeAll("}}");
+        },
     }
 
     try w.writeAll("}");
@@ -842,7 +855,7 @@ test "buildRequestBody produces valid JSON with system as first message" {
         },
     };
 
-    const body = try buildRequestBody("gpt-4o", "You are a helper.", &messages, &tool_defs, .{}, null, allocator);
+    const body = try buildRequestBody("gpt-4o", "You are a helper.", &messages, &tool_defs, .{}, null, .auto, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -871,7 +884,7 @@ test "buildRequestBody formats tools with function wrapper" {
         },
     };
 
-    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, null, allocator);
+    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, null, .auto, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -897,7 +910,7 @@ test "buildRequestBody omits tools when none provided" {
     const messages = [_]types.Message{};
     const tool_defs = [_]types.ToolDefinition{};
 
-    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, null, allocator);
+    const body = try buildRequestBody("gpt-4o", "system", &messages, &tool_defs, .{}, null, .auto, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -921,6 +934,7 @@ test "buildRequestBody injects reasoning_effort when endpoint and runtime both o
         &.{},
         reasoning,
         "high",
+        .auto,
         allocator,
     );
     defer allocator.free(body);
@@ -947,6 +961,7 @@ test "buildRequestBody omits reasoning_effort when runtime level is null" {
         &.{},
         reasoning,
         null,
+        .auto,
         allocator,
     );
     defer allocator.free(body);
@@ -969,6 +984,7 @@ test "buildRequestBody omits reasoning_effort when endpoint did not opt in" {
         &.{},
         .{},
         "high",
+        .auto,
         allocator,
     );
     defer allocator.free(body);
@@ -984,7 +1000,7 @@ test "buildStreamingRequestBody includes stream:true" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, null, allocator);
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, null, .auto, allocator);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -998,7 +1014,7 @@ test "buildStreamingRequestBody sets stream_options.include_usage=true" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};
 
-    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, null, allocator);
+    const body = try buildStreamingRequestBody("gpt-4o", "system", &messages, &.{}, .{}, null, .auto, allocator);
     defer allocator.free(body);
 
     // Raw-substring check pins the on-the-wire JSON shape: OpenAI only emits
@@ -1011,6 +1027,48 @@ test "buildStreamingRequestBody sets stream_options.include_usage=true" {
     const root = parsed.value.object;
     const stream_options = root.get("stream_options") orelse return error.TestUnexpectedResult;
     try std.testing.expect(stream_options.object.get("include_usage").?.bool == true);
+}
+
+test "openai serializes forced tool_choice" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    // Raw-substring check pins the exact on-the-wire shape. OpenAI nests the
+    // name under `function` with `type:"function"` (vs Anthropic's flat
+    // `name` + `type:"tool"`). Strict gateways (Moonshot/Kimi) reject any
+    // other shape, so this golden is the guard against wire-shape drift.
+    const body = try buildRequestBody(
+        "gpt-4o",
+        "system",
+        &messages,
+        &.{},
+        .{},
+        null,
+        .{ .tool = "emit" },
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"emit\"}}") != null);
+}
+
+test "openai omits tool_choice when auto" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildRequestBody(
+        "gpt-4o",
+        "system",
+        &messages,
+        &.{},
+        .{},
+        null,
+        .auto,
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
 }
 
 test "parseResponse parses text-only response" {
@@ -1272,7 +1330,7 @@ test "parseResponse skips reasoning when response_fields is empty" {
 }
 
 test "openai body places system as first message" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, null, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, null, .auto, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\",\"content\":\"sys\"") != null);
 }
@@ -1282,7 +1340,7 @@ test "openai wraps tool as type-function object" {
         .{ .name = "t", .description = "d", .input_schema_json = "{\"type\":\"object\"}" },
     };
 
-    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, .{}, null, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &tool_defs, false, 128, .{}, null, .auto, std.testing.allocator);
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\",\"function\":{\"name\":\"t\",") != null);
@@ -1290,7 +1348,7 @@ test "openai wraps tool as type-function object" {
 }
 
 test "openai omits tools field when none are provided" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, null, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, null, .auto, std.testing.allocator);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -1299,7 +1357,7 @@ test "openai omits tools field when none are provided" {
 }
 
 test "streaming flag is omitted by default" {
-    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, null, std.testing.allocator);
+    const body = try serializeRequest("m", "sys", &.{}, &.{}, false, 128, .{}, null, .auto, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\"") == null);
 }
@@ -1893,7 +1951,7 @@ test "Request.joinedSystem matches single-string openai body byte-for-byte" {
     const joined = try split_req.joinedSystem(allocator);
     defer allocator.free(joined);
 
-    const split_body = try buildRequestBody("gpt-4o", joined, &messages, &.{}, .{}, null, allocator);
+    const split_body = try buildRequestBody("gpt-4o", joined, &messages, &.{}, .{}, null, .auto, allocator);
     defer allocator.free(split_body);
 
     const single_body = try buildRequestBody(
@@ -1903,6 +1961,7 @@ test "Request.joinedSystem matches single-string openai body byte-for-byte" {
         &.{},
         .{},
         null,
+        .auto,
         allocator,
     );
     defer allocator.free(single_body);

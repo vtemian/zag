@@ -219,9 +219,12 @@ pub fn create(cfg: Config) !*EventOrchestrator {
 
     // Lua layout/pane bindings call the window manager directly on the main
     // thread; point the engine at the now-stable manager and buffer registry.
+    // The child-runner registry is also a stable interior address now, so the
+    // engine can drive it to drain workflow children at retire/shutdown.
     if (cfg.lua_engine) |engine| {
         engine.window_manager = &self.window_manager;
         engine.buffer_registry = &self.window_manager.buffer_registry;
+        engine.child_runner_registry = &self.child_runner_registry;
     }
 
     // The root runner services `layout_request` round-trips against this WM
@@ -508,6 +511,10 @@ fn tick(
             // completions and retires the coroutine, firing its req.done so
             // the parked producer returns error.Cancelled.
             eng.cancelTriggeredFires();
+            // Propagate a cancelled workflow's cancellation to its in-flight
+            // children (Ctrl+C and the workflow-tool's scope.cancel both mark
+            // the scope; this is where it reaches the child AgentRunners).
+            eng.cancelInFlightWorkflowChildren();
             pumpLuaCompletions(eng);
         }
 
@@ -1270,7 +1277,6 @@ fn onUserInputSubmitted(
         .provider = self.provider.provider,
         .model_spec = spec,
         .registry = self.registry,
-        .subagents = if (self.lua_engine) |eng| eng.subagentRegistry() else null,
         .session_id = session_id,
         .child_registry = &self.child_runner_registry,
     });

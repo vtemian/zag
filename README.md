@@ -45,7 +45,7 @@ That's it. No Docker, no Python venvs, no npm install.
 | **Lua plugins + async runtime** | Custom tools, hooks, keymaps, slash commands, providers, and prompt packs. Blocking I/O (HTTP, subprocess, filesystem, LLM) runs on a worker pool and resumes your coroutine on the main thread. |
 | **Mid-turn steering** | Type while the agent is running — your message is queued as a system-reminder interrupt instead of dangling at the tail. |
 | **Automatic context compaction** | Predictive cascade (Lua structured summary → Zig summarization → drop-oldest → refuse) keeps long sessions inside the context window. |
-| **Subagent delegation** | Built-in `task` tool dispatches sub-problems to named subagents with their own prompt and optional model, discovered from `*.md` files or registered in Lua. |
+| **Subagent delegation** | Built-in `task` tool dispatches one sub-problem to an inline subagent (prompt, tool allowlist, optional structured-output schema); a `workflow` tool runs a Lua script that spawns and coordinates many. |
 | **Crash-safe sessions** | Append-only JSONL with tail recovery, per-project scoping. Browse, rename, delete, and resume from the `/sessions` sidebar (`Ctrl-E`). |
 | **Inline images** | PNG decode to half-block truecolor cells with grapheme-aware width and markdown rendering. |
 | **Opt-in bash sandboxing** | macOS seatbelt or Linux Landlock + seccomp. Toggle from Lua. |
@@ -157,27 +157,40 @@ The agent can call:
 - `edit` — exact text replacement
 - `bash` — subprocess with seatbelt sandbox support
 - `layout_tree`, `layout_focus`, `layout_split`, `layout_close`, `layout_resize` — agent sees and reshapes your workspace
-- `task` — delegate to a subagent
+- `task` — delegate one shot to an inline subagent (see [Subagents and workflows](#subagents-and-workflows))
+- `workflow` — orchestrate many subagents from a Lua script
 - `pane_read` — read rendered pane contents
 
 Multiple tool calls in one turn run in parallel, each on its own thread and arena.
 
 ---
 
-## Subagents
+## Subagents and workflows
 
-Drop a Markdown file with YAML frontmatter into `.zag/agents/`, `.agents/agents/`, or `~/.config/zag/agents/`:
+The model has two always-on tools for delegating work to subagents. There is no named-agent catalog: every subagent is described inline at spawn time.
 
-```markdown
----
-name: reviewer
-description: Reviews a diff for correctness
-tools: [read, bash]
----
-You are a meticulous code reviewer...
+**`task` delegates one shot.** Spawn a single subagent, block until it finishes, and get its result as the tool result. Inputs: `prompt` (required), `system` (persona prompt), `tools` (allowlist, a subset of the caller's; omit to inherit all), `model` (carried but inert in v1; the child uses the parent's), `schema` (forces structured output, see below), and `name` (transcript label, default `"subagent"`).
+
+**`workflow` orchestrates many.** Write a Lua script that runs as a main-thread coroutine and spawns/coordinates subagents:
+
+```lua
+local out = zag.task{ prompt = "summarize the diff", system = "you are terse" }
+-- out is { summary = "...", is_error = false }
+return out.summary
 ```
 
-The `task` tool exposes it to the model automatically. Subagent turns persist into the parent session JSONL.
+- `zag.task{ prompt=, system=, tools=, model=, schema=, name= }` spawns a subagent and yields until it finishes. Returns `{ summary, is_error }`, plus a decoded `output` table when `schema` is set so the script can branch on the result.
+- `zag.workflow.parallel(fns)` runs worker functions concurrently, bounded by the fan-out window.
+- `zag.workflow.pipeline(items, stage1, stage2, ...)` threads each item through the stages, bounded by the same window.
+- `zag.workflow.max_fanout()` / `zag.workflow.set_max_fanout(n)` read and tune the per-level concurrency bound (default 8). The one knob an author tunes against provider rate limits.
+
+The script returns a string, which becomes the tool result.
+
+**Structured output.** Pass a `schema` (JSON-schema string) to `task` or `zag.task` and the subagent's final turn is forced to emit one matching JSON object; the validated object is returned in place of the prose summary (as the decoded `output` table for `zag.task`). A schema-violating emit returns an error. The validator supports `enum`, `pattern`, nested objects, and `additionalProperties`.
+
+**Nesting and bounds.** Subagents inherit `task` + `workflow` by default, so a subagent can spawn its own children. Two orthogonal limits keep this bounded: the per-level fan-out window (`max_fanout`) caps concurrent siblings, and a hard depth backstop of 8 caps the delegation chain. Hand a subagent a narrower `tools` list to force a leaf. Subagent turns persist into the parent session JSONL and can be browsed in the sessions sidebar.
+
+**Headless limitation.** Under `--headless` / the eval harness there is no main-thread child drainer, so the `workflow` tool returns an error rather than spawning undrained children. The `task` tool still works headless (it drains on its own thread).
 
 ---
 

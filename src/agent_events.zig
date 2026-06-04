@@ -16,6 +16,13 @@ const Hooks = @import("Hooks.zig");
 const prompt = @import("prompt.zig");
 const types = @import("types.zig");
 
+/// The `workflow` tool's round-trip request. Defined in `LuaEngine` (the
+/// engine owns `startWorkflowScript` and the completion lifecycle); referenced
+/// here as a pointer-typed union arm. The mutual `LuaEngine` <-> `agent_events`
+/// import is sound: only a pointer is held, so neither file needs the other's
+/// layout at analysis time.
+pub const WorkflowRequest = @import("LuaEngine.zig").LuaEngine.WorkflowRequest;
+
 const log = std.log.scoped(.agent_events);
 
 /// Default backpressure budget for `pushWithBackpressure`. Chosen so a
@@ -148,6 +155,16 @@ pub const AgentEvent = union(enum) {
     /// (tool_use, tool_result, thinking, redacted_thinking) and accepts
     /// a structured return shape (use_default / cancel / replace).
     compact_request: *CompactRequest,
+
+    /// Round-trip: the `workflow` tool's agent thread asks main to compile
+    /// and spawn its Lua orchestration script as a result-capturing coroutine
+    /// (`LuaEngine.startWorkflowScript`). Unlike the other round-trip arms,
+    /// servicing does NOT fire `req.done`: `startWorkflowScript` only spawns
+    /// the coroutine and returns, and `done` fires later when the coroutine
+    /// retires (its return value / error / cancellation captured into `req`).
+    /// The tool thread parks on `req.done` for the whole orchestration. The
+    /// request is caller-owned (lives on the parked tool thread's frame).
+    workflow_request: *WorkflowRequest,
 
     /// One-way structured event emitted at the end of each compaction
     /// cycle. Carries the outcome (which stage of the fallback chain
@@ -300,6 +317,11 @@ pub const AgentEvent = union(enum) {
                 req.error_name = "drained_without_dispatch";
                 req.done.set();
             },
+            // A dropped workflow request leaves the tool thread parked awaiting
+            // `done`; complete it with an error message so the tool surfaces a
+            // visible failure instead of hanging. (Workflow completion normally
+            // fires `done` from the coroutine retire path, never here.)
+            .workflow_request => |req| req.failDropped("workflow request dropped: event queue full"),
         }
     }
 };
@@ -1404,6 +1426,50 @@ test "freeOwned signals lua_tool_request done with error_name" {
     ev.freeOwned();
     try std.testing.expect(req.done.isSet());
     try std.testing.expectEqualStrings("drained_without_dispatch", req.error_name.?);
+}
+
+test "freeOwned fails a dropped workflow_request with is_error and a message" {
+    // The queue-full drop arm: a workflow request that loses the push race
+    // must be completed via failDropped so the parked tool thread unblocks
+    // instead of hanging on a `done` that would otherwise never fire.
+    // failDropped never dereferences `ctx`, so a stub pointer is enough here.
+    var req: WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = std.testing.allocator,
+    };
+    const ev: AgentEvent = .{ .workflow_request = &req };
+    try std.testing.expect(!req.done.isSet());
+    ev.freeOwned();
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "queue full") != null);
+}
+
+test "tryPush onto a full queue drops a workflow_request through failDropped" {
+    // Drive the real drop path: a capacity-1 queue already holding one event
+    // rejects the workflow request, and tryPush routes it through freeOwned ->
+    // failDropped. No hang, no leak (testing.allocator catches a leaked dupe).
+    var queue = try EventQueue.initBounded(std.testing.allocator, 1);
+    defer queue.deinit();
+
+    try queue.push(.done);
+
+    var req: WorkflowRequest = .{
+        .script = "return 'x'",
+        .ctx = undefined,
+        .allocator = std.testing.allocator,
+    };
+    queue.tryPush(.{ .workflow_request = &req });
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.is_error);
+    const msg = req.result orelse return error.NoMessage;
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "queue full") != null);
+    try std.testing.expectEqual(@as(u64, 1), queue.dropped.load(.monotonic));
 }
 
 test "push and drain lua_tool_request event" {
