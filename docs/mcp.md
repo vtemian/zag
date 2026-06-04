@@ -107,7 +107,7 @@ linear = {
 | `direct_tools` | boolean | `false` | Global default for per-server `direct_tools`. |
 | `disable_proxy_tool` | boolean | `false` | Drop the `mcp` proxy tool, but only when every server is fully cached. See [Direct tools](#direct-tools). |
 | `auto_auth` | boolean | `true` | On a 401 from an `auth = "oauth"` server, run the OAuth flow automatically and retry once. |
-| `imports` | string array | `{}` | Reserved. Accepted for forward compatibility; no import readers are wired yet. |
+| `imports` | string array | `{}` | Import servers from other apps' MCP config files. See [Imports](#imports). |
 
 ## Transports
 
@@ -220,6 +220,45 @@ The merge rule is **Lua wins**: a server declared in `config.lua` shadows a
 `.mcp.json` entry with the same name. `.mcp.json` entries with names not already
 declared in Lua are added. The file is read lazily on the first tool call (file
 reads cannot happen during the synchronous `setup`), not at config load.
+
+## Imports
+
+If you already declare MCP servers in another tool, `settings.imports` reads
+those tools' config files and merges their servers in, so you do not redeclare
+them in `config.lua`. It is an array of well-known app ids:
+
+```lua
+mcp.setup{
+  settings = { imports = { "claude-code", "cursor" } },
+}
+```
+
+Each id maps to one or more well-known paths. All but `vscode` are resolved
+against your home directory; `vscode` is read from the current project:
+
+| Id | Paths |
+|:---|:---|
+| `claude-code` | `~/.claude/mcp.json`, and the `mcpServers` key of `~/.claude.json` |
+| `claude-desktop` | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| `cursor` | `~/.cursor/mcp.json` |
+| `vscode` | `.vscode/mcp.json` (project-relative) |
+
+Every file is read in the standard
+`{ "mcpServers": { "<name>": { ... } } }` shape, the same one `.mcp.json` uses,
+including the `command` (string) plus `args` (array) split that external tools
+write; zag folds those into its single argv array automatically. A file is
+skipped silently when it is absent, unparseable, or does not contain an
+`mcpServers` object. Newer VS Code configs nest servers under a `servers` key
+rather than `mcpServers`; zag reads only the `mcpServers` shape and skips a file
+that has just `servers`.
+
+The merge precedence, from lowest to highest, is **imports, then `.mcp.json`,
+then Lua-declared servers**. A name declared in `config.lua` wins over the same
+name in `.mcp.json`, which wins over an import. Within `imports`, entries are
+applied in array order with first-writer-wins, so an earlier id (and an earlier
+file within an id) shadows a later one on a name collision. Like `.mcp.json`,
+imports are read lazily on the first tool call, not during `setup`. An
+unrecognized id is warned about and skipped.
 
 ## Metadata cache
 
