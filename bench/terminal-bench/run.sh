@@ -8,10 +8,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 auth_store="$HOME/.config/zag/auth.json"
-for pair in "MOONSHOT_API_KEY:moonshot" "ANTHROPIC_API_KEY:anthropic"; do
+for pair in "MOONSHOT_API_KEY:moonshot" "ANTHROPIC_API_KEY:anthropic" "OPENAI_API_KEY:openai"; do
   var="${pair%%:*}" prov="${pair##*:}"
   if [[ -z "${!var:-}" && -f "$auth_store" ]]; then
-    val="$(jq -r ".$prov.key // empty" "$auth_store")"
+    # A malformed auth store must not abort the run for env-var users.
+    val="$(jq -r ".$prov.key // empty" "$auth_store" 2>/dev/null || true)"
     if [[ -n "$val" ]]; then
       export "$var=$val"
     fi

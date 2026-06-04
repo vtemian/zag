@@ -93,5 +93,23 @@ def test_populate_context_no_trajectory_file(tmp_path):
     assert context.cost_usd is None
 
 
+def test_populate_context_malformed_trajectory(tmp_path):
+    (tmp_path / "trajectory.json").write_text("{ this is not json")
+    agent = _make_agent(tmp_path)
+    context = AgentContext()
+    agent.populate_context_post_run(context)
+    assert context.n_input_tokens is None
+    assert context.cost_usd is None
+
+
+def test_populate_context_null_final_metrics(tmp_path):
+    (tmp_path / "trajectory.json").write_text(json.dumps({"final_metrics": None}))
+    agent = _make_agent(tmp_path)
+    context = AgentContext()
+    agent.populate_context_post_run(context)
+    assert context.n_input_tokens is None
+    assert context.cost_usd is None
+
+
 def test_agent_name_is_zag():
     assert ZagAgent.name() == "zag"
