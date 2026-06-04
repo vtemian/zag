@@ -2075,6 +2075,9 @@ const OAuthFixture = struct {
     register_hits: std.atomic.Value(u32) = .init(0),
     refresh_grant_seen: std.atomic.Value(bool) = .init(false),
     client_credentials_seen: std.atomic.Value(bool) = .init(false),
+    /// When set, the authorization-server metadata advertises a non-loopback
+    /// cleartext token_endpoint so the HTTPS gate must reject the flow.
+    poison_token_endpoint: bool = false,
     /// base url ("http://127.0.0.1:<port>") so metadata can advertise itself.
     base_buf: [48]u8 = undefined,
     base_len: usize = 0,
@@ -2125,12 +2128,14 @@ const OAuthFixture = struct {
         }
         if (std.mem.indexOf(u8, request, "/.well-known/oauth-authorization-server") != null) {
             var out: [512]u8 = undefined;
+            const token_ep: []const u8 = if (ctx.poison_token_endpoint) "http://203.0.113.5/token" else ctx.base();
+            const token_suffix: []const u8 = if (ctx.poison_token_endpoint) "" else "/token";
             const json = std.fmt.bufPrint(&out,
                 "{{\"issuer\":\"{s}\"," ++
                 "\"authorization_endpoint\":\"{s}/authorize\"," ++
-                "\"token_endpoint\":\"{s}/token\"," ++
+                "\"token_endpoint\":\"{s}{s}\"," ++
                 "\"registration_endpoint\":\"{s}/register\"," ++
-                "\"code_challenge_methods_supported\":[\"S256\"]}}", .{ ctx.base(), ctx.base(), ctx.base(), ctx.base() }) catch return;
+                "\"code_challenge_methods_supported\":[\"S256\"]}}", .{ ctx.base(), ctx.base(), token_ep, token_suffix, ctx.base() }) catch return;
             ctx.writeJson(conn, json);
             return;
         }
@@ -2506,5 +2511,79 @@ test "mcp oauth: legacy SSE 401 maps to needs-auth with discovery info" {
         \\assert(srv.status == "needs-auth", "status needs-auth, got " .. tostring(srv.status))
         \\assert(srv.needs_auth_info ~= nil, "WWW-Authenticate captured")
         \\assert(srv.needs_auth_info:find("resource_metadata", 1, true), "carries resource_metadata")
+    );
+}
+
+test "mcp oauth: a non-loopback http token_endpoint is rejected and no token is stored" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ctx: OAuthFixture = undefined;
+    const thread = try startOAuthFixture(&engine, &ctx, &tmp, &abs_buf);
+    // The auth-server metadata now advertises a cleartext, non-loopback token
+    // endpoint; the HTTPS gate must reject the flow before any token POST.
+    ctx.poison_token_endpoint = true;
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // The browser opener must never be reached: discovery fails first.
+    try runLua(&engine,
+        \\mcp._test.set_browser_opener(function() error("browser must not open: discovery should reject the endpoint") end)
+    );
+
+    try runCoroutineBodyTolerant(&engine,
+        \\  local srv = mcp._test.normalize_server("poison", { url = _oauth_url, auth = "oauth" })
+        \\  mcp._test.servers().poison = srv
+        \\  local ok, err = mcp._test.oauth_authorize(srv)
+        \\  assert(not ok, "cleartext token endpoint must fail the flow")
+        \\  assert(err:find("203.0.113.5", 1, true), "error names the offending host: " .. tostring(err))
+        \\  assert(srv.oauth_access_token == nil, "no token applied on a rejected flow")
+    );
+
+    // The token endpoint was never reached and no token file was written.
+    try testing.expect(!ctx.token_saw_code_verifier.load(.acquire));
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len2 = try tmp.dir.realPathFile(std.testing.io, ".", &path_buf);
+    var tok_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const token_path = try std.fmt.bufPrint(&tok_buf, "{s}/.config/zag/mcp-oauth/poison/tokens.json", .{path_buf[0..dir_len2]});
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, token_path, .{}));
+}
+
+test "mcp oauth: require_https accepts https anywhere and http only for loopback" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // require_https gates every discovered URL before a request: https passes
+    // unconditionally; http passes ONLY for loopback hosts so the test fixtures
+    // (loopback http) keep working; any other http URL is rejected and the
+    // error names the offending scheme + host without echoing the query string.
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local rh = mcp._test.require_https
+        \\-- https passes regardless of host.
+        \\assert(rh("https://api.example.com/token"), "https accepted")
+        \\assert(rh("https://203.0.113.5/token"), "https accepted for any host")
+        \\-- http passes only for the three loopback forms.
+        \\assert(rh("http://127.0.0.1:19876/callback"), "loopback v4 http accepted")
+        \\assert(rh("http://localhost:8080/token"), "localhost http accepted")
+        \\assert(rh("http://[::1]:8080/token"), "loopback v6 http accepted")
+        \\-- non-loopback http is rejected; the error names scheme + host and
+        \\-- carries no query string.
+        \\local ok, err = rh("http://203.0.113.5/token?code=secret&verifier=secret")
+        \\assert(not ok, "non-loopback http rejected")
+        \\assert(err:find("http", 1, true), "error names the scheme: " .. tostring(err))
+        \\assert(err:find("203.0.113.5", 1, true), "error names the host: " .. tostring(err))
+        \\assert(not err:find("secret", 1, true), "error must not echo the query string")
     );
 }

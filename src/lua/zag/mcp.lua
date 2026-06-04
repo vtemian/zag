@@ -1011,6 +1011,42 @@ local function form_encode(params)
   return table.concat(parts, "&")
 end
 
+-- Gate a discovered OAuth URL on transport security before any request rides
+-- it. `https://` is accepted anywhere; `http://` is accepted ONLY for loopback
+-- hosts (127.0.0.1, localhost, [::1]) so local dev fixtures keep working.
+-- Anything else is rejected so an attacker-declared `http://` endpoint can
+-- never receive the code+verifier (or client_secret) in cleartext. Returns
+-- (true) when allowed, else (nil, err) naming the scheme + host only — never
+-- the query string, which may carry secrets.
+local function require_https(url)
+  local scheme, authority = tostring(url):match("^([%a][%w+.-]*)://([^/?#]*)")
+  if not scheme then
+    return nil, "rejecting non-URL OAuth endpoint"
+  end
+  scheme = scheme:lower()
+  -- Strip userinfo, then peel the host out of host[:port], handling the
+  -- bracketed IPv6 form ([::1]:port). Lowercase for the loopback compare.
+  local hostport = authority:gsub("^[^@]*@", "")
+  local host
+  local bracketed = hostport:match("^(%[[^%]]*%])")
+  if bracketed then
+    host = bracketed
+  else
+    host = hostport:match("^([^:]*)")
+  end
+  host = (host or ""):lower()
+  if scheme == "https" then return true end
+  if scheme == "http" then
+    if host == "127.0.0.1" or host == "localhost" or host == "[::1]" then
+      return true
+    end
+    return nil, string.format(
+      "insecure OAuth endpoint rejected: scheme=%s host=%s (only https, or http on loopback, is allowed)",
+      scheme, host)
+  end
+  return nil, string.format("unsupported OAuth endpoint scheme=%s host=%s", scheme, host)
+end
+
 -- Canonical resource indicator (RFC 8707): scheme://host[:port][/path], no
 -- query, no fragment, scheme + host lowercased. This is the `resource` value
 -- the token request must carry.
@@ -1096,6 +1132,8 @@ local function oauth_discover(srv)
     rm = scheme .. host .. "/.well-known/oauth-protected-resource"
   end
 
+  local rm_ok, rm_err = require_https(rm)
+  if not rm_ok then return nil, rm_err end
   local prm, perr = oauth_get_json(rm)
   if not prm then return nil, "protected-resource metadata: " .. tostring(perr) end
   local servers = prm.authorization_servers
@@ -1103,11 +1141,22 @@ local function oauth_discover(srv)
     return nil, "no authorization_servers in protected-resource metadata"
   end
   local as_base = servers[1]:gsub("/+$", "")
+  local as_ok, as_err = require_https(as_base)
+  if not as_ok then return nil, as_err end
 
   local asm, aerr = oauth_get_json(as_base .. "/.well-known/oauth-authorization-server")
   if not asm then return nil, "authorization-server metadata: " .. tostring(aerr) end
   if not asm.token_endpoint then
     return nil, "authorization-server metadata missing token_endpoint"
+  end
+  -- Gate every declared endpoint before any of them receives a request:
+  -- an attacker-controlled metadata document could point token_endpoint (which
+  -- carries code+verifier or client_secret) at a cleartext host.
+  for _, ep in ipairs({ asm.authorization_endpoint, asm.token_endpoint, asm.registration_endpoint }) do
+    if ep then
+      local ep_ok, ep_err = require_https(ep)
+      if not ep_ok then return nil, ep_err end
+    end
   end
   return {
     authorization_endpoint = asm.authorization_endpoint,
@@ -2791,6 +2840,7 @@ M._test = {
   -- H OAuth internals + seams.
   set_home_dir = function(d) M._home_dir_override = d end,
   set_browser_opener = function(fn) M._browser_opener = fn end,
+  require_https = function(u) return require_https(u) end,
   form_encode = function(p) return form_encode(p) end,
   canonical_resource = function(u) return canonical_resource(u) end,
   oauth_save_tokens = function(srv, bundle) return oauth_save_tokens(srv, bundle) end,
