@@ -65,6 +65,14 @@ pub const OnDone = union(enum) {
 pub const Handle = struct {
     runner: *AgentRunner,
     on_done: OnDone,
+    /// The `*ChildAgent` behind this runner, kept opaque to preserve this
+    /// module's no-import design (importing ChildAgent would form a cycle). It
+    /// is the identity payload the subagent lifecycle hooks read (name, child
+    /// conversation, spec) when they fire from `drainAll`.
+    child: ?*anyopaque = null,
+    /// Set by `drainAll` once the spawn lifecycle event has fired for this
+    /// handle, so the spawn announce happens exactly once per child.
+    announced: bool = false,
 };
 
 mutex: sync.Mutex = .{},
@@ -202,6 +210,31 @@ test "register then remove by pointer empties the registry" {
     // Removing an absent runner is a no-op.
     reg.remove(&runner_a);
     try testing.expect(reg.isEmpty());
+}
+
+test "a registered handle carries the child identity and starts unannounced" {
+    const testing = std.testing;
+    var reg = ChildRunnerRegistry.init(testing.allocator);
+    defer reg.deinit();
+
+    var runner: AgentRunner = undefined;
+    var done: sync.ResetEvent = .{};
+    // A distinct heap object stands in for the *ChildAgent; the registry treats
+    // it as opaque and never dereferences it.
+    const child_marker = try testing.allocator.create(u8);
+    defer testing.allocator.destroy(child_marker);
+
+    try reg.register(.{
+        .runner = &runner,
+        .on_done = .{ .park = &done },
+        .child = child_marker,
+    });
+
+    try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
+    const handle = reg.entries.items[0];
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(child_marker)), handle.child);
+    // The spawn lifecycle event has not fired yet for a freshly registered child.
+    try testing.expect(!handle.announced);
 }
 
 const Conversation = @import("Conversation.zig");
