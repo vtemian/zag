@@ -211,6 +211,13 @@ function M.setup(config)
     M._register_proxy_tool()
   end
 
+  -- Register the /mcp slash commands (status / reconnect / tools). A separate
+  -- human-facing surface from the proxy tool, so it registers whenever any
+  -- server is configured even if the proxy tool itself is suppressed.
+  if has_servers then
+    M._register_commands()
+  end
+
   -- If any server is eager, register the one-shot turn_start connector. Hook
   -- registration does not yield, so it is safe at config load.
   local has_eager = false
@@ -1450,6 +1457,120 @@ function M._register_proxy_tool()
 end
 
 -- ---------------------------------------------------------------------------
+-- /mcp slash command (Task F2)
+--
+-- Slash-command dispatch in zag is exact-match on the whole draft string with
+-- no argument passing, and the Lua callback runs synchronously on the main
+-- thread (NOT a coroutine: `LuaEngine.invokeCallback` does a zero-arg
+-- protectedCall and ignores the return). So we register three distinct
+-- entries instead of `/mcp <subcommand>`, and surface output through
+-- `zag.notify` (the only text-to-UI channel today). The I/O-bearing commands
+-- run their body in a `zag.detach` worker (legal from the command's
+-- protectedCall context once the async runtime is up) and notify
+-- "reconnecting..." up front so the UI is never silent during the round-trip.
+-- Per-server reconnect/connect stays available through the proxy tool
+-- (`mcp({connect="server"})`), which the slash form cannot express.
+-- ---------------------------------------------------------------------------
+
+-- Status text for the bare `/mcp` command: reuse the proxy's status formatter.
+local function cmd_status_text()
+  M.ensure_config_loaded()
+  return mode_status()
+end
+
+-- A flat listing of every tool across all servers (cached + live), each
+-- tagged with its source so the user can tell which servers are connected.
+local function cmd_tools_text()
+  M.ensure_config_loaded()
+  local names = {}
+  for name in pairs(M._servers) do names[#names + 1] = name end
+  table.sort(names)
+
+  local lines = {}
+  local total = 0
+  for _, name in ipairs(names) do
+    local srv = M._servers[name]
+    local meta = metadata_for(srv)
+    local marker = (srv.status == "connected") and "live" or "cached"
+    for _, t in ipairs(meta or {}) do
+      total = total + 1
+      lines[#lines + 1] = string.format("- %s [%s/%s]", t.name, name, marker)
+    end
+  end
+
+  if total == 0 then
+    return "No MCP tools available. Configure servers and run /mcp-reconnect."
+  end
+  return string.format("MCP tools (%d):\n", total) .. table.concat(lines, "\n")
+end
+
+-- Reconnect one server (when `server_name` is given) or all of them. Tears the
+-- existing handle down then connects + refreshes metadata. Returns a summary
+-- string suitable for notify. Yields (disconnect/connect), so the caller runs
+-- it in a coroutine (the command path detaches it).
+local function cmd_reconnect(server_name)
+  M.ensure_config_loaded()
+  local targets = {}
+  if server_name then
+    if not M._servers[server_name] then
+      return string.format('MCP: server "%s" not found.', server_name)
+    end
+    targets[1] = server_name
+  else
+    for name in pairs(M._servers) do targets[#targets + 1] = name end
+    table.sort(targets)
+  end
+
+  local results = {}
+  for _, name in ipairs(targets) do
+    local srv = M._servers[name]
+    disconnect(srv)
+    local ok, err = ensure_connected_and_fresh(srv)
+    if ok then
+      local meta = metadata_for(srv)
+      results[#results + 1] = string.format("\xE2\x9C\x93 %s (%d tools)", name, meta and #meta or 0)
+    else
+      srv.status = "failed"
+      results[#results + 1] = string.format("\xE2\x9C\x97 %s: %s", name, tostring(err))
+    end
+  end
+  return "MCP reconnect:\n" .. table.concat(results, "\n")
+end
+
+-- Register the slash commands. Called from setup() only when at least one
+-- server is configured (same token philosophy as the proxy tool).
+function M._register_commands()
+  zag.command{
+    name = "mcp",
+    desc = "Show MCP server status",
+    fn = function()
+      zag.detach(function()
+        zag.notify(cmd_status_text())
+      end)
+    end,
+  }
+  zag.command{
+    name = "mcp-reconnect",
+    desc = "Reconnect all MCP servers",
+    fn = function()
+      zag.notify("MCP: reconnecting servers...")
+      zag.detach(function()
+        zag.notify(cmd_reconnect(nil))
+      end)
+    end,
+  }
+  zag.command{
+    name = "mcp-tools",
+    desc = "List all MCP tools (cached and live)",
+    fn = function()
+      zag.detach(function()
+        zag.notify(cmd_tools_text())
+      end)
+    end,
+  }
+end
+
+-- ---------------------------------------------------------------------------
 -- Test export: internals exercised by mcp_test.zig.
 -- ---------------------------------------------------------------------------
 
@@ -1500,6 +1621,10 @@ M._test = {
   register_direct_tools = function() return M._register_direct_tools() end,
   cache_load_sync = function() return cache_load_sync() end,
   collisions = function() return M._direct_collisions end,
+  -- F2 command internals.
+  cmd_status_text = function() return cmd_status_text() end,
+  cmd_tools_text = function() return cmd_tools_text() end,
+  cmd_reconnect = function(name) return cmd_reconnect(name) end,
   -- E5 lifecycle internals.
   disconnect = function(srv) return disconnect(srv) end,
   maintenance_tick = function() return maintenance_tick() end,

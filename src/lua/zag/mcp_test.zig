@@ -1045,3 +1045,140 @@ test "mcp direct: calling a registered direct tool round-trips to the server" {
     try testing.expectEqualStrings("3", req.result_content.?);
     try testing.expect(!req.result_is_error);
 }
+
+// ---------------------------------------------------------------------------
+// F2: the /mcp slash command (+ /mcp-reconnect, /mcp-tools)
+// ---------------------------------------------------------------------------
+
+/// Whether `slash_name` (with the leading slash) resolves to a Lua-callback
+/// command on the engine.
+fn hasCommand(engine: *LuaEngine, slash_name: []const u8) bool {
+    const hit = engine.command_registry.lookup(slash_name) orelse return false;
+    return hit == .lua_callback;
+}
+
+test "mcp command: setup registers /mcp, /mcp-reconnect, /mcp-tools" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp.setup{ servers = { fake = { command = { "echo" } } } }
+    );
+    try testing.expect(hasCommand(&engine, "/mcp"));
+    try testing.expect(hasCommand(&engine, "/mcp-reconnect"));
+    try testing.expect(hasCommand(&engine, "/mcp-tools"));
+
+    // Zero servers -> no commands, mirroring the proxy-tool token philosophy.
+    var bare = try LuaEngine.init(testing.allocator);
+    defer bare.deinit();
+    bare.storeSelfPointer();
+    try runLua(&bare,
+        \\local mcp = require("zag.mcp")
+        \\mcp.setup{ servers = {} }
+    );
+    try testing.expect(!hasCommand(&bare, "/mcp"));
+}
+
+test "mcp command: status text names the configured server" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    // cmd_status_text mirrors what the bare /mcp command surfaces via notify.
+    // It runs ensure_config_loaded (which starts the detached maintenance loop
+    // that parks in zag.sleep forever), so pump on a completion flag rather
+    // than waiting for every task to retire.
+    try runLua(&engine,
+        \\function _run() _status = mcp._test.cmd_status_text(); _done = true end
+    );
+    _ = try engine.lua.getGlobal("_run");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_done");
+    try runLua(&engine,
+        \\assert(type(_status) == "string", "status is a string")
+        \\assert(_status:find("fake", 1, true), "status names the server: " .. _status)
+        \\assert(_status:find("MCP:", 1, true), "status has the header")
+    );
+}
+
+test "mcp command: tools text lists cached tools with a marker" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    try runLua(&engine,
+        \\function _run() _tools = mcp._test.cmd_tools_text(); _done = true end
+    );
+    _ = try engine.lua.getGlobal("_run");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_done");
+    try runLua(&engine,
+        \\assert(_tools:find("fake_add", 1, true), "lists the cached tool: " .. _tools)
+        \\assert(_tools:find("cached", 1, true), "marks it cached")
+    );
+}
+
+test "mcp command: reconnect exercises disconnect then connect" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    // Connect once, then drive cmd_reconnect against the live fixture: it must
+    // tear the handle down and bring it back up. Both steps yield; the
+    // ensure_config_loaded inside cmd_reconnect starts the detached
+    // maintenance loop (parks forever), so pump on a flag and record the
+    // outcome into globals to assert from Zig. The body is pcall-wrapped so a
+    // Lua assert surfaces as _ok=false rather than a lost error.
+    try runLua(&engine,
+        \\function _run()
+        \\  _ok, _err = pcall(function()
+        \\    local srv = mcp._test.servers().fake
+        \\    assert(mcp._test.connect(srv), "initial connect")
+        \\    local first = srv.handle
+        \\    assert(first ~= nil, "handle present after connect")
+        \\    local report = mcp._test.cmd_reconnect("fake")
+        \\    assert(srv.status == "connected", "reconnected: " .. tostring(srv.status))
+        \\    assert(srv.handle ~= nil, "handle present after reconnect")
+        \\    assert(srv.handle ~= first, "handle was replaced (real disconnect+connect)")
+        \\    assert(report:find("fake", 1, true), "report names the server: " .. report)
+        \\    mcp._test.disconnect(srv)
+        \\  end)
+        \\  _done = true
+        \\end
+    );
+    _ = try engine.lua.getGlobal("_run");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_done");
+    _ = try engine.lua.getGlobal("_ok");
+    const ok = engine.lua.toBoolean(-1);
+    engine.lua.pop(1);
+    if (!ok) {
+        _ = engine.lua.getGlobal("_err") catch {};
+        std.debug.print("\nreconnect body failed: {s}\n", .{engine.lua.toStringEx(-1)});
+        engine.lua.pop(1);
+        return error.ReconnectBodyFailed;
+    }
+}
