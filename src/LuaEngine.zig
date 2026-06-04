@@ -8054,6 +8054,94 @@ test "zag.http.stream flushes trailing partial line on EOS" {
     try eng.lua.doString("collectgarbage('collect')");
 }
 
+test "zag.http.stream exposes status and headers to Lua" {
+    // Lua-level glue for the C-milestone `:status()` / `:header(name)`
+    // accessors: status integer, case-insensitive header hit, missing
+    // header -> nil. The primitive-level coverage lives in
+    // primitives/http_stream.zig; this pins the metatable methods the
+    // mcp plugin's Streamable-HTTP transport branches on.
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    var server_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try server_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
+
+    const ServerCtx = struct {
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: 6\r\n" ++
+                "Content-Type: text/event-stream\r\n" ++
+                "Mcp-Session-Id: abc123\r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n" ++
+                "hello\n";
+            test_net.streamWriteAll(conn, resp) catch {};
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    try eng.lua.doString(
+        \\function test_accessors(url)
+        \\  local s, err = zag.http.stream(url)
+        \\  if err then _acc_err = err; return end
+        \\  _acc_status = s:status()
+        \\  -- Case-insensitive: the server sent "Content-Type".
+        \\  _acc_ctype = s:header("content-type")
+        \\  -- Custom header, looked up with different casing.
+        \\  _acc_session = s:header("MCP-SESSION-ID")
+        \\  -- Absent header -> nil. Record the nil-ness as a bool so the
+        \\  -- global exists for the Zig side to read (assigning nil to a
+        \\  -- global leaves it unset).
+        \\  _acc_missing_is_nil = (s:header("x-not-present") == nil)
+        \\  for _ in s:lines() do end
+        \\  s:close()
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_accessors");
+    _ = eng.lua.pushString(url);
+    _ = try eng.spawnCoroutine(1, null);
+
+    const deadline = clock.milliTimestamp() + 3000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| try eng.resumeFromJob(job) else clock.sleep(1 * std.time.ns_per_ms);
+    }
+
+    _ = try eng.lua.getGlobal("_acc_status");
+    try std.testing.expectEqual(@as(i64, 200), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_acc_ctype");
+    try std.testing.expectEqualStrings("text/event-stream", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_acc_session");
+    try std.testing.expectEqualStrings("abc123", try eng.lua.toString(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_acc_missing_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+
+    try eng.lua.doString("collectgarbage('collect')");
+}
+
 test "zag.cmd.spawn :lines flushes trailing partial line on EOF" {
     // Regression: child prints "a\nb\nc" with no trailing newline.
     // The read_line path must surface "c" as the final line before
