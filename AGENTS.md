@@ -293,14 +293,23 @@ Lua script. The script runs as a main-thread coroutine and may call:
   decoded `output` table when `schema` is set, so the script can branch on the
   result.
 - `zag.workflow.parallel(fns)` — run worker functions concurrently, bounded by
-  the fan-out window.
+  the fan-out window. Returns an array aligned with `fns`; each element is
+  `{ value = <the fn's return>, err = <error or nil> }`, so a `zag.task` result
+  is read as `slot.value.summary` / `slot.value.output`, not `slot.summary`.
 - `zag.workflow.pipeline(items, stage1, stage2, ...)` — thread each item through
-  the stages, bounded by the same window.
+  the stages, bounded by the same window. Returns the same `{value, err}` slots
+  (`value` = the final stage's output).
 - `zag.workflow.max_fanout()` / `zag.workflow.set_max_fanout(n)` — read/tune the
   per-level concurrency bound (default 8). The one knob an author tunes against
   provider rate limits.
 
 The script returns a string, which becomes the tool result.
+
+**Lua string syntax (the #1 script-compile footgun).** Double-quoted Lua strings
+cannot contain raw newlines; a multi-line prompt inside `"..."` fails to compile
+with `unfinished string`. Write multi-line text as a long string —
+`prompt = [[line one
+line two]]` — or keep it on one line.
 
 **Structured output.** Pass a `schema` (to `task`) or `schema` (to `zag.task`)
 and the subagent's final turn is forced to emit one matching JSON object; the
