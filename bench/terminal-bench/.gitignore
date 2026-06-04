@@ -1,0 +1,5 @@
+bin/
+jobs/
+zig-out-linux/
+.venv/
+__pycache__/

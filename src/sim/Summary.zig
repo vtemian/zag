@@ -6,7 +6,8 @@
 //! it into place so half-written summaries never appear on disk.
 
 const std = @import("std");
-const clock = @import("../clock.zig");
+const clock = @import("clock");
+const process_io = @import("process_io");
 const Artifacts = @import("Artifacts.zig");
 const Runner = @import("Runner.zig");
 
@@ -91,14 +92,15 @@ pub fn flush(self: *Summary) !void {
     const final_path = try self.artifacts.pathFor("summary.json");
     defer self.alloc.free(final_path);
 
+    const io = process_io.get();
     {
-        const file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(bytes);
-        try file.sync();
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, bytes);
+        try file.sync(io);
     }
 
-    try std.fs.renameAbsolute(tmp_path, final_path);
+    try std.Io.Dir.renameAbsolute(tmp_path, final_path, io);
 }
 
 fn serialize(self: *Summary, duration_ms: i64) ![]u8 {
@@ -215,7 +217,7 @@ fn writeJsonString(alloc: std.mem.Allocator, w: *std.ArrayList(u8), s: []const u
 test "flush writes parseable JSON with step records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
@@ -232,7 +234,7 @@ test "flush writes parseable JSON with step records" {
 
     try summary.flush();
 
-    const bytes = try tmp.dir.readFileAlloc(std.testing.allocator, "summary.json", 64 * 1024);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "summary.json", std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
@@ -255,7 +257,7 @@ test "flush writes parseable JSON with step records" {
 test "flush leaves no stray .tmp file on success" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     const artifacts = try Artifacts.create(std.testing.allocator, dir_path);
@@ -267,8 +269,8 @@ test "flush leaves no stray .tmp file on success" {
     try summary.flush();
 
     // Final file exists.
-    var f = try tmp.dir.openFile("summary.json", .{});
-    f.close();
+    var f = try tmp.dir.openFile(std.testing.io, "summary.json", .{});
+    f.close(std.testing.io);
     // Tmp file does not.
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("summary.json.tmp", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "summary.json.tmp", .{}));
 }

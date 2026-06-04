@@ -190,6 +190,11 @@ pub const LuaEngine = struct {
     /// shutdown can release every producer parked on a request that was
     /// already pulled out of the event queue.
     pending_fires: std.ArrayList(*PendingFire) = .empty,
+    /// Set once async teardown has run. `failFiresMatching` must become a
+    /// no-op afterwards: `tasks`/`pending_fires` are deinit'ed, and a late
+    /// `AgentRunner.shutdown` (teardown-order drift in a caller) would
+    /// otherwise walk freed memory.
+    async_torn_down: bool = false,
     /// Set by `beginHook` for the duration of the dispatcher's spawn loop so
     /// `sinkSpawnHook` binds each spawned hook coroutine to this deferred fire.
     /// Null outside a deferred hook dispatch (the in-process `fireHook` path).
@@ -2809,6 +2814,13 @@ pub const LuaEngine = struct {
         // resume_fn into the now-freed `self.tasks`. The registry itself is
         // owned by the orchestrator and outlives the engine.
         self.child_runner_registry = null;
+
+        // tasks/pending_fires are now deinit'ed. Mark teardown done so a late
+        // `failFiresMatching` (e.g. a caller whose teardown order ran async
+        // shutdown before the orchestrator's) is a no-op instead of a UAF.
+        // Set LAST: the `failAllPendingFires` at the top of this fn must still
+        // do real work while the maps are live.
+        self.async_torn_down = true;
     }
 
     /// Called by the orchestrator tick after a worker posts a completion.
@@ -3115,6 +3127,9 @@ pub const LuaEngine = struct {
     /// `finalizePendingFire`, which sees `finalized` and only frees. Lua is
     /// NOT invoked here (the engine may be tearing down).
     fn failFiresMatching(self: *LuaEngine, flag: ?*agent_events.CancelFlag, reason: []const u8) void {
+        // After async teardown the maps are deinit'ed; a late release call
+        // (caller teardown-order drift) would walk freed memory.
+        if (self.async_torn_down) return;
         for (self.pending_fires.items) |pf| {
             if (pf.finalized) continue;
             if (flag) |f| {
@@ -3881,6 +3896,24 @@ test "failAllPendingFires releases a parked compaction producer at shutdown" {
     // deinitAsync (deferred) force-retires the still-parked coroutine; the
     // `finalized` guard prevents a double-stamp and the severed request
     // pointer prevents a UAF. testing.allocator asserts no leak/corruption.
+}
+
+test "failPendingFiresForFlag after deinitAsync is a safe no-op" {
+    // Regression: main.zig's defer order ran deinitAsync before
+    // EventOrchestrator.deinit, so AgentRunner.shutdown's
+    // failPendingFiresForFlag walked a deinit'ed tasks map (UAF panic
+    // "incorrect alignment" in std.hash_map). The engine must tolerate
+    // fire-release calls after async teardown regardless of caller order.
+    const alloc = std.testing.allocator;
+    var engine = try LuaEngine.init(alloc);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    engine.deinitAsync();
+
+    var flag = agent_events.CancelFlag.init(false);
+    engine.failPendingFiresForFlag(&flag, "after_teardown");
+    // Reaching here without a panic is the assertion.
 }
 
 test "cancelTriggeredFires aborts an in-flight fire only once its turn is cancelled" {

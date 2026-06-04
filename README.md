@@ -3,13 +3,10 @@
 > A composable agent development environment. Built in Zig.
 
 <!--
-To make the demo video playable inline on GitHub:
-1. Open any issue or PR on this repo
-2. Drag /Users/whitemonk/Downloads/zag-demo.mp4 into the comment box
-3. GitHub will upload it and generate a URL like https://user-images.githubusercontent.com/...
-4. Replace the <video> src below with that URL
+Demo video: drag the mp4 into any issue/PR comment box on this repo, copy the
+generated user-images.githubusercontent.com URL, and add it here as
+<video src="..." autoplay loop muted playsinline width="100%"></video>
 -->
-<video src="/Users/whitemonk/Downloads/zag-demo.mp4" autoplay loop muted playsinline width="100%"></video>
 
 Zag is an AI coding agent where the **window system is the platform**. Splits, focus, and buffers are primitives. Everything above that — from the session tree to how agent responses render to which system prompt a model gets — is a plugin.
 
@@ -20,7 +17,7 @@ Think **Neovim's architecture, applied to AI agents**.
 ## Quickstart
 
 ```bash
-# Build (Zig 0.15.2)
+# Build (Zig 0.16.0)
 zig build
 
 # Run — first boot launches an onboarding wizard

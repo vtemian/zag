@@ -7,27 +7,35 @@
 # Turn 2: read tool reads the seed file.
 # Turn 3: write tool adds a second file.
 # Turn 4: bash lists the dir and we assert both files appear.
+#
+# Anchoring rules: wait_text is a substring match over the visible grid,
+# and the typed prompt echoes there instantly, so a wait may only target
+# text NO prompt contains. Turn 1 writes its token via `rev` of a
+# reversed seed; turn 4 asserts through `tr a-z A-Z` and `rev`
+# transforms. Turns with no echo-safe anchor settle on idle instead
+# (small window, long deadline) — an Enter typed mid-turn never submits.
 
 spawn ./zig-out/bin/zag
 wait_text /Welcome to zag/
 wait_idle 500ms
 
-send "Run this single bash command: rm -rf /tmp/zag-sim-deep && mkdir -p /tmp/zag-sim-deep && echo 'seed-token-DK1' > /tmp/zag-sim-deep/seed.txt && ls /tmp/zag-sim-deep" <Enter>
-wait_text /seed.txt/ 45s
+send "Run this single bash command: rm -rf /tmp/zag-sim-deep && mkdir -p /tmp/zag-sim-deep && echo 1KD-nekot-dees | rev > /tmp/zag-sim-deep/seed.txt && ls /tmp/zag-sim-deep" <Enter>
+wait_idle 2s 60s
 
 send "Use the read tool on /tmp/zag-sim-deep/seed.txt and quote its exact contents back to me in your reply." <Enter>
+# The forward token never appears in any prompt (turn 1 wrote it via
+# rev), so this can only match the read tool surfacing the file content.
 wait_text /seed-token-DK1/ 45s
+wait_idle 2s 60s
 
 send "Use the write tool to create /tmp/zag-sim-deep/note.txt with the single line 'note-token-MV2'." <Enter>
-# The write tool returns "wrote N lines to <path>" (src/tools/write.zig:82),
-# which surfaces in the tool_result block. Anchor on the path so we know
-# the write actually completed before we list the directory.
-wait_text /note.txt/ 45s
+wait_idle 2s 60s
 
-send "Run 'ls /tmp/zag-sim-deep && cat /tmp/zag-sim-deep/note.txt' as one bash tool call." <Enter>
-wait_text /note-token-MV2/ 45s
-wait_text /seed.txt/ 5s
-wait_text /note.txt/ 5s
+send "Run one bash call: ls /tmp/zag-sim-deep | tr a-z A-Z && cat /tmp/zag-sim-deep/note.txt | rev" <Enter>
+# Uppercase listing and reversed note content appear in no prompt.
+wait_text /SEED.TXT/ 45s
+wait_text /NOTE.TXT/ 5s
+wait_text /2VM-nekot-eton/ 5s
 
 snapshot final
 send "/quit" <Enter>
