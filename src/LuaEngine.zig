@@ -376,6 +376,11 @@ pub const LuaEngine = struct {
         /// completed (exactly-once). Borrowed; the parked agent thread owns the
         /// `WorkflowRequest`.
         workflow_request: ?*WorkflowRequest = null,
+        /// Non-null only on a coroutine running a `zag.tool` execute fn: the
+        /// round-trip request whose result/done the tool's return value fills.
+        /// Same exactly-once + park-until-retire contract as `workflow_request`.
+        /// Borrowed; the parked tool thread owns it.
+        lua_tool_request: ?*Hooks.LuaToolRequest = null,
     };
 
     /// A workflow-script run requested by a parked agent thread (the future
@@ -3028,7 +3033,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null, null);
     }
 
     /// Spawn a coroutine that inherits a workflow context from its spawner.
@@ -3043,7 +3048,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         workflow_ctx: ?*const tools_mod.TaskContext,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, null, null);
     }
 
     /// Spawn a coroutine already bound to a `PendingFire`. The binding is set
@@ -3059,7 +3064,7 @@ pub const LuaEngine = struct {
         pf: *PendingFire,
     ) !i32 {
         pf.outstanding += 1;
-        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null) catch |err| {
+        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null, null) catch |err| {
             // The spawn never registered the task (so retireTask will not run
             // for it); undo the bump so the guard release still reaches 0.
             pf.outstanding -= 1;
@@ -3230,6 +3235,17 @@ pub const LuaEngine = struct {
                         log.warn("workflow scope cancel failed: {s}", .{@errorName(err)});
                 }
             }
+            // Same contract for a `zag.tool` coroutine: the parked tool thread
+            // sets `cancel_requested`; we cancel its scope ON MAIN, where the
+            // scope lifetime is controlled (it is freed in retireTask the
+            // instant the coroutine retires, so an off-main cancel races that
+            // free).
+            if (task.lua_tool_request) |req| {
+                if (req.cancel_requested.load(.acquire) and !task.scope.isCancelled()) {
+                    task.scope.cancel("lua tool cancelled") catch |err|
+                        log.warn("lua tool scope cancel failed: {s}", .{@errorName(err)});
+                }
+            }
             const child = task.pending_child orelse continue;
             if (!task.scope.isCancelled()) continue;
             child.child_runner.cancelAgent();
@@ -3285,7 +3301,7 @@ pub const LuaEngine = struct {
         // (so its return value is captured). Both are set before the first
         // resume inside spawnCoroutineFull, so even a no-yield script that
         // returns immediately has its result captured.
-        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req) catch |err| {
+        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req, null) catch |err| {
             // The spawn never registered a task (so retireTask cannot complete
             // the request); complete it here. The chunk on the stack was either
             // consumed by spawnCoroutineFull (on the xMove) or left on a failure
@@ -3328,6 +3344,86 @@ pub const LuaEngine = struct {
         req.done.set();
     }
 
+    /// Spawn `req.tool_name`'s execute fn as a result-capturing coroutine. MUST
+    /// be called on the MAIN thread (it touches the Lua VM). Does NOT block;
+    /// `req.done` fires from the coroutine's retire path — the parked tool
+    /// thread keeps the request alive (park-until-retire) while the main loop
+    /// pumps the coroutine, so its execute fn may yield on `zag.cmd`/`zag.http`/
+    /// `zag.sleep` between resumes.
+    ///
+    /// Completion is exactly-once: an unknown-tool or input-parse failure
+    /// completes `req` here; a successful run captures the coroutine's return
+    /// (`string` | `nil, err`) in `resumeTask`'s `.ok` arm; a runtime error or
+    /// cancellation completes it via the resume-error branch or `retireTask`.
+    pub fn startLuaToolCall(self: *LuaEngine, req: *Hooks.LuaToolRequest) void {
+        const tool = self.findTool(req.tool_name) orelse {
+            completeLuaToolRequestOwned(req, "error: unknown lua tool", true);
+            return;
+        };
+        _ = self.lua.rawGetIndex(zlua.registry_index, tool.func_ref);
+        lua_json.pushJsonAsTable(self.lua, req.input_raw, self.allocator) catch |err| {
+            self.lua.pop(1); // pop the function
+            completeLuaToolRequestOwned(req, @errorName(err), true);
+            return;
+        };
+        // Stack: [fn, input_table]. spawnCoroutineFull moves both to the new
+        // coroutine (nargs = 1) and tags it with the request so the return
+        // value is captured even for a no-yield tool that retires inside the
+        // spawn.
+        _ = self.spawnCoroutineFull(1, self.root_scope, null, null, null, null, null, req) catch |err| {
+            // The spawn never registered a task (so retireTask cannot complete
+            // the request); complete it here. The fn+arg on the stack were
+            // either consumed by spawnCoroutineFull (on the xMove) or left on a
+            // failure before it; clear the stack to be safe.
+            self.lua.setTop(0);
+            completeLuaToolRequestOwned(req, @errorName(err), true);
+        };
+    }
+
+    /// Complete a `LuaToolRequest` exactly once: dupe `message` into the
+    /// requester's allocator as the result content, stamp `is_error`, and fire
+    /// `done`. A second call is a no-op (guarded by `done.isSet`). Used by the
+    /// unknown-tool / parse-error / cancel / shutdown paths.
+    fn completeLuaToolRequestOwned(req: *Hooks.LuaToolRequest, message: []const u8, is_error: bool) void {
+        if (req.done.isSet()) return;
+        req.result_content = req.allocator.dupe(u8, message) catch null;
+        req.result_owned = req.result_content != null;
+        req.result_is_error = is_error;
+        req.done.set();
+    }
+
+    /// Capture a finished tool coroutine's return value into its request,
+    /// honoring the tool return convention (`string` success, `nil, err`
+    /// failure). Reads the returns WITHOUT popping (the caller pops after),
+    /// dupes the chosen message into the requester's allocator, and fires
+    /// `done`. Called from `resumeTask`'s `.ok` arm.
+    ///
+    /// A cancelled scope means the tool was aborted (Ctrl+C or the tool
+    /// thread's `cancel_requested`); surface it as an error regardless of the
+    /// returned value so a cancelled tool never reports a misleading success.
+    fn captureLuaToolReturn(req: *Hooks.LuaToolRequest, co: *Lua, num_results: i32, was_cancelled: bool) void {
+        if (req.done.isSet()) return;
+        if (was_cancelled) {
+            completeLuaToolRequestOwned(req, "error: lua tool cancelled", true);
+            return;
+        }
+        if (num_results >= 1 and co.isString(-num_results)) {
+            const s = co.toString(-num_results) catch "";
+            req.result_content = req.allocator.dupe(u8, s) catch null;
+            req.result_owned = req.result_content != null;
+            req.result_is_error = false;
+        } else if (num_results >= 2 and co.isNoneOrNil(-num_results)) {
+            const msg = co.toString(-(num_results - 1)) catch "unknown error from Lua tool";
+            req.result_content = req.allocator.dupe(u8, msg) catch null;
+            req.result_owned = req.result_content != null;
+            req.result_is_error = true;
+        } else {
+            completeLuaToolRequestOwned(req, "error: Lua tool returned non-string", true);
+            return;
+        }
+        req.done.set();
+    }
+
     fn spawnCoroutineFull(
         self: *LuaEngine,
         nargs: i32,
@@ -3337,6 +3433,7 @@ pub const LuaEngine = struct {
         pending_fire: ?*PendingFire,
         workflow_ctx: ?*const tools_mod.TaskContext,
         workflow_request: ?*WorkflowRequest,
+        lua_tool_request: ?*Hooks.LuaToolRequest,
     ) !i32 {
         // The async runtime must be up before a coroutine can be scheduled.
         // Internal callers (hooks, compaction) only run after `initAsync`,
@@ -3380,6 +3477,10 @@ pub const LuaEngine = struct {
             // retires inside this spawn still has its return value captured by
             // resumeTask's `.ok` arm.
             .workflow_request = workflow_request,
+            // Set before the first resume for the same reason as
+            // `workflow_request`: a no-yield tool retiring inside this spawn
+            // must still capture its return value into the request.
+            .lua_tool_request = lua_tool_request,
         };
 
         // Stash the Task in the coroutine's extraspace for O(1) lookup in
@@ -3486,6 +3587,15 @@ pub const LuaEngine = struct {
                     // workflow never reports a misleading success.
                     captureWorkflowReturn(req, task.co, num_results, task.scope.isCancelled());
                     task.workflow_request = null;
+                } else if (task.lua_tool_request) |req| {
+                    // Lua-tool retire path. The execute fn's return (a string,
+                    // or `nil, err`) lives at the coroutine's stack top; capture
+                    // it into the request BEFORE the pop, then null the field so
+                    // retireTask's completion arm is a no-op (exactly-once). A
+                    // cancelled scope surfaces as an error regardless of the
+                    // returned value.
+                    captureLuaToolReturn(req, task.co, num_results, task.scope.isCancelled());
+                    task.lua_tool_request = null;
                 }
                 task.co.pop(num_results);
                 self.retireTask(task);
@@ -3542,6 +3652,20 @@ pub const LuaEngine = struct {
             const msg: []const u8 = if (was_cancelled) "cancelled" else "workflow script error";
             completeWorkflowRequestOwned(req, msg, true);
             task.workflow_request = null;
+        }
+
+        // Same as the workflow-request arm: a tool coroutine reaching retire
+        // WITHOUT having captured its return (normal completion nulls
+        // `lua_tool_request` first) is being torn down by a runtime error or
+        // cancellation. Complete the request with an error so the parked tool
+        // thread unwinds instead of hanging on `done`.
+        if (task.lua_tool_request) |req| {
+            completeLuaToolRequestOwned(
+                req,
+                if (was_cancelled) "error: lua tool cancelled" else "error: lua tool aborted",
+                true,
+            );
+            task.lua_tool_request = null;
         }
 
         // Capture the bound fire before the task is destroyed; the decrement
@@ -4264,6 +4388,57 @@ test "luaTableToJson serializes nested tables" {
     try std.testing.expectEqual(@as(i64, 42), obj.get("num").?.integer);
     try std.testing.expectEqual(true, obj.get("flag").?.bool);
     try std.testing.expect(obj.get("nested") != null);
+}
+
+test "lua tool runs as coroutine and can yield on zag.sleep" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // A tool that yields (zag.sleep) before returning proves the execute fn
+    // runs as a coroutine: the sync protectedCall path could never suspend.
+    try engine.lua.doString(
+        \\zag.tool({
+        \\  name = "sleepy",
+        \\  description = "d",
+        \\  input_schema = { type = "object" },
+        \\  execute = function(input)
+        \\    zag.sleep(1)
+        \\    return "slept"
+        \\  end,
+        \\})
+    );
+
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "sleepy",
+        .input_raw = "{}",
+        .allocator = std.testing.allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    engine.startLuaToolCall(&req);
+
+    // Pump completions until the coroutine retires and fires `req.done`
+    // (same shape as the workflow-script tests' pump loop).
+    const deadline = clock.milliTimestamp() + 4000;
+    while (!req.done.isSet() and clock.milliTimestamp() < deadline) {
+        if (engine.async_runtime.?.completions.pop()) |job| {
+            try engine.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result_content != null);
+    defer if (req.result_owned) std.testing.allocator.free(req.result_content.?);
+    try std.testing.expectEqualStrings("slept", req.result_content.?);
+    try std.testing.expect(!req.result_is_error);
 }
 
 test "executeTool calls Lua function and returns result" {
