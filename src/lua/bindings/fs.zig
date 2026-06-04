@@ -138,6 +138,13 @@ fn zagFsWriteImpl(co: *Lua, comptime mode: enum { overwrite, append }) i32 {
     var file_mode: ?std.posix.mode_t = null;
     if (co.isTable(3)) {
         _ = co.getField(3, "mode");
+        // A present-but-non-integer mode must NOT silently fall back to the
+        // OS default: token files would land with wide perms. Reject it.
+        if (!co.isNil(-1) and !co.isInteger(-1)) {
+            staged.arena_ptr.deinit();
+            staged.engine.allocator.destroy(staged.arena_ptr);
+            co.raiseErrorStr("zag.fs.write: opts.mode must be an integer in 0..0o7777", .{});
+        }
         if (co.isInteger(-1)) {
             const v = co.toInteger(-1) catch -1;
             if (v < 0 or v > 0o7777) {

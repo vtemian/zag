@@ -4028,6 +4028,56 @@ test "zag.fs.write with a mode option stamps the created file 0600" {
     try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode())) & 0o777);
 }
 
+test "zag.fs.write with a non-integer mode raises instead of widening perms" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var realbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = realbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &realbuf)];
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/token.json", .{base});
+
+    // A present-but-non-integer mode must raise, not silently fall back to
+    // the OS default (which would leave a token file world-readable). The
+    // raise is synchronous (before the job submits), so pcall catches it in
+    // the same resume; no completion is ever posted.
+    _ = engine.lua.pushString(path);
+    engine.lua.setGlobal("_test_write_path");
+    try engine.lua.doString(
+        \\_test_write_ok = nil
+        \\_test_write_err = nil
+        \\function test_write_bad_mode()
+        \\  local ok, err = pcall(function()
+        \\    return zag.fs.write(_test_write_path, "secret", { mode = "600" })
+        \\  end)
+        \\  _test_write_ok = ok
+        \\  _test_write_err = tostring(err)
+        \\end
+    );
+    _ = try engine.lua.getGlobal("test_write_bad_mode");
+    _ = try engine.spawnCoroutine(0, null);
+
+    // pcall captured the raise; the coroutine returned without yielding.
+    _ = try engine.lua.getGlobal("_test_write_ok");
+    try testing.expect(!engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    _ = engine.lua.getGlobal("_test_write_err") catch {};
+    const err_text = engine.lua.toString(-1) catch "";
+    try testing.expect(std.mem.indexOf(u8, err_text, "opts.mode must be an integer") != null);
+    engine.lua.pop(1);
+
+    // The refused write never created the file (wide-perm fallback avoided).
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, path, .{}));
+}
+
 test "zag.http.await_callback resolves with URL-decoded params via the real binding" {
     std.testing.log_level = .err;
     const allocator = testing.allocator;
