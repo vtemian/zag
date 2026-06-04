@@ -1167,6 +1167,58 @@ test "mcp command: tools text lists cached tools with a marker" {
     );
 }
 
+test "mcp command: /mcp invokeCallback detaches a worker that notifies status" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    // The /mcp command's `fn` runs through invokeCallback (a zero-arg
+    // protectedCall, NOT a coroutine) and spawns a `zag.detach` worker that
+    // calls zag.notify(status). zag.notify only logs, so capture its text by
+    // shadowing it with a Lua stub that records into a global the test reads.
+    try runLua(&engine,
+        \\_notified = nil
+        \\zag.notify = function(msg) _notified = msg end
+    );
+
+    // Resolve the registered command exactly as WindowManager.handleCommand
+    // would, then fire it. invokeCallback returns immediately; the notify
+    // happens later, from inside the detached worker the pump advances.
+    const cmd = engine.command_registry.lookup("/mcp") orelse
+        return error.TestExpectedCommand;
+    try testing.expect(cmd == .lua_callback);
+    engine.invokeCallback(cmd.lua_callback);
+
+    // The detached worker's ensure_config_loaded starts the maintenance loop
+    // (parks in zag.sleep forever), so pump on the captured-flag rather than
+    // waiting for every task to retire: _notified flips once notify fires.
+    const deadline = clock.milliTimestamp() + 5000;
+    while (clock.milliTimestamp() < deadline) {
+        engine.pumpCompletions();
+        if (engine.lua.getGlobal("_notified")) |_| {
+            const is_str = engine.lua.isString(-1);
+            engine.lua.pop(1);
+            if (is_str) break;
+        } else |_| {
+            engine.lua.pop(1);
+        }
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+
+    try runLua(&engine,
+        \\assert(type(_notified) == "string", "the detached worker notified status text")
+        \\assert(_notified:find("MCP:", 1, true), "status header present: " .. tostring(_notified))
+        \\assert(_notified:find("fake", 1, true), "status names the configured server: " .. tostring(_notified))
+    );
+}
+
 test "mcp command: reconnect exercises disconnect then connect" {
     var engine = try LuaEngine.init(testing.allocator);
     defer engine.deinit();
