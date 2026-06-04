@@ -88,12 +88,15 @@ fn runCoroutineBody(engine: *LuaEngine, body: [:0]const u8) !void {
 /// notifications.
 const fake_mcp_sh =
     \\#!/bin/sh
+    \\reqid() { rest=${1#*\"id\":}; printf '%s' "${rest%%[!0-9]*}"; }
     \\while IFS= read -r line; do
+    \\  id=$(reqid "$line")
     \\  case "$line" in
-    \\    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"0"}}}' ;;
+    \\    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"0"}}}' ;;
     \\    *'"notifications/initialized"'*) ;;
-    \\    *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"add","description":"adds","inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}}]}}' ;;
-    \\    *'"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"3"}],"isError":false}}' ;;
+    \\    *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","description":"adds two numbers","inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}}]}}' ;;
+    \\    *'"resources/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[]}}' ;;
+    \\    *'"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"3"}],"isError":false}}' ;;
     \\  esac
     \\done
     \\
@@ -125,6 +128,14 @@ fn writeFixture(tmp: *std.testing.TmpDir, name: []const u8, contents: []const u8
 }
 
 // ---------------------------------------------------------------------------
+/// Whether a tool of `name` is registered on the engine.
+fn hasTool(engine: *LuaEngine, name: []const u8) bool {
+    for (engine.tools.items) |t| {
+        if (std.mem.eql(u8, t.name, name)) return true;
+    }
+    return false;
+}
+
 // E1: skeleton, config normalization, env interpolation
 // ---------------------------------------------------------------------------
 
@@ -482,4 +493,200 @@ test "mcp stdio: per-request timeout fires when the server never replies" {
         \\  assert(err == "timeout", "expected timeout, got " .. tostring(err))
         \\  mcp._test.disconnect_handle(fake)
     );
+}
+
+// ---------------------------------------------------------------------------
+// E4: the `mcp` proxy tool
+// ---------------------------------------------------------------------------
+
+/// Drive the registered `mcp` proxy tool with a JSON input through the
+/// coroutine tool path, returning its result string into Lua global
+/// `_proxy_result` (and surfacing is_error).
+fn callProxy(engine: *LuaEngine, input_json: [:0]const u8) ![]const u8 {
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = "mcp",
+        .input_raw = input_json,
+        .allocator = testing.allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    engine.startLuaToolCall(&req);
+    try pumpToolToDone(engine, &req);
+    if (req.result_owned) {
+        // Caller frees via the returned slice's owner; dupe into the testing
+        // allocator-independent path is overkill — copy to a static-ish buf.
+        const out = try testing.allocator.dupe(u8, req.result_content.?);
+        testing.allocator.free(@constCast(req.result_content.?));
+        return out;
+    }
+    return error.NoProxyResult;
+}
+
+// Set up an engine with the fake server configured via setup() (which
+// registers the proxy tool), and seed the metadata cache with the `add` tool
+// so discovery modes work without connecting.
+fn setupProxyEngine(engine: *LuaEngine, tmp: *std.testing.TmpDir, abs_buf: []u8) !void {
+    const path = try writeFixture(tmp, "fake-mcp.sh", fake_mcp_sh, abs_buf);
+    _ = engine.lua.pushString(path);
+    engine.lua.setGlobal("_fixture_path");
+    // Point the cache at the tmp dir and pin the clock.
+    const dir_len = try tmp.dir.realPathFile(std.testing.io, ".", abs_buf);
+    _ = engine.lua.pushString(abs_buf[0..dir_len]);
+    engine.lua.setGlobal("_cache_dir");
+    try runLua(engine,
+        \\mcp = require("zag.mcp")
+        \\mcp._test.set_cache_dir(_cache_dir)
+        \\mcp._test.set_now(1000000)
+        \\mcp.setup{ servers = { fake = { command = { "sh", _fixture_path } } } }
+    );
+    // Seed a valid cache entry and PERSIST it to disk, so the proxy's lazy
+    // ensure_config_loaded() (which runs cache_load) reads it back rather
+    // than wiping the in-memory seed. cache_save yields, so run in a
+    // coroutine.
+    try runCoroutineBody(engine,
+        \\  local srv = mcp._test.servers().fake
+        \\  mcp._test.cache().servers.fake = {
+        \\    config_hash = mcp._test.config_hash(srv),
+        \\    cached_at = 1000000,
+        \\    tools = { { name = "add", description = "adds two numbers",
+        \\      input_schema = { type = "object",
+        \\        properties = { a = { type = "number" }, b = { type = "number" } },
+        \\        required = { "a", "b" } } } },
+        \\    resources = {},
+        \\  }
+        \\  mcp._test.cache_save()
+    );
+}
+
+test "mcp proxy: status lists servers with markers" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    const out = try callProxy(&engine, "{}");
+    defer testing.allocator.free(out);
+    // Cached-but-not-connected server: ○ marker, tool count, "cached".
+    try testing.expect(std.mem.indexOf(u8, out, "MCP: 0/1 servers, 1 tools") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fake") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "cached") != null);
+}
+
+test "mcp proxy: search finds a cached tool, describe renders params" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    const search = try callProxy(&engine, "{\"search\":\"add\"}");
+    defer testing.allocator.free(search);
+    try testing.expect(std.mem.indexOf(u8, search, "fake_add") != null);
+    try testing.expect(std.mem.indexOf(u8, search, "adds two numbers") != null);
+    try testing.expect(std.mem.indexOf(u8, search, "Parameters:") != null);
+
+    const desc = try callProxy(&engine, "{\"describe\":\"fake_add\"}");
+    defer testing.allocator.free(desc);
+    try testing.expect(std.mem.indexOf(u8, desc, "Server: fake") != null);
+    try testing.expect(std.mem.indexOf(u8, desc, "*required*") != null);
+}
+
+test "mcp proxy: server mode lists tools; unknown tool guidance" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    const list = try callProxy(&engine, "{\"server\":\"fake\"}");
+    defer testing.allocator.free(list);
+    try testing.expect(std.mem.indexOf(u8, list, "fake_add") != null);
+    try testing.expect(std.mem.indexOf(u8, list, "cached") != null);
+
+    const unknown = try callProxy(&engine, "{\"describe\":\"nope\"}");
+    defer testing.allocator.free(unknown);
+    try testing.expect(std.mem.indexOf(u8, unknown, "not found") != null);
+    try testing.expect(std.mem.indexOf(u8, unknown, "mcp({ search") != null);
+}
+
+test "mcp proxy: tool call lazy-connects and returns content text" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupProxyEngine(&engine, &tmp, &abs_buf);
+
+    // The proxy resolves fake_add -> fake, connects, calls; fixture -> "3".
+    const out = try callProxy(&engine, "{\"tool\":\"fake_add\",\"args\":\"{\\\"a\\\":1,\\\"b\\\":2}\"}");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("3", out);
+
+    // After the call the server is connected and in_flight settled to 0.
+    try runLua(&engine,
+        \\assert(mcp._test.servers().fake.status == "connected", "connected after call")
+        \\assert(mcp._test.servers().fake.in_flight == 0, "in_flight settled")
+    );
+}
+
+test "mcp proxy: content_to_string degrades image and resource blocks" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local s = mcp._test.content_to_string({
+        \\  { type = "text", text = "hello" },
+        \\  { type = "image", mimeType = "image/png", data = "AAAA" },
+        \\  { type = "resource", resource = { uri = "file:///r", text = "body" } },
+        \\})
+        \\assert(s:find("hello", 1, true), "text kept")
+        \\assert(s:find("[image image/png, 4 bytes]", 1, true), "image marker: " .. s)
+        \\assert(s:find("[Resource: file:///r]", 1, true), "resource marker")
+        \\assert(s:find("body", 1, true), "resource body")
+    );
+}
+
+test "mcp proxy tool is registered only when a server is configured" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Zero servers -> no proxy tool registered.
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp.setup{ servers = {} }
+    );
+    try testing.expect(!hasTool(&engine, "mcp"));
+
+    // With a server, setup registers the proxy tool.
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp.setup{ servers = { fake = { command = { "echo" } } } }
+    );
+    try testing.expect(hasTool(&engine, "mcp"));
 }

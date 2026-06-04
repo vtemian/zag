@@ -665,6 +665,550 @@ end
 M._cache_load = cache_load
 
 -- ---------------------------------------------------------------------------
+-- Tool-name prefixing + metadata view (port of pi tool-metadata.ts)
+-- ---------------------------------------------------------------------------
+
+-- The prefix a server's tools carry under a given mode (port of pi's
+-- getServerPrefix). "none" -> "", "short" -> strip a trailing -?mcp and
+-- normalize, "server" -> the name with hyphens as underscores.
+local function server_prefix(name, mode)
+  if mode == "none" then return "" end
+  if mode == "short" then
+    local short = name:gsub("%-?[Mm][Cc][Pp]$", ""):gsub("%-", "_")
+    if short == "" then short = "mcp" end
+    return short
+  end
+  return (name:gsub("%-", "_"))
+end
+
+local function format_tool_name(tool_name, server_name, mode)
+  local p = server_prefix(server_name, mode)
+  if p ~= "" then return p .. "_" .. tool_name end
+  return tool_name
+end
+
+local function normalize_tool_name(s)
+  return (s:gsub("%-", "_"))
+end
+
+-- Is `tool_name` excluded for `server_name` under `mode`? Matches the
+-- original name and all prefix variants, hyphen-normalized (pi types.ts).
+local function is_tool_excluded(tool_name, server_name, mode, exclude_tools)
+  if type(exclude_tools) ~= "table" or #exclude_tools == 0 then return false end
+  local candidates = {
+    [normalize_tool_name(tool_name)] = true,
+    [normalize_tool_name(format_tool_name(tool_name, server_name, mode))] = true,
+    [normalize_tool_name(format_tool_name(tool_name, server_name, "server"))] = true,
+    [normalize_tool_name(format_tool_name(tool_name, server_name, "short"))] = true,
+  }
+  for _, ex in ipairs(exclude_tools) do
+    if type(ex) == "string" and candidates[normalize_tool_name(ex)] then
+      return true
+    end
+  end
+  return false
+end
+
+-- Turn a resource name into a tool-name fragment (port of pi's
+-- resourceNameToToolName: lowercase, non-alnum -> underscore).
+local function resource_name_to_tool_name(name)
+  return (name:lower():gsub("[^%w]+", "_"):gsub("^_+", ""):gsub("_+$", ""))
+end
+
+-- Build the metadata view (prefixed tool entries) for a server from its
+-- cache entry. Returns an array of
+--   { name, original_name, description, input_schema, resource_uri? }.
+local function build_metadata(srv, entry)
+  local mode = M._settings.tool_prefix or "server"
+  local out = {}
+  for _, t in ipairs(entry.tools or {}) do
+    if t.name and not is_tool_excluded(t.name, srv.name, mode, srv.exclude_tools) then
+      out[#out + 1] = {
+        name = format_tool_name(t.name, srv.name, mode),
+        original_name = t.name,
+        description = t.description or "",
+        input_schema = t.input_schema,
+      }
+    end
+  end
+  if srv.expose_resources ~= false then
+    for _, r in ipairs(entry.resources or {}) do
+      if r.name and r.uri then
+        local base = "get_" .. resource_name_to_tool_name(r.name)
+        if not is_tool_excluded(base, srv.name, mode, srv.exclude_tools) then
+          out[#out + 1] = {
+            name = format_tool_name(base, srv.name, mode),
+            original_name = base,
+            description = r.description or ("Read resource: " .. r.uri),
+            resource_uri = r.uri,
+          }
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- The live metadata view: name -> metadata array, rebuilt from M._cache.
+-- Populated lazily; refreshed when a server (re)connects.
+M._metadata = {}
+
+local function metadata_for(srv)
+  if M._metadata[srv.name] then return M._metadata[srv.name] end
+  local entry = M._cache.servers[srv.name]
+  if entry then
+    M._metadata[srv.name] = build_metadata(srv, entry)
+    return M._metadata[srv.name]
+  end
+  return nil
+end
+
+-- Find a tool by prefixed name within a metadata array: exact first, then
+-- hyphen-normalized (port of pi's findToolByName).
+local function find_tool(meta, name)
+  if not meta then return nil end
+  for _, t in ipairs(meta) do
+    if t.name == name then return t end
+  end
+  local norm = normalize_tool_name(name)
+  for _, t in ipairs(meta) do
+    if normalize_tool_name(t.name) == norm then return t end
+  end
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Output formatting (port of pi tool-metadata.ts / proxy-modes.ts)
+-- ---------------------------------------------------------------------------
+
+local function truncate_at_word(text, target)
+  if not text or #text <= target then return text end
+  local truncated = text:sub(1, target)
+  local last_space = truncated:find(" [^ ]*$")  -- index of last space
+  if last_space and last_space > target * 0.6 then
+    return truncated:sub(1, last_space - 1) .. "..."
+  end
+  return truncated .. "..."
+end
+
+local format_property
+local function format_schema(schema, indent)
+  indent = indent or "  "
+  if type(schema) ~= "table" then return indent .. "(no schema)" end
+  if schema.type == "object" and type(schema.properties) == "table" then
+    local props = schema.properties
+    local required = {}
+    if type(schema.required) == "table" then
+      for _, r in ipairs(schema.required) do required[r] = true end
+    end
+    if next(props) == nil then return indent .. "(no parameters)" end
+    local lines = {}
+    -- Sort property names for stable output.
+    local names = {}
+    for name in pairs(props) do names[#names + 1] = name end
+    table.sort(names)
+    for _, name in ipairs(names) do
+      lines[#lines + 1] = format_property(name, props[name], required[name], indent)
+    end
+    return table.concat(lines, "\n")
+  end
+  if schema.type then return indent .. "(" .. tostring(schema.type) .. ")" end
+  return indent .. "(complex schema)"
+end
+
+function format_property(name, schema, required, indent)
+  if type(schema) ~= "table" then
+    return indent .. name .. (required and " *required*" or "")
+  end
+  local type_str = ""
+  if schema.type then
+    if type(schema.type) == "table" then
+      type_str = table.concat(schema.type, " | ")
+    else
+      type_str = tostring(schema.type)
+    end
+  elseif schema["enum"] then
+    type_str = "enum"
+  elseif schema.anyOf or schema.oneOf then
+    type_str = "union"
+  end
+  if type(schema["enum"]) == "table" then
+    local vals = {}
+    for _, v in ipairs(schema["enum"]) do
+      vals[#vals + 1] = zag.json.encode({ v }):sub(2, -2)
+    end
+    type_str = "enum: " .. table.concat(vals, ", ")
+  end
+  local parts = { indent .. name }
+  if type_str ~= "" then parts[#parts + 1] = "(" .. type_str .. ")" end
+  if required then parts[#parts + 1] = "*required*" end
+  if type(schema.description) == "string" then
+    parts[#parts + 1] = "- " .. schema.description
+  end
+  if schema.default ~= nil then
+    parts[#parts + 1] = "[default: " .. zag.json.encode({ schema.default }):sub(2, -2) .. "]"
+  end
+  return table.concat(parts, " ")
+end
+
+-- Convert MCP content blocks to the plain-string ToolResult (port of pi's
+-- transformMcpContent, degraded for zag's string-only results). text is
+-- concatenated; image -> a size marker; resource -> a labelled block.
+local function content_to_string(content)
+  if type(content) ~= "table" then return "" end
+  local parts = {}
+  for _, c in ipairs(content) do
+    if c.type == "text" then
+      parts[#parts + 1] = c.text or ""
+    elseif c.type == "image" then
+      local data = c.data or ""
+      parts[#parts + 1] = string.format("[image %s, %d bytes]",
+        c.mimeType or "image/png", #data)
+    elseif c.type == "resource" then
+      local uri = (c.resource and c.resource.uri) or "(no URI)"
+      local body = (c.resource and c.resource.text) or "(no content)"
+      parts[#parts + 1] = "[Resource: " .. uri .. "]\n" .. body
+    else
+      parts[#parts + 1] = (zag.json.encode(c))
+    end
+  end
+  return table.concat(parts, "\n")
+end
+
+-- Extract just the concatenated text content (for error rendering).
+local function content_text(content)
+  if type(content) ~= "table" then return "" end
+  local parts = {}
+  for _, c in ipairs(content) do
+    if c.type == "text" then parts[#parts + 1] = c.text or "" end
+  end
+  return table.concat(parts, "\n")
+end
+
+-- ---------------------------------------------------------------------------
+-- Proxy tool dispatch (port of pi proxy-modes.ts)
+-- ---------------------------------------------------------------------------
+
+-- The status glyph for a server given its connection/metadata state.
+local function server_status_label(srv)
+  if srv.status == "connected" then return "connected" end
+  if srv.status == "needs-auth" then return "needs-auth" end
+  if srv.status == "failed" then return "failed" end
+  if M._cache.servers[srv.name] then return "cached" end
+  return "not connected"
+end
+
+-- mcp({}) -> status listing with ✓/○/⚠/✗ markers.
+local function mode_status()
+  local names = {}
+  for name in pairs(M._servers) do names[#names + 1] = name end
+  table.sort(names)
+
+  local total_tools = 0
+  local connected = 0
+  local lines = {}
+  for _, name in ipairs(names) do
+    local srv = M._servers[name]
+    local meta = metadata_for(srv)
+    local tool_count = meta and #meta or 0
+    total_tools = total_tools + tool_count
+    local status = server_status_label(srv)
+    if status == "connected" then connected = connected + 1 end
+
+    if status == "connected" then
+      lines[#lines + 1] = string.format("\xE2\x9C\x93 %s (%d tools)", name, tool_count)
+    elseif status == "needs-auth" then
+      lines[#lines + 1] = string.format("\xE2\x9A\xA0 %s (needs auth)", name)
+    elseif status == "cached" then
+      lines[#lines + 1] = string.format("\xE2\x97\x8B %s (%d tools, cached)", name, tool_count)
+    elseif status == "failed" then
+      lines[#lines + 1] = string.format("\xE2\x9C\x97 %s (failed)", name)
+    else
+      lines[#lines + 1] = string.format("\xE2\x97\x8B %s (not connected)", name)
+    end
+  end
+
+  local header = string.format("MCP: %d/%d servers, %d tools\n\n",
+    connected, #names, total_tools)
+  local text = header .. table.concat(lines, "\n")
+  if #names > 0 then
+    text = text .. "\n\nmcp({ server = \"name\" }) to list tools, mcp({ search = \"...\" }) to search"
+  end
+  return (text:gsub("%s+$", ""))
+end
+
+-- mcp({ describe = "name" }) -> name, server, description, parameters.
+local function mode_describe(tool_name)
+  for name, srv in pairs(M._servers) do
+    local meta = metadata_for(srv)
+    local t = find_tool(meta, tool_name)
+    if t then
+      local text = t.name .. "\n" .. "Server: " .. name .. "\n"
+      if t.resource_uri then
+        text = text .. "Type: Resource (reads from " .. t.resource_uri .. ")\n"
+      end
+      text = text .. "\n" .. (t.description ~= "" and t.description or "(no description)") .. "\n"
+      if t.input_schema and not t.resource_uri then
+        text = text .. "\nParameters:\n" .. format_schema(t.input_schema)
+      elseif t.resource_uri then
+        text = text .. "\nNo parameters required (resource tool)."
+      else
+        text = text .. "\nNo parameters defined."
+      end
+      return (text:gsub("%s+$", ""))
+    end
+  end
+  return string.format('Tool "%s" not found. Use mcp({ search = "..." }) to search.', tool_name)
+end
+
+-- OR-token substring match: any whitespace-separated term hitting name or
+-- description counts as a match. Case-insensitive.
+local function search_matches(query, name, description)
+  local hay = (name .. " " .. (description or "")):lower()
+  for term in query:lower():gmatch("%S+") do
+    if hay:find(term, 1, true) then return true end
+  end
+  return false
+end
+
+-- mcp({ search = "q" }) -> matching tools with schemas.
+local function mode_search(query)
+  query = query and query:gsub("^%s+", ""):gsub("%s+$", "") or ""
+  if query == "" then return "Search query cannot be empty" end
+
+  local names = {}
+  for name in pairs(M._servers) do names[#names + 1] = name end
+  table.sort(names)
+
+  local matches = {}
+  for _, name in ipairs(names) do
+    local meta = metadata_for(M._servers[name])
+    for _, t in ipairs(meta or {}) do
+      if search_matches(query, t.name, t.description) then
+        matches[#matches + 1] = t
+      end
+    end
+  end
+
+  if #matches == 0 then
+    return string.format('No tools matching "%s"', query)
+  end
+
+  local plural = (#matches == 1) and "" or "s"
+  local text = string.format('Found %d tool%s matching "%s":\n\n', #matches, plural, query)
+  for _, t in ipairs(matches) do
+    text = text .. t.name .. "\n"
+    text = text .. "  " .. (t.description ~= "" and t.description or "(no description)") .. "\n"
+    if t.input_schema and not t.resource_uri then
+      text = text .. "\n  Parameters:\n" .. format_schema(t.input_schema, "    ") .. "\n"
+    elseif t.resource_uri then
+      text = text .. "  No parameters (resource tool).\n"
+    end
+    text = text .. "\n"
+  end
+  return (text:gsub("%s+$", ""))
+end
+
+-- mcp({ server = "s" }) -> that server's tools (cached vs connected noted).
+local function mode_list(server_name)
+  local srv = M._servers[server_name]
+  if not srv then
+    return string.format('Server "%s" not found. Use mcp({}) to see available servers.', server_name)
+  end
+  local meta = metadata_for(srv)
+  if not meta or #meta == 0 then
+    if srv.status == "connected" then
+      return string.format('Server "%s" has no tools.', server_name)
+    end
+    if M._cache.servers[server_name] then
+      return string.format('Server "%s" has no cached tools (not connected).', server_name)
+    end
+    return string.format(
+      'Server "%s" is configured but not connected. Use mcp({ connect = "%s" }) or /mcp reconnect %s to retry.',
+      server_name, server_name, server_name)
+  end
+  local note = (srv.status == "connected") and "" or " (not connected, cached)"
+  local text = string.format("%s (%d tools%s):\n\n", server_name, #meta, note)
+  for _, t in ipairs(meta) do
+    local desc = truncate_at_word(t.description or "", 50)
+    text = text .. "- " .. t.name
+    if desc and desc ~= "" then text = text .. " - " .. desc end
+    text = text .. "\n"
+  end
+  return (text:gsub("%s+$", ""))
+end
+
+-- Connect (or reconnect) a server and refresh its metadata + cache. Returns
+-- (true, nil) or (nil, err). Shared by connect/call lazy paths.
+local function ensure_connected_and_fresh(srv)
+  if srv.status ~= "connected" or not srv.handle then
+    local ok, err = connect(srv)
+    if not ok then
+      srv.status = "failed"
+      return nil, err
+    end
+  end
+  -- Refresh metadata from the live server and persist.
+  local entry, ferr = fetch_metadata(srv)
+  if entry then
+    cache_put(srv.name, entry)
+    M._metadata[srv.name] = build_metadata(srv, entry)
+  end
+  return true, ferr
+end
+
+-- mcp({ connect = "s" }) -> connect, refresh, then list.
+local function mode_connect(server_name)
+  local srv = M._servers[server_name]
+  if not srv then
+    return string.format('Server "%s" not found. Use mcp({}) to see available servers.', server_name)
+  end
+  local ok, err = ensure_connected_and_fresh(srv)
+  if not ok then
+    return string.format('Failed to connect to "%s": %s', server_name, tostring(err))
+  end
+  return mode_list(server_name)
+end
+
+-- mcp({ tool = "name", args = "{...}" }) -> lazy connect, call, return text.
+local function mode_call(tool_name, args_json, server_override)
+  -- Resolve the server holding this tool.
+  local srv, tool_meta
+  if server_override then
+    srv = M._servers[server_override]
+    if not srv then
+      return string.format('Server "%s" not found. Use mcp({}) to see available servers.', server_override)
+    end
+    tool_meta = find_tool(metadata_for(srv), tool_name)
+  else
+    for _, s in pairs(M._servers) do
+      local t = find_tool(metadata_for(s), tool_name)
+      if t then srv = s; tool_meta = t; break end
+    end
+  end
+
+  -- Lazy connect if the tool isn't in the (cached) view yet but a server is
+  -- named, or to refresh after connecting.
+  if srv and not tool_meta then
+    local ok = ensure_connected_and_fresh(srv)
+    if ok then tool_meta = find_tool(metadata_for(srv), tool_name) end
+  end
+
+  if not srv or not tool_meta then
+    return string.format('Tool "%s" not found. Use mcp({ search = "..." }) to search.', tool_name)
+  end
+
+  -- Decode the args JSON string (the proxy schema takes args as a string).
+  local args = {}
+  if type(args_json) == "string" and #args_json > 0 then
+    local decoded, derr = zag.json.decode(args_json)
+    if type(decoded) ~= "table" then
+      return "Invalid args JSON: " .. tostring(derr)
+    end
+    args = decoded
+  elseif type(args_json) == "table" then
+    args = args_json
+  end
+
+  -- Connect if needed for the actual call.
+  local ok, cerr = ensure_connected_and_fresh(srv)
+  if not ok and srv.status ~= "connected" then
+    return string.format('Failed to connect to "%s": %s', srv.name, tostring(cerr))
+  end
+
+  srv.in_flight = (srv.in_flight or 0) + 1
+  srv.last_used = M._now()
+  local call_ok, result, call_err = pcall(function()
+    if tool_meta.resource_uri then
+      local r, e = rpc_request(srv, "resources/read", { uri = tool_meta.resource_uri })
+      return r, e
+    end
+    return call_tool(srv, tool_meta.original_name, args)
+  end)
+  srv.in_flight = srv.in_flight - 1
+  srv.last_used = M._now()
+
+  if not call_ok then
+    return "Failed to call tool: " .. tostring(result)
+  end
+  if not result then
+    local msg = "Failed to call tool: " .. tostring(call_err)
+    if tool_meta.input_schema then
+      msg = msg .. "\n\nExpected parameters:\n" .. format_schema(tool_meta.input_schema)
+    end
+    return msg
+  end
+
+  -- Resource read result shape differs (contents, not content).
+  if tool_meta.resource_uri then
+    local parts = {}
+    for _, c in ipairs(result.contents or {}) do
+      parts[#parts + 1] = c.text or "(binary)"
+    end
+    if #parts == 0 then return "(empty resource)" end
+    return table.concat(parts, "\n")
+  end
+
+  if result.isError then
+    local errtext = content_text(result.content)
+    if errtext == "" then errtext = "Tool execution failed" end
+    local msg = "Error: " .. errtext
+    if tool_meta.input_schema then
+      msg = msg .. "\n\nExpected parameters:\n" .. format_schema(tool_meta.input_schema)
+    end
+    return msg
+  end
+
+  local text = content_to_string(result.content)
+  if text == "" then return "(empty result)" end
+  return text
+end
+
+-- Top-level dispatch. Order mirrors pi: tool > connect > describe > search >
+-- server > status.
+function M._proxy_execute(input)
+  M.ensure_config_loaded()
+  input = input or {}
+  if input.tool then
+    return mode_call(input.tool, input.args, input.server)
+  elseif input.connect then
+    return mode_connect(input.connect)
+  elseif input.describe then
+    return mode_describe(input.describe)
+  elseif input.search then
+    return mode_search(input.search)
+  elseif input.server then
+    return mode_list(input.server)
+  else
+    return mode_status()
+  end
+end
+
+-- Register the single proxy tool. Called from setup() only when at least one
+-- server is configured and the proxy tool is not disabled.
+function M._register_proxy_tool()
+  zag.tool{
+    name = "mcp",
+    description = "MCP gateway. Call tools from configured MCP servers.\n"
+      .. "mcp({}) status | mcp({search=\"q\"}) find tools | mcp({describe=\"name\"}) params | "
+      .. "mcp({server=\"s\"}) list | mcp({tool=\"name\", args=\"{...json...}\"}) call",
+    prompt_snippet = "MCP gateway - mcp({search=...}) to discover tools, mcp({tool=..., args=...}) to call them",
+    input_schema = {
+      type = "object",
+      properties = {
+        tool = { type = "string", description = "Tool name to call" },
+        args = { type = "string", description = "Arguments as a JSON string" },
+        search = { type = "string", description = "Search tools by name/description" },
+        describe = { type = "string", description = "Tool name to describe" },
+        server = { type = "string", description = "Server to list, or disambiguate tool calls" },
+        connect = { type = "string", description = "Server name to connect and refresh" },
+      },
+    },
+    execute = function(input) return M._proxy_execute(input) end,
+  }
+end
+
+-- ---------------------------------------------------------------------------
 -- Test export: internals exercised by mcp_test.zig.
 -- ---------------------------------------------------------------------------
 
@@ -697,6 +1241,18 @@ M._test = {
   cache_get_valid = function(srv) return cache_get_valid(srv) end,
   cache = function() return M._cache end,
   set_cache_dir = function(d) M._cache_dir_override = d end,
+  -- E4 proxy internals.
+  server_prefix = function(name, mode) return server_prefix(name, mode) end,
+  format_tool_name = function(t, s, m) return format_tool_name(t, s, m) end,
+  is_tool_excluded = function(t, s, m, ex) return is_tool_excluded(t, s, m, ex) end,
+  build_metadata = function(srv, entry) return build_metadata(srv, entry) end,
+  find_tool = function(meta, name) return find_tool(meta, name) end,
+  format_schema = function(schema, indent) return format_schema(schema, indent) end,
+  truncate_at_word = function(text, target) return truncate_at_word(text, target) end,
+  content_to_string = function(c) return content_to_string(c) end,
+  metadata = function() return M._metadata end,
+  proxy_execute = function(input) return M._proxy_execute(input) end,
+  register_proxy_tool = function() return M._register_proxy_tool() end,
 }
 
 return M
