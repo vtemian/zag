@@ -22,7 +22,6 @@ const Theme = @import("Theme.zig");
 const CommandRegistry = @import("CommandRegistry.zig");
 const input = @import("input.zig");
 const llm = @import("llm.zig");
-const subagents_mod = @import("subagents.zig");
 const frontmatter_mod = @import("frontmatter.zig");
 const prompt = @import("prompt.zig");
 const Instruction = @import("Instruction.zig");
@@ -134,12 +133,6 @@ pub const LuaEngine = struct {
     /// a full-schema Lua declaration always wins. Read at startup by
     /// `llm.createProviderFromLuaConfig` through a borrowed pointer.
     providers_registry: llm.Registry,
-    /// Registry of subagents declared via `zag.subagent.register{...}`.
-    /// Starts empty; each `register` call deep-copies strings into
-    /// `allocator` so the registry outlives the Lua snippet that
-    /// produced the entry. The `task` tool and future inspection
-    /// bindings read through `subagentRegistry()`.
-    subagents: subagents_mod.SubagentRegistry = .{},
     /// System-prompt layer registry shared across turns. Built-in layers
     /// (identity, skills catalog, tool list, guidelines) are seeded at
     /// `init`. Lua plugins append more via `zag.prompt.layer{...}`; each
@@ -629,13 +622,6 @@ pub const LuaEngine = struct {
         return &self.input_parser;
     }
 
-    /// Borrow a read-only view of the subagent registry. The `task`
-    /// tool and schema-emitters call through this handle; they must
-    /// not mutate the registry so the binding stays the single writer.
-    pub fn subagentRegistry(self: *const LuaEngine) *const subagents_mod.SubagentRegistry {
-        return &self.subagents;
-    }
-
     /// Resolve ~/.config/zag paths and load config.lua. All failures are
     /// logged and swallowed; missing config is not an error. The user-dir
     /// searcher that covers `~/.config/zag/lua/*.lua` is installed once in
@@ -657,12 +643,11 @@ pub const LuaEngine = struct {
     }
 
     /// Require every embedded `zag.builtin.*`, `zag.layers.*`,
-    /// `zag.jit.*`, `zag.loop.*`, `zag.compact.*`, the `zag.prompt`
-    /// dispatcher, and the `zag.subagents.filesystem` loader so the side
-    /// effects (slash command registrations, keymap bindings, prompt
-    /// layer registrations, JIT context handlers, loop detector handlers,
-    /// compaction strategy handlers, and filesystem-discovered subagents)
-    /// land in the engine's registries. Must be called before
+    /// `zag.jit.*`, `zag.loop.*`, `zag.compact.*`, and the `zag.prompt`
+    /// dispatcher so the side effects (slash command registrations, keymap
+    /// bindings, prompt layer registrations, JIT context handlers, loop
+    /// detector handlers, and compaction strategy handlers) land in the
+    /// engine's registries. Must be called before
     /// `loadUserConfig` so a user's
     /// overrides win via the command registry's last-write-wins
     /// semantics and so that stable-class prompt layers register before
@@ -687,8 +672,7 @@ pub const LuaEngine = struct {
             const is_loop = std.mem.startsWith(u8, entry.name, "zag.loop.");
             const is_compact = std.mem.startsWith(u8, entry.name, "zag.compact.");
             const is_prompt_dispatcher = std.mem.eql(u8, entry.name, "zag.prompt");
-            const is_subagent_loader = std.mem.eql(u8, entry.name, "zag.subagents.filesystem");
-            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_compact and !is_prompt_dispatcher and !is_subagent_loader) continue;
+            if (!is_builtin and !is_layer and !is_jit and !is_loop and !is_compact and !is_prompt_dispatcher) continue;
             var src_buf: [128]u8 = undefined;
             const src = std.fmt.bufPrintZ(&src_buf, "require('{s}')", .{entry.name}) catch {
                 log.warn("builtin plugin: module name too long: {s}", .{entry.name});
@@ -757,7 +741,6 @@ pub const LuaEngine = struct {
         }
         self.hook_dispatcher.deinit();
         self.providers_registry.deinit();
-        self.subagents.deinit(self.allocator);
         if (self.default_model) |m| self.allocator.free(m);
         if (self.thinking_effort) |e| self.allocator.free(e);
         // Release every Lua callback ref a keymap binding still holds.
@@ -925,12 +908,6 @@ pub const LuaEngine = struct {
         lua.pushFunction(zlua.wrap(zagModeGetFn));
         lua.setField(-2, "get");
         lua.setField(-2, "mode"); // zag.mode = mode_table; [zag_table]
-
-        // zag.subagent; declarative registry for Lua-defined subagents.
-        // `register{}` validates and deep-copies the entry into the
-        // engine-owned SubagentRegistry so the `task` tool can dispatch
-        // to it later without chasing Lua-side lifetimes.
-        @import("lua/bindings/subagent.zig").registerOn(lua);
 
         // zag.task; yielding spawn primitive for orchestration scripts. Spawns
         // an inline ChildAgent and suspends the calling coroutine until it
@@ -9325,107 +9302,6 @@ test "zag.keymap rejects a handle that doesn't live in the registry" {
     engine.lua.pop(1);
 }
 
-test "zag.subagent.register stores entries" {
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    try engine.lua.doString(
-        \\zag.subagent.register{
-        \\  name = "reviewer",
-        \\  description = "Review diffs",
-        \\  prompt = "You review.",
-        \\}
-        \\zag.subagent.register{
-        \\  name = "scout",
-        \\  description = "Scout codebase",
-        \\  prompt = "You scout.",
-        \\  model = "anthropic/claude-haiku-4-5",
-        \\  tools = {"read", "grep"},
-        \\}
-    );
-
-    const registry = engine.subagentRegistry();
-    try std.testing.expectEqual(@as(usize, 2), registry.entries.items.len);
-
-    const reviewer = registry.lookup("reviewer") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("reviewer", reviewer.name);
-    try std.testing.expectEqualStrings("Review diffs", reviewer.description);
-    try std.testing.expectEqualStrings("You review.", reviewer.prompt);
-    try std.testing.expect(reviewer.model == null);
-    try std.testing.expect(reviewer.tools == null);
-
-    const scout = registry.lookup("scout") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("scout", scout.name);
-    try std.testing.expectEqualStrings("anthropic/claude-haiku-4-5", scout.model.?);
-    try std.testing.expectEqual(@as(usize, 2), scout.tools.?.len);
-    try std.testing.expectEqualStrings("read", scout.tools.?[0]);
-    try std.testing.expectEqualStrings("grep", scout.tools.?[1]);
-}
-
-test "zag.subagent.register rejects duplicate" {
-    std.testing.log_level = .err;
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    try engine.lua.doString(
-        \\zag.subagent.register{
-        \\  name = "foo",
-        \\  description = "first",
-        \\  prompt = "p",
-        \\}
-        \\_ok, _err = pcall(function()
-        \\  zag.subagent.register{
-        \\    name = "foo",
-        \\    description = "second",
-        \\    prompt = "p",
-        \\  }
-        \\end)
-    );
-
-    _ = try engine.lua.getGlobal("_ok");
-    try std.testing.expect(!engine.lua.toBoolean(-1));
-    engine.lua.pop(1);
-
-    _ = try engine.lua.getGlobal("_err");
-    defer engine.lua.pop(1);
-    const err_msg = try engine.lua.toString(-1);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "duplicate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "foo") != null);
-
-    try std.testing.expectEqual(@as(usize, 1), engine.subagentRegistry().entries.items.len);
-}
-
-test "zag.subagent.register rejects invalid name" {
-    std.testing.log_level = .err;
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    try engine.lua.doString(
-        \\_ok, _err = pcall(function()
-        \\  zag.subagent.register{
-        \\    name = "Bad_Name",
-        \\    description = "nope",
-        \\    prompt = "p",
-        \\  }
-        \\end)
-    );
-
-    _ = try engine.lua.getGlobal("_ok");
-    try std.testing.expect(!engine.lua.toBoolean(-1));
-    engine.lua.pop(1);
-
-    _ = try engine.lua.getGlobal("_err");
-    defer engine.lua.pop(1);
-    const err_msg = try engine.lua.toString(-1);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "invalid name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "Bad_Name") != null);
-
-    try std.testing.expectEqual(@as(usize, 0), engine.subagentRegistry().entries.items.len);
-}
-
 fn fakePromptLayerContext() prompt.LayerContext {
     return .{
         .model = .{ .provider_name = "anthropic", .model_id = "claude-sonnet-4-5" },
@@ -10317,107 +10193,6 @@ test "zag.fs.read_file_sync and list_dir_sync" {
     _ = try engine.lua.getGlobal("_missing");
     try std.testing.expect(engine.lua.toBoolean(-1));
     engine.lua.pop(1);
-}
-
-test "zag.subagents.filesystem loads agents from tmpdir" {
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const reviewer_md =
-        \\---
-        \\name: reviewer
-        \\description: Review staged diffs.
-        \\model: anthropic/claude-haiku-4-5
-        \\tools: [read, grep]
-        \\---
-        \\You are a reviewer. Read the diff and return findings.
-    ;
-    try tmp.dir.createDirPath(std.testing.io, "agents");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/reviewer.md", .data = reviewer_md });
-
-    const scout_md =
-        \\---
-        \\name: scout
-        \\description: Scout the codebase.
-        \\---
-        \\You are a scout.
-    ;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/scout.md", .data = scout_md });
-
-    // A sibling file without the right extension must be ignored.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agents/README", .data = "ignore me" });
-
-    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
-
-    _ = engine.lua.pushString(base);
-    engine.lua.setGlobal("_agents_dir");
-
-    try engine.lua.doString(
-        \\local fs = require("zag.subagents.filesystem")
-        \\fs.load_from(_agents_dir)
-    );
-
-    const registry = engine.subagentRegistry();
-    try std.testing.expectEqual(@as(usize, 2), registry.entries.items.len);
-
-    const reviewer = registry.lookup("reviewer") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("Review staged diffs.", reviewer.description);
-    try std.testing.expectEqualStrings(
-        "You are a reviewer. Read the diff and return findings.",
-        reviewer.prompt,
-    );
-    try std.testing.expectEqualStrings("anthropic/claude-haiku-4-5", reviewer.model.?);
-    try std.testing.expectEqual(@as(usize, 2), reviewer.tools.?.len);
-    try std.testing.expectEqualStrings("read", reviewer.tools.?[0]);
-    try std.testing.expectEqualStrings("grep", reviewer.tools.?[1]);
-
-    const scout = registry.lookup("scout") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("Scout the codebase.", scout.description);
-    try std.testing.expectEqualStrings("You are a scout.", scout.prompt);
-    try std.testing.expect(scout.model == null);
-    try std.testing.expect(scout.tools == null);
-}
-
-test "zag.subagents.filesystem skips malformed files with a warning" {
-    std.testing.log_level = .err;
-    var engine = try LuaEngine.init(std.testing.allocator);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agents");
-    // Missing `name` field; must be skipped.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "agents/broken.md",
-        .data = "---\ndescription: no name\n---\nbody\n",
-    });
-    // Valid; must be loaded even though a sibling was malformed.
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "agents/good.md",
-        .data = "---\nname: good\ndescription: ok\n---\nhi\n",
-    });
-
-    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = rbuf[0..try tmp.dir.realPathFile(std.testing.io, "agents", &rbuf)];
-
-    _ = engine.lua.pushString(base);
-    engine.lua.setGlobal("_agents_dir");
-
-    try engine.lua.doString(
-        \\local fs = require("zag.subagents.filesystem")
-        \\fs.load_from(_agents_dir)
-    );
-
-    const registry = engine.subagentRegistry();
-    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
-    try std.testing.expect(registry.lookup("good") != null);
 }
 
 test "zag.prompt.resolve maps known model ids to the right pack module" {
@@ -12089,35 +11864,6 @@ test "loadBuiltinPlugins eager-loads zag.loop.* entries" {
     engine.loadBuiltinPlugins();
     // The default detector module registers exactly one global handler.
     try std.testing.expect(engine.loopDetectHandler() != null);
-}
-
-test "loadBuiltinPlugins registers the default general subagent" {
-    const alloc = std.testing.allocator;
-    var engine = try LuaEngine.init(alloc);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    // Empty before bootstrap; the `task` tool would be gated off here.
-    try std.testing.expectEqual(@as(usize, 0), engine.subagentRegistry().entries.items.len);
-    engine.loadBuiltinPlugins();
-    // The shipped delegate makes delegation work with zero user config:
-    // a non-empty registry is what `tools.registerTaskTool` gates on.
-    try std.testing.expect(engine.subagentRegistry().lookup("general") != null);
-}
-
-test "loadBuiltinPlugins auto-requires the filesystem subagent loader" {
-    const alloc = std.testing.allocator;
-    var engine = try LuaEngine.init(alloc);
-    defer engine.deinit();
-    engine.storeSelfPointer();
-
-    engine.loadBuiltinPlugins();
-    // Without auto-load a user would have to `require` it before a dropped
-    // agent `.md` is discovered. Proof it ran: package.loaded is populated.
-    try engine.lua.doString("_fs_loaded = package.loaded['zag.subagents.filesystem'] ~= nil");
-    _ = try engine.lua.getGlobal("_fs_loaded");
-    defer engine.lua.pop(1);
-    try std.testing.expect(engine.lua.toBoolean(-1));
 }
 
 test "zag.loop.default does not act before the 5-call threshold" {

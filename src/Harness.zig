@@ -518,7 +518,6 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         .provider = deps.provider.*,
         .model_spec = spec,
         .registry = deps.registry,
-        .subagents = if (deps.lua_engine) |eng| eng.subagentRegistry() else null,
         .session_id = deps.session_id,
     });
 

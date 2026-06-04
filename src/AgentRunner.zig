@@ -29,7 +29,6 @@ const prompt_mod = @import("prompt.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 const skills_mod = @import("skills.zig");
-const subagents_mod = @import("subagents.zig");
 const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 const Sink = @import("Sink.zig").Sink;
 const SinkEvent = @import("Sink.zig").Event;
@@ -250,10 +249,6 @@ pub const SpawnDeps = struct {
     /// Optional skill registry to advertise via the
     /// `builtin.skills_catalog` prompt layer. Null skips the layer.
     skills: ?*const skills_mod.SkillRegistry = null,
-    /// Optional subagent registry consulted by the built-in `task`
-    /// tool. Null disables delegation (the `task` tool surfaces a
-    /// "no TaskContext bound" error when invoked).
-    subagents: ?*const subagents_mod.SubagentRegistry = null,
     /// Stable session identifier surfaced in per-turn `Telemetry`
     /// timeline lines and artifact files. Borrowed; the caller
     /// (main.zig for the TUI, the headless harness for

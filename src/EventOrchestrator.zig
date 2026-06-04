@@ -1277,7 +1277,6 @@ fn onUserInputSubmitted(
         .provider = self.provider.provider,
         .model_spec = spec,
         .registry = self.registry,
-        .subagents = if (self.lua_engine) |eng| eng.subagentRegistry() else null,
         .session_id = session_id,
         .child_registry = &self.child_runner_registry,
     });
