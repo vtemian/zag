@@ -996,6 +996,74 @@ test "HttpStreamHandle snapshots response status and headers" {
     try testing.expect(handle.headerValue("missing") == null);
 }
 
+test "HttpStreamHandle delivers a single unterminated line at EOF" {
+    // Streamable HTTP `application/json` responses carry one JSON object
+    // with no trailing newline. The reader must hand that final
+    // unterminated chunk over before signalling EOF.
+    std.testing.log_level = .err;
+    const alloc = testing.allocator;
+    const root = try @import("../Scope.zig").Scope.init(alloc, null);
+    defer root.deinit();
+
+    var completions = try completion_queue.Queue.init(alloc, 16);
+    defer {
+        while (completions.pop()) |j| alloc.destroy(j);
+        completions.deinit();
+    }
+
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(std.testing.io, .{ .reuse_address = true });
+    defer server.deinit(std.testing.io);
+    const port = test_net.boundPort(&server);
+
+    const ServerCtx = struct {
+        fn run(srv: *std.Io.net.Server) void {
+            var conn = srv.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = test_net.streamRead(conn, buf[total..]) catch return;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+            }
+
+            // Body is `{"x":1}`: 7 bytes, no trailing newline.
+            const resp =
+                "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: 7\r\n" ++
+                "\r\n" ++
+                "{\"x\":1}";
+            test_net.streamWriteAll(conn, resp) catch return;
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server});
+    defer server_thread.join();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const arena_ptr = try alloc.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(alloc);
+    const url_dup = try arena_ptr.allocator().dupe(u8, url);
+
+    const handle = try HttpStreamHandle.init(alloc, &completions, root, arena_ptr, url_dup, .{});
+    defer handle.shutdownAndCleanup();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |l| alloc.free(l);
+        lines.deinit(alloc);
+    }
+    try drainStream(alloc, handle, &completions, &lines);
+
+    try testing.expectEqual(@as(usize, 1), lines.items.len);
+    try testing.expectEqualStrings("{\"x\":1}", lines.items[0]);
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
