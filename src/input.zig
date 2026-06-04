@@ -993,6 +993,43 @@ test "Parser: overflow resets pending then buffers new bytes fresh" {
     }
 }
 
+test "pollOnce drains a 210-byte burst with zero loss" {
+    // A burst larger than PARSER_BUF_SIZE lands in one write (sim sends,
+    // paste-speed input). The caller loops pollOnce until null each tick;
+    // no typed byte may be discarded by the pending-buffer overflow reset.
+    const pipe = try wake_pipe.open();
+    const read_fd = pipe[0];
+    const write_fd = pipe[1];
+    defer wake_pipe.close(read_fd);
+    defer wake_pipe.close(write_fd);
+
+    var burst: [210]u8 = undefined;
+    for (&burst, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+
+    // One write delivers the whole burst, mirroring a pty paste/sim send.
+    _ = try wake_pipe.write(write_fd, &burst);
+
+    var p: Parser = .{};
+    var collected: [burst.len]u8 = undefined;
+    var collected_len: usize = 0;
+    var guard: usize = 0;
+    while (guard < 4096) : (guard += 1) {
+        const ev = p.pollOnce(read_fd, 0) orelse break;
+        switch (ev) {
+            .key => |k| switch (k.key) {
+                .char => |cp| {
+                    collected[collected_len] = @intCast(cp);
+                    collected_len += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    try std.testing.expectEqualSlices(u8, &burst, collected[0..collected_len]);
+}
+
 test "Parser: bare-ESC from a single byte without timeout returns null" {
     // With now_ms equal to pending_since_ms (0ms elapsed), we must not
     // emit bare-ESC yet. Only Task 4's timeout path produces it.
