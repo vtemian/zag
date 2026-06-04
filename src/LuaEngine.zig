@@ -2518,72 +2518,11 @@ pub const LuaEngine = struct {
     }
 
     // -- Tool execution --------------------------------------------------------
-
-    /// Execute a Lua tool by name with raw JSON input. Returns a ToolResult.
-    ///
-    /// Errors raised here:
-    /// - `InvalidInput`: the raw JSON does not parse.
-    /// - `OutOfMemory`: allocator failure while marshalling input or output.
-    ///
-    /// Lua runtime errors (thrown `error()`, `nil, err` convention, non-string
-    /// returns) are surfaced as `ToolResult { is_error = true }` so the LLM
-    /// can observe and retry.
-    pub fn executeTool(self: *LuaEngine, name: []const u8, input_json: []const u8, allocator: Allocator) types.ToolError!types.ToolResult {
-        const tool = self.findTool(name) orelse return .{
-            .content = "error: unknown lua tool",
-            .is_error = true,
-            .owned = false,
-        };
-
-        // Push the Lua function via its registry ref
-        _ = self.lua.rawGetIndex(zlua.registry_index, tool.func_ref);
-
-        // Parse JSON input and push as Lua table
-        lua_json.pushJsonAsTable(self.lua, input_json, self.allocator) catch |err| {
-            self.lua.pop(1); // pop the function
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    log.err("executeTool: failed to parse input JSON: {}", .{err});
-                    return error.InvalidInput;
-                },
-            }
-        };
-
-        // pcall(fn, input_table) -> result_string or nil,err
-        self.lua.protectedCall(.{ .args = 1, .results = 2 }) catch {
-            const err_msg = self.lua.toString(-1) catch "unknown Lua error";
-            const owned_msg = allocator.dupe(u8, err_msg) catch {
-                self.lua.pop(1);
-                return error.OutOfMemory;
-            };
-            self.lua.pop(1);
-            return .{ .content = owned_msg, .is_error = true };
-        };
-
-        // Check return convention: string OR nil,messageing
-        if (self.lua.isNoneOrNil(-2)) {
-            const err_msg = self.lua.toString(-1) catch "unknown error from Lua tool";
-            const owned = allocator.dupe(u8, err_msg) catch {
-                self.lua.pop(2);
-                return error.OutOfMemory;
-            };
-            self.lua.pop(2);
-            return .{ .content = owned, .is_error = true };
-        }
-
-        // Success: first return value is the result string
-        const result = self.lua.toString(-2) catch {
-            self.lua.pop(2);
-            return .{ .content = "error: Lua tool returned non-string", .is_error = true, .owned = false };
-        };
-        const output = allocator.dupe(u8, result) catch {
-            self.lua.pop(2);
-            return error.OutOfMemory;
-        };
-        self.lua.pop(2);
-        return .{ .content = output, .is_error = false };
-    }
+    //
+    // Lua tools run as result-capturing coroutines: `luaToolExecute` round-trips
+    // a `LuaToolRequest` to the main thread, which calls `startLuaToolCall` to
+    // spawn the execute fn as a coroutine (so it may yield on async primitives).
+    // `findTool` + `registerTools` below are the registry side of that path.
 
     /// Find a LuaTool by name (linear scan).
     fn findTool(self: *const LuaEngine, name: []const u8) ?LuaTool {
@@ -3527,6 +3466,14 @@ pub const LuaEngine = struct {
         const status = task.co.resumeThread(self.lua, num_args_on_co, &num_results) catch |err| {
             const msg = task.co.toString(-1) catch "<no msg>";
             log.warn("coroutine errored: {s}: {s}", .{ @errorName(err), msg });
+            // A tool coroutine that errors (a thrown `error(...)` in its execute
+            // fn) surfaces the Lua message as the (error) tool result, matching
+            // the old sync path. Capture it BEFORE the pop, then null the field
+            // so retireTask's completion arm is a no-op (exactly-once).
+            if (task.lua_tool_request) |req| {
+                completeLuaToolRequestOwned(req, msg, true);
+                task.lua_tool_request = null;
+            }
             task.co.pop(1);
             self.retireTask(task);
             return;
@@ -4441,10 +4388,41 @@ test "lua tool runs as coroutine and can yield on zag.sleep" {
     try std.testing.expect(!req.result_is_error);
 }
 
-test "executeTool calls Lua function and returns result" {
+/// Drive `tool_name` through `startLuaToolCall` and pump completions until the
+/// tool coroutine retires and fires `req.done`. Returns the completed request
+/// (the caller frees `result_content` when `result_owned`). Shared by the
+/// reworked Lua-tool tests so the pump loop lives in one place.
+fn runLuaToolForTest(engine: *LuaEngine, tool_name: []const u8, input_raw: []const u8) Hooks.LuaToolRequest {
+    var req: Hooks.LuaToolRequest = .{
+        .tool_name = tool_name,
+        .input_raw = input_raw,
+        .allocator = std.testing.allocator,
+        .done = .{},
+        .result_content = null,
+        .result_is_error = false,
+        .result_owned = false,
+        .error_name = null,
+    };
+    engine.startLuaToolCall(&req);
+    const deadline = clock.milliTimestamp() + 4000;
+    while (!req.done.isSet() and clock.milliTimestamp() < deadline) {
+        if (engine.async_runtime) |rt| {
+            if (rt.completions.pop()) |job| {
+                engine.resumeFromJob(job) catch {};
+                continue;
+            }
+        }
+        clock.sleep(1 * std.time.ns_per_ms);
+    }
+    return req;
+}
+
+test "startLuaToolCall calls Lua function and returns result" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
 
     try engine.lua.doString(
         \\zag.tool({
@@ -4457,16 +4435,19 @@ test "executeTool calls Lua function and returns result" {
         \\})
     );
 
-    const result = try engine.executeTool("echo", "{\"message\": \"hi\"}", std.testing.allocator);
-    defer std.testing.allocator.free(result.content);
-    try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("echo: hi", result.content);
+    var req = runLuaToolForTest(&engine, "echo", "{\"message\": \"hi\"}");
+    defer if (req.result_owned) std.testing.allocator.free(req.result_content.?);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(!req.result_is_error);
+    try std.testing.expectEqualStrings("echo: hi", req.result_content.?);
 }
 
-test "executeTool handles Lua runtime errors" {
+test "startLuaToolCall handles Lua runtime errors" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
 
     try engine.lua.doString(
         \\zag.tool({
@@ -4479,16 +4460,19 @@ test "executeTool handles Lua runtime errors" {
         \\})
     );
 
-    const result = try engine.executeTool("crasher", "{}", std.testing.allocator);
-    defer std.testing.allocator.free(result.content);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "intentional crash") != null);
+    var req = runLuaToolForTest(&engine, "crasher", "{}");
+    defer if (req.result_owned) std.testing.allocator.free(req.result_content.?);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result_is_error);
+    try std.testing.expect(std.mem.indexOf(u8, req.result_content.?, "intentional crash") != null);
 }
 
-test "executeTool handles nil,err return convention" {
+test "startLuaToolCall handles nil,err return convention" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
     engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
 
     try engine.lua.doString(
         \\zag.tool({
@@ -4501,20 +4485,25 @@ test "executeTool handles nil,err return convention" {
         \\})
     );
 
-    const result = try engine.executeTool("failsoft", "{}", std.testing.allocator);
-    defer std.testing.allocator.free(result.content);
-    try std.testing.expect(result.is_error);
-    try std.testing.expectEqualStrings("something went wrong", result.content);
+    var req = runLuaToolForTest(&engine, "failsoft", "{}");
+    defer if (req.result_owned) std.testing.allocator.free(req.result_content.?);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result_is_error);
+    try std.testing.expectEqualStrings("something went wrong", req.result_content.?);
 }
 
-test "executeTool returns error for unknown tool" {
+test "startLuaToolCall returns error for unknown tool" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
+    engine.storeSelfPointer();
 
-    const result = try engine.executeTool("nonexistent", "{}", std.testing.allocator);
-    try std.testing.expect(result.is_error);
-    try std.testing.expectEqualStrings("error: unknown lua tool", result.content);
-    try std.testing.expect(!result.owned);
+    // Unknown tool completes synchronously inside startLuaToolCall (no spawn),
+    // so this path needs no async runtime.
+    var req = runLuaToolForTest(&engine, "nonexistent", "{}");
+    defer if (req.result_owned) std.testing.allocator.free(req.result_content.?);
+    try std.testing.expect(req.done.isSet());
+    try std.testing.expect(req.result_is_error);
+    try std.testing.expectEqualStrings("error: unknown lua tool", req.result_content.?);
 }
 
 test "registerTools adds Lua tools to the Zig registry" {
@@ -4753,6 +4742,12 @@ test "end-to-end: config file to registry execution" {
 
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
+    engine.storeSelfPointer();
+    // Lua tools now run as coroutines, which require the async runtime; the
+    // `adder` tool does not yield, so it retires on the pump thread's first
+    // resume inside `serviceRoundTripEvent`.
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
 
     // Write config
     const tmp_path = "/tmp/zag_test_e2e.lua";
@@ -4812,7 +4807,7 @@ test "end-to-end: config file to registry execution" {
     tools_mod.lua_request_queue = &queue;
     defer tools_mod.lua_request_queue = null;
 
-    // Execute through the full registry path (luaToolExecute -> queue -> dispatcher -> executeTool)
+    // Execute through the full registry path (luaToolExecute -> queue -> dispatcher -> startLuaToolCall)
     const result = try registry.execute("adder", "{\"a\": 3, \"b\": 4}", std.testing.allocator, null);
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
