@@ -628,6 +628,34 @@ fn httpStreamClose(co: *Lua) i32 {
     return 0;
 }
 
+/// `HttpStreamHandle:status()`: the HTTP status code of the response,
+/// as an integer (e.g. 200). Available immediately after
+/// `zag.http.stream` returns, since `init` blocks through `receiveHead`.
+fn httpStreamStatus(co: *Lua) i32 {
+    const ud = co.checkUserdata(HttpStreamHandleUd, 1, HttpStreamHandleUd.METATABLE_NAME);
+    const h = ud.ptr orelse {
+        co.raiseErrorStr("http_stream:status: invalid handle", .{});
+    };
+    co.pushInteger(@intCast(h.status));
+    return 1;
+}
+
+/// `HttpStreamHandle:header(name)`: case-insensitive response-header
+/// lookup. Returns the value string, or nil when the header is absent.
+fn httpStreamHeader(co: *Lua) i32 {
+    const ud = co.checkUserdata(HttpStreamHandleUd, 1, HttpStreamHandleUd.METATABLE_NAME);
+    const h = ud.ptr orelse {
+        co.raiseErrorStr("http_stream:header: invalid handle", .{});
+    };
+    const name = co.checkString(2);
+    if (h.headerValue(name)) |value| {
+        _ = co.pushString(value);
+    } else {
+        co.pushNil();
+    }
+    return 1;
+}
+
 /// `__gc` metamethod for HttpStreamHandle userdata. Joins the
 /// helper and frees the handle. Idempotent: if `:close()` was
 /// called previously the helper is already winding down and the
@@ -667,6 +695,10 @@ pub fn registerHandleMetatable(lua: *Lua) !void {
     lua.setField(-2, "lines");
     lua.pushFunction(zlua.wrap(httpStreamClose));
     lua.setField(-2, "close");
+    lua.pushFunction(zlua.wrap(httpStreamStatus));
+    lua.setField(-2, "status");
+    lua.pushFunction(zlua.wrap(httpStreamHeader));
+    lua.setField(-2, "header");
     lua.pushValue(-1);
     lua.setField(-2, "__index");
     lua.pushFunction(zlua.wrap(httpStreamGc));
