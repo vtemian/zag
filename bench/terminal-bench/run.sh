@@ -2,7 +2,7 @@
 # Terminal-Bench runner for zag. Defaults to the full 89-task suite on kimi.
 #   ./run.sh                      full run, moonshot/kimi-k2.6
 #   MODEL=anthropic/<model> ./run.sh
-#   ./run.sh -i 'task-glob'       subset
+#   ./run.sh -i 'terminal-bench/<task>'   subset (names are namespaced)
 #   ./run.sh -a oracle            oracle pass (no LLM cost, validates images)
 set -euo pipefail
 cd "$(dirname "$0")"

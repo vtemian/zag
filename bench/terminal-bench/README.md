@@ -29,10 +29,12 @@ Build the arm64 linux binary once, then run the suite:
 ./run.sh           # full 89-task run on moonshot/kimi-k2.6
 ```
 
-Run a subset by task name (glob):
+Run a subset by task name (glob). Task names are namespaced, so include the
+`terminal-bench/` prefix or use a wildcard:
 
 ```sh
-./run.sh -i 'hello-world'
+./run.sh -i 'terminal-bench/make-mips-interpreter'
+./run.sh -i '*mips*'
 ```
 
 Oracle pass (runs the reference solution, no LLM cost, validates the images):
