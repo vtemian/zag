@@ -22,7 +22,6 @@
 const std = @import("std");
 const sync = @import("../sync.zig");
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.workflow_tool);
 const types = @import("../types.zig");
 const tools = @import("../tools.zig");
 const agent_events = @import("../agent_events.zig");
@@ -103,22 +102,23 @@ pub fn execute(
     };
 
     // Park on `done`, forwarding cancellation to the whole workflow. On the
-    // first cancel we abort the orchestration scope ONCE (off-main is safe:
-    // Scope.cancel is VM-free — CAS + mutex + job aborters), then keep waiting
-    // for `done`: the engine completes the request via the retire path with
-    // is_error set, so we never abandon the parked frame the coroutine borrows.
-    var cancel_requested = false;
+    // first cancel we set the request's atomic flag ONCE; the engine's
+    // per-tick main-thread sweep (`cancelInFlightWorkflowChildren`) observes
+    // it and cancels the orchestration scope ON MAIN, where the scope's
+    // lifetime is controlled (it is freed in `retireTask` the instant the
+    // coroutine retires, so dereferencing it from this thread would race that
+    // free). Then keep waiting for `done`: the engine completes the request
+    // via the retire path with is_error set, so we never abandon the parked
+    // frame the coroutine borrows.
+    var cancel_forwarded = false;
     while (true) {
         if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
             break;
         } else |_| {
             if (cancel) |c| {
-                if (!cancel_requested and c.load(.acquire)) {
-                    if (req.scope) |scope| {
-                        scope.cancel("workflow cancelled") catch |err|
-                            log.warn("workflow scope cancel failed: {s}", .{@errorName(err)});
-                        cancel_requested = true;
-                    }
+                if (!cancel_forwarded and c.load(.acquire)) {
+                    req.cancel_requested.store(true, .release);
+                    cancel_forwarded = true;
                 }
             }
         }

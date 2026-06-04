@@ -407,12 +407,14 @@ pub const LuaEngine = struct {
         is_error: bool = false,
         /// Allocator the requester wants `result` duped into.
         allocator: std.mem.Allocator,
-        /// The orchestration coroutine's scope, stashed by `startWorkflowScript`
-        /// so the parked agent thread can cancel the whole workflow (and cascade
-        /// to its children) without touching Lua. `Scope.cancel` is VM-free
-        /// (CAS + mutex + job aborters only), so calling it off-main is safe.
-        /// Null until the script is spawned.
-        scope: ?*async_scope.Scope = null,
+        /// Set by the parked agent thread to request cancellation of the whole
+        /// workflow. The per-tick main-thread sweep
+        /// (`cancelInFlightWorkflowChildren`) observes it and cancels the
+        /// orchestration coroutine's scope ON MAIN, where the scope's lifetime
+        /// is controlled. The tool thread must never dereference the scope
+        /// itself: the main thread frees it in `retireTask` the instant the
+        /// coroutine retires, so an off-main `scope.cancel` races that free.
+        cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         /// Complete a request that was dropped or shut down before its
         /// coroutine could be spawned (queue-full drop, shutdown drain): dupe
@@ -425,7 +427,6 @@ pub const LuaEngine = struct {
             if (self.done.isSet()) return;
             self.result = self.allocator.dupe(u8, message) catch null;
             self.is_error = true;
-            self.scope = null;
             self.done.set();
         }
     };
@@ -3212,14 +3213,23 @@ pub const LuaEngine = struct {
     ///
     /// Called every tick (alongside `cancelTriggeredFires`) so it serves BOTH
     /// the Ctrl+C path (turn cancel marks the scope; this propagates to the
-    /// children on the same/next tick) AND the workflow-tool path
-    /// (`req.scope.cancel` from the parked tool thread marks the scope; this
-    /// sweep then cancels the children). Cheap: only tasks with a live
-    /// `pending_child` AND a cancelled scope do any work.
+    /// children on the same/next tick) AND the workflow-tool path (the parked
+    /// tool thread sets `req.cancel_requested`; this sweep cancels the
+    /// orchestration scope ON MAIN, where the scope's lifetime is controlled,
+    /// then cancels the children). The tool thread never touches the scope
+    /// itself: `retireTask` frees it the instant the coroutine retires, so an
+    /// off-main `scope.cancel` would race that free. Cheap: only tasks with a
+    /// pending cancel request or a live `pending_child` do any work.
     pub fn cancelInFlightWorkflowChildren(self: *LuaEngine) void {
         var it = self.tasks.valueIterator();
         while (it.next()) |task_ptr| {
             const task = task_ptr.*;
+            if (task.workflow_request) |req| {
+                if (req.cancel_requested.load(.acquire) and !task.scope.isCancelled()) {
+                    task.scope.cancel("workflow cancelled") catch |err|
+                        log.warn("workflow scope cancel failed: {s}", .{@errorName(err)});
+                }
+            }
             const child = task.pending_child orelse continue;
             if (!task.scope.isCancelled()) continue;
             child.child_runner.cancelAgent();
@@ -3286,15 +3296,14 @@ pub const LuaEngine = struct {
     }
 
     /// Complete a `WorkflowRequest` exactly once: dupe `message`/result into
-    /// the requester's allocator, stamp `is_error`, sever the borrowed scope,
-    /// and fire `done`. A second call (e.g. retire after a normal completion)
-    /// is a no-op because the caller nulls `task.workflow_request` first; this
-    /// guards the request's own `done` against a double-fire via `done.isSet`.
+    /// the requester's allocator, stamp `is_error`, and fire `done`. A second
+    /// call (e.g. retire after a normal completion) is a no-op because the
+    /// caller nulls `task.workflow_request` first; this guards the request's
+    /// own `done` against a double-fire via `done.isSet`.
     fn completeWorkflowRequestOwned(req: *WorkflowRequest, message: []const u8, is_error: bool) void {
         if (req.done.isSet()) return;
         req.result = req.allocator.dupe(u8, message) catch null;
         req.is_error = is_error;
-        req.scope = null;
         req.done.set();
     }
 
@@ -3316,7 +3325,6 @@ pub const LuaEngine = struct {
         }
         req.result = req.allocator.dupe(u8, text) catch null;
         req.is_error = was_cancelled;
-        req.scope = null;
         req.done.set();
     }
 
@@ -3373,13 +3381,6 @@ pub const LuaEngine = struct {
             // resumeTask's `.ok` arm.
             .workflow_request = workflow_request,
         };
-
-        // Expose the workflow coroutine's scope on its request BEFORE the first
-        // resume so a parked agent thread (the workflow tool) can cancel the
-        // whole workflow + cascade to children via `Scope.cancel` (which is
-        // VM-free, so it is safe to call off the main thread). Valid only while
-        // the coroutine is alive; `completeWorkflowRequest` nulls it.
-        if (workflow_request) |req| req.scope = scope;
 
         // Stash the Task in the coroutine's extraspace for O(1) lookup in
         // taskForCoroutine. Written here so the slot is valid before the
@@ -3478,7 +3479,7 @@ pub const LuaEngine = struct {
                     // retireTask's completion arm is a no-op (exactly-once).
                     //
                     // A cancelled scope means the workflow was aborted (Ctrl+C
-                    // or the tool thread's `req.scope.cancel`): its in-flight
+                    // or the tool thread's `req.cancel_requested`): its in-flight
                     // children were cancelled and the script may have returned a
                     // partial/garbage value off a cancelled child. Surface it as
                     // an error regardless of the returned value so a cancelled
