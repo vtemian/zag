@@ -2132,30 +2132,25 @@ fn attachBorrowedSplit(self: *WindowManager, entry: *PaneEntry, take_focus: bool
 }
 
 /// Open a borrowed-Conversation FLOAT view of `child`. Routes through
-/// `openFloatPane` (which always builds a null-conversation float), then
-/// patches the resulting entry to borrow `child` and flag it
+/// `openFloatPaneEntry` (which always builds a null-conversation float)
+/// and patches the returned entry in place to borrow `child` and flag it
 /// `is_subagent_view` so the close guard in `closeFloatById` skips
 /// freeing the borrowed transcript. `take_focus` maps to the float's
 /// `enter` (whether the float grabs keyboard focus).
 fn attachBorrowedFloat(self: *WindowManager, child: *Conversation, take_focus: bool) !NodeRegistry.Handle {
     const seed: Layout.Rect = .{ .x = 0, .y = 0, .width = self.screen.width, .height = self.screen.height };
-    const handle = try self.openFloatPane(
+    const entry = try self.openFloatPaneEntry(
         .{ .buffer = child.buf(), .view = child.view() },
         seed,
         .{ .enter = take_focus },
     );
-    // Patch the freshly-created float entry to borrow the child and carry
-    // the subagent-view flag. openFloatPane leaves `conversation = null`;
-    // locate the entry by the float's buffer pointer (same lookup
-    // closeFloatById uses) and rewrite it in place.
-    for (self.extra_floats.items) |entry| {
-        if (entry.pane.buffer.ptr == child.buf().ptr) {
-            entry.pane.conversation = child;
-            entry.is_subagent_view = true;
-            break;
-        }
-    }
-    return handle;
+    // Patch the freshly-created float entry directly: openFloatPaneEntry
+    // leaves `conversation = null`, so rebind it to the borrowed child and
+    // set the subagent-view flag. Direct-patch (vs a buffer-pointer scan)
+    // cannot misfire onto an earlier float that happens to share a buffer.
+    entry.pane.conversation = child;
+    entry.is_subagent_view = true;
+    return entry.pane.handle.?;
 }
 
 /// Result of `findSubagentView`: the borrowed-view `PaneEntry` plus
@@ -2186,9 +2181,17 @@ fn findSubagentView(self: *WindowManager, child: *Conversation) ?SubagentViewMat
 /// (from `getFocusedLeaf`) is in hand but a `*LayoutNode` is needed to
 /// set `layout.focused`.
 fn nodeForLeaf(self: *WindowManager, target: *Layout.LayoutNode.Leaf) ?*Layout.LayoutNode {
+    // Bounded scratch: `visibleLeaves` (via `collectLeaves`) silently
+    // stops collecting at `leaves.len`, so a layout with >64 visible
+    // tiles would not find a target leaf past the 64th. 64 is far above
+    // any usable tile count (binary splits have no min-cell floor; even a
+    // dozen tiles are unreadable), so this caps practical layouts. The
+    // assert fires in debug if that bound is ever hit so the silent miss
+    // is caught rather than returning a spurious null.
     var leaves: [64]*Layout.LayoutNode = undefined;
     var count: usize = 0;
     self.layout.visibleLeaves(&leaves, &count);
+    std.debug.assert(count < leaves.len);
     for (leaves[0..count]) |node| {
         if (&node.leaf == target) return node;
     }
@@ -2434,6 +2437,22 @@ pub fn openFloatPane(
     rect: Layout.Rect,
     config: Layout.FloatConfig,
 ) !NodeRegistry.Handle {
+    const entry = try self.openFloatPaneEntry(surface, rect, config);
+    return entry.pane.handle.?;
+}
+
+/// Internal openFloatPane variant returning the created `*PaneEntry`
+/// (whose `pane.handle` is already stamped) so callers that need to patch
+/// the entry in place -- e.g. `attachBorrowedFloat` flagging it
+/// `is_subagent_view` and rebinding its borrowed conversation -- can do so
+/// without a fragile post-hoc buffer-pointer scan. The public
+/// `openFloatPane` wraps this and returns only the handle.
+fn openFloatPaneEntry(
+    self: *WindowManager,
+    surface: AttachedSurface,
+    rect: Layout.Rect,
+    config: Layout.FloatConfig,
+) !*PaneEntry {
     const pane: Pane = .{
         .buffer = surface.buffer,
         .view = surface.view,
@@ -2486,7 +2505,7 @@ pub fn openFloatPane(
     // compositor draws until the next handleResize.
     self.layout.recalculate(self.screen.width, self.screen.height);
     self.compositor.layout_dirty = true;
-    return handle;
+    return entry;
 }
 
 /// Close the float identified by `handle`. Frees the float's pane entry,
@@ -4921,8 +4940,12 @@ test "closing an owned-conversation float sweeps borrowed child views before fre
     // Heap-allocate a parent conversation owned by a float pane. Closing
     // the float recursively frees this parent AND its subagents; a child
     // view borrowing one of those subagents would dangle without the
-    // divorce sweep. Under std.testing.allocator that dangle surfaces as
-    // a leak/UAF -- the test is RED without `closeSubagentViewsUnder`.
+    // divorce sweep. The RED signal here is the post-close `extra_panes`
+    // length assertion below: without `closeSubagentViewsUnder` the
+    // borrowed-view tile is never removed, so the entry (now pointing at a
+    // freed child conversation) lingers in `extra_panes` and the
+    // expectEqual(0, ...) fails. (A subsequent render off that stale entry
+    // is the real-world UAF the assertion stands in for.)
     const parent = try allocator.create(Conversation);
     parent.* = try Conversation.init(allocator, 1, "parent");
     // No defer-free: the float now owns `parent`; closeFloatById frees it.
