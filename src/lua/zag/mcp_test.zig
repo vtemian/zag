@@ -810,3 +810,101 @@ test "mcp lifecycle: keep-alive server is exempt from idle disconnect" {
         \\  mcp._test.disconnect(fake)
     );
 }
+
+// ---------------------------------------------------------------------------
+// G1: incremental SSE event parser (pure Lua, no I/O)
+// ---------------------------------------------------------------------------
+
+test "mcp sse: single-line data dispatches on empty line" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\-- A data line accumulates; the event only fires on the blank line.
+        \\assert(mcp._test.sse_feed(p, "data: hello") == nil, "no dispatch mid-event")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev ~= nil, "blank line dispatches")
+        \\assert(ev.event == "message", "default event name")
+        \\assert(ev.data == "hello", "data captured, got " .. tostring(ev.data))
+        \\assert(ev.id == nil, "no id set")
+    );
+}
+
+test "mcp sse: multi-line data joins with newline" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\mcp._test.sse_feed(p, "data: line one")
+        \\mcp._test.sse_feed(p, "data: line two")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev.data == "line one\nline two", "multi-line join, got " .. tostring(ev.data))
+    );
+}
+
+test "mcp sse: event and id fields are captured" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\mcp._test.sse_feed(p, "event: endpoint")
+        \\mcp._test.sse_feed(p, "id: 42")
+        \\mcp._test.sse_feed(p, "data: /messages?session=abc")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev.event == "endpoint", "named event, got " .. tostring(ev.event))
+        \\assert(ev.id == "42", "id captured, got " .. tostring(ev.id))
+        \\assert(ev.data == "/messages?session=abc", "data, got " .. tostring(ev.data))
+    );
+}
+
+test "mcp sse: comments and value formatting" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\-- A comment line (leading colon) is ignored entirely.
+        \\assert(mcp._test.sse_feed(p, ": this is a keep-alive comment") == nil, "comment ignored")
+        \\-- A field with no leading space after the colon keeps its value verbatim.
+        \\mcp._test.sse_feed(p, "data:no-space")
+        \\-- A field with no colon at all is treated as field name with empty value.
+        \\mcp._test.sse_feed(p, "data")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\-- Two data lines: "no-space" then "" -> joined with newline.
+        \\assert(ev.data == "no-space\n", "no-space + empty join, got " .. tostring(ev.data))
+    );
+}
+
+test "mcp sse: blank line with no data does not dispatch" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local p = mcp._test.sse_new()
+        \\-- A blank line before any field is a no-op (no event to dispatch).
+        \\assert(mcp._test.sse_feed(p, "") == nil, "blank with no buffered data")
+        \\-- An event-only field with no data line also does not dispatch (SSE
+        \\-- spec: an event with an empty data buffer is not dispatched).
+        \\mcp._test.sse_feed(p, "event: ping")
+        \\assert(mcp._test.sse_feed(p, "") == nil, "event with no data does not dispatch")
+        \\-- After a non-dispatching blank line the buffer resets, so a fresh
+        \\-- data line starts clean.
+        \\mcp._test.sse_feed(p, "data: real")
+        \\local ev = mcp._test.sse_feed(p, "")
+        \\assert(ev.data == "real", "fresh event after reset, got " .. tostring(ev.data))
+        \\assert(ev.event == "message", "event name reset to default")
+    );
+}

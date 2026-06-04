@@ -414,6 +414,88 @@ function disconnect_handle(srv)
 end
 
 -- ---------------------------------------------------------------------------
+-- SSE event parser (pure Lua, no I/O)
+--
+-- An incremental, line-fed state machine implementing the WHATWG
+-- server-sent-events stream format, which both HTTP transports speak:
+-- Streamable HTTP returns `text/event-stream` for some responses, and the
+-- legacy transport delivers everything over one long-lived event stream.
+-- Each fed line is already \r-stripped by the stream's `:lines()`. Fields:
+--   * `data:`  appended to the data buffer (one trailing newline per line);
+--              at dispatch the single trailing newline is removed, so
+--              multi-line data joins with `\n`.
+--   * `event:` names the event; defaults to "message".
+--   * `id:`    captured as the last event id.
+--   * a line starting with ':' is a comment and is ignored.
+--   * a blank line dispatches the buffered event (only when data is non-nil).
+-- Other fields (e.g. `retry:`) are accepted and ignored. A field value has
+-- exactly one leading space stripped after the colon, per spec.
+-- ---------------------------------------------------------------------------
+
+local function sse_new()
+  return { data = nil, event = nil, id = nil }
+end
+
+-- Reset the per-event accumulation (data/event), preserving `id` which the
+-- spec treats as stream-level (the last id seen persists across events).
+local function sse_reset(parser)
+  parser.data = nil
+  parser.event = nil
+end
+
+-- Feed one line into the parser. Returns an event table
+-- `{ event = <name>, data = <string>, id = <string|nil> }` when a blank line
+-- dispatches a buffered event, otherwise nil.
+local function sse_feed(parser, line)
+  -- Blank line: dispatch if we have buffered data.
+  if line == "" then
+    if parser.data == nil then
+      -- Nothing to dispatch; an event/id with no data is discarded.
+      sse_reset(parser)
+      return nil
+    end
+    -- Strip the single trailing newline the data accumulation appended.
+    local data = parser.data
+    if data:sub(-1) == "\n" then data = data:sub(1, #data - 1) end
+    local ev = {
+      event = parser.event or "message",
+      data = data,
+      id = parser.id,
+    }
+    sse_reset(parser)
+    return ev
+  end
+
+  -- Comment line (leading colon): ignore.
+  if line:sub(1, 1) == ":" then
+    return nil
+  end
+
+  -- Split "field: value" / "field:value" / "field" (no colon -> empty value).
+  local field, value
+  local colon = line:find(":", 1, true)
+  if colon then
+    field = line:sub(1, colon - 1)
+    value = line:sub(colon + 1)
+    -- One leading space after the colon is stripped.
+    if value:sub(1, 1) == " " then value = value:sub(2) end
+  else
+    field = line
+    value = ""
+  end
+
+  if field == "data" then
+    parser.data = (parser.data or "") .. value .. "\n"
+  elseif field == "event" then
+    parser.event = value
+  elseif field == "id" then
+    parser.id = value
+  end
+  -- Unknown fields (retry, etc.) are accepted and ignored.
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
 -- MCP method wrappers
 -- ---------------------------------------------------------------------------
 
@@ -1346,6 +1428,9 @@ M._test = {
   -- E5 lifecycle internals.
   disconnect = function(srv) return disconnect(srv) end,
   maintenance_tick = function() return maintenance_tick() end,
+  -- G1 SSE parser internals.
+  sse_new = function() return sse_new() end,
+  sse_feed = function(parser, line) return sse_feed(parser, line) end,
 }
 
 return M
