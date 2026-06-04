@@ -204,6 +204,38 @@ const StubTextProvider = struct {
     }
 };
 
+/// Stub provider for the forced structured-output path: returns a single
+/// `emit` tool_use whose raw JSON input is `emit_input`, on the
+/// `LlmResponse.content` where `collectToolCalls` reads. No sink event is
+/// pushed (the forced tool_use must never be projected as a tool_call node),
+/// matching what a real provider does for a forced terminal turn.
+const StubEmitProvider = struct {
+    emit_input: []const u8,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "stub_emit",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *StubEmitProvider = @ptrCast(@alignCast(ptr));
+        // The wire arena (`req.allocator`) owns the content for the turn, so
+        // the runner never frees it through the wrong heap.
+        const blocks = req.allocator.alloc(types.ContentBlock, 1) catch return error.OutOfMemory;
+        blocks[0] = .{ .tool_use = .{ .id = "emit_1", .name = "emit", .input_raw = self.emit_input } };
+        return .{ .content = blocks, .stop_reason = .tool_use, .input_tokens = 1, .output_tokens = 1 };
+    }
+
+    fn provider(self: *StubEmitProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
 /// Everything the test-only spawn binding needs, stashed so the C function can
 /// reach it. The real `zag.task` binding (Milestone E) reads `tools.task_context`
 /// and parses a spec table; this test stand-in just spawns one preconfigured
@@ -807,6 +839,78 @@ test "startWorkflowScript runs a script that spawns two subagents and aggregates
     try testing.expect(std.mem.indexOf(u8, result[sep..], "RESULT") != null);
 
     // Everything drained: no live tasks, registry empty, no leak at deinit.
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+}
+
+test "zag.task with a schema returns a decoded output table the script branches on" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // The child is forced to emit this object; the agent loop validates it
+    // against the spec schema and hands it back as the run's result.
+    var stub = StubEmitProvider{
+        .emit_input =
+        \\{"status":"ok","count":7}
+        ,
+    };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .subagents = undefined,
+        .provider = p,
+        .provider_name = "stub_emit",
+        .model_spec = .{ .provider_name = "stub_emit", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // The script spawns one schema-mode subagent and branches on its typed
+    // output fields, returning a string the test asserts on.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\local r = zag.task{
+        \\  prompt = "produce a status",
+        \\  schema = '{"type":"object","required":["status","count"],"additionalProperties":false,"properties":{"status":{"type":"string","enum":["ok","fail"]},"count":{"type":"integer"}}}',
+        \\}
+        \\assert(r.is_error == false, "expected success")
+        \\assert(type(r.output) == "table", "expected a decoded output table")
+        \\return r.output.status .. ":" .. tostring(r.output.count)
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    // The script read r.output.status (string) and r.output.count (integer)
+    // as native Lua values and composed them.
+    try testing.expectEqualStrings("ok:7", result);
+
     try testing.expectEqual(@as(u32, 0), engine.tasks.count());
     try testing.expect(child_registry.isEmpty());
 }

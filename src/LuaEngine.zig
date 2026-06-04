@@ -2909,15 +2909,28 @@ pub const LuaEngine = struct {
     /// Push a finished child's result onto its awaiting coroutine's stack as
     /// the `(result, err)` 2-tuple the binding convention expects. Mirrors the
     /// `.llm_complete` arm of `pushJobResultOntoStack`: build a result table,
-    /// push `nil` for the error slot, return the value count. The orchestration
-    /// script reads `summary` / `is_error` off the table; structured output
-    /// (a later milestone) extends this shape.
-    fn pushChildResultOntoStack(co: *Lua, res: ChildAgent.ChildResult) i32 {
+    /// push `nil` for the error slot, return the value count.
+    ///
+    /// The orchestration script always reads `summary` / `is_error` off the
+    /// table. When the child ran in structured-output mode (`schema_mode`) and
+    /// succeeded, the `summary` IS the validated JSON, so we also decode it
+    /// onto an `output` field as a typed Lua table for `result.output.field`
+    /// access. A decode failure (pathologically deep JSON) leaves `output`
+    /// absent rather than failing the resume; the raw JSON is still on
+    /// `summary`.
+    fn pushChildResultOntoStack(self: *LuaEngine, co: *Lua, res: ChildAgent.ChildResult, schema_mode: bool) i32 {
         co.newTable();
         _ = co.pushString(res.summary);
         co.setField(-2, "summary");
         co.pushBoolean(res.is_error);
         co.setField(-2, "is_error");
+        if (schema_mode and !res.is_error) {
+            if (lua_json.pushJsonAsTable(co, res.summary, self.allocator)) {
+                co.setField(-2, "output");
+            } else |err| {
+                log.warn("structured child output decode failed: {}", .{err});
+            }
+        }
         co.pushNil();
         return 2;
     }
@@ -2990,7 +3003,7 @@ pub const LuaEngine = struct {
             // future edit reading `res.summary` after the arena is gone. Do not
             // "fix" by deiniting the arena before the resume.
             t.pending_child = null;
-            const n = pushChildResultOntoStack(t.co, res);
+            const n = self.pushChildResultOntoStack(t.co, res, child.spec.output_schema != null);
             child.deinit();
             self.allocator.destroy(child);
             self.resumeTask(t, n);
