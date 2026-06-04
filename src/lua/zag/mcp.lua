@@ -1060,28 +1060,52 @@ local function canonical_resource(url)
   return scheme:lower() .. "://" .. authority .. (path or "")
 end
 
+-- The server name becomes a directory segment under mcp-oauth, so it must be a
+-- single safe path segment. A name can come from a repo-shipped .mcp.json, so
+-- reject anything that could traverse out of mcp-oauth or hide as a dotfile:
+-- only [A-Za-z0-9._-], no leading dot, and never "..". Returns (name) or
+-- (nil, err). The server itself still works without OAuth; only the token
+-- path/flow refuses.
+local function safe_server_segment(srv)
+  local name = srv.name
+  if type(name) ~= "string"
+      or not name:match("^[%w._-]+$")
+      or name:match("^%.")
+      or name == ".." then
+    return nil, "unsafe MCP server name for OAuth token storage: " .. tostring(name)
+  end
+  return name
+end
+
 -- The token file path for a server: HOME/.config/zag/mcp-oauth/<server>/tokens.json.
+-- Returns (path) or (nil, err) when the server name is not a safe segment.
 local function oauth_token_path(srv)
-  return home_dir() .. "/.config/zag/mcp-oauth/" .. srv.name .. "/tokens.json"
+  local segment, err = safe_server_segment(srv)
+  if not segment then return nil, err end
+  return home_dir() .. "/.config/zag/mcp-oauth/" .. segment .. "/tokens.json"
 end
 
 -- Persist a token bundle (tokens + client_info + server_url) as JSON, 0600.
 -- The directory is created first; the file mode is stamped on write.
 local function oauth_save_tokens(srv, bundle)
-  local dir = home_dir() .. "/.config/zag/mcp-oauth/" .. srv.name
+  local segment, seg_err = safe_server_segment(srv)
+  if not segment then return nil, seg_err end
+  local dir = home_dir() .. "/.config/zag/mcp-oauth/" .. segment
   local ok_mk, mk_err = zag.fs.mkdir(dir, { parents = true })
   if not ok_mk and not zag.fs.exists(dir) then
     return nil, "token dir mkdir failed: " .. tostring(mk_err)
   end
   local encoded = zag.json.encode(bundle)
-  local ok_w, w_err = zag.fs.write(oauth_token_path(srv), encoded, { mode = tonumber("600", 8) })
+  local ok_w, w_err = zag.fs.write(dir .. "/tokens.json", encoded, { mode = tonumber("600", 8) })
   if not ok_w then return nil, "token write failed: " .. tostring(w_err) end
   return true
 end
 
--- Load a server's token bundle, or nil when none exists / is unreadable.
+-- Load a server's token bundle, or nil when none exists / is unreadable / the
+-- server name is not a safe path segment.
 local function oauth_load_tokens(srv)
   local path = oauth_token_path(srv)
+  if not path then return nil end
   if not zag.fs.exists(path) then return nil end
   local raw = zag.fs.read(path)
   if not raw then return nil end
@@ -1355,6 +1379,10 @@ end
 -- Run the OAuth flow for `srv`: client_credentials when configured, else the
 -- interactive authorization_code flow. Returns (true, nil) or (nil, err).
 function oauth_authorize(srv)
+  -- Refuse early on an unsafe server name so no browser opens and no network
+  -- call fires before we discover the token path is unwritable.
+  local _, seg_err = safe_server_segment(srv)
+  if seg_err then return nil, seg_err end
   local grant = srv.oauth and srv.oauth.grant_type
   if grant == "client_credentials" then
     return oauth_client_credentials(srv)

@@ -2559,6 +2559,46 @@ test "mcp oauth: a non-loopback http token_endpoint is rejected and no token is 
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, token_path, .{}));
 }
 
+test "mcp oauth: a traversal server name is refused and writes no file outside mcp-oauth" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPathFile(std.testing.io, ".", &abs_buf);
+    _ = engine.lua.pushString(abs_buf[0..dir_len]);
+    engine.lua.setGlobal("_home_dir");
+
+    try runLua(&engine,
+        \\mcp = require("zag.mcp")
+        \\mcp._test.set_home_dir(_home_dir)
+    );
+
+    // A server named "../evil" must be refused by the OAuth path functions so
+    // its tokens.json cannot be planted outside HOME/.config/zag/mcp-oauth.
+    try runCoroutineBody(&engine,
+        \\  local srv = mcp._test.normalize_server("../evil", { url = "https://api.example/mcp", auth = "oauth" })
+        \\  local path, perr = mcp._test.oauth_token_path(srv)
+        \\  assert(not path, "traversal name must not yield a path")
+        \\  assert(perr and perr:find("name", 1, true), "error names the bad server name: " .. tostring(perr))
+        \\  local ok, serr = mcp._test.oauth_save_tokens(srv, {
+        \\    tokens = { access_token = "A" }, client_info = {}, server_url = "https://api.example/mcp",
+        \\  })
+        \\  assert(not ok, "save must refuse the traversal name")
+        \\  assert(serr and serr:find("name", 1, true), "save error names the bad name: " .. tostring(serr))
+    );
+
+    // The escaped path (HOME/.config/zag/evil/tokens.json, one level above
+    // mcp-oauth) must not exist.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const escaped = try std.fmt.bufPrint(&path_buf, "{s}/.config/zag/evil/tokens.json", .{abs_buf[0..dir_len]});
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, escaped, .{}));
+}
+
 test "mcp oauth: require_https accepts https anywhere and http only for loopback" {
     var engine = try LuaEngine.init(testing.allocator);
     defer engine.deinit();
