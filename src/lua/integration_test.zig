@@ -3978,6 +3978,55 @@ test "sessions sidebar hides sessions from other projects" {
     );
 }
 
+test "zag.fs.write with a mode option stamps the created file 0600" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var realbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = realbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &realbuf)];
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/token.json", .{base});
+
+    // Drive the real binding through a coroutine: zag.fs.write yields,
+    // and a 0600 mode opt must land on the file.
+    _ = engine.lua.pushString(path);
+    engine.lua.setGlobal("_test_write_path");
+    try engine.lua.doString(
+        \\_test_write_done = false
+        \\function test_write_mode()
+        \\  local ok, err = zag.fs.write(_test_write_path, "secret",
+        \\                               { mode = tonumber("600", 8) })
+        \\  assert(ok, "write failed: " .. tostring(err))
+        \\  _test_write_done = true
+        \\end
+    );
+    _ = try engine.lua.getGlobal("test_write_mode");
+    _ = try engine.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (clock.milliTimestamp() < deadline) {
+        engine.pumpCompletions();
+        _ = try engine.lua.getGlobal("_test_write_done");
+        const done = engine.lua.toBoolean(-1);
+        engine.lua.pop(1);
+        if (done) break;
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    _ = try engine.lua.getGlobal("_test_write_done");
+    try testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+
+    const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode())) & 0o777);
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

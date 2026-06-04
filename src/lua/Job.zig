@@ -232,6 +232,12 @@ pub const FsWriteSpec = struct {
     path: []const u8,
     content: []const u8,
     mode: enum { overwrite, append },
+    /// Optional POSIX permission bits to stamp on the file after it is
+    /// created/opened (`File.setPermissions`). Null leaves the OS
+    /// default in place (existing files keep their mode, new files get
+    /// the umask-adjusted default) — the historical behaviour. OAuth
+    /// token files pass 0o600.
+    file_mode: ?std.posix.mode_t = null,
 };
 
 /// Payload for an `fs_mkdir` job. `parents` = true calls
