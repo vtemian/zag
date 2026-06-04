@@ -406,9 +406,6 @@ pub fn run(mode: cli_args.HeadlessMode, gpa: Allocator, lua_engine: *LuaEngine) 
     lua_engine.registerTools(&registry) catch |err| {
         log.warn("failed to register lua tools: {}", .{err});
     };
-    tools.registerTaskTool(&registry, lua_engine.subagentRegistry()) catch |err| {
-        log.warn("failed to register task tool: {}", .{err});
-    };
 
     var session_mgr = if (!mode.no_session)
         Session.SessionManager.init(gpa) catch |err| blk: {

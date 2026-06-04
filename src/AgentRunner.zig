@@ -315,26 +315,24 @@ pub fn submit(
     self.output_tokens.store(0, .release);
 
     // Populate the TaskContext the agent thread publishes into the
-    // threadlocal slot so the built-in `task` tool can reach back to
-    // our provider, subagent registry, session handle, and depth
-    // counter. Missing a subagent registry means task delegation is
-    // disabled; the tool surfaces a tool-result error when called.
-    if (deps.subagents) |subs| {
-        self.task_ctx = .{
-            .allocator = deps.allocator,
-            .subagents = subs,
-            .provider = deps.provider,
-            .provider_name = deps.model_spec.provider_name,
-            .model_spec = deps.model_spec,
-            .registry = deps.registry,
-            .session_handle = self.conversation.session_handle,
-            .lua_engine = deps.lua_engine,
-            .task_depth = self.task_depth,
-            .wake_fd = deps.wake_write_fd,
-            .parent_conv = self.conversation,
-            .child_registry = deps.child_registry,
-        };
-    }
+    // threadlocal slot so the always-on `task` and `workflow` spawn
+    // primitives can reach back to our provider, session handle, and depth
+    // counter. Published unconditionally: both tools are always advertised,
+    // so the context must always be available (the tools gate themselves at
+    // runtime when a child drainer is absent).
+    self.task_ctx = .{
+        .allocator = deps.allocator,
+        .provider = deps.provider,
+        .provider_name = deps.model_spec.provider_name,
+        .model_spec = deps.model_spec,
+        .registry = deps.registry,
+        .session_handle = self.conversation.session_handle,
+        .lua_engine = deps.lua_engine,
+        .task_depth = self.task_depth,
+        .wake_fd = deps.wake_write_fd,
+        .parent_conv = self.conversation,
+        .child_registry = deps.child_registry,
+    };
 
     self.agent_thread = try std.Thread.spawn(.{}, threadMain, .{
         deps.provider,
@@ -347,7 +345,7 @@ pub fn submit(
         deps.model_spec,
         self.pane_handle_packed,
         deps.skills orelse self.skills,
-        if (deps.subagents != null) &self.task_ctx else null,
+        &self.task_ctx,
         &self.turn_in_progress,
         deps.session_id,
         deps.output_schema,

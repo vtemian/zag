@@ -327,7 +327,6 @@ test "a coroutine yields on a workflow child and resumes with its result" {
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
@@ -448,7 +447,6 @@ test "force-retiring a coroutine with a live workflow child at shutdown tears it
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "gated_cancel",
         .model_spec = .{ .provider_name = "gated_cancel", .model_id = "stub-1" },
@@ -568,7 +566,6 @@ test "onChildRetiredOnMain persists task_end on the normal-resume path (real ses
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
@@ -659,7 +656,6 @@ test "onChildRetiredOnMain persists task_end on the task-gone/orphaned path (rea
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "gated_cancel",
         .model_spec = .{ .provider_name = "gated_cancel", .model_id = "stub-1" },
@@ -799,7 +795,6 @@ test "startWorkflowScript runs a script that spawns two subagents and aggregates
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
@@ -873,7 +868,6 @@ test "zag.task with a schema returns a decoded output table the script branches 
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "stub_emit",
         .model_spec = .{ .provider_name = "stub_emit", .model_id = "stub-1" },
@@ -934,7 +928,6 @@ test "startWorkflowScript completes with is_error on a compile error" {
     var stub = StubTextProvider{ .response_text = "x" };
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = stub.provider(),
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
@@ -981,7 +974,6 @@ test "startWorkflowScript completes with is_error when the script raises at runt
     var stub = StubTextProvider{ .response_text = "x" };
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = stub.provider(),
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
@@ -1150,7 +1142,6 @@ test "workflow tool runs a parallel script over two subagents and aggregates" {
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
@@ -1236,7 +1227,6 @@ test "workflow tool cancel returns promptly with is_error and cancels in-flight 
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "gated_cancel",
         .model_spec = .{ .provider_name = "gated_cancel", .model_id = "stub-1" },
@@ -1313,7 +1303,6 @@ test "workflow tool returns an error result when the driver has no child registr
     // refuse rather than spawn undrained children.
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },

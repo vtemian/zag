@@ -29,9 +29,9 @@ const LuaEngine = @import("../../LuaEngine.zig").LuaEngine;
 const ChildAgent = @import("../../ChildAgent.zig");
 const ChildRunnerRegistry = @import("../../ChildRunnerRegistry.zig");
 
-/// Mirrors the `task` tool's recursion cap (`src/tools/task.zig`): the hard
-/// backstop on delegation depth, orthogonal to the per-level fan-out bound.
-const max_task_depth: u8 = 8;
+/// The hard backstop on delegation depth, orthogonal to the per-level fan-out
+/// bound. Single owner lives on `ChildAgent`; both spawn surfaces read it.
+const max_task_depth = ChildAgent.max_task_depth;
 
 /// `zag.task{ prompt, system?, tools?, model?, schema?, name? }` — spawn an
 /// inline subagent and yield until it finishes. Resumes with

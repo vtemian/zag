@@ -37,29 +37,25 @@ const layout_tool = @import("tools/layout.zig");
 const task_tool = @import("tools/task.zig");
 const workflow_tool = @import("tools/workflow.zig");
 
-const subagents_mod = @import("subagents.zig");
 const llm = @import("llm.zig");
 const Session = @import("Session.zig");
 const LuaEngine_mod = @import("LuaEngine.zig");
 const Conversation = @import("Conversation.zig");
 const ChildRunnerRegistry = @import("ChildRunnerRegistry.zig");
 
-/// Per-thread context consumed by the `task` tool. Set by AgentRunner
-/// before spawning the agent thread and republished by parallel tool
-/// workers so the task tool can reach the parent runner's provider,
-/// subagent registry, session handle, and depth counter without adding
+/// Per-thread context consumed by the `task` tool and the `zag.task` Lua
+/// binding. Set by AgentRunner before spawning the agent thread and
+/// republished by parallel tool workers so the spawn primitives can reach the
+/// parent runner's provider, session handle, and depth counter without adding
 /// a context argument to every tool's execute signature.
 ///
-/// Null when task delegation is not wired (e.g. unit tests with no
-/// subagents registered, or headless test harnesses). The task tool
-/// surfaces this as a tool-result error rather than crashing.
+/// Null in test harnesses that do not wire a runner. The task tool surfaces
+/// this as a tool-result error rather than crashing.
 pub const TaskContext = struct {
     /// Heap allocator used by the child agent thread and its queue.
     allocator: std.mem.Allocator,
-    /// Subagent registry consulted for name lookup.
-    subagents: *const subagents_mod.SubagentRegistry,
-    /// LLM provider to share with the child. v1 ignores the subagent's
-    /// own `model` field and always reuses this provider.
+    /// LLM provider to share with the child. v1 ignores the spec's `model`
+    /// field and always reuses this provider.
     provider: llm.Provider,
     /// Provider name for child `formatAgentErrorMessage` calls. Mirrors
     /// `model_spec.provider_name`; kept as a separate field because the
@@ -111,13 +107,6 @@ pub threadlocal var task_context: ?*const TaskContext = null;
 /// A name-indexed collection of tools that supports registration, lookup, and execution.
 pub const Registry = struct {
     tools: std.StringHashMap(types.Tool),
-    /// Owned input_schema_json for the built-in `task` tool, rendered
-    /// from the SubagentRegistry at `registerTaskTool` time. The default
-    /// schema in `tools/task.zig` is a permissive stub; once subagents
-    /// are registered we replace it with the dynamic enum-bearing schema
-    /// so the LLM sees the real list of delegates. Null when `task` is
-    /// not registered or when no SubagentRegistry was provided.
-    task_input_schema: ?[]u8 = null,
 
     /// Create an empty registry backed by the given allocator.
     pub fn init(allocator: Allocator) Registry {
@@ -126,8 +115,6 @@ pub const Registry = struct {
 
     /// Release all memory owned by the registry.
     pub fn deinit(self: *Registry) void {
-        if (self.task_input_schema) |buf| self.tools.allocator.free(buf);
-        self.task_input_schema = null;
         self.tools.deinit();
     }
 
@@ -279,40 +266,14 @@ pub fn createDefaultRegistry(allocator: Allocator) !Registry {
     try registry.register(layout_tool.close_tool);
     try registry.register(layout_tool.resize_tool);
     try registry.register(layout_tool.pane_read_tool);
-    // Always-on: the workflow tool is gated at runtime (it returns an error
-    // result without an orchestrator/child drainer), not by registration, so
-    // the model always sees it.
+    // Always-on spawn primitives. Both `task` (blocking one-shot delegation)
+    // and `workflow` (Lua orchestration script) carry a fixed inline schema
+    // and are gated at runtime, not by registration, so the model always sees
+    // them: `task` builds its child from inline args; `workflow` returns an
+    // error result without an orchestrator/child drainer.
+    try registry.register(task_tool.tool);
     try registry.register(workflow_tool.tool);
     return registry;
-}
-
-/// Register the built-in `task` tool on `registry` when the
-/// subagent registry has at least one entry. Called from main.zig
-/// after config.lua has run so the advertised tool list reflects
-/// the user's declared delegates. A no-op on empty registries so
-/// the model doesn't see a `task` tool it can never usefully call.
-///
-/// The advertised `input_schema` is rendered dynamically from the
-/// subagent registry so the LLM sees an `agent` enum constrained to
-/// the actually-registered names. The rendered JSON is owned by the
-/// tool registry and freed in `Registry.deinit`.
-pub fn registerTaskTool(
-    registry: *Registry,
-    subagents: *const subagents_mod.SubagentRegistry,
-) !void {
-    if (subagents.entries.items.len == 0) return;
-
-    const schema = try subagents.taskInputSchemaJson(registry.tools.allocator);
-    errdefer registry.tools.allocator.free(schema);
-
-    var tool = task_tool.tool;
-    tool.definition.input_schema_json = schema;
-    try registry.register(tool);
-
-    // Drop any previously-cached schema before replacing the slot.
-    // Re-registration is rare but should not leak.
-    if (registry.task_input_schema) |old| registry.tools.allocator.free(old);
-    registry.task_input_schema = schema;
 }
 
 /// Static function pointer shared by all Lua-defined tools. Runs on the
@@ -615,59 +576,32 @@ test "definitions returns names sorted ascending regardless of insert order" {
     try std.testing.expectEqualStrings("zoo", defs[2].name);
 }
 
-test "registerTaskTool emits agent enum on the wire to providers" {
+test "createDefaultRegistry advertises task and workflow with zero config" {
     const allocator = std.testing.allocator;
 
-    var subagent_registry: subagents_mod.SubagentRegistry = .{};
-    defer subagent_registry.deinit(allocator);
-    try subagent_registry.register(allocator, .{
-        .name = "reviewer",
-        .description = "Reviews diffs.",
-        .prompt = "p",
-    });
-    try subagent_registry.register(allocator, .{
-        .name = "planner",
-        .description = "Plans work.",
-        .prompt = "p",
-    });
-
-    var registry = Registry.init(allocator);
+    var registry = try createDefaultRegistry(allocator);
     defer registry.deinit();
-    try registerTaskTool(&registry, &subagent_registry);
 
+    // Both spawn primitives are always-on: no catalog, no user config needed.
     const task = registry.get("task") orelse return error.TestUnexpectedResult;
-    // Direct schema check: dynamic schema replaced the static stub.
-    try std.testing.expect(std.mem.indexOf(u8, task.definition.input_schema_json, "\"enum\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, task.definition.input_schema_json, "\"reviewer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, task.definition.input_schema_json, "\"planner\"") != null);
+    try std.testing.expectEqualStrings("task", task.definition.name);
+    // Inline schema: requires `prompt`, no `agent` enum.
+    try std.testing.expect(std.mem.indexOf(u8, task.definition.input_schema_json, "\"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, task.definition.input_schema_json, "\"enum\"") == null);
 
-    // End-to-end: schema must round-trip through `registry.definitions` into
-    // an Anthropic request body. This is the codepath that flows to the LLM.
+    try std.testing.expect(registry.get("workflow") != null);
+
+    // The advertised definition list contains both.
     const defs = try registry.definitions(allocator);
     defer allocator.free(defs);
-
-    const anthropic = @import("providers/anthropic.zig");
-    const body = try anthropic.buildRequestBody("m", "sys", "", &.{}, defs, null, allocator);
-    defer allocator.free(body);
-
-    // The wire body for the `task` tool's input_schema must carry both
-    // registered names as enum values.
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"name\":\"task\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"enum\":[\"reviewer\",\"planner\"]") != null);
-}
-
-test "registerTaskTool is a no-op on empty subagent registry" {
-    const allocator = std.testing.allocator;
-
-    var subagent_registry: subagents_mod.SubagentRegistry = .{};
-    defer subagent_registry.deinit(allocator);
-
-    var registry = Registry.init(allocator);
-    defer registry.deinit();
-    try registerTaskTool(&registry, &subagent_registry);
-
-    try std.testing.expect(registry.get("task") == null);
-    try std.testing.expect(registry.task_input_schema == null);
+    var saw_task = false;
+    var saw_workflow = false;
+    for (defs) |d| {
+        if (std.mem.eql(u8, d.name, "task")) saw_task = true;
+        if (std.mem.eql(u8, d.name, "workflow")) saw_workflow = true;
+    }
+    try std.testing.expect(saw_task);
+    try std.testing.expect(saw_workflow);
 }
 
 test {

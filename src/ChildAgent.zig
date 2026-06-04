@@ -34,6 +34,13 @@ const llm = @import("llm.zig");
 
 const ChildAgent = @This();
 
+/// Maximum nested `task`/`zag.task` invocations on a single delegation chain.
+/// The hard backstop that keeps runaway delegation from blowing the stack or
+/// the token budget, orthogonal to the per-level fan-out bound. Both spawn
+/// surfaces (the `task` tool and the `zag.task` Lua binding) read this single
+/// owner before spawning a child whose depth would exceed it.
+pub const max_task_depth: u8 = 8;
+
 /// Inline replacement for a static-catalog `Subagent` lookup. Carries
 /// everything a child run needs from its spawner.
 pub const ChildSpec = struct {
@@ -217,7 +224,6 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
         .model_spec = child_model_spec,
         .registry = &self.child_registry,
         .skills = null,
-        .subagents = ctx.subagents,
         .session_id = child_session_id,
         .child_registry = ctx.child_registry,
         // When the spec declares a schema, the child run is forced to emit a
@@ -367,7 +373,6 @@ test "ChildAgent starts, drains to completion, and reports the summary" {
 
     const ctx: tools.TaskContext = .{
         .allocator = allocator,
-        .subagents = undefined,
         .provider = p,
         .provider_name = "stub_text",
         .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
@@ -452,7 +457,6 @@ test "ChildAgent.start unwinds cleanly on allocation failure at any stage" {
 
         const ctx: tools.TaskContext = .{
             .allocator = allocator,
-            .subagents = undefined,
             .provider = p,
             .provider_name = "stub_text",
             .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
