@@ -2073,6 +2073,7 @@ const OAuthFixture = struct {
     token_saw_resource: std.atomic.Value(bool) = .init(false),
     token_form_encoded: std.atomic.Value(bool) = .init(false),
     register_hits: std.atomic.Value(u32) = .init(0),
+    token_hits: std.atomic.Value(u32) = .init(0),
     refresh_grant_seen: std.atomic.Value(bool) = .init(false),
     client_credentials_seen: std.atomic.Value(bool) = .init(false),
     /// When set, the authorization-server metadata advertises a non-loopback
@@ -2148,6 +2149,7 @@ const OAuthFixture = struct {
             return;
         }
         if (std.mem.indexOf(u8, request, "POST /token") != null) {
+            _ = ctx.token_hits.fetchAdd(1, .acq_rel);
             // The token request body is application/x-www-form-urlencoded.
             if (HttpFixture.findHeaderValue(headers, "content-type")) |ct| {
                 if (std.mem.indexOf(u8, ct, "application/x-www-form-urlencoded") != null) {
@@ -2315,6 +2317,68 @@ test "mcp oauth: auto-auth runs the PKCE flow and retries the 401 once" {
     try testing.expect(ctx.token_saw_code_verifier.load(.acquire));
     try testing.expect(ctx.token_saw_resource.load(.acquire));
     try testing.expect(ctx.register_hits.load(.acquire) >= 1);
+}
+
+test "mcp oauth: concurrent needs-auth calls run a single interactive flow" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ctx: OAuthFixture = undefined;
+    const thread = try startOAuthFixture(&engine, &ctx, &tmp, &abs_buf);
+    defer {
+        ctx.stop.store(true, .release);
+        if (test_net.connectLoopback(test_net.boundPort(&ctx.server))) |s| s.close(std.testing.io) else |_| {}
+        thread.join();
+        ctx.server.deinit(std.testing.io);
+    }
+
+    // The injected opener counts its invocations: two concurrent flows would
+    // open the browser twice (and collide on the callback port). One flow must
+    // open exactly once. The opener simulates the user's redirect.
+    try runLua(&engine,
+        \\_opener_calls = 0
+        \\mcp._test.set_browser_opener(function(url)
+        \\  _opener_calls = _opener_calls + 1
+        \\  local state = url:match("[?&]state=([^&]+)")
+        \\  zag.detach(function()
+        \\    local cb = "http://127.0.0.1:19876/callback?code=testcode&state=" .. state
+        \\    for _ = 1, 200 do
+        \\      local resp = zag.http.get(cb)
+        \\      if resp and (resp.status == 200) then return end
+        \\      zag.sleep(10)
+        \\    end
+        \\  end)
+        \\end)
+    );
+
+    // Two coroutines hit the same needs-auth server concurrently. The first
+    // runs the flow; the second finds oauth_flow_in_progress set, waits, and
+    // re-checks. Both must succeed off the single flow.
+    try runCoroutineBodyTolerant(&engine,
+        \\  local srv = mcp._test.normalize_server("auth", { url = _oauth_url, auth = "oauth" })
+        \\  mcp._test.servers().auth = srv
+        \\  _res1, _res2 = nil, nil
+        \\  zag.detach(function() _res1 = mcp._test.oauth_authorize(srv) end)
+        \\  zag.detach(function() _res2 = mcp._test.oauth_authorize(srv) end)
+        \\  -- Wait for both detached flows to settle.
+        \\  for _ = 1, 1000 do
+        \\    if _res1 ~= nil and _res2 ~= nil then break end
+        \\    zag.sleep(10)
+        \\  end
+        \\  assert(_res1 == true, "first flow succeeds: " .. tostring(_res1))
+        \\  assert(_res2 == true, "second caller succeeds off the single flow: " .. tostring(_res2))
+        \\  assert(srv.oauth_access_token == "tok-access", "token applied, got " .. tostring(srv.oauth_access_token))
+        \\  assert(_opener_calls == 1, "browser opened exactly once, got " .. tostring(_opener_calls))
+    );
+
+    // The token endpoint was exchanged exactly once.
+    try testing.expectEqual(@as(u32, 1), ctx.token_hits.load(.acquire));
 }
 
 test "mcp oauth: state mismatch on the callback is rejected" {

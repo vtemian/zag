@@ -965,6 +965,10 @@ end
 local OAUTH_CALLBACK_PORT = 19876
 local OAUTH_CALLBACK_PATH = "/callback"
 local OAUTH_REFRESH_SKEW_S = 60
+-- How long a second concurrent caller waits for an in-progress interactive
+-- flow to finish before giving up. Covers the leader's full 300s callback
+-- window plus discovery/exchange slack.
+local OAUTH_FLOW_WAIT_MS = 330000
 
 -- Test seam: HOME for the token directory. os.getenv reads libc directly, so a
 -- test cannot mutate it; production leaves this nil and falls back to $HOME.
@@ -1376,18 +1380,50 @@ local function oauth_authorization_code(srv)
   return true
 end
 
--- Run the OAuth flow for `srv`: client_credentials when configured, else the
--- interactive authorization_code flow. Returns (true, nil) or (nil, err).
-function oauth_authorize(srv)
-  -- Refuse early on an unsafe server name so no browser opens and no network
-  -- call fires before we discover the token path is unwritable.
-  local _, seg_err = safe_server_segment(srv)
-  if seg_err then return nil, seg_err end
+-- Dispatch the OAuth flow for `srv`: client_credentials when configured, else
+-- the interactive authorization_code flow. Returns (true, nil) or (nil, err).
+local function oauth_run_flow(srv)
   local grant = srv.oauth and srv.oauth.grant_type
   if grant == "client_credentials" then
     return oauth_client_credentials(srv)
   end
   return oauth_authorization_code(srv)
+end
+
+-- Run the OAuth flow for `srv`, serializing concurrent callers so only ONE
+-- interactive flow runs at a time (otherwise two needs-auth calls open two
+-- browser tabs and collide on the callback port). The same cooperative-flag
+-- idiom as acquire_busy: coroutines are scheduled cooperatively on the main
+-- thread, so a plain flag with yields between read and set is an effective
+-- lock. A second caller finding the flag set waits for the leader to finish,
+-- then reports success if a token landed (rather than starting its own flow).
+function oauth_authorize(srv)
+  -- Refuse early on an unsafe server name so no browser opens and no network
+  -- call fires before we discover the token path is unwritable.
+  local _, seg_err = safe_server_segment(srv)
+  if seg_err then return nil, seg_err end
+
+  if srv.oauth_flow_in_progress then
+    local deadline = M._now() + math.ceil(OAUTH_FLOW_WAIT_MS / 1000)
+    while srv.oauth_flow_in_progress do
+      if M._now() >= deadline then
+        return nil, "timed out waiting for an in-progress authorization flow"
+      end
+      zag.sleep(20)
+    end
+    if srv.oauth_access_token then return true end
+    return nil, "concurrent authorization flow finished without a token"
+  end
+
+  -- pcall the flow so the in-progress flag ALWAYS clears, even on error; a
+  -- stuck flag would wedge every later auth attempt for this server.
+  srv.oauth_flow_in_progress = true
+  local ok, result, err = pcall(oauth_run_flow, srv)
+  srv.oauth_flow_in_progress = false
+  if not ok then
+    return nil, "authorization flow error: " .. tostring(result)
+  end
+  return result, err
 end
 
 -- Refresh an expiring token via the refresh_token grant. Returns (true, nil)
