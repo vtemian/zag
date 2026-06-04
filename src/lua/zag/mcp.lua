@@ -422,6 +422,249 @@ local function call_tool(srv, name, args)
 end
 
 -- ---------------------------------------------------------------------------
+-- Stable serialization (for the cache config hash)
+--
+-- zag.json.encode does not guarantee key order, so the hash uses this
+-- recursive key-sorted serializer instead. Arrays keep their order; object
+-- keys are emitted sorted. Mirrors pi's stableStringify.
+-- ---------------------------------------------------------------------------
+
+local function is_array(t)
+  local n = 0
+  for _ in pairs(t) do n = n + 1 end
+  return n == #t
+end
+
+local stable_stringify
+function stable_stringify(value)
+  local vt = type(value)
+  if value == nil then
+    return "null"
+  elseif vt == "boolean" then
+    return value and "true" or "false"
+  elseif vt == "number" then
+    return tostring(value)
+  elseif vt == "string" then
+    -- Reuse JSON string escaping by encoding a one-element wrapper and
+    -- slicing the quotes-and-escapes back out.
+    local enc = zag.json.encode({ value })
+    return enc:sub(2, #enc - 1)  -- strip the surrounding [ ]
+  elseif vt == "table" then
+    if next(value) == nil then
+      return "{}"
+    end
+    if is_array(value) then
+      local parts = {}
+      for i = 1, #value do parts[i] = stable_stringify(value[i]) end
+      return "[" .. table.concat(parts, ",") .. "]"
+    end
+    local keys = {}
+    for k in pairs(value) do keys[#keys + 1] = tostring(k) end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+      parts[#parts + 1] = '"' .. k .. '":' .. stable_stringify(value[k])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+  end
+  return "null"
+end
+
+-- ---------------------------------------------------------------------------
+-- Metadata fetch + on-disk cache
+-- ---------------------------------------------------------------------------
+
+local CACHE_VERSION = 1
+local CACHE_MAX_AGE_S = 7 * 24 * 60 * 60
+
+-- Hex-encode a raw byte string.
+local function to_hex(bytes)
+  local out = {}
+  for i = 1, #bytes do out[i] = string.format("%02x", string.byte(bytes, i)) end
+  return table.concat(out)
+end
+
+-- sha256 hex over the identity fields that determine which tools/resources a
+-- server exposes. Excludes runtime-only knobs (lifecycle, idle_timeout) per
+-- pi's rule.
+local function config_hash(srv)
+  local identity = {
+    command = srv.command,
+    env = srv.env,
+    cwd = srv.cwd,
+    url = srv.url,
+    headers = srv.headers,
+    auth = srv.auth,
+    bearer_token = srv.bearer_token,
+    bearer_token_env = srv.bearer_token_env,
+    expose_resources = srv.expose_resources,
+    exclude_tools = srv.exclude_tools,
+  }
+  return to_hex(zag.crypto.sha256(stable_stringify(identity)))
+end
+
+-- The metadata cache directory: (XDG_CACHE_HOME or HOME/.cache)/zag/.
+-- `M._cache_dir_override` is a test-only seam (Lua's os.getenv reads libc
+-- directly, which tests must not mutate); production leaves it nil.
+M._cache_dir_override = nil
+local function cache_dir()
+  if M._cache_dir_override then return M._cache_dir_override end
+  local xdg = os.getenv("XDG_CACHE_HOME")
+  if xdg and #xdg > 0 then return xdg .. "/zag" end
+  return (os.getenv("HOME") or ".") .. "/.cache/zag"
+end
+
+local function cache_path()
+  return cache_dir() .. "/mcp-metadata.json"
+end
+
+-- Paginated tools/list: follow nextCursor until exhausted. Returns the
+-- accumulated tools array or (nil, err).
+local function fetch_tools(srv)
+  local all = {}
+  local cursor = nil
+  while true do
+    local params = {}
+    if cursor then params.cursor = cursor end
+    local result, err = rpc_request(srv, "tools/list", params)
+    if not result then return nil, err end
+    for _, t in ipairs(result.tools or {}) do all[#all + 1] = t end
+    cursor = result.nextCursor
+    if not cursor then break end
+  end
+  return all
+end
+
+-- Paginated resources/list. Returns the accumulated resources array; an empty
+-- array if the server reports no resources or errors on the call (resources
+-- are optional, so a failure there must not abort metadata fetch).
+local function fetch_resources(srv)
+  local all = {}
+  local cursor = nil
+  while true do
+    local params = {}
+    if cursor then params.cursor = cursor end
+    local result, err = rpc_request(srv, "resources/list", params)
+    if not result then
+      -- Server may not implement resources; treat as empty.
+      return all
+    end
+    for _, r in ipairs(result.resources or {}) do all[#all + 1] = r end
+    cursor = result.nextCursor
+    if not cursor then break end
+  end
+  return all
+end
+
+-- Fetch tools (always) and resources (when expose_resources). Returns a
+-- normalized metadata entry { config_hash, cached_at, tools, resources } or
+-- (nil, err). The server must already be connected.
+local function fetch_metadata(srv)
+  local tools, terr = fetch_tools(srv)
+  if not tools then return nil, terr end
+
+  local resources = {}
+  if srv.expose_resources then
+    resources = fetch_resources(srv)
+  end
+
+  -- Normalize to the snake_case cache shape.
+  local norm_tools = {}
+  for _, t in ipairs(tools) do
+    if t.name then
+      norm_tools[#norm_tools + 1] = {
+        name = t.name,
+        description = t.description or "",
+        input_schema = t.inputSchema,
+      }
+    end
+  end
+  local norm_resources = {}
+  for _, r in ipairs(resources) do
+    if r.uri and r.name then
+      norm_resources[#norm_resources + 1] = {
+        uri = r.uri,
+        name = r.name,
+        description = r.description,
+      }
+    end
+  end
+
+  return {
+    config_hash = config_hash(srv),
+    cached_at = M._now(),
+    tools = norm_tools,
+    resources = norm_resources,
+  }
+end
+
+-- In-memory cache: name -> entry. Loaded from disk lazily, written through on
+-- each refresh.
+M._cache = { version = CACHE_VERSION, servers = {} }
+
+-- Read the cache file into M._cache. Tolerant of missing/corrupt files.
+local function cache_load()
+  M._cache = { version = CACHE_VERSION, servers = {} }
+  local path = cache_path()
+  if not zag.fs.exists(path) then return end
+  local raw, err = zag.fs.read(path)
+  if not raw then
+    zag.log.warn("zag.mcp: failed to read metadata cache: %s", tostring(err))
+    return
+  end
+  local decoded = zag.json.decode(raw)
+  if type(decoded) ~= "table" or decoded.version ~= CACHE_VERSION
+      or type(decoded.servers) ~= "table" then
+    return
+  end
+  M._cache = decoded
+end
+
+-- Atomically write M._cache to disk (temp file + os.rename).
+local function cache_save()
+  local dir = cache_dir()
+  -- parents = true uses makePath, which is a no-op when the dir exists.
+  local ok_mk, mk_err = zag.fs.mkdir(dir, { parents = true })
+  if not ok_mk and not zag.fs.exists(dir) then
+    zag.log.warn("zag.mcp: cache mkdir failed: %s", tostring(mk_err))
+    return
+  end
+  local path = cache_path()
+  local tmp = path .. ".tmp"
+  local encoded = zag.json.encode(M._cache)
+  local ok_w, w_err = zag.fs.write(tmp, encoded)
+  if not ok_w then
+    zag.log.warn("zag.mcp: cache write failed: %s", tostring(w_err))
+    return
+  end
+  local ok_r = os.rename(tmp, path)
+  if not ok_r then
+    zag.log.warn("zag.mcp: cache rename failed")
+  end
+end
+
+-- Store one server's fresh metadata and persist the cache.
+local function cache_put(name, entry)
+  M._cache.servers[name] = entry
+  cache_save()
+end
+
+-- Return a server's cache entry IF it is valid: config hash matches the
+-- current definition and it is within the 7-day TTL. Otherwise nil.
+local function cache_get_valid(srv)
+  local entry = M._cache.servers[srv.name]
+  if not entry then return nil end
+  if entry.config_hash ~= config_hash(srv) then return nil end
+  if type(entry.cached_at) ~= "number" then return nil end
+  if M._now() - entry.cached_at > CACHE_MAX_AGE_S then return nil end
+  return entry
+end
+
+-- Wire cache_load into the lazy config completion (declared as M._cache_load
+-- so ensure_config_loaded can call it without a forward reference).
+M._cache_load = cache_load
+
+-- ---------------------------------------------------------------------------
 -- Test export: internals exercised by mcp_test.zig.
 -- ---------------------------------------------------------------------------
 
@@ -443,6 +686,17 @@ M._test = {
   end,
   list_tools = function(srv) return list_tools(srv) end,
   call_tool = function(srv, name, args) return call_tool(srv, name, args) end,
+  -- E3 cache internals.
+  stable_stringify = function(v) return stable_stringify(v) end,
+  config_hash = function(srv) return config_hash(srv) end,
+  fetch_metadata = function(srv) return fetch_metadata(srv) end,
+  cache_path = function() return cache_path() end,
+  cache_load = function() return cache_load() end,
+  cache_save = function() return cache_save() end,
+  cache_put = function(name, entry) return cache_put(name, entry) end,
+  cache_get_valid = function(srv) return cache_get_valid(srv) end,
+  cache = function() return M._cache end,
+  set_cache_dir = function(d) M._cache_dir_override = d end,
 }
 
 return M

@@ -324,6 +324,129 @@ test "mcp stdio: id-matching skips an interleaved notification" {
     );
 }
 
+// ---------------------------------------------------------------------------
+// E3: metadata fetch (cursor pagination) + on-disk cache
+// ---------------------------------------------------------------------------
+
+// A server whose tools/list paginates once (first page carries nextCursor,
+// the cursor-bearing follow-up carries the rest) and which serves a
+// resources/list page. The client matches responses by the id IT sent, so
+// every reply echoes the request's id back — parsed out of the line with a
+// shell substring trick (the id is the integer after `"id":`).
+const fake_mcp_paginate_sh =
+    \\#!/bin/sh
+    \\# Extract the integer request id: strip up to `"id":`, then keep the
+    \\# leading digits (drop everything from the first non-digit).
+    \\reqid() {
+    \\  rest=${1#*\"id\":}
+    \\  printf '%s' "${rest%%[!0-9]*}"
+    \\}
+    \\while IFS= read -r line; do
+    \\  id=$(reqid "$line")
+    \\  case "$line" in
+    \\    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}' ;;
+    \\    *'"notifications/initialized"'*) ;;
+    \\    *'"tools/list"'*)
+    \\      case "$line" in
+    \\        *'"cursor"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"second","description":"p2"}]}}' ;;
+    \\        *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"first","description":"p1"}],"nextCursor":"c2"}}' ;;
+    \\      esac ;;
+    \\    *'"resources/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[{"uri":"file:///r","name":"res","description":"a resource"}]}}' ;;
+    \\  esac
+    \\done
+    \\
+;
+
+test "mcp metadata: tools/list paginates and resources/list is fetched" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupFakeServer(&engine, &tmp, fake_mcp_paginate_sh, &abs_buf);
+
+    try runCoroutineBody(&engine,
+        \\  assert(mcp._test.connect(fake), "connect")
+        \\  local meta, err = mcp._test.fetch_metadata(fake)
+        \\  assert(meta, "fetch_metadata: " .. tostring(err))
+        \\  assert(#meta.tools == 2, "expected 2 tools across pages, got " .. #meta.tools)
+        \\  assert(meta.tools[1].name == "first", "page 1")
+        \\  assert(meta.tools[2].name == "second", "page 2")
+        \\  assert(#meta.resources == 1, "one resource")
+        \\  assert(meta.resources[1].uri == "file:///r", "resource uri")
+        \\  assert(type(meta.config_hash) == "string" and #meta.config_hash == 64, "hex sha256")
+        \\  mcp._test.disconnect_handle(fake)
+    );
+}
+
+test "mcp cache: save/load round-trips and config-hash + TTL invalidate" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realPathFile(std.testing.io, ".", &abs_buf);
+    _ = engine.lua.pushString(abs_buf[0..dir]);
+    engine.lua.setGlobal("_cache_dir");
+
+    try runLua(&engine,
+        \\mcp = require("zag.mcp")
+        \\mcp._test.set_cache_dir(_cache_dir)
+        \\mcp._test.set_now(1000000)
+        \\srv = mcp._test.normalize_server("fake", { command = { "echo", "x" } })
+    );
+
+    try runCoroutineBody(&engine,
+        \\  -- Compute the entry's hash and persist it.
+        \\  local entry = {
+        \\    config_hash = mcp._test.config_hash(srv),
+        \\    cached_at = 1000000,
+        \\    tools = { { name = "add", description = "adds", input_schema = { type = "object" } } },
+        \\    resources = {},
+        \\  }
+        \\  mcp._test.cache_put("fake", entry)
+        \\  -- Drop the in-memory cache and reload from disk.
+        \\  mcp._test.cache_load()
+        \\  local loaded = mcp._test.cache()
+        \\  assert(loaded.servers.fake ~= nil, "fake survived round-trip")
+        \\  assert(loaded.servers.fake.tools[1].name == "add", "tool name persisted")
+        \\  -- Within TTL and matching hash -> valid.
+        \\  assert(mcp._test.cache_get_valid(srv) ~= nil, "valid entry returned")
+        \\  -- Advance the clock past the 7-day TTL -> invalid.
+        \\  mcp._test.set_now(1000000 + 8 * 24 * 60 * 60)
+        \\  assert(mcp._test.cache_get_valid(srv) == nil, "TTL expiry invalidates")
+        \\  -- Reset clock; change the server identity -> hash mismatch invalidates.
+        \\  mcp._test.set_now(1000000)
+        \\  local srv2 = mcp._test.normalize_server("fake", { command = { "echo", "DIFFERENT" } })
+        \\  assert(mcp._test.cache_get_valid(srv2) == nil, "config-hash mismatch invalidates")
+    );
+}
+
+test "mcp cache: stable_stringify sorts object keys" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local s = mcp._test.stable_stringify
+        \\-- Key order is deterministic regardless of insertion order.
+        \\assert(s({ b = 1, a = 2 }) == '{"a":2,"b":1}', "got " .. s({ b = 1, a = 2 }))
+        \\-- Arrays preserve order.
+        \\assert(s({ 3, 1, 2 }) == "[3,1,2]", "array order")
+        \\-- Nested + scalars.
+        \\assert(s({ x = { 1, "a" }, y = true }) == '{"x":[1,"a"],"y":true}', "nested")
+    );
+}
+
 test "mcp stdio: per-request timeout fires when the server never replies" {
     var engine = try LuaEngine.init(testing.allocator);
     defer engine.deinit();
