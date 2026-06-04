@@ -173,6 +173,35 @@ const fake_mcp_interleave_sh =
     \\
 ;
 
+// A variant that, on a tools/call, first issues a server-initiated
+// `sampling/createMessage` request (sampling is deliberately unsupported), then
+// reads the client's reply to it. The client must answer JSON-RPC -32601; the
+// fixture only emits the real tools/call result once it has seen that -32601
+// reply, so a passing assertion proves BOTH that the sampling request was
+// refused with -32601 AND that the original tools/call still completed.
+const fake_mcp_sampling_sh =
+    \\#!/bin/sh
+    \\reqid() { rest=${1#*\"id\":}; printf '%s' "${rest%%[!0-9]*}"; }
+    \\while IFS= read -r line; do
+    \\  id=$(reqid "$line")
+    \\  case "$line" in
+    \\    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}' ;;
+    \\    *'"notifications/initialized"'*) ;;
+    \\    *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","description":"adds","inputSchema":{"type":"object"}}]}}' ;;
+    \\    *'"tools/call"'*)
+    \\      # Mid-response: ask the client to sample (server-initiated request).
+    \\      printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"sampling/createMessage","params":{"messages":[]}}'
+    \\      # Read the client's reply to id 99; only proceed if it refused -32601.
+    \\      IFS= read -r reply
+    \\      case "$reply" in
+    \\        *'"id":99'*'-32601'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"3"}],"isError":false}}' ;;
+    \\        *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":1,"message":"client did not refuse sampling with -32601: '"$reply"'"}}' ;;
+    \\      esac ;;
+    \\  esac
+    \\done
+    \\
+;
+
 fn writeFixture(tmp: *std.testing.TmpDir, name: []const u8, contents: []const u8, abs_buf: []u8) ![]const u8 {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = contents });
     // realPathFile returns the byte count written into abs_buf.
@@ -391,6 +420,32 @@ test "mcp stdio: id-matching skips an interleaved notification" {
         \\  assert(ok, "connect should skip the stray notification: " .. tostring(err))
         \\  local tools = mcp._test.list_tools(fake)
         \\  assert(tools and tools[1].name == "add", "list after interleave")
+        \\  mcp._test.disconnect_handle(fake)
+    );
+}
+
+test "mcp stdio: server-initiated sampling/createMessage is refused with -32601" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try setupFakeServer(&engine, &tmp, fake_mcp_sampling_sh, &abs_buf);
+
+    // The fixture interleaves a `sampling/createMessage` request before the
+    // tools/call response and gates that response on having seen a -32601
+    // reply. A successful call_tool therefore pins both halves: the unsupported
+    // server-initiated request was refused with -32601, and the in-flight
+    // request still completed.
+    try runCoroutineBody(&engine,
+        \\  assert(mcp._test.connect(fake), "connect")
+        \\  local res, cerr = mcp._test.call_tool(fake, "add", { a = 1, b = 2 })
+        \\  assert(res, "call_tool after sampling refusal: " .. tostring(cerr))
+        \\  assert(res.content[1].text == "3", "result text 3 after sampling refusal")
         \\  mcp._test.disconnect_handle(fake)
     );
 }
