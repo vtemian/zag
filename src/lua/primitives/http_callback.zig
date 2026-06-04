@@ -310,6 +310,7 @@ pub const HttpCallbackListener = struct {
             const name = try urlDecode(self.alloc, raw_name);
             errdefer self.alloc.free(name);
             const value = try urlDecode(self.alloc, raw_value);
+            errdefer self.alloc.free(value);
             try list.append(self.alloc, .{ .name = name, .value = value });
         }
 
