@@ -21,6 +21,7 @@ test {
     _ = @import("bindings/json.zig");
     _ = @import("bindings/crypto.zig");
     _ = @import("integration_test.zig");
+    _ = @import("zag/mcp_test.zig");
     _ = @import("hook_registry.zig");
     _ = @import("job_result.zig");
     _ = @import("lua_json.zig");
