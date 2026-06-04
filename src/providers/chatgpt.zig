@@ -89,6 +89,7 @@ pub const ChatgptSerializer = struct {
             req.messages,
             req.tool_definitions,
             effective_reasoning,
+            req.tool_choice,
             req.allocator,
         );
         defer req.allocator.free(body);
@@ -146,6 +147,7 @@ pub const ChatgptSerializer = struct {
             req.messages,
             req.tool_definitions,
             effective_reasoning,
+            req.tool_choice,
             req.allocator,
         );
         defer req.allocator.free(body);
@@ -192,7 +194,7 @@ pub fn buildRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, false, .{}, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, false, .{}, .auto, allocator);
 }
 
 /// Serialize a streaming Responses API request body (`stream: true`). See
@@ -204,7 +206,7 @@ pub fn buildStreamingRequestBody(
     tool_definitions: []const types.ToolDefinition,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, .{}, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, .{}, .auto, allocator);
 }
 
 /// Streaming variant that lets the caller plug in a per-endpoint
@@ -216,9 +218,10 @@ pub fn buildStreamingRequestBodyWithReasoning(
     messages: []const types.Message,
     tool_definitions: []const types.ToolDefinition,
     reasoning: llm.Endpoint.ReasoningConfig,
+    tool_choice: llm.ToolChoice,
     allocator: Allocator,
 ) ![]const u8 {
-    return serializeRequest(model, system_prompt, messages, tool_definitions, true, reasoning, allocator);
+    return serializeRequest(model, system_prompt, messages, tool_definitions, true, reasoning, tool_choice, allocator);
 }
 
 fn serializeRequest(
@@ -228,6 +231,7 @@ fn serializeRequest(
     tool_definitions: []const types.ToolDefinition,
     stream: bool,
     reasoning: llm.Endpoint.ReasoningConfig,
+    tool_choice: llm.ToolChoice,
     allocator: Allocator,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -254,7 +258,20 @@ fn serializeRequest(
     try w.writeAll(",");
     try writeTools(tool_definitions, w);
 
-    try w.writeAll(",\"tool_choice\":\"auto\"");
+    // The Responses API takes a FLAT top-level function reference for a
+    // forced call (`{"type":"function","name":"emit"}`), mirroring the flat
+    // tool entries `writeTools` emits, NOT the Chat-Completions nested
+    // `function:{name}` shape. `.auto` keeps the historical hardcode
+    // byte-identical so existing (unforced) requests don't change.
+    switch (tool_choice) {
+        .auto => try w.writeAll(",\"tool_choice\":\"auto\""),
+        .none => try w.writeAll(",\"tool_choice\":\"none\""),
+        .tool => |name| {
+            try w.writeAll(",\"tool_choice\":{\"type\":\"function\",\"name\":");
+            try std.json.Stringify.value(name, .{}, w);
+            try w.writeAll("}");
+        },
+    }
     try w.writeAll(",\"parallel_tool_calls\":true");
     try w.writeAll(",\"store\":false");
     // Codex-specific fields. Matches pi-mono's openai-codex-responses
@@ -1266,6 +1283,70 @@ test "chatgpt: empty tools array is still emitted" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("tools").?.array.items.len);
+}
+
+test "chatgpt: serializes forced tool_choice as a flat function reference" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    // Raw-substring check pins the exact on-the-wire shape. The Responses
+    // API takes a FLAT top-level `{"type":"function","name":...}` (vs Chat
+    // Completions' nested `function:{name}`), matching this file's flat tool
+    // entries. This golden is the guard against wire-shape drift.
+    const body = try buildStreamingRequestBodyWithReasoning(
+        "gpt-5-codex",
+        "",
+        &messages,
+        &.{},
+        .{},
+        .{ .tool = "emit" },
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"function\",\"name\":\"emit\"}") != null);
+    // The Chat-Completions nested wrapper must be absent.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"function\":{\"name\":\"emit\"}") == null);
+}
+
+test "chatgpt: tool_choice none serializes the string sentinel" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    const body = try buildStreamingRequestBodyWithReasoning(
+        "gpt-5-codex",
+        "",
+        &messages,
+        &.{},
+        .{},
+        .none,
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"none\"") != null);
+}
+
+test "chatgpt: tool_choice auto stays byte-identical to the historical hardcode" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{};
+
+    // `.auto` (the default for every existing request) must emit the exact
+    // bytes the hardcode produced before tool_choice was threaded through.
+    const body = try buildStreamingRequestBodyWithReasoning(
+        "gpt-5-codex",
+        "",
+        &messages,
+        &.{},
+        .{},
+        .auto,
+        allocator,
+    );
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true") != null);
+    // The forced / none shapes must not appear for an auto request.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"function\",\"name\":") == null);
 }
 
 test "chatgpt: JSON escapes special characters in text" {
@@ -2354,6 +2435,7 @@ test "chatgpt: reasoning override emits effort/summary/verbosity from ReasoningC
         &messages,
         &.{},
         .{ .effort = "high", .summary = "concise", .verbosity = "low" },
+        .auto,
         allocator,
     );
     defer allocator.free(body);
@@ -2378,6 +2460,7 @@ test "chatgpt serializeRequest honours Request.thinking_effort over endpoint.rea
         &messages,
         &.{},
         .{ .effort = "high", .summary = "auto", .verbosity = "medium" },
+        .auto,
         allocator,
     );
     defer allocator.free(body);
@@ -2398,6 +2481,7 @@ test "chatgpt: summary='none' omits the summary key entirely" {
         &messages,
         &.{},
         .{ .effort = "minimal", .summary = "none", .verbosity = "high" },
+        .auto,
         allocator,
     );
     defer allocator.free(body);
