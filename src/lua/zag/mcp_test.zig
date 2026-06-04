@@ -357,6 +357,176 @@ test "mcp .mcp.json merges under Lua-declared servers" {
     );
 }
 
+test "mcp imports: cursor config is read from HOME and normalized to argv" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // A fake HOME holding ~/.cursor/mcp.json in the standard command+args
+    // shape. set_home_dir overrides the HOME seam the import readers consult.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const home_abs = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
+
+    try tmp.dir.createDirPath(std.testing.io, ".cursor");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".cursor/mcp.json",
+        .data =
+        \\{ "mcpServers": {
+        \\  "ctx": { "command": "npx", "args": ["-y", "ctx-mcp"] }
+        \\} }
+        ,
+    });
+
+    _ = engine.lua.pushString(home_abs);
+    engine.lua.setGlobal("_home");
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp._test.set_home_dir(_home)
+        \\mcp.setup{ settings = { imports = { "cursor" } } }
+    );
+
+    try runLua(&engine,
+        \\function _mcp_load()
+        \\  require("zag.mcp").ensure_config_loaded()
+        \\  _mcp_loaded = true
+        \\end
+    );
+    _ = try engine.lua.getGlobal("_mcp_load");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_mcp_loaded");
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local servers = mcp._test.servers()
+        \\assert(servers.ctx ~= nil, "imported cursor server present")
+        \\assert(servers.ctx.transport == "stdio", "stdio transport")
+        \\-- command (string) + args (array) joins into a single argv array.
+        \\assert(#servers.ctx.command == 3, "argv length 3, got " .. #servers.ctx.command)
+        \\assert(servers.ctx.command[1] == "npx", "argv[1]")
+        \\assert(servers.ctx.command[2] == "-y", "argv[2]")
+        \\assert(servers.ctx.command[3] == "ctx-mcp", "argv[3]")
+    );
+}
+
+test "mcp imports: Lua > .mcp.json > import precedence on a name collision" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // A project dir holding a .mcp.json AND acting as the fake HOME holding
+    // ~/.cursor/mcp.json. Both declare `shared`; Lua also declares it. Lua wins.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
+
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(orig_cwd);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".mcp.json",
+        .data =
+        \\{ "mcpServers": { "shared": { "command": ["from-json"] } } }
+        ,
+    });
+    try tmp.dir.createDirPath(std.testing.io, ".cursor");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".cursor/mcp.json",
+        .data =
+        \\{ "mcpServers": { "shared": { "command": "from-import" } } }
+        ,
+    });
+    try std.process.setCurrentPath(std.testing.io, tmp_abs);
+
+    _ = engine.lua.pushString(tmp_abs);
+    engine.lua.setGlobal("_home");
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp._test.set_home_dir(_home)
+        \\mcp.setup{
+        \\  servers = { shared = { command = { "from-lua" } } },
+        \\  settings = { imports = { "cursor" } },
+        \\}
+    );
+
+    try runLua(&engine,
+        \\function _mcp_load()
+        \\  require("zag.mcp").ensure_config_loaded()
+        \\  _mcp_loaded = true
+        \\end
+    );
+    _ = try engine.lua.getGlobal("_mcp_load");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_mcp_loaded");
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local servers = mcp._test.servers()
+        \\assert(servers.shared.command[1] == "from-lua", "Lua wins over .mcp.json and import")
+    );
+}
+
+test "mcp imports: absent file is silent; file without mcpServers is skipped" {
+    var engine = try LuaEngine.init(testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    // HOME with NO ~/.cursor/mcp.json, and a vscode-shape file nested under the
+    // newer `servers` key (no `mcpServers`), which must be skipped.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = rbuf[0..try tmp.dir.realPathFile(std.testing.io, ".", &rbuf)];
+
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(orig_cwd);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+
+    try tmp.dir.createDirPath(std.testing.io, ".vscode");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".vscode/mcp.json",
+        // Newer VS Code nests under `servers`, not `mcpServers`: skip it.
+        .data =
+        \\{ "servers": { "vs": { "command": "code-mcp" } } }
+        ,
+    });
+    try std.process.setCurrentPath(std.testing.io, tmp_abs);
+
+    _ = engine.lua.pushString(tmp_abs);
+    engine.lua.setGlobal("_home");
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\mcp._test.set_home_dir(_home)
+        \\-- cursor file is absent under HOME; vscode file lacks mcpServers.
+        \\mcp.setup{ settings = { imports = { "cursor", "vscode" } } }
+    );
+
+    try runLua(&engine,
+        \\function _mcp_load()
+        \\  require("zag.mcp").ensure_config_loaded()
+        \\  _mcp_loaded = true
+        \\end
+    );
+    _ = try engine.lua.getGlobal("_mcp_load");
+    _ = try engine.spawnCoroutine(0, null);
+    try pumpUntilGlobalTrue(&engine, "_mcp_loaded");
+
+    try runLua(&engine,
+        \\local mcp = require("zag.mcp")
+        \\local servers = mcp._test.servers()
+        \\assert(next(servers) == nil, "no servers from an absent file or a mcpServers-less file")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // E2: JSON-RPC stdio client
 // ---------------------------------------------------------------------------

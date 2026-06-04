@@ -253,29 +253,45 @@ end
 -- ---------------------------------------------------------------------------
 -- Lazy config completion: .mcp.json + imports merge. Reads files (yields),
 -- so only callable from a coroutine context. Runs its body exactly once.
--- Lua-declared servers WIN over .mcp.json on a name collision.
+-- Precedence, highest first: Lua-declared > project .mcp.json > settings.imports.
 -- ---------------------------------------------------------------------------
 
--- Read the project-local .mcp.json (standard `{ "mcpServers": {...} }`
--- format) if present, merging UNDER the Lua-declared servers.
-local function load_project_mcp_json()
-  local path = ".mcp.json"
-  if not zag.fs.exists(path) then return end
-  local raw, err = zag.fs.read(path)
-  if not raw then
-    zag.log.warn("zag.mcp: failed to read .mcp.json: %s", tostring(err))
-    return
+-- Forward declaration: `home_dir` (the HOME seam) is defined in the OAuth
+-- section far below, but the imports reader (here) needs it to resolve
+-- HOME-relative cross-app config paths. Without the forward-declared local the
+-- reference would bind to a nil global.
+local home_dir
+
+-- The standard external MCP config shape (.mcp.json, Claude Code, Cursor, ...)
+-- splits a stdio launch as `command` (string) + `args` (array). zag's
+-- normalized entry carries a single `command` argv array, so fold the two into
+-- one before handing the entry to normalize_server. A `command` that is already
+-- an array (the form zag's own docs use) passes through untouched; an HTTP
+-- entry (no command) is returned as-is.
+local function fold_standard_command(raw_entry)
+  if type(raw_entry) ~= "table" then return raw_entry end
+  if type(raw_entry.command) ~= "string" then return raw_entry end
+  local argv = { raw_entry.command }
+  if type(raw_entry.args) == "table" then
+    for _, a in ipairs(raw_entry.args) do argv[#argv + 1] = a end
   end
-  local decoded, derr = zag.json.decode(raw)
-  if not decoded or type(decoded) ~= "table" then
-    zag.log.warn("zag.mcp: .mcp.json is not valid JSON: %s", tostring(derr))
-    return
-  end
-  local servers = decoded.mcpServers
-  if type(servers) ~= "table" then return end
+  -- Shallow copy so the source table is left untouched; replace command,
+  -- drop the now-folded args.
+  local out = {}
+  for k, v in pairs(raw_entry) do out[k] = v end
+  out.command = argv
+  out.args = nil
+  return out
+end
+
+-- Merge a standard `{ <name> = <entry> }` server map (the value of an
+-- `mcpServers` key) UNDER whatever is already in M._servers: an entry is added
+-- only when its name is not already taken, so earlier (higher-precedence)
+-- sources win. `source` names the origin for warnings.
+local function merge_standard_servers(servers, source)
   for name, raw_entry in pairs(servers) do
     if M._servers[name] == nil then
-      local srv = normalize_server(name, raw_entry)
+      local srv = normalize_server(name, fold_standard_command(raw_entry))
       if srv.idle_timeout_min == nil then
         srv.idle_timeout_min = M._settings.idle_timeout_min
       end
@@ -284,10 +300,86 @@ local function load_project_mcp_json()
   end
 end
 
+-- Decode a standard MCP config file and return its `mcpServers` map, or nil.
+-- Missing / unreadable / unparseable files, and files without an `mcpServers`
+-- object (e.g. newer VS Code configs that nest under `servers`), are skipped:
+-- a missing file is silent, a malformed one logs at debug level. `source` names
+-- the origin for that log.
+local function read_standard_mcp_servers(path, source)
+  if not zag.fs.exists(path) then return nil end
+  local raw, err = zag.fs.read(path)
+  if not raw then
+    zag.log.debug("zag.mcp: failed to read %s (%s): %s", source, path, tostring(err))
+    return nil
+  end
+  local decoded, derr = zag.json.decode(raw)
+  if type(decoded) ~= "table" then
+    zag.log.debug("zag.mcp: %s (%s) is not valid JSON: %s", source, path, tostring(derr))
+    return nil
+  end
+  -- Standard shape only. VS Code's newer `servers` key is intentionally NOT
+  -- read; a file without `mcpServers` is skipped silently.
+  local servers = decoded.mcpServers
+  if type(servers) ~= "table" then return nil end
+  return servers
+end
+
+-- Read the project-local .mcp.json (standard `{ "mcpServers": {...} }`
+-- format) if present, merging UNDER the Lua-declared servers.
+local function load_project_mcp_json()
+  local servers = read_standard_mcp_servers(".mcp.json", ".mcp.json")
+  if servers then merge_standard_servers(servers, ".mcp.json") end
+end
+
+-- Well-known cross-app MCP config locations, keyed by the `settings.imports`
+-- id. Each maps to one or more standard `{ "mcpServers": {...} }` files.
+-- Paths are HOME-relative (resolved against the HOME seam) except vscode, which
+-- is project-relative. claude-code's `~/.claude.json` is its global config
+-- file, which carries servers under the same `mcpServers` key.
+local IMPORT_PATHS = {
+  ["claude-code"] = { home = { ".claude/mcp.json", ".claude.json" } },
+  ["claude-desktop"] = {
+    home = { "Library/Application Support/Claude/claude_desktop_config.json" },
+  },
+  ["cursor"] = { home = { ".cursor/mcp.json" } },
+  ["vscode"] = { project = { ".vscode/mcp.json" } },
+}
+
+-- Read the files named by `settings.imports`, merging their servers UNDER both
+-- the project `.mcp.json` and the Lua-declared servers (imports are the lowest
+-- precedence tier). Imports are applied in array order with first-writer-wins,
+-- so an earlier id (and an earlier file within an id) shadows a later one on a
+-- name collision. Unknown ids are warned once; every file is skipped silently
+-- when absent.
+local function load_imports()
+  local imports = M._settings.imports
+  if type(imports) ~= "table" then return end
+  for _, id in ipairs(imports) do
+    local spec = IMPORT_PATHS[id]
+    if not spec then
+      zag.log.warn("zag.mcp: unknown settings.imports id %q (expected one of "
+        .. "claude-code, claude-desktop, cursor, vscode)", tostring(id))
+    else
+      for _, rel in ipairs(spec.home or {}) do
+        local servers = read_standard_mcp_servers(home_dir() .. "/" .. rel, "import:" .. id)
+        if servers then merge_standard_servers(servers, "import:" .. id) end
+      end
+      for _, rel in ipairs(spec.project or {}) do
+        local servers = read_standard_mcp_servers(rel, "import:" .. id)
+        if servers then merge_standard_servers(servers, "import:" .. id) end
+      end
+    end
+  end
+end
+
 function M.ensure_config_loaded()
   if M._config_loaded then return end
   M._config_loaded = true
+  -- Precedence, highest first: Lua-declared (already in M._servers from setup)
+  -- > project .mcp.json > imports. merge_standard_servers is add-if-absent, so
+  -- calling .mcp.json before imports gives .mcp.json the higher tier.
   load_project_mcp_json()
+  load_imports()
   -- Cache load + maintenance start are wired in Tasks E3 / E5.
   if M._cache_load then M._cache_load() end
   if M.ensure_maintenance then M.ensure_maintenance() end
@@ -977,7 +1069,9 @@ local OAUTH_FLOW_WAIT_MS = 330000
 -- Test seam: HOME for the token directory. os.getenv reads libc directly, so a
 -- test cannot mutate it; production leaves this nil and falls back to $HOME.
 M._home_dir_override = nil
-local function home_dir()
+-- Binds the forward-declared local from the config section so the imports
+-- reader and the OAuth token paths share one HOME seam.
+function home_dir()
   if M._home_dir_override then return M._home_dir_override end
   return os.getenv("HOME") or "."
 end
@@ -2860,6 +2954,8 @@ M._test = {
   interpolate_collect = interpolate,
   normalize_server = normalize_server,
   load_project_mcp_json = load_project_mcp_json,
+  load_imports = load_imports,
+  fold_standard_command = fold_standard_command,
   set_now = function(t) M._now_override = t end,
   servers = function() return M._servers end,
   settings = function() return M._settings end,
