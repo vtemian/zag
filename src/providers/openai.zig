@@ -279,7 +279,7 @@ fn writeMessage(msg: types.Message, reasoning: llm.Endpoint.ReasoningConfig, w: 
                     try std.json.Stringify.value(tr.tool_use_id, .{}, w);
                     try w.writeAll(",");
                     try w.writeAll("\"content\":");
-                    try std.json.Stringify.value(tr.content, .{}, w);
+                    try types.writeSanitizedJsonString(w, tr.content);
                     try w.writeAll("}");
                 },
                 else => log.warn("writeMessage: dropping non-tool_result block in tool_result message", .{}),
@@ -1931,6 +1931,64 @@ test "openai writeMessage emits tool role for tool_result" {
     try std.testing.expectEqualStrings("tool", root.get("role").?.string);
     try std.testing.expectEqualStrings("call_001", root.get("tool_call_id").?.string);
     try std.testing.expectEqualStrings("file contents", root.get("content").?.string);
+}
+
+test "openai writeMessage emits tool_result content as a JSON string even for invalid utf-8" {
+    const allocator = std.testing.allocator;
+
+    // bash output from grepping a binary file: invalid UTF-8 bytes embedded.
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_result = .{
+        .tool_use_id = "call_bin",
+        .content = "exit code: 0\nstdout:\n\xff\xfegarbage",
+        .is_error = false,
+    } };
+
+    const msg = types.Message{ .role = .user, .content = content };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{}, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    // The content field MUST be a JSON string, NOT an array of byte numbers
+    // (Moonshot rejects the array with "number is not acceptable").
+    const value = parsed.value.object.get("content").?;
+    try std.testing.expect(value == .string);
+    // The replacement character stands in for the invalid bytes.
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "garbage") != null);
+}
+
+test "openai writeMessage tool_result wire bytes are byte-identical for valid utf-8" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_result = .{
+        .tool_use_id = "call_valid",
+        .content = "exit 0\nstdout: héllo \"quotes\"\n\ttab\tαβγ 日本語 🦀",
+        .is_error = false,
+    } };
+
+    const msg = types.Message{ .role = .user, .content = content };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try writeMessage(msg, .{}, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    // Pin: the sanitizing serializer must produce exactly the same wire bytes
+    // that std.json.Stringify produced for valid UTF-8 content. Provider/cache
+    // stability depends on this.
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_valid\",\"content\":\"exit 0\\nstdout: héllo \\\"quotes\\\"\\n\\ttab\\tαβγ 日本語 🦀\"}",
+        json,
+    );
 }
 
 test "Request.joinedSystem matches single-string openai body byte-for-byte" {

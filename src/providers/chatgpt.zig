@@ -411,7 +411,7 @@ fn writeFunctionCallOutputItem(tr: types.ContentBlock.ToolResultBlock, w: anytyp
     try w.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
     try std.json.Stringify.value(tr.tool_use_id, .{}, w);
     try w.writeAll(",\"output\":");
-    try std.json.Stringify.value(tr.content, .{}, w);
+    try types.writeSanitizedJsonString(w, tr.content);
     try w.writeAll("}");
 }
 
@@ -2656,4 +2656,47 @@ test "chatgpt writeFunctionCallOutputItem escapes tr.tool_use_id" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("result_id\"with\\quote", parsed.value.object.get("call_id").?.string);
+}
+
+test "chatgpt writeFunctionCallOutputItem emits output as a JSON string even for invalid utf-8" {
+    const allocator = std.testing.allocator;
+
+    const tr: types.ContentBlock.ToolResultBlock = .{
+        .tool_use_id = "call_bin",
+        .content = "exit code: 0\nstdout:\n\xff\xfegarbage",
+        .is_error = false,
+    };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try writeFunctionCallOutputItem(tr, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("output").?;
+    try std.testing.expect(value == .string);
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "garbage") != null);
+}
+
+test "chatgpt writeFunctionCallOutputItem output bytes are byte-identical for valid utf-8" {
+    const allocator = std.testing.allocator;
+
+    const tr: types.ContentBlock.ToolResultBlock = .{
+        .tool_use_id = "call_valid",
+        .content = "exit 0\nstdout: héllo \"q\"\n\ttab\tαβγ 日本語 🦀",
+        .is_error = false,
+    };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try writeFunctionCallOutputItem(tr, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_valid\",\"output\":\"exit 0\\nstdout: héllo \\\"q\\\"\\n\\ttab\\tαβγ 日本語 🦀\"}",
+        json,
+    );
 }

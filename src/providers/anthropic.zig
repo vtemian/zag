@@ -370,7 +370,7 @@ fn writeMessage(model: []const u8, msg: types.Message, w: anytype) !void {
                 try w.writeAll(",");
                 if (tr.is_error) try w.writeAll("\"is_error\":true,");
                 try w.writeAll("\"content\":");
-                try std.json.Stringify.value(tr.content, .{}, w);
+                try types.writeSanitizedJsonString(w, tr.content);
                 try w.writeAll("}");
             },
             .thinking => |th| {
@@ -2088,6 +2088,60 @@ test "anthropic writeMessage serializes tool_result with is_error" {
 
     const block = parsed.value.object.get("content").?.array.items[0].object;
     try testing.expect(block.get("is_error").?.bool);
+}
+
+test "anthropic writeMessage emits tool_result content as a JSON string even for invalid utf-8" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_result = .{
+        .tool_use_id = "toolu_bin",
+        .content = "exit code: 0\nstdout:\n\xff\xfegarbage",
+        .is_error = false,
+    } };
+
+    const msg = types.Message{ .role = .user, .content = content };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const block = parsed.value.object.get("content").?.array.items[0].object;
+    const value = block.get("content").?;
+    try testing.expect(value == .string);
+    try testing.expect(std.mem.indexOf(u8, value.string, "\u{FFFD}") != null);
+    try testing.expect(std.mem.indexOf(u8, value.string, "garbage") != null);
+}
+
+test "anthropic writeMessage tool_result wire bytes are byte-identical for valid utf-8" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .tool_result = .{
+        .tool_use_id = "toolu_valid",
+        .content = "exit 0\nstdout: héllo \"q\"\n\ttab\tαβγ 日本語 🦀",
+        .is_error = false,
+    } };
+
+    const msg = types.Message{ .role = .user, .content = content };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try writeMessage("claude-sonnet-4-20250514", msg, &out.writer);
+    const json = try out.toOwnedSlice();
+    defer allocator.free(json);
+
+    try testing.expectEqualStrings(
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_valid\",\"content\":\"exit 0\\nstdout: héllo \\\"q\\\"\\n\\ttab\\tαβγ 日本語 🦀\"}]}",
+        json,
+    );
 }
 
 test "anthropic writeMessage serializes thinking block on thinking-capable model" {

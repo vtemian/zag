@@ -7,6 +7,7 @@
 //! observation.results on the preceding agent step.
 
 const std = @import("std");
+const types = @import("types.zig");
 
 /// ATIF schema version string emitted verbatim as `schema_version`.
 pub const SCHEMA_VERSION = "ATIF-v1.2";
@@ -160,6 +161,18 @@ fn writeStringField(writer: anytype, name: []const u8, value: []const u8, first:
     try std.json.Stringify.value(value, .{}, writer);
 }
 
+/// Like `writeStringField` but the value is tool/model output that may contain
+/// invalid UTF-8 (e.g. bash grepping a binary file). `Stringify.value` would
+/// emit such bytes as a JSON array of numbers; the sanitizing writer keeps the
+/// field a parseable JSON string with U+FFFD standing in for invalid bytes.
+fn writeSanitizedStringField(writer: anytype, name: []const u8, value: []const u8, first: bool) !void {
+    if (!first) try writer.writeByte(',');
+    try writer.writeByte('"');
+    try writer.writeAll(name);
+    try writer.writeAll("\":");
+    try types.writeSanitizedJsonString(writer, value);
+}
+
 fn writeAgent(writer: anytype, agent: Agent) !void {
     try writer.writeByte('{');
     try writeStringField(writer, "name", agent.name, true);
@@ -250,7 +263,7 @@ fn writeObservationResult(writer: anytype, r: ObservationResult) !void {
         first = false;
     }
     if (r.content) |c| {
-        try writeStringField(writer, "content", c, first);
+        try writeSanitizedStringField(writer, "content", c, first);
         first = false;
     }
     try writer.writeByte('}');
@@ -827,6 +840,54 @@ test "serialize minimal trajectory matches golden shape" {
     // Output must round-trip as valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
+}
+
+test "observation content with invalid utf-8 serializes as a JSON string" {
+    const results = [_]ObservationResult{
+        .{ .source_call_id = "t1", .content = "exit code: 0\nstdout:\n\xff\xfegarbage" },
+    };
+    const steps = [_]Step{
+        .{ .step_id = 1, .source = .agent, .message = "", .observation = .{ .results = &results } },
+    };
+    const traj = Trajectory{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .steps = &steps,
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serialize(traj, std.testing.allocator, &out.writer);
+
+    // Whole trajectory must remain parseable JSON (no array-of-byte-numbers).
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+
+    const result_obj = parsed.value.object.get("steps").?.array.items[0]
+        .object.get("observation").?.object.get("results").?.array.items[0].object;
+    const value = result_obj.get("content").?;
+    try std.testing.expect(value == .string);
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "garbage") != null);
+}
+
+test "observation content with valid utf-8 is unchanged" {
+    const results = [_]ObservationResult{
+        .{ .source_call_id = "t1", .content = "héllo \"q\" 日本語" },
+    };
+    const steps = [_]Step{
+        .{ .step_id = 1, .source = .agent, .message = "", .observation = .{ .results = &results } },
+    };
+    const traj = Trajectory{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .steps = &steps,
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serialize(traj, std.testing.allocator, &out.writer);
+
+    // The content field bytes match what Stringify.value produces for valid UTF-8.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"content\":\"héllo \\\"q\\\" 日本語\"") != null);
 }
 
 test "tool_calls arguments serialize as object not string" {
