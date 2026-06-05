@@ -2718,6 +2718,15 @@ pub const LuaEngine = struct {
     /// pattern). Must run BEFORE `deinit()` since workers may hold references
     /// into the completion queue.
     pub fn deinitAsync(self: *LuaEngine) void {
+        // Idempotent: both `main` and `Harness.runWithProvider` register a
+        // `defer deinitAsync()`, so on the headless path this runs twice (once
+        // when the harness frame unwinds on an agent error, once at main's
+        // exit). The second call must be a no-op: the first already
+        // `tasks.deinit()`'d and freed `root_scope`, so re-entering the
+        // task-retire loop below would iterate a freed map and trap. The
+        // `async_torn_down` latch set at the end is the natural guard.
+        if (self.async_torn_down) return;
+
         // Release any in-flight deferred round-trip so a parked producer
         // unblocks, and sever its bound request pointers before the tasks are
         // force-retired below (retireTask does not resume, so this is belt-and-
@@ -4154,6 +4163,20 @@ test "LuaEngine.init starts with an empty providers_registry" {
     try std.testing.expectEqual(@as(usize, 0), engine.providers_registry.endpoints.items.len);
     try std.testing.expectEqual(@as(?*const llm.Endpoint, null), engine.providers_registry.find("anthropic"));
     try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
+}
+
+test "deinitAsync is idempotent: a second call is a no-op" {
+    // The headless path registers a deinitAsync defer in both main() and
+    // Harness.runWithProvider, so on an agent error it fires twice. The
+    // second call must not re-enter the task-retire loop against the already
+    // freed tasks map (which traps with an alignment panic).
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    try engine.initAsync(2, 16);
+    engine.deinitAsync();
+    try std.testing.expect(engine.async_torn_down);
+    // Second call: must return immediately without touching freed state.
+    engine.deinitAsync();
 }
 
 test "invokeCallback is a no-op on ref_nil and 0" {
