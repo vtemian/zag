@@ -34,13 +34,26 @@ pub const ErrorClass = union(enum) {
     context_overflow: struct { provider_message: []const u8 },
     rate_limit: struct { retry_after_seconds: ?u32, plan_type: ?[]const u8 },
     plan_limit: struct { reset_at: ?i64, plan_type: ?[]const u8 },
+    /// Account-level billing failure (suspension, insufficient balance,
+    /// quota exhausted). Surfaces inside a 429 envelope but is fatal: no
+    /// amount of backoff recharges the account, so the agent must not retry.
+    billing: struct { provider_message: []const u8 },
     auth: struct { reason: AuthReason },
     model_not_found: struct { provider_message: []const u8 },
     invalid_request: struct { provider_message: []const u8 },
     gateway_html: struct { status: u16 },
+    /// Transport-layer failure that never produced an HTTP status
+    /// (connection refused, DNS failure, head-read failure, response remap).
+    /// A fresh connection often succeeds, so this class is retryable.
+    transport: struct {},
     unknown: struct { status: u16, snippet: []const u8 },
 
     pub const AuthReason = enum { expired };
+
+    /// Flat tag enum mirroring `ErrorClass`'s union tags. Carries no
+    /// borrowed slices, so it is safe to stash past the lifetime of the
+    /// `response_body` the union payloads point into (see `ErrorDetail`).
+    pub const Tag = std.meta.Tag(ErrorClass);
 };
 
 /// Substrings that mark an error as a context-window overflow. Matched
@@ -83,6 +96,24 @@ pub const NON_OVERFLOW_PATTERNS = [_][]const u8{
     "rate limit",
     "too many requests",
 };
+
+/// Substrings that mark a 429/529 envelope as an account billing failure
+/// rather than transient backpressure. Matched case-insensitively against
+/// the whole response body. Billing failures are fatal: backing off and
+/// retrying never recharges the account, so the agent must surface them.
+pub const BILLING_PATTERNS = [_][]const u8{
+    "insufficient balance",
+    "suspended",
+    "recharge",
+    "quota exhausted",
+};
+
+fn matchesBilling(body: []const u8) bool {
+    inline for (BILLING_PATTERNS) |pat| {
+        if (std.ascii.indexOfIgnoreCase(body, pat) != null) return true;
+    }
+    return false;
+}
 
 /// Classify a provider response. Cheap; safe to call on every error.
 pub fn classify(
@@ -252,11 +283,16 @@ fn statusShortcut(
         },
         // 429 (Too Many Requests) and 529 (Anthropic "Overloaded") are
         // both transient backpressure signals the agent loop can retry
-        // after honoring Retry-After.
-        429, 529 => .{ .rate_limit = .{
-            .retry_after_seconds = parseRetryAfter(response_headers),
-            .plan_type = null,
-        } },
+        // after honoring Retry-After. A billing suspension is sometimes
+        // wrapped in a 429 envelope (kimi/moonshot do this); it is fatal,
+        // so scan the body and split it out before defaulting to rate_limit.
+        429, 529 => if (matchesBilling(response_body))
+            ErrorClass{ .billing = .{ .provider_message = snippet(response_body) } }
+        else
+            ErrorClass{ .rate_limit = .{
+                .retry_after_seconds = parseRetryAfter(response_headers),
+                .plan_type = null,
+            } },
         500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511 => .{ .unknown = .{
             .status = status,
             .snippet = snippet(response_body),
@@ -395,6 +431,16 @@ pub fn userMessage(class: ErrorClass, allocator: Allocator) ![]u8 {
             }
             break :blk allocator.dupe(u8, "Rate limited. Retry shortly.");
         },
+        .billing => |c| blk: {
+            if (c.provider_message.len > 0) {
+                break :blk std.fmt.allocPrint(
+                    allocator,
+                    "Account billing problem; recharge or check your balance. ({s})",
+                    .{trimForDisplay(c.provider_message)},
+                );
+            }
+            break :blk allocator.dupe(u8, "Account billing problem; recharge or check your balance.");
+        },
         .plan_limit => |c| blk: {
             if (c.reset_at) |r| {
                 break :blk std.fmt.allocPrint(
@@ -420,6 +466,7 @@ pub fn userMessage(class: ErrorClass, allocator: Allocator) ![]u8 {
             "HTTP {d}: blocked by gateway/proxy. Check auth or network.",
             .{c.status},
         ),
+        .transport => allocator.dupe(u8, "Connection failed before the provider responded. Retrying."),
         .unknown => |c| std.fmt.allocPrint(
             allocator,
             "HTTP {d}. Check ~/.zag/logs for the request body.",
@@ -439,6 +486,17 @@ const testing = std.testing;
 
 fn classifyBody(body: []const u8) ErrorClass {
     return classify(400, body, &.{});
+}
+
+test "classify: 429 with insufficient-balance body is billing, not rate_limit" {
+    const body = "{\"error\":{\"message\":\"Your account org-xxx <ak-yyy> is suspended due to insufficient balance, please recharge\",\"type\":\"rate_limit_error\"}}";
+    const class = classify(429, body, &.{});
+    try testing.expect(class == .billing);
+}
+
+test "classify: plain 429 stays rate_limit" {
+    const class = classify(429, "{\"error\":{\"message\":\"rate limit exceeded\"}}", &.{});
+    try testing.expect(class == .rate_limit);
 }
 
 test "OVERFLOW_PATTERNS each matches a synthetic body" {

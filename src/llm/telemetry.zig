@@ -296,10 +296,12 @@ fn staticTagName(class: error_class.ErrorClass) []const u8 {
         .context_overflow => "context_overflow",
         .rate_limit => "rate_limit",
         .plan_limit => "plan_limit",
+        .billing => "billing",
         .auth => "auth",
         .model_not_found => "model_not_found",
         .invalid_request => "invalid_request",
         .gateway_html => "gateway_html",
+        .transport => "transport",
         .unknown => "unknown",
     };
 }
