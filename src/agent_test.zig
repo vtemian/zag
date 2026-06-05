@@ -454,6 +454,152 @@ test "runLoopStreaming propagates a second context-overflow instead of looping" 
     try std.testing.expectEqual(@as(u32, 4), stub.call_count);
 }
 
+/// Rejects with a `.context_overflow` ApiError whenever any tool_result in the
+/// request still carries more than `overflow_threshold` bytes of content;
+/// succeeds otherwise. Models the live train-fasttext profile where the bloat
+/// is a recent giant tool_result, so the recovery has to TRUNCATE (drop-oldest
+/// can't reach it) before the re-send fits.
+const FatToolResultOverflowProvider = struct {
+    call_count: u32 = 0,
+    overflow_threshold: usize,
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "fat_tool_result_overflow",
+    };
+    fn anyFatResult(self: *FatToolResultOverflowProvider, messages: []const types.Message) bool {
+        for (messages) |msg| {
+            for (msg.content) |block| switch (block) {
+                .tool_result => |tr| if (tr.content.len > self.overflow_threshold) return true,
+                else => {},
+            };
+        }
+        return false;
+    }
+    fn callImpl(ptr: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *FatToolResultOverflowProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (self.anyFatResult(req.messages)) {
+            if (req.error_detail_out) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+            return error.ApiError;
+        }
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *FatToolResultOverflowProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (self.anyFatResult(req.messages)) {
+            if (req.error_detail_out) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+            return error.ApiError;
+        }
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+    fn provider(self: *FatToolResultOverflowProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "runLoopStreaming truncates a giant tool_result on overflow and the retry succeeds" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned();
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    // History: a normal user prompt, then a recent user turn carrying a 200 KiB
+    // tool_result (the bash-dump bloat). The provider overflows while that fat
+    // result is present; truncation must shrink it under the threshold.
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(allocator);
+        messages.deinit(allocator);
+    }
+    {
+        const text = try allocator.dupe(u8, "run the build and report");
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try messages.append(allocator, .{ .role = .user, .content = blocks });
+    }
+    const fat_len: usize = 200 * 1024;
+    {
+        const big = try allocator.alloc(u8, fat_len);
+        @memset(big, 'Z');
+        const id = try allocator.dupe(u8, "call_bash");
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .tool_result = .{ .tool_use_id = id, .content = big, .is_error = false } };
+        try messages.append(allocator, .{ .role = .user, .content = blocks });
+    }
+
+    // context_window 0 disables the proactive estimator gate AND drop-oldest's
+    // budget math, so the only recovery that can fire here is truncation. If
+    // truncation didn't run, the retry would overflow again and the turn would
+    // die with error.ApiError.
+    // Threshold sits between the post-truncation size (~32 KiB head+tail) and
+    // the original 200 KiB, so only an actual truncation lets the retry fit.
+    const spec: llm.ModelSpec = .{ .provider_name = "stubprov", .model_id = "stubmodel-1", .context_window = 0 };
+    var stub = FatToolResultOverflowProvider{ .overflow_threshold = 64 * 1024 };
+    const p = stub.provider();
+
+    try agent.runLoopStreaming(
+        &messages,
+        &registry,
+        p,
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-overflow-truncate",
+        &detail,
+        null,
+    );
+
+    // First attempt overflows on streaming + non-streaming fallback (2 calls),
+    // recovery truncates the fat result, and the re-sent streaming call now
+    // fits and succeeds (3rd). Bounded — no second forced compaction.
+    try std.testing.expectEqual(@as(u32, 3), stub.call_count);
+
+    // The giant tool_result was truncated below the provider's threshold.
+    const fat = messages.items[1].content[0].tool_result;
+    try std.testing.expect(fat.content.len < fat_len);
+    try std.testing.expect(fat.content.len <= stub.overflow_threshold);
+    try std.testing.expect(std.mem.indexOf(u8, fat.content, "after context overflow") != null);
+
+    // A truncated_tool_results compaction_event was emitted during recovery,
+    // and NO summarization or drop_oldest event (those paths are gone/skipped).
+    var saw_truncate = false;
+    var saw_other = false;
+    var buf: [64]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .compaction_event => |c| {
+                if (std.mem.eql(u8, c.outcome, "truncated_tool_results")) {
+                    saw_truncate = true;
+                } else if (std.mem.eql(u8, c.outcome, "summarized") or std.mem.eql(u8, c.outcome, "drop_oldest")) {
+                    saw_other = true;
+                }
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    try std.testing.expect(saw_truncate);
+    try std.testing.expect(!saw_other);
+}
+
 // ============================================================================
 // Test helpers for parallel tool execution + executeTools/jit/transform tests
 // Moved from src/agent.zig in audit step J.
