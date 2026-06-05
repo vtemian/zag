@@ -270,7 +270,15 @@ fn recordFloatRects(self: *Compositor, float_drafts: []const FloatDraft) void {
 /// give them their full interior height.
 fn leafHasPrompt(leaf_drafts: []const LeafDraft, leaf: *const Layout.LayoutNode.Leaf) bool {
     for (leaf_drafts) |entry| {
-        if (entry.leaf == leaf) return true;
+        // Identity by backing buffer, not leaf address: the draw walks
+        // (`drawAllLeaves`/`drawDirtyLeaves`) bind switch-capture COPIES
+        // of the leaf payload, so the address of `leaf` never equals the
+        // draft's pointer into the layout node. Address comparison made
+        // this always-false, the content window then skipped the prompt
+        // reserve, and the bottom-anchored tail of any
+        // taller-than-viewport transcript was painted into the rows
+        // `drawPanePrompts` repaints, hiding the newest output.
+        if (entry.leaf.buffer.ptr == leaf.buffer.ptr) return true;
     }
     return false;
 }
@@ -820,6 +828,11 @@ fn drawPanePromptsPass(
 /// hash map is overkill. Returns null when the leaf has no registered
 /// pane (drift between layout and pane registry; the prompt is then
 /// drawn empty rather than crashing on a buffer downcast).
+///
+/// Address identity is safe HERE because every caller passes
+/// `&node.leaf` (a pointer into the layout node, the same address
+/// `collectLeafDrafts` stored). Callers that bind a switch-capture
+/// copy must match by buffer instead; see `leafHasPrompt`.
 fn draftForLeaf(
     leaf_drafts: []const LeafDraft,
     leaf: *const Layout.LayoutNode.Leaf,
@@ -2922,4 +2935,73 @@ test "working line is wiped on the frame after agent_running flips false" {
         }
         try std.testing.expect(!saw_text);
     }
+}
+
+test "bottom-anchored tail stays visible above the prompt block" {
+    // Regression: leafHasPrompt compared the draft's leaf pointer against
+    // the address of a switch-capture COPY of the leaf, so it never
+    // matched and every conversation pane drew its content window with
+    // prompt-reserve 0. On transcripts taller than the viewport the
+    // bottom-anchored tail then landed in the rows drawPanePrompts
+    // repaints, hiding the newest output (workflow replies, long-turn
+    // tails). Identity must follow the backing buffer, not the address.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 20);
+    defer screen.deinit();
+
+    const theme = Theme.defaultTheme();
+
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    cb.turn_gap = 0;
+    var n: usize = 0;
+    while (n < 29) : (n += 1) {
+        _ = try cb.appendNode(null, .assistant_text, "filler line");
+    }
+    _ = try cb.appendNode(null, .assistant_text, "ZTAILZ");
+
+    var layout = Layout.init(allocator);
+    defer layout.deinit();
+    var test_viewport: Viewport = .{};
+    try layout.setRoot(.{ .buffer = cb.buf(), .view = cb.view(), .viewport = &test_viewport });
+    layout.recalculate(40, 20);
+
+    // Draft built the way EventOrchestrator.collectLeafDrafts does: a
+    // pointer to the leaf INSIDE the layout node.
+    var leaves_buf: [4]*Layout.LayoutNode = undefined;
+    var leaf_count: usize = 0;
+    layout.visibleLeaves(&leaves_buf, &leaf_count);
+    try std.testing.expectEqual(@as(usize, 1), leaf_count);
+    const drafts = [_]Compositor.LeafDraft{.{
+        .leaf = &leaves_buf[0].leaf,
+        .draft = "",
+        .draft_cursor = 0,
+    }};
+
+    compositor.composite(&layout, &drafts, &[_]Compositor.FloatDraft{}, .{ .mode = .insert });
+
+    // The newest line must be on screen, and above the 4-row prompt
+    // block (outer height 20 -> content rows end at row 14).
+    var found_row: ?u16 = null;
+    var row: u16 = 0;
+    while (row < screen.height) : (row += 1) {
+        var col: u16 = 0;
+        while (col + 6 <= screen.width) : (col += 1) {
+            if (screen.getCellConst(row, col).codepoint == 'Z' and
+                screen.getCellConst(row, col + 1).codepoint == 'T' and
+                screen.getCellConst(row, col + 2).codepoint == 'A' and
+                screen.getCellConst(row, col + 3).codepoint == 'I' and
+                screen.getCellConst(row, col + 4).codepoint == 'L' and
+                screen.getCellConst(row, col + 5).codepoint == 'Z')
+            {
+                found_row = row;
+            }
+        }
+    }
+    try std.testing.expect(found_row != null);
+    try std.testing.expect(found_row.? <= 14);
 }

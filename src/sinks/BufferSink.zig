@@ -581,3 +581,89 @@ test "assistant_reset clears last_assistant_node so thinking_delta cannot follow
     try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
     try std.testing.expectEqual(Conversation.NodeType.thinking, roots[1].node_type);
 }
+
+test "post-workflow reply and second subagent link render in the visible window" {
+    // In-process repro of the workflow render gap: a turn that runs the
+    // workflow tool (tool_use -> two spawnSubagent links -> tool_result ->
+    // streamed reply) must surface the reply and BOTH links in the
+    // bottom-anchored window, across composite passes that mimic the
+    // live compositor (getWindow + dirty-ring drain each frame).
+    const Theme = @import("../Theme.zig");
+    const allocator = std.testing.allocator;
+    var cb = try Conversation.init(allocator, 0, "test");
+    defer cb.deinit();
+    var bs = BufferSink.init(allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+    const theme = Theme.defaultTheme();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const Frame = struct {
+        // One compositor frame: window the buffer, then drain the dirty
+        // ring into the cache exactly like Compositor.syncTreeSnapshot.
+        fn composite(conv: *Conversation, ar: *std.heap.ArenaAllocator, th: *const Theme) !@import("../View.zig").ScrollPlan {
+            const plan = try conv.view().getWindow(ar.allocator(), std.testing.allocator, th, 78, 21, 0);
+            var ids: [ConversationTree.DirtyRing.capacity]u32 = undefined;
+            const drained = conv.tree.drainDirty(&ids);
+            if (drained.overflowed) {
+                conv.cache.invalidateAll();
+            } else if (drained.written > 0) {
+                conv.cache.invalidateMany(ids[0..drained.written]);
+            }
+            return plan;
+        }
+    };
+
+    _ = try cb.appendNode(null, .user_message, "use the workflow tool with two parallel tasks and repeat the result");
+    _ = try Frame.composite(&cb, &arena, &theme);
+
+    // Turn opens: empty stream-open delta, then thinking.
+    s.push(.{ .assistant_delta = .{ .text = "" } });
+    s.push(.{ .thinking_delta = .{ .text = "planning the script" } });
+    s.push(.thinking_stop);
+    _ = try Frame.composite(&cb, &arena, &theme);
+
+    // Workflow tool call with a long single-line script (wraps hard at 78).
+    s.push(.{ .tool_use = .{
+        .name = "workflow",
+        .call_id = "workflow:0",
+        .input_raw = "{\"script\":\"local slots = zag.workflow.parallel({ function() local t = zag.task{ prompt = \\\"run bash echo seed-a | rev\\\" } return t.summary end, function() local t = zag.task{ prompt = \\\"run bash echo seed-b | rev\\\" } return t.summary end }) return slots[1].value .. ' ' .. slots[2].value\"}",
+    } });
+    _ = try Frame.composite(&cb, &arena, &theme);
+
+    // Two children spawn; each streams enough appends into its own tree to
+    // flood the parent's dirty ring (notifyChildChanged pushes the link id
+    // per child mutation), mimicking the live overflow -> invalidateAll path.
+    const child0 = try cb.spawnSubagent("subagent", "run bash echo seed-a | rev");
+    const child1 = try cb.spawnSubagent("subagent", "run bash echo seed-b | rev");
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        _ = try child0.appendNode(null, .assistant_text, "child0 token");
+        _ = try child1.appendNode(null, .assistant_text, "child1 token");
+    }
+    _ = try Frame.composite(&cb, &arena, &theme);
+
+    // Workflow result lands, then the parent streams its final reply.
+    s.push(.{ .tool_result = .{ .content = "tok-A tok-B", .is_error = false, .call_id = "workflow:0" } });
+    _ = try Frame.composite(&cb, &arena, &theme);
+
+    s.push(.{ .assistant_delta = .{ .text = "" } });
+    s.push(.{ .assistant_delta = .{ .text = "tok-A " } });
+    s.push(.{ .assistant_delta = .{ .text = "tok-B" } });
+    s.push(.{ .thinking_delta = .{ .text = "done" } });
+    s.push(.thinking_stop);
+    const plan = try Frame.composite(&cb, &arena, &theme);
+
+    var found_reply = false;
+    var link_lines: usize = 0;
+    for (plan.lines.items) |line| {
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(allocator);
+        for (line.spans) |span| try joined.appendSlice(allocator, span.text);
+        if (std.mem.indexOf(u8, joined.items, "tok-A tok-B") != null) found_reply = true;
+        if (std.mem.indexOf(u8, joined.items, "[subagent: subagent]") != null) link_lines += 1;
+    }
+    try std.testing.expect(found_reply);
+    try std.testing.expectEqual(@as(usize, 2), link_lines);
+}
