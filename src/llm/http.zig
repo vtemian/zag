@@ -16,6 +16,7 @@ const openai_provider = @import("../providers/openai.zig");
 const chatgpt_provider = @import("../providers/chatgpt.zig");
 const auth = @import("../auth.zig");
 const error_detail = @import("error_detail.zig");
+const error_class = @import("error_class.zig");
 const registry = @import("registry.zig");
 const socket_timeouts = @import("socket_timeouts.zig");
 
@@ -375,11 +376,23 @@ pub fn httpPostJson(
     timeouts: ?registry.Endpoint.TimeoutConfig,
     error_detail_out: ?*error_detail.ErrorDetail,
 ) ![]const u8 {
-    const raw = try httpPostJsonRaw(url, body, extra_headers, allocator, timeouts);
+    const raw = httpPostJsonRaw(url, body, extra_headers, allocator, timeouts) catch |err| {
+        // A transport-layer failure (DNS/connect/write/head-read) never
+        // produced a status. Tag the out-channel so the agent retry loop
+        // treats it as retryable; a fresh connection usually succeeds.
+        if (err == error.ApiError) {
+            if (error_detail_out) |out| out.setClass(.{ .transport = .{} });
+        }
+        return err;
+    };
     if (raw.status >= 200 and raw.status < 300) return raw.body;
     defer raw.deinit(allocator);
     const snippet = raw.body[0..@min(raw.body.len, MAX_ERROR_BODY_BYTES)];
     log.err("http {d}: {s}", .{ raw.status, snippet });
+    // Classify the non-2xx body so the agent retry loop can decide. The
+    // classifier borrows from `raw.body`; `setClass` keeps only the plain
+    // tag + backoff, which outlive the body freed by the deferred deinit.
+    const class = error_class.classify(raw.status, raw.body, &.{});
     const detail = std.fmt.allocPrint(
         allocator,
         "HTTP {d}: {s}",
@@ -387,6 +400,7 @@ pub fn httpPostJson(
     ) catch return error.ApiError;
     if (error_detail_out) |out| {
         out.setOwned(detail);
+        out.setClass(class);
     } else {
         allocator.free(detail);
     }

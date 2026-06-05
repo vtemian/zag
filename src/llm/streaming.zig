@@ -25,6 +25,13 @@ const telemetry = @import("telemetry.zig");
 
 const log = std.log.scoped(.streaming);
 
+/// Tag the out-channel as a transport failure that never produced an HTTP
+/// status (DNS/connect/write/head-read failure). The agent retry loop treats
+/// `.transport` as retryable because a fresh connection usually succeeds.
+fn markTransport(out: ?*error_detail.ErrorDetail) void {
+    if (out) |o| o.setClass(.{ .transport = .{} });
+}
+
 /// Cap on the number of response headers we snapshot per response. Defends
 /// against pathological gateway responses while comfortably covering every
 /// realistic provider header set (Anthropic and Codex top out around 20).
@@ -187,6 +194,7 @@ pub const StreamingResponse = struct {
             .keep_alive = false,
         }) catch |err| {
             log.err("streaming: request creation failed: {s}", .{@errorName(err)});
+            markTransport(opts.error_detail_out);
             return error.ApiError;
         };
         errdefer self.req.deinit();
@@ -195,21 +203,26 @@ pub const StreamingResponse = struct {
         self.req.transfer_encoding = .{ .content_length = body.len };
         var bw = self.req.sendBodyUnflushed(&.{}) catch |err| {
             log.err("streaming: sendBodyUnflushed failed: {s}", .{@errorName(err)});
+            markTransport(opts.error_detail_out);
             return error.ApiError;
         };
         bw.writer.writeAll(body) catch |err| {
             log.err("streaming: body write failed: {s}", .{@errorName(err)});
+            markTransport(opts.error_detail_out);
             return error.ApiError;
         };
         bw.end() catch |err| {
             log.err("streaming: body end failed: {s}", .{@errorName(err)});
+            markTransport(opts.error_detail_out);
             return error.ApiError;
         };
         (self.req.connection orelse {
             log.err("streaming: no connection after body send", .{});
+            markTransport(opts.error_detail_out);
             return error.ApiError;
         }).flush() catch |err| {
             log.err("streaming: flush failed: {s}", .{@errorName(err)});
+            markTransport(opts.error_detail_out);
             return error.ApiError;
         };
 
@@ -222,6 +235,7 @@ pub const StreamingResponse = struct {
             error.ReadTimeout => return error.ReadTimeout,
             else => {
                 log.err("streaming: receiveHead failed: {s}", .{@errorName(err)});
+                markTransport(opts.error_detail_out);
                 return error.ApiError;
             },
         };
@@ -314,6 +328,11 @@ pub const StreamingResponse = struct {
                 );
             if (opts.error_detail_out) |out| {
                 out.setOwned(detail);
+                // Record the flat classification so the agent's retry loop
+                // can decide without re-parsing. The class union borrows
+                // from `response_body`; `setClass` keeps only the plain tag
+                // and backoff, so this is safe past the body free below.
+                if (classification) |c| out.setClass(c);
             } else {
                 allocator.free(detail);
             }

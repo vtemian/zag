@@ -2726,6 +2726,15 @@ pub const LuaEngine = struct {
     /// pattern). Must run BEFORE `deinit()` since workers may hold references
     /// into the completion queue.
     pub fn deinitAsync(self: *LuaEngine) void {
+        // Idempotent: both `main` and `Harness.runWithProvider` register a
+        // `defer deinitAsync()`, so on the headless path this runs twice (once
+        // when the harness frame unwinds on an agent error, once at main's
+        // exit). The second call must be a no-op: the first already
+        // `tasks.deinit()`'d and freed `root_scope`, so re-entering the
+        // task-retire loop below would iterate a freed map and trap. The
+        // `async_torn_down` latch set at the end is the natural guard.
+        if (self.async_torn_down) return;
+
         // Release any in-flight deferred round-trip so a parked producer
         // unblocks, and sever its bound request pointers before the tasks are
         // force-retired below (retireTask does not resume, so this is belt-and-
@@ -4227,6 +4236,20 @@ test "LuaEngine.init starts with an empty providers_registry" {
     try std.testing.expectEqual(@as(usize, 0), engine.providers_registry.endpoints.items.len);
     try std.testing.expectEqual(@as(?*const llm.Endpoint, null), engine.providers_registry.find("anthropic"));
     try std.testing.expectEqual(@as(?[]const u8, null), engine.default_model);
+}
+
+test "deinitAsync is idempotent: a second call is a no-op" {
+    // The headless path registers a deinitAsync defer in both main() and
+    // Harness.runWithProvider, so on an agent error it fires twice. The
+    // second call must not re-enter the task-retire loop against the already
+    // freed tasks map (which traps with an alignment panic).
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    try engine.initAsync(2, 16);
+    engine.deinitAsync();
+    try std.testing.expect(engine.async_torn_down);
+    // Second call: must return immediately without touching freed state.
+    engine.deinitAsync();
 }
 
 test "invokeCallback is a no-op on ref_nil and 0" {
@@ -13191,6 +13214,26 @@ test "bootstrapStdlibProviders populates an empty engine registry" {
     try std.testing.expect(engine.providers_registry.find("anthropic") != null);
     const oauth_ep = engine.providers_registry.find("openai-oauth").?;
     try std.testing.expectEqual(std.meta.Tag(llm.Endpoint.Auth).oauth, std.meta.activeTag(oauth_ep.auth));
+}
+
+test "resolveModelSpec carries the declared context_window after stdlib bootstrap" {
+    // The headless agent loop resolves its ModelSpec through this exact seam:
+    // main() bootstraps the stdlib providers into providers_registry, then
+    // Harness calls llm.resolveModelSpec(&registry, model_id). fireCompact
+    // short-circuits on a zero context_window, so a 262144-token window MUST
+    // survive the Lua-table -> Endpoint.models -> ModelSpec round-trip, or the
+    // overflow guard never fires headless and oversized requests reach the
+    // provider (the reshard-c4-data bench failure).
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    _ = engine.bootstrapStdlibProviders();
+
+    const spec = llm.resolveModelSpec(&engine.providers_registry, "moonshot/kimi-k2.6");
+    try std.testing.expectEqualStrings("moonshot", spec.provider_name);
+    try std.testing.expectEqualStrings("kimi-k2.6", spec.model_id);
+    try std.testing.expectEqual(@as(u32, 262144), spec.context_window);
 }
 
 test "bootstrap is a no-op when config.lua already populated the registry" {

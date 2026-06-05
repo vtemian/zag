@@ -262,6 +262,198 @@ test "runLoopStreaming constructs Telemetry per turn with session_id and provide
     try std.testing.expectEqual(@as(u32, 1), capture.captured_turn);
 }
 
+/// Returns `error.ApiError` with a `.context_overflow` class on the first
+/// streaming call, then succeeds (end_turn) once the agent loop force-compacts
+/// and re-sends. Proves the reactive overflow recovery path in runLoopStreaming.
+const OverflowThenRecoverProvider = struct {
+    call_count: u32 = 0,
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "overflow_then_recover",
+    };
+    fn callImpl(ptr: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *OverflowThenRecoverProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (req.error_detail_out) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *OverflowThenRecoverProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (self.call_count == 1) {
+            if (req.error_detail_out) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+            return error.ApiError;
+        }
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+    fn provider(self: *OverflowThenRecoverProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "runLoopStreaming force-compacts and re-sends once on a context-overflow rejection" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned();
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    // Seed several small messages so drop-oldest has a prefix to trim. The
+    // window is tiny so the drop-oldest budget collapses to 1 and trims all
+    // but the most recent message; summarization's 20k keep-recent leaves
+    // every message in the "recent" window, so it returns null without ever
+    // calling the provider — drop-oldest is the recovery that fires.
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(allocator);
+        messages.deinit(allocator);
+    }
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |label| {
+        const text = try allocator.dupe(u8, label);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try messages.append(allocator, .{ .role = .user, .content = blocks });
+    }
+    const messages_before = messages.items.len;
+
+    const spec: llm.ModelSpec = .{ .provider_name = "stubprov", .model_id = "stubmodel-1", .context_window = 50 };
+    var stub = OverflowThenRecoverProvider{};
+    const p = stub.provider();
+
+    try agent.runLoopStreaming(
+        &messages,
+        &registry,
+        p,
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-overflow",
+        &detail,
+        null,
+    );
+
+    // The first attempt overflowed on BOTH the streaming call and callLlm's
+    // non-streaming fallback (2 calls, both ApiError/context_overflow), then
+    // recovery trimmed history and the re-sent streaming call succeeded (3rd).
+    try std.testing.expectEqual(@as(u32, 3), stub.call_count);
+    // Drop-oldest ran: fewer messages survived than we seeded (plus the
+    // single assistant turn the successful retry appended).
+    try std.testing.expect(messages.items.len < messages_before + 1);
+    // A drop_oldest compaction_event was emitted during recovery.
+    var saw_drop = false;
+    var buf: [64]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .compaction_event => |c| if (std.mem.eql(u8, c.outcome, "drop_oldest")) {
+                saw_drop = true;
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    try std.testing.expect(saw_drop);
+}
+
+/// Always rejects with a `.context_overflow` ApiError. Proves the reactive
+/// recovery retries at most once and then propagates, never looping forever.
+const AlwaysOverflowProvider = struct {
+    call_count: u32 = 0,
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "always_overflow",
+    };
+    fn setOverflow(req_detail: ?*llm.error_detail.ErrorDetail) void {
+        if (req_detail) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+    }
+    fn callImpl(ptr: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *AlwaysOverflowProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        setOverflow(req.error_detail_out);
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *AlwaysOverflowProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        setOverflow(req.error_detail_out);
+        return error.ApiError;
+    }
+    fn provider(self: *AlwaysOverflowProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "runLoopStreaming propagates a second context-overflow instead of looping" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned();
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(allocator);
+        messages.deinit(allocator);
+    }
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |label| {
+        const text = try allocator.dupe(u8, label);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try messages.append(allocator, .{ .role = .user, .content = blocks });
+    }
+
+    const spec: llm.ModelSpec = .{ .provider_name = "stubprov", .model_id = "stubmodel-1", .context_window = 50 };
+    var stub = AlwaysOverflowProvider{};
+    const p = stub.provider();
+
+    const result = agent.runLoopStreaming(
+        &messages,
+        &registry,
+        p,
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-overflow2",
+        &detail,
+        null,
+    );
+    try std.testing.expectError(error.ApiError, result);
+    // First attempt: streaming + fallback (2). One forced compaction. Second
+    // attempt: streaming + fallback (2). Then overflow_retried blocks further
+    // retries. Bounded at 4 provider calls — never an infinite loop.
+    try std.testing.expectEqual(@as(u32, 4), stub.call_count);
+}
+
 // ============================================================================
 // Test helpers for parallel tool execution + executeTools/jit/transform tests
 // Moved from src/agent.zig in audit step J.
@@ -3179,6 +3371,185 @@ test "callLlm does not retry a ReadTimeout when the turn was cancelled" {
     const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, null);
     try std.testing.expectError(error.ReadTimeout, result);
     try std.testing.expectEqual(@as(u32, 1), stub.attempt);
+}
+
+/// Fails BOTH the streaming attempt and the non-streaming fallback with
+/// `error.ApiError`, stamping `error_detail_out` with `class` so callLlm's
+/// outer retry loop can decide. Recovers (streaming success) once the outer
+/// attempt count passes `fail_outer_attempts`. `streaming_calls` counts
+/// distinct outer attempts (the streaming call fires once per outer attempt
+/// because ApiError is not pre-stream-retryable).
+const BothPathsFailProvider = struct {
+    class: llm.error_class.ErrorClass,
+    fail_outer_attempts: u32,
+    streaming_calls: u32 = 0,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "both_paths_fail_stub",
+    };
+    fn callImpl(ptr: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *BothPathsFailProvider = @ptrCast(@alignCast(ptr));
+        // Fallback also fails so the outer loop is the only recovery path.
+        if (req.error_detail_out) |out| out.setClass(self.class);
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *BothPathsFailProvider = @ptrCast(@alignCast(ptr));
+        self.streaming_calls += 1;
+        if (self.streaming_calls > self.fail_outer_attempts) {
+            req.callback.on_event(req.callback.ctx, .{ .text_delta = "recovered" });
+            return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+        }
+        if (req.error_detail_out) |out| out.setClass(self.class);
+        return error.ApiError;
+    }
+    fn provider(self: *BothPathsFailProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "callLlm outer-retries a retryable ApiError and recovers" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    // Fail the first outer attempt (transport class), recover on the second.
+    var stub = BothPathsFailProvider{ .class = .{ .transport = .{} }, .fail_outer_attempts = 1 };
+    const p = stub.provider();
+    const resp = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, &detail);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
+    // One failed outer attempt + one successful = two streaming calls.
+    try std.testing.expectEqual(@as(u32, 2), stub.streaming_calls);
+    // Recovery reset the partial then re-streamed "recovered".
+    var buf: [16]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    var saw_reply = false;
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .text_delta => |t| if (std.mem.eql(u8, t.bytes, "recovered")) {
+                saw_reply = true;
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    try std.testing.expect(saw_reply);
+}
+
+test "callLlm does not outer-retry a billing-classified ApiError" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    // Billing is fatal: never recovers, but the loop must give up after one
+    // attempt rather than burning the full budget on a hopeless retry.
+    var stub = BothPathsFailProvider{ .class = .{ .billing = .{ .provider_message = "recharge" } }, .fail_outer_attempts = 99 };
+    const p = stub.provider();
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, &detail);
+    try std.testing.expectError(error.ApiError, result);
+    try std.testing.expectEqual(@as(u32, 1), stub.streaming_calls);
+}
+
+/// Streams a thinking_delta ONLY (no text) on its first outer attempt, then
+/// fails with `error.ApiError` (transport class) on both the streaming and
+/// non-streaming paths; recovers on the second outer attempt by streaming a
+/// thinking_delta plus a text_delta and succeeding. Models the kimi/moonshot
+/// reasoning wedge: a turn that emits reasoning, then dies mid-thought before
+/// any visible text. The first attempt's thinking must be discarded
+/// (reset_assistant_text) so the recovered turn's reasoning is not doubled.
+const ThinkingOnlyThenRecoverProvider = struct {
+    streaming_calls: u32 = 0,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "thinking_only_then_recover_stub",
+    };
+    fn callImpl(_: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        // Non-streaming fallback also fails so the outer loop is the only
+        // recovery path (mirrors BothPathsFailProvider).
+        if (req.error_detail_out) |out| out.setClass(.{ .transport = .{} });
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *ThinkingOnlyThenRecoverProvider = @ptrCast(@alignCast(ptr));
+        self.streaming_calls += 1;
+        if (self.streaming_calls == 1) {
+            // First attempt: reasoning only, then wedge with a retryable error.
+            req.callback.on_event(req.callback.ctx, .{ .thinking_delta = .{ .text = "first-thought" } });
+            if (req.error_detail_out) |out| out.setClass(.{ .transport = .{} });
+            return error.ApiError;
+        }
+        // Second attempt: reasoning again, then a visible reply, then succeed.
+        req.callback.on_event(req.callback.ctx, .{ .thinking_delta = .{ .text = "second-thought" } });
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = "recovered" });
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+    fn provider(self: *ThinkingOnlyThenRecoverProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "callLlm resets thinking-only partial across an outer retry" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    var stub = ThinkingOnlyThenRecoverProvider{};
+    const p = stub.provider();
+    const resp = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, &detail);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
+    // One failed (thinking-only) outer attempt + one successful = two calls.
+    try std.testing.expectEqual(@as(u32, 2), stub.streaming_calls);
+
+    var buf: [16]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    var reset_index: ?usize = null;
+    var first_thought_index: ?usize = null;
+    var second_thought_index: ?usize = null;
+    var saw_reply = false;
+    for (buf[0..n], 0..) |ev, i| {
+        switch (ev) {
+            .reset_assistant_text => reset_index = i,
+            .thinking_delta => |td| {
+                if (std.mem.eql(u8, td.text.bytes, "first-thought")) first_thought_index = i;
+                if (std.mem.eql(u8, td.text.bytes, "second-thought")) second_thought_index = i;
+            },
+            .text_delta => |t| if (std.mem.eql(u8, t.bytes, "recovered")) {
+                saw_reply = true;
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    // The recovered turn's reasoning and reply both made it through.
+    try std.testing.expect(second_thought_index != null);
+    try std.testing.expect(saw_reply);
+    // A reset fired between the wedged attempt's thinking and the recovery's
+    // thinking, so the stale reasoning node is discarded instead of doubled.
+    try std.testing.expect(reset_index != null);
+    try std.testing.expect(first_thought_index != null);
+    try std.testing.expect(reset_index.? > first_thought_index.?);
+    try std.testing.expect(reset_index.? < second_thought_index.?);
 }
 
 // ============================================================================

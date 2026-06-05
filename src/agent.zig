@@ -60,6 +60,52 @@ pub const max_prestream_retries: u8 = 2;
 /// Brief pause before re-firing, giving a wedged gateway a moment to clear.
 const prestream_retry_backoff_ms: u64 = 300;
 
+/// Total attempts an LLM call gets before the failure surfaces: 1 original
+/// plus 3 classified retries. Wraps the whole streaming+fallback sequence,
+/// distinct from the inner pre-first-token retry budget above.
+pub const max_llm_call_attempts: u8 = 4;
+/// Backoff cap honored even when a provider's Retry-After asks for longer.
+const max_retry_backoff_ms: u64 = 60_000;
+
+/// Whether a failed LLM call should be re-attempted, given its
+/// classification and where we are in the attempt budget. Transient
+/// failures (transport hiccups, rate limits, opaque unknowns) retry;
+/// terminal failures (billing, auth, malformed request, model-not-found)
+/// re-fire into the same wall and so propagate immediately. Context
+/// overflow is handled by the agent loop's compact-and-retry (Task 5),
+/// not here, so it does not retry at this layer.
+fn shouldRetryLlmCall(class: llm.error_class.ErrorClass.Tag, attempt: u8, max_attempts: u8) bool {
+    if (attempt >= max_attempts) return false;
+    return switch (class) {
+        .transport, .rate_limit, .gateway_html, .unknown => true,
+        .billing, .auth, .invalid_request, .model_not_found, .plan_limit, .context_overflow => false,
+    };
+}
+
+/// Exponential-ish backoff for the Nth retry (1-based), honoring a
+/// provider-requested delay when present. Schedule is 1s / 4s / 15s; a
+/// `Retry-After` overrides the schedule but is still clamped to the cap so
+/// a hostile header can't park the turn for minutes.
+fn retryBackoffMs(retry_index: u8, retry_after_ms: ?u32) u64 {
+    if (retry_after_ms) |after| {
+        return @min(@as(u64, after), max_retry_backoff_ms);
+    }
+    return switch (retry_index) {
+        1 => 1_000,
+        2 => 4_000,
+        else => 15_000,
+    };
+}
+
+/// Whether the agent loop may force-compact and re-send after the provider
+/// rejected a request as context-overflow. The proactive estimator gate
+/// already runs every turn; this is the reactive net for when the estimate
+/// undershot. Allowed exactly once per turn: a second overflow on the same
+/// turn means even the compacted history doesn't fit, so the failure is real.
+fn overflowRetryAllowed(already_retried: bool) bool {
+    return !already_retried;
+}
+
 /// Runs the streaming agent loop: call LLM, execute tools, repeat until
 /// the model produces a text-only response or the cancel flag is set.
 /// Pushes events to the queue for UI updates. Returns errors to the caller
@@ -436,7 +482,47 @@ pub fn runLoopStreaming(
             );
         defer if (filtered_owned) |d| allocator.free(d);
 
-        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, forced_tool_choice, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out);
+        // Reactive context-overflow recovery wraps the call: the proactive
+        // estimator can undershoot (chars/4 on mixed/binary tool output), so
+        // when the provider itself rejects the request as context-overflow we
+        // force-compact and re-send ONCE before giving up. A second overflow
+        // means even the trimmed history doesn't fit, so it propagates.
+        var overflow_retried = false;
+        const response = overflow_loop: while (true) {
+            break :overflow_loop callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, forced_tool_choice, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out) catch |call_err| {
+                const overflowed = call_err == error.ApiError and
+                    if (error_detail_out) |d| d.class == .context_overflow else false;
+                if (overflowed and overflowRetryAllowed(overflow_retried) and !cancel.load(.acquire)) {
+                    const keep_recent: u32 = if (lua_engine) |e| e.compact_keep_recent_tokens else DEFAULT_KEEP_RECENT_TOKENS;
+                    log.warn("provider rejected request as context-overflow; force-compacting and re-sending once", .{});
+                    const shrank = forceCompactForOverflow(
+                        messages,
+                        provider,
+                        model_spec.context_window,
+                        reserve_tokens,
+                        keep_recent,
+                        allocator,
+                        queue,
+                        cancel,
+                    ) catch |compact_err| {
+                        log.warn("overflow recovery compaction failed: {s}", .{@errorName(compact_err)});
+                        return call_err;
+                    };
+                    overflow_retried = true;
+                    if (shrank) {
+                        // History changed: the prior usage anchor no longer
+                        // maps onto the new shape, so the next estimate must
+                        // walk from scratch.
+                        last_usage_anchor = null;
+                        last_usage_index = null;
+                        continue :overflow_loop;
+                    }
+                    // Nothing left to trim; the overflow is unrecoverable.
+                    return call_err;
+                }
+                return call_err;
+            };
+        };
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
@@ -859,6 +945,33 @@ fn isStreamingRetryable(err: llm.ProviderError) bool {
     };
 }
 
+/// Whether a provider error that survived BOTH the streaming attempt and the
+/// non-streaming fallback is eligible for the outer classified retry. Only
+/// `error.ApiError` (non-2xx status or a transport hiccup) carries the
+/// `error_detail_out` classification the retry loop reads; every other typed
+/// error is terminal at this layer — auth/config errors re-fire into the same
+/// wall, OOM/Cancelled are not transient, and `ReadTimeout` already had its
+/// dedicated pre-first-token retry. Exhaustive so a new variant forces a
+/// deliberate decision here.
+fn isOuterRetryable(err: llm.ProviderError) bool {
+    return switch (err) {
+        error.ApiError => true,
+        error.SseLineTooLong,
+        error.SseEventDataTooLarge,
+        error.SseEventTypeTooLong,
+        error.MalformedResponse,
+        error.ProviderResponseFailed,
+        error.Cancelled,
+        error.NotLoggedIn,
+        error.LoginExpired,
+        error.InvalidUri,
+        error.MissingApiKey,
+        error.ReadTimeout,
+        error.OutOfMemory,
+        => false,
+    };
+}
+
 /// Call the LLM with streaming, falling back to non-streaming on error.
 pub fn callLlm(
     provider: llm.Provider,
@@ -914,71 +1027,143 @@ pub fn callLlm(
         .error_detail_out = error_detail_out,
     };
 
-    var attempt: u8 = 0;
-    return outer: while (true) {
-        stream_ctx.emitted_any = false;
-        break provider.callStreaming(&stream_req) catch |streaming_err| {
-            // A connection that wedges BEFORE any content is the transient
-            // per-connection moonshot/kimi hang: a fresh connection usually
-            // succeeds, so re-fire (bounded) rather than failing the turn.
-            // Once content was emitted, re-firing would double-stream, so
-            // fall through to the existing recovery. Cancellation also skips
-            // retry.
-            if (streaming_err == error.ReadTimeout and
-                !stream_ctx.emitted_any and
-                attempt < max_prestream_retries and
-                !cancel.load(.acquire))
-            {
-                attempt += 1;
-                log.warn("pre-first-token stall; retrying streaming (attempt {d}/{d})", .{ attempt, max_prestream_retries });
-                clock.sleep(prestream_retry_backoff_ms * std.time.ns_per_ms);
-                continue;
-            }
-            // A fatal streaming error re-fires into the same wall non-streamed,
-            // so skip the fallback and propagate. If partial text was already
-            // rendered, discard it first so the turn doesn't strand an
-            // orphaned partial assistant node when the error surfaces (RESIL-6:
-            // the reset must fire on the fatal-propagate path too, not only
-            // when the fallback runs).
-            if (!isStreamingRetryable(streaming_err)) {
-                if (stream_ctx.text_count > 0) {
-                    queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
+    // Outer bounded retry over the WHOLE streaming+fallback sequence. Each
+    // attempt resets the error-detail slot so the classification the inner
+    // sequence writes belongs to this attempt only. A retryable failure
+    // (transport hiccup, rate limit, opaque 5xx) backs off and re-attempts;
+    // a terminal one (billing, auth, malformed request) propagates at once.
+    var call_attempt: u8 = 1;
+    return retry_loop: while (true) {
+        if (error_detail_out) |out| out.reset();
+        // If a prior attempt streamed partial content, discard it before
+        // re-attempting so the UI/trajectory never see doubled output (same
+        // reset the non-streaming fallback uses on its success path). Gated
+        // on `emitted_any`, not `text_count`: a reasoning model that wedged
+        // mid-thought emitted only thinking_delta (text_count == 0) yet still
+        // left a live thinking node the next attempt would append to.
+        if (stream_ctx.emitted_any) {
+            queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
+            stream_ctx.text_count = 0;
+            stream_ctx.emitted_any = false;
+        }
+
+        // The inner sequence: streaming attempt with its own pre-first-token
+        // retry, then a single non-streaming fallback. It breaks with either
+        // a successful response or the provider error that ended the attempt.
+        const attempt_err: llm.ProviderError = inner: {
+            var attempt: u8 = 0;
+            while (true) {
+                stream_ctx.emitted_any = false;
+                const streaming_result = provider.callStreaming(&stream_req);
+                if (streaming_result) |response| {
+                    break :retry_loop response;
+                } else |streaming_err| {
+                    // A connection that wedges BEFORE any content is the transient
+                    // per-connection moonshot/kimi hang: a fresh connection usually
+                    // succeeds, so re-fire (bounded) rather than failing the turn.
+                    // Once content was emitted, re-firing would double-stream, so
+                    // fall through to the existing recovery. Cancellation also skips
+                    // retry.
+                    if (streaming_err == error.ReadTimeout and
+                        !stream_ctx.emitted_any and
+                        attempt < max_prestream_retries and
+                        !cancel.load(.acquire))
+                    {
+                        attempt += 1;
+                        log.warn("pre-first-token stall; retrying streaming (attempt {d}/{d})", .{ attempt, max_prestream_retries });
+                        clock.sleep(prestream_retry_backoff_ms * std.time.ns_per_ms);
+                        continue;
+                    }
+                    // A fatal streaming error re-fires into the same wall non-streamed,
+                    // so skip the fallback and surface it. If partial text was already
+                    // rendered, discard it first so the turn doesn't strand an
+                    // orphaned partial assistant node when the error surfaces (RESIL-6:
+                    // the reset must fire on the fatal-propagate path too, not only
+                    // when the fallback runs).
+                    if (!isStreamingRetryable(streaming_err)) {
+                        if (stream_ctx.emitted_any) {
+                            queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
+                        }
+                        break :inner streaming_err;
+                    }
+                    log.warn("streaming failed ({s}), falling back to non-streaming", .{@errorName(streaming_err)});
+                    const req = llm.Request{
+                        .system_stable = system_stable,
+                        .system_volatile = system_volatile,
+                        .messages = messages,
+                        .tool_definitions = tool_defs,
+                        .tool_choice = tool_choice,
+                        .allocator = allocator,
+                        .thinking_effort = thinking_effort,
+                        .error_detail_out = error_detail_out,
+                    };
+                    const fallback = provider.call(&req) catch |fallback_err| break :inner fallback_err;
+                    // If streaming already rendered partial content (text or
+                    // reasoning), discard it so the full fallback response
+                    // doesn't appear concatenated to the partial.
+                    if (stream_ctx.emitted_any) {
+                        queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
+                    }
+                    // Push text to queue since streaming callback didn't fire (or was reset)
+                    for (fallback.content) |block| {
+                        switch (block) {
+                            .text => |t| {
+                                const duped = agent_events.OwnedPayload.dupe(allocator, t.text) catch |err| {
+                                    log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
+                                    continue;
+                                };
+                                queue.pushWithBackpressure(.{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
+                            },
+                            else => {},
+                        }
+                    }
+                    break :retry_loop fallback;
                 }
-                return streaming_err;
             }
-            log.warn("streaming failed ({s}), falling back to non-streaming", .{@errorName(streaming_err)});
-            const req = llm.Request{
-                .system_stable = system_stable,
-                .system_volatile = system_volatile,
-                .messages = messages,
-                .tool_definitions = tool_defs,
-                .tool_choice = tool_choice,
-                .allocator = allocator,
-                .thinking_effort = thinking_effort,
-                .error_detail_out = error_detail_out,
-            };
-            const fallback = try provider.call(&req);
-            // If streaming already rendered partial text, discard it so the
-            // full fallback response doesn't appear concatenated to the partial.
-            if (stream_ctx.text_count > 0) {
-                queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
-            }
-            // Push text to queue since streaming callback didn't fire (or was reset)
-            for (fallback.content) |block| {
-                switch (block) {
-                    .text => |t| {
-                        const duped = agent_events.OwnedPayload.dupe(allocator, t.text) catch |err| {
-                            log.warn("dropped fallback text delta: {s}", .{@errorName(err)});
-                            continue;
-                        };
-                        queue.pushWithBackpressure(.{ .text_delta = duped }, agent_events.default_backpressure_ms) catch {};
-                    },
-                    else => {},
-                }
-            }
-            break :outer fallback;
         };
+
+        // Both the streaming attempt and the non-streaming fallback failed.
+        // Cancellation always wins, and only the generic transport/HTTP error
+        // (`error.ApiError`) carries a classification worth retrying: auth and
+        // config errors re-fire into the same wall, and a `ReadTimeout` has
+        // its own bounded pre-first-token retry (the inner loop owns it), so
+        // by the time it reaches here it would just stall again.
+        if (attempt_err == error.Cancelled or cancel.load(.acquire)) return attempt_err;
+        if (!isOuterRetryable(attempt_err)) return attempt_err;
+        const class: llm.error_class.ErrorClass.Tag =
+            if (error_detail_out) |out| out.class else .unknown;
+        const retry_after_ms: ?u32 =
+            if (error_detail_out) |out| out.retry_after_ms else null;
+        if (!shouldRetryLlmCall(class, call_attempt, max_llm_call_attempts)) {
+            return attempt_err;
+        }
+        const backoff_ms = retryBackoffMs(call_attempt, retry_after_ms);
+        log.warn("llm call failed (class={s}); retry {d}/{d} in {d}ms", .{
+            @tagName(class), call_attempt, max_llm_call_attempts - 1, backoff_ms,
+        });
+        if (telemetry_opt) |t| t.onRetry();
+        // Sleep cancellably so Ctrl+C during a long backoff aborts promptly.
+        if (sleepCancellable(backoff_ms, cancel)) {
+            // Cancelled mid-backoff: surface the original failure, don't retry.
+            return attempt_err;
+        }
+        call_attempt += 1;
     };
+}
+
+/// Sleep `total_ms`, waking every 100ms to check the cancel flag. Returns
+/// true if cancellation aborted the wait early, false if the full duration
+/// elapsed. Used by the retry backoff so a long delay never traps Ctrl+C.
+fn sleepCancellable(total_ms: u64, cancel: *agent_events.CancelFlag) bool {
+    const slice_ms: u64 = 100;
+    var slept: u64 = 0;
+    while (slept < total_ms) {
+        if (cancel.load(.acquire)) return true;
+        const this_slice: u64 = @min(slice_ms, total_ms - slept);
+        clock.sleep(this_slice * std.time.ns_per_ms);
+        slept += this_slice;
+    }
+    return cancel.load(.acquire);
 }
 
 /// Find the forced structured-output `emit` tool_use among collected calls.
@@ -1546,6 +1731,30 @@ pub fn estimateContextTokens(
     };
 }
 
+test "retry decision: transport and rate_limit retry, billing and invalid_request do not" {
+    try std.testing.expect(shouldRetryLlmCall(.transport, 1, 4));
+    try std.testing.expect(shouldRetryLlmCall(.rate_limit, 1, 4));
+    try std.testing.expect(shouldRetryLlmCall(.unknown, 1, 4));
+    try std.testing.expect(!shouldRetryLlmCall(.billing, 1, 4));
+    try std.testing.expect(!shouldRetryLlmCall(.invalid_request, 1, 4));
+    try std.testing.expect(!shouldRetryLlmCall(.auth, 1, 4));
+    try std.testing.expect(!shouldRetryLlmCall(.context_overflow, 1, 4)); // Task 5 handles it
+    try std.testing.expect(!shouldRetryLlmCall(.transport, 4, 4)); // budget exhausted
+}
+
+test "retry backoff schedule honors retry-after and caps" {
+    try std.testing.expectEqual(@as(u64, 1000), retryBackoffMs(1, null));
+    try std.testing.expectEqual(@as(u64, 4000), retryBackoffMs(2, null));
+    try std.testing.expectEqual(@as(u64, 15000), retryBackoffMs(3, null));
+    try std.testing.expectEqual(@as(u64, 30000), retryBackoffMs(1, 30000)); // Retry-After wins
+    try std.testing.expectEqual(@as(u64, 60000), retryBackoffMs(1, 300000)); // capped at 60s
+}
+
+test "overflow retry: allowed once, refused after the first attempt" {
+    try std.testing.expect(overflowRetryAllowed(false));
+    try std.testing.expect(!overflowRetryAllowed(true));
+}
+
 test "estimateContextTokens no anchor, no messages returns zero" {
     const est = estimateContextTokens(&.{}, null, null);
     try std.testing.expectEqual(@as(u32, 0), est.total);
@@ -1948,6 +2157,85 @@ pub fn dropOldestMessages(
         messages.items[drop_count..],
     );
     messages.shrinkRetainingCapacity(remaining);
+}
+
+/// Reactively shrink `messages` after the provider rejected a request as
+/// context-overflow. Unlike the proactive cascade at the top of the loop,
+/// this fires UNCONDITIONALLY — the provider already told us the request
+/// overflowed, so we don't consult the (undershooting) estimator. Runs Zig
+/// structured summarization first; if that doesn't shrink the history,
+/// falls back to drop-oldest against the model window. Returns true when it
+/// actually changed `messages`, so the caller knows a re-send can help.
+/// `context_window` of 0 disables drop-oldest's budget math (summarization
+/// can still fire). Caller owns `messages` storage and content.
+fn forceCompactForOverflow(
+    messages: *std.ArrayList(types.Message),
+    provider: llm.Provider,
+    context_window: u32,
+    reserve_tokens: u32,
+    keep_recent_tokens: u32,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !bool {
+    const before = messages.items.len;
+
+    // Stage 1: structured summarization (lossy-but-coherent). Best effort;
+    // a network/auth failure here falls through to drop-oldest.
+    if (runDefaultSummarization(
+        messages.items,
+        provider,
+        keep_recent_tokens,
+        allocator,
+        queue,
+        cancel,
+    )) |maybe_replacement| {
+        if (maybe_replacement) |replacement| {
+            Metrics.recordCompactionZigSummary();
+            try installCompactReplacement(messages, allocator, replacement);
+            queue.pushWithBackpressure(.{ .compaction_event = .{
+                .outcome = "summarized",
+                .messages_before = @intCast(before),
+                .messages_after = @intCast(messages.items.len),
+                .estimate_tokens = estimateContextTokens(messages.items, null, null).total,
+            } }, agent_events.default_backpressure_ms) catch {};
+            return true;
+        }
+    } else |err| {
+        log.warn("overflow recovery: summarization failed ({s}); trying drop-oldest", .{@errorName(err)});
+    }
+
+    // Ctrl+C during the summarization LLM call is the user aborting the turn,
+    // not a request to fall through to lossy drop-oldest. Re-check before the
+    // next stage so cancellation stops here instead of trimming history the
+    // user no longer wants sent.
+    if (cancel.load(.acquire)) return messages.items.len != before;
+
+    // Stage 2: drop-oldest against the model window. Lossy but deterministic.
+    if (context_window > 0) {
+        const budget: u32 = if (context_window > reserve_tokens)
+            context_window - reserve_tokens
+        else
+            1;
+        const cut = findCutPoint(messages.items, budget);
+        if (cut.first_kept > 0) {
+            Metrics.recordCompactionDropOldest();
+            log.warn(
+                "overflow recovery: drop-oldest trimming {d} of {d} messages",
+                .{ cut.first_kept, messages.items.len },
+            );
+            try dropOldestMessages(messages, allocator, cut.first_kept);
+            queue.pushWithBackpressure(.{ .compaction_event = .{
+                .outcome = "drop_oldest",
+                .messages_before = @intCast(before),
+                .messages_after = @intCast(messages.items.len),
+                .estimate_tokens = estimateContextTokens(messages.items, null, null).total,
+            } }, agent_events.default_backpressure_ms) catch {};
+            return true;
+        }
+    }
+
+    return messages.items.len != before;
 }
 
 test "dropOldestMessages removes a prefix and shifts survivors left" {

@@ -7,6 +7,7 @@
 //! observation.results on the preceding agent step.
 
 const std = @import("std");
+const types = @import("types.zig");
 
 /// ATIF schema version string emitted verbatim as `schema_version`.
 pub const SCHEMA_VERSION = "ATIF-v1.2";
@@ -160,6 +161,18 @@ fn writeStringField(writer: anytype, name: []const u8, value: []const u8, first:
     try std.json.Stringify.value(value, .{}, writer);
 }
 
+/// Like `writeStringField` but the value is tool/model output that may contain
+/// invalid UTF-8 (e.g. bash grepping a binary file). `Stringify.value` would
+/// emit such bytes as a JSON array of numbers; the sanitizing writer keeps the
+/// field a parseable JSON string with U+FFFD standing in for invalid bytes.
+fn writeSanitizedStringField(writer: anytype, name: []const u8, value: []const u8, first: bool) !void {
+    if (!first) try writer.writeByte(',');
+    try writer.writeByte('"');
+    try writer.writeAll(name);
+    try writer.writeAll("\":");
+    try types.writeSanitizedJsonString(writer, value);
+}
+
 fn writeAgent(writer: anytype, agent: Agent) !void {
     try writer.writeByte('{');
     try writeStringField(writer, "name", agent.name, true);
@@ -250,7 +263,7 @@ fn writeObservationResult(writer: anytype, r: ObservationResult) !void {
         first = false;
     }
     if (r.content) |c| {
-        try writeStringField(writer, "content", c, first);
+        try writeSanitizedStringField(writer, "content", c, first);
         first = false;
     }
     try writer.writeByte('}');
@@ -409,6 +422,19 @@ pub const Capture = struct {
     pub fn addThinkingDelta(self: *Capture, delta: []const u8) !void {
         const turn = self.cur orelse return error.NoActiveTurn;
         try turn.reasoning_text.appendSlice(self.arena.allocator(), delta);
+    }
+
+    /// Discard the current turn's accumulated assistant output (both visible
+    /// text and reasoning). Mirrors the `reset_assistant_text` event: an LLM
+    /// retry abandons the partial output of the wedged attempt, so the capture
+    /// must drop it too or the recovered attempt's text/reasoning appends to
+    /// the discarded partial (doubled output in the trajectory). The arena
+    /// keeps the dropped bytes until deinit; `clearRetainingCapacity` only
+    /// rewinds the per-turn ArrayLists, which is the intended cheap reset.
+    pub fn resetTurnContent(self: *Capture) !void {
+        const turn = self.cur orelse return error.NoActiveTurn;
+        turn.text.clearRetainingCapacity();
+        turn.reasoning_text.clearRetainingCapacity();
     }
 
     /// Mark the end of a thinking block. Multiple blocks within one turn are
@@ -829,6 +855,54 @@ test "serialize minimal trajectory matches golden shape" {
     defer parsed.deinit();
 }
 
+test "observation content with invalid utf-8 serializes as a JSON string" {
+    const results = [_]ObservationResult{
+        .{ .source_call_id = "t1", .content = "exit code: 0\nstdout:\n\xff\xfegarbage" },
+    };
+    const steps = [_]Step{
+        .{ .step_id = 1, .source = .agent, .message = "", .observation = .{ .results = &results } },
+    };
+    const traj = Trajectory{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .steps = &steps,
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serialize(traj, std.testing.allocator, &out.writer);
+
+    // Whole trajectory must remain parseable JSON (no array-of-byte-numbers).
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+
+    const result_obj = parsed.value.object.get("steps").?.array.items[0]
+        .object.get("observation").?.object.get("results").?.array.items[0].object;
+    const value = result_obj.get("content").?;
+    try std.testing.expect(value == .string);
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value.string, "garbage") != null);
+}
+
+test "observation content with valid utf-8 is unchanged" {
+    const results = [_]ObservationResult{
+        .{ .source_call_id = "t1", .content = "héllo \"q\" 日本語" },
+    };
+    const steps = [_]Step{
+        .{ .step_id = 1, .source = .agent, .message = "", .observation = .{ .results = &results } },
+    };
+    const traj = Trajectory{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .steps = &steps,
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serialize(traj, std.testing.allocator, &out.writer);
+
+    // The content field bytes match what Stringify.value produces for valid UTF-8.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"content\":\"héllo \\\"q\\\" 日本語\"") != null);
+}
+
 test "tool_calls arguments serialize as object not string" {
     const calls = [_]ToolCall{
         .{ .tool_call_id = "t1", .function_name = "bash", .arguments_json = "{\"cmd\":\"ls\"}" },
@@ -923,6 +997,43 @@ test "Capture joins multiple thinking blocks with a newline separator" {
     defer freeTrajectory(traj, std.testing.allocator);
 
     try std.testing.expectEqualStrings("first block\nsecond block", traj.steps[2].reasoning_content.?);
+}
+
+test "resetTurnContent drops the wedged attempt's text and reasoning before recovery" {
+    // A reasoning model wedged mid-thought: it streamed reasoning (and maybe a
+    // little text) before the attempt died, then the retry re-streamed both.
+    // Without the reset, the capture would concatenate both attempts; with it,
+    // only the recovered attempt's content survives.
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    // Wedged attempt: reasoning + partial text, then the retry resets it.
+    try cap.addThinkingDelta("first-thought");
+    try cap.addTextDelta("partial");
+    try cap.resetTurnContent();
+    // Recovered attempt: fresh reasoning and the real answer.
+    try cap.addThinkingDelta("second-thought");
+    try cap.addThinkingStop();
+    try cap.addTextDelta("the answer is 42");
+    try cap.endTurn(.{});
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expectEqualStrings("the answer is 42", traj.steps[2].message);
+    try std.testing.expectEqualStrings("second-thought", traj.steps[2].reasoning_content.?);
+}
+
+test "resetTurnContent without an active turn surfaces NoActiveTurn" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try std.testing.expectError(error.NoActiveTurn, cap.resetTurnContent());
 }
 
 test "build omits reasoning_content when no thinking was captured" {

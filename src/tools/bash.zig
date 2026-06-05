@@ -84,8 +84,15 @@ const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
 /// from a runaway command doesn't exhaust memory.
 const max_output_bytes: usize = 1024 * 1024;
 
+/// Wall-clock budget a command gets before the tool kills its process group.
+/// The model can override per call via `timeout_ms`, clamped to `max_timeout_ms`
+/// so a runaway or hostile value can't wedge a turn for hours.
+const default_timeout_ms: u32 = 120_000;
+const max_timeout_ms: u32 = 600_000;
+
 const BashInput = struct {
     command: []const u8,
+    timeout_ms: ?u32 = null,
 };
 
 /// Spawn `/bin/sh -c <command>`, collect output with cancel polling, and
@@ -101,6 +108,7 @@ pub fn execute(
     };
     defer parsed.deinit();
     const input = parsed.value;
+    const timeout_ms = @min(input.timeout_ms orelse default_timeout_ms, max_timeout_ms);
 
     // Wrap the shell in a platform-specific sandbox helper so the threat
     // model in the module docstring actually holds. macOS uses Apple's
@@ -163,7 +171,7 @@ pub fn execute(
     // cancellation SIGKILL below.
     const child_pid = child.id.?;
 
-    const outcome = collectWithCancel(&child, io, allocator, cancel) catch |err| {
+    const outcome = collectWithCancel(&child, io, allocator, cancel, timeout_ms) catch |err| {
         // Kill the whole group (negative pid) so the sandboxed grandchild dies
         // too; child.kill() would only signal the wrapper.
         std.posix.kill(-child_pid, std.posix.SIG.KILL) catch |kill_err| log.debug("bash cleanup group kill: {s}", .{@errorName(kill_err)});
@@ -183,6 +191,21 @@ pub fn execute(
         std.posix.kill(-child_pid, std.posix.SIG.KILL) catch |err| log.debug("bash cancel group kill: {s}", .{@errorName(err)});
         _ = child.wait(io) catch |err| log.debug("bash cancel wait: {s}", .{@errorName(err)});
         return .{ .content = "error: cancelled", .is_error = true, .owned = false };
+    }
+
+    if (outcome.timed_out) {
+        // Same unignorable group SIGKILL as cancellation: the command (or a
+        // sandboxed grandchild) may have trapped TERM, and a timeout must
+        // reach every descendant. Return the partial output collected so far
+        // so the model can see what ran before the deadline and react.
+        std.posix.kill(-child_pid, std.posix.SIG.KILL) catch |err| log.debug("bash timeout group kill: {s}", .{@errorName(err)});
+        _ = child.wait(io) catch |err| log.debug("bash timeout wait: {s}", .{@errorName(err)});
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "error: command timed out after {d}ms (default {d}ms, max {d}ms; pass timeout_ms to adjust)\n\npartial stdout:\n{s}\npartial stderr:\n{s}",
+            .{ timeout_ms, default_timeout_ms, max_timeout_ms, outcome.stdout, outcome.stderr },
+        ) catch return types.oomResult();
+        return .{ .content = msg, .is_error = true };
     }
 
     const term = child.wait(io) catch |err| {
@@ -213,13 +236,15 @@ pub fn execute(
     };
 }
 
-/// What collectWithCancel returns: either full output or a cancellation marker.
-/// The caller always owns `stdout` / `stderr` even when cancelled so the
-/// partial output can be inspected or freed uniformly.
+/// What collectWithCancel returns: either full output, a cancellation marker,
+/// or a timeout marker. The caller always owns `stdout` / `stderr` even when
+/// cancelled or timed out so the partial output can be inspected or freed
+/// uniformly.
 const Outcome = struct {
     stdout: []u8,
     stderr: []u8,
     cancelled: bool,
+    timed_out: bool = false,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
 };
@@ -242,6 +267,7 @@ fn collectWithCancel(
     io: std.Io,
     allocator: Allocator,
     cancel: ?*std.atomic.Value(bool),
+    timeout_ms: u32,
 ) !Outcome {
     var mr_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -262,13 +288,21 @@ fn collectWithCancel(
     var stderr_snapshot: ?[]u8 = null;
     errdefer if (stderr_snapshot) |s| allocator.free(s);
 
+    const timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    const start_ns = clock.monotonicNs();
+
     var cancelled = false;
+    var timed_out = false;
     drain: while (true) {
         if (cancel) |flag| {
             if (flag.load(.acquire)) {
                 cancelled = true;
                 break :drain;
             }
+        }
+        if (clock.monotonicNs() - start_ns >= timeout_ns) {
+            timed_out = true;
+            break :drain;
         }
         multi_reader.fill(64, tick) catch |err| switch (err) {
             error.Timeout => continue :drain,
@@ -279,7 +313,7 @@ fn collectWithCancel(
         try captureAndDrainOverflow(stderr_reader, allocator, &stderr_snapshot);
     }
 
-    if (!cancelled) try multi_reader.checkAnyError();
+    if (!cancelled and !timed_out) try multi_reader.checkAnyError();
 
     const stdout_truncated = stdout_snapshot != null;
     const stderr_truncated = stderr_snapshot != null;
@@ -298,6 +332,7 @@ fn collectWithCancel(
         .stdout = stdout,
         .stderr = stderr,
         .cancelled = cancelled,
+        .timed_out = timed_out,
         .stdout_truncated = stdout_truncated,
         .stderr_truncated = stderr_truncated,
     };
@@ -333,7 +368,8 @@ pub const definition = types.ToolDefinition{
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "command": { "type": "string", "description": "Shell command to execute" }
+    \\    "command": { "type": "string", "description": "Shell command to execute" },
+    \\    "timeout_ms": { "type": "integer", "description": "Kill the command after this many milliseconds (default 120000, max 600000)" }
     \\  },
     \\  "required": ["command"],
     \\  "additionalProperties": false
@@ -578,6 +614,29 @@ test "bash kills child on cancel" {
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.is_error);
     try std.testing.expectEqualStrings("error: cancelled", result.?.content);
+}
+
+test "bash kills command at timeout_ms and reports partial output" {
+    const allocator = std.testing.allocator;
+    // Prints a line, then blocks far past the timeout.
+    const json = "{\"command\":\"echo started; sleep 30\",\"timeout_ms\":500}";
+    var timer = try clock.Timer.start();
+    const result = try execute(json, allocator, null);
+    const elapsed_ns = timer.read();
+    defer if (result.owned) allocator.free(result.content);
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 500ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "started") != null); // partial stdout preserved
+}
+
+test "bash timeout_ms is clamped to the maximum" {
+    // Parse-level check: a huge timeout must clamp, not overflow.
+    const allocator = std.testing.allocator;
+    const json = "{\"command\":\"true\",\"timeout_ms\":99999999}";
+    const result = try execute(json, allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+    try std.testing.expect(!result.is_error); // command completes fine under the clamp
 }
 
 test "bash group-kills sandboxed grandchild on cancel" {

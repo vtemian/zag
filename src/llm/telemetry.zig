@@ -95,6 +95,9 @@ pub const Telemetry = struct {
     /// Stable static string per `ErrorClass` tag, set on error callbacks.
     /// Static-lifetime; no need to free.
     error_kind: ?[]const u8 = null,
+    /// Number of classified retries the agent fired for this call before it
+    /// succeeded or gave up. Zero on the happy path; shown in the timeline.
+    retry_count: u32 = 0,
 
     /// Construct a `Telemetry` on the heap. Caller must call `deinit` to
     /// emit the timeline line and free internal state.
@@ -131,7 +134,7 @@ pub const Telemetry = struct {
         const error_kind = self.error_kind orelse "-";
         return std.fmt.allocPrint(
             self.allocator,
-            "turn={d} session={s} model={s} status={d} req_bytes={d} elapsed_ms={d} error={s} error_kind={s}",
+            "turn={d} session={s} model={s} status={d} req_bytes={d} elapsed_ms={d} error={s} error_kind={s} retry_count={d}",
             .{
                 self.turn,
                 self.session_id,
@@ -141,8 +144,16 @@ pub const Telemetry = struct {
                 elapsed_ms,
                 if (self.had_error) "true" else "false",
                 error_kind,
+                self.retry_count,
             },
         );
+    }
+
+    /// Count a classified retry the agent fired for this call. Surfaced as
+    /// `retry_count` in the deinit timeline line so a `tail -f` shows which
+    /// turns survived transient provider failures.
+    pub fn onRetry(self: *Telemetry) void {
+        self.retry_count += 1;
     }
 
     /// Stash the status and request size for the deinit timeline line.
@@ -296,10 +307,12 @@ fn staticTagName(class: error_class.ErrorClass) []const u8 {
         .context_overflow => "context_overflow",
         .rate_limit => "rate_limit",
         .plan_limit => "plan_limit",
+        .billing => "billing",
         .auth => "auth",
         .model_not_found => "model_not_found",
         .invalid_request => "invalid_request",
         .gateway_html => "gateway_html",
+        .transport => "transport",
         .unknown => "unknown",
     };
 }
@@ -386,7 +399,24 @@ test "Telemetry deinit emits timeline log line" {
     try testing.expect(std.mem.indexOf(u8, line, "model=openai/gpt-5") != null);
     try testing.expect(std.mem.indexOf(u8, line, "error=false") != null);
     try testing.expect(std.mem.indexOf(u8, line, "error_kind=-") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "retry_count=0") != null);
 
+    t.deinit();
+}
+
+test "Telemetry.onRetry increments retry_count in the timeline" {
+    const t = try Telemetry.init(.{
+        .allocator = testing.allocator,
+        .session_id = "s",
+        .turn = 1,
+        .model = "m",
+    });
+    t.onRetry();
+    t.onRetry();
+    try testing.expectEqual(@as(u32, 2), t.retry_count);
+    const line = try t.formatTimeline();
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line, "retry_count=2") != null);
     t.deinit();
 }
 
