@@ -84,7 +84,10 @@ pub const max_visible_toasts = 3;
 /// Queue bound; pushing past it drops the OLDEST queued toast (logged).
 pub const max_queued_toasts = 16;
 /// Toast messages longer than this are truncated on copy; keeps a runaway
-/// notify payload from allocating without bound.
+/// notify payload from allocating without bound. Byte cap, not
+/// codepoint-safe: the tail may split a UTF-8 sequence, which is harmless
+/// because rendering only decodes the first ~40 display columns per line,
+/// far inside the intact prefix.
 const max_toast_message_bytes = 4096;
 
 /// Pane composition: a rendered Buffer plus the optional agent-pane

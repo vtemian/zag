@@ -690,10 +690,6 @@ fn tick(
         .output_tokens = output_tokens,
         .toasts = self.window_manager.toasts[0..self.window_manager.toasts_len],
     });
-    // The visible toast set was just painted; clear the dirty flag so the
-    // next idle tick doesn't force a redundant composite. Mirrors how the
-    // working-line tracker is reset at the tail of tick.
-    self.window_manager.toasts_dirty = false;
     var rendered_to_terminal = true;
     self.screen.render(self.stdout_file) catch |err| switch (err) {
         // Backpressure on the terminal fd: frame is dropped, the next
@@ -704,6 +700,13 @@ fn tick(
     };
     if (rendered_to_terminal) {
         self.last_rendered_working_secs = if (agent_running) current_secs else null;
+        // The toast frame actually reached the terminal; clear the dirty
+        // flag so the next idle tick doesn't force a redundant composite.
+        // Guarded like the working-line reset above: a WriteTimeout-dropped
+        // frame must leave the flag set, or an idle loop never re-renders
+        // the erase frame and a dismissed toast ghosts on the physical
+        // terminal until the next keypress.
+        self.window_manager.toasts_dirty = false;
     }
 }
 
