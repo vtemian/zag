@@ -652,3 +652,111 @@ test "child_history pre-seeded with task_start_id chains child events under the 
 fn restoreCwdForTest(abs_path: []const u8) void {
     std.process.setCurrentPath(std.testing.io, abs_path) catch {};
 }
+
+/// Stub provider that hands back a single `probe` tool_use on its FIRST
+/// streaming call, then plain text on every later call. The tool the
+/// child runs sets the runner's cancel flag, so the loop's next
+/// top-of-turn check returns cleanly between turns — the masking window.
+/// A second call would mean the loop ran turn 2: the text "should never
+/// run" is a tripwire, and `calls` lets the test assert turn 2 never ran.
+const ProbeThenTextProvider = struct {
+    calls: u32 = 0,
+    alloc: Allocator,
+    /// Heap-owned content slice handed back on the first response. The
+    /// agent loop does not free `response.content`, so the stub owns it.
+    content_buf: ?[]types.ContentBlock = null,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "probe_then_text",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(
+        ptr: *anyopaque,
+        req: *const llm.StreamRequest,
+    ) llm.ProviderError!types.LlmResponse {
+        const self: *ProbeThenTextProvider = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.calls == 1) {
+            const blocks = self.alloc.alloc(types.ContentBlock, 1) catch return error.OutOfMemory;
+            blocks[0] = .{ .tool_use = .{ .id = "probe_1", .name = "probe", .input_raw = "{}" } };
+            self.content_buf = blocks;
+            return .{
+                .content = blocks,
+                .stop_reason = .tool_use,
+                .input_tokens = 1,
+                .output_tokens = 1,
+            };
+        }
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = "should never run" });
+        return .{
+            .content = &.{},
+            .stop_reason = .end_turn,
+            .input_tokens = 1,
+            .output_tokens = 1,
+        };
+    }
+
+    fn provider(self: *ProbeThenTextProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *ProbeThenTextProvider) void {
+        if (self.content_buf) |b| self.alloc.free(b);
+    }
+};
+
+/// Stub tool that simulates Ctrl+C landing while a tool batch runs: it
+/// sets the runner's cancel flag, so the agent loop's NEXT top-of-turn
+/// check observes it and returns cleanly — the between-turns window.
+const CancelProbeTool = struct {
+    fn executeFn(
+        input_raw: []const u8,
+        allocator: Allocator,
+        cancel: ?*std.atomic.Value(bool),
+    ) types.ToolError!types.ToolResult {
+        _ = input_raw;
+        _ = allocator;
+        if (cancel) |c| c.store(true, .release);
+        return .{ .content = "ok", .is_error = false, .owned = false };
+    }
+
+    const probe_definition = types.ToolDefinition{
+        .name = "probe",
+        .description = "Test tool that requests cancellation.",
+        .input_schema_json =
+        \\{"type":"object","properties":{},"additionalProperties":false}
+        ,
+    };
+
+    const tool = types.Tool{ .definition = probe_definition, .execute = &executeFn };
+};
+
+test "task reports a child cancelled between turns as an error result" {
+    const allocator = testing.allocator;
+
+    var stub = ProbeThenTextProvider{ .alloc = allocator };
+    defer stub.deinit();
+    var harness = try InlineHarness.init(allocator, stub.provider());
+    defer harness.deinit();
+    // The child must reach the `probe` tool, so register it on the parent
+    // registry before bind() (the child inherits the parent's tools).
+    try harness.parent_registry.register(CancelProbeTool.tool);
+    harness.bind();
+
+    const result = try execute("{\"prompt\":\"go\"}", allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+
+    // The child cancelled between turns: the run must surface as an error
+    // carrying the same "Cancelled" text the mid-stream cancel path emits.
+    try testing.expect(result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.content, "Cancelled") != null);
+    // Turn 2 never ran: the cancel was observed at the top of the loop,
+    // proving the between-turns window (not a mid-stream abort).
+    try testing.expectEqual(@as(u32, 1), stub.calls);
+}
