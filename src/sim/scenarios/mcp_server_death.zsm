@@ -1,0 +1,34 @@
+# MCP server death: resilience under a real model. Burns one real LLM turn.
+#
+# Launched with ZAG_SIM_MCP_SERVER pointing at fake-mcp-die.sh, a variant that
+# answers initialize + tools/list normally (advertising get_token) but EXITS
+# the instant it receives a tools/call -- closing stdin/stdout without
+# replying. zag's stdio transport must observe the EOF / connection-closed
+# while waiting for the response and surface it to the model as a tool error.
+#
+# The contract under test: the failure is handled gracefully. zag must NOT
+# crash (exit code 2) and must NOT hang. The turn completes -- the model gets
+# an error tool result and reports failure -- then the app exits cleanly on
+# /quit. This pins the EOF / "connection closed" path under a real model.
+#
+# A dedicated HOME, wiped fresh: no stale cache, so the model's proxy call
+# forces a live connect (initialize + tools/list succeed, tools/call dies).
+#
+# We can't reliably anchor on the model's failure wording (it varies), so we
+# wait for the turn to finish (a small idle window inside a long deadline,
+# since reasoning-model streaming never goes idle mid-turn), snapshot for the
+# post-run record, then /quit. A clean wait_exit is the real assertion: a
+# crash or hang would surface as a non-zero / signaled exit or a timeout.
+
+set env ZAG_SIM_MCP_HOME=/tmp/zag-sim-mcp-death-home
+set env ZAG_SIM_MCP_SERVER=fake-mcp-die.sh
+spawn ./src/sim/scenarios/testdata/mcp_launch.sh
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Use the mcp tool to call the MCP tool named get_token on the server named fake (call it as mcp with server set to fake and tool set to get_token and args set to {}). If the call fails, just tell me it failed." <Enter>
+# Turn runs: connect, list, then the call wedges on EOF and errors back. Wait
+# for the turn to settle (3s quiet inside a 120s deadline).
+wait_idle 3s 120s
+snapshot death_final
+send "/quit" <Enter>
+wait_exit

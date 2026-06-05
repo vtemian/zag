@@ -1,0 +1,44 @@
+# /mcp status command, deterministic and LLM-free. Proves the .mcp.json
+# auto-merge, the /mcp command path, and the zag.detach status worker survive
+# end to end without crashing the TUI.
+#
+# Setup (via the parameterized launcher): a fixture HOME plus a project dir
+# whose .mcp.json declares a SECOND server (jsonsrv, standard command-string +
+# args shape) alongside the Lua-declared `fake`. The launcher cd's into that
+# project dir before exec'ing zag, so zag's cwd-relative .mcp.json read merges
+# jsonsrv on the first coroutine-context config load (which /mcp triggers).
+#
+# WHAT THIS SCENARIO CAN ASSERT ON THE GRID: only that the command ran and the
+# TUI survived. zag.notify (the channel /mcp uses for its status text) routes
+# to the file log, NOT the conversation grid -- there is no grid-visible
+# rendering of notify output today (LuaEngine.zagNotifyFn writes to the
+# .lua_user log scope; a future phase will push it to a compositor toast). The
+# probe-verified grid stays on the welcome screen after /mcp. So a wait_text on
+# "MCP: ", "jsonsrv", or "fake" against the grid would always time out, NOT
+# because the plumbing is broken but because the text never reaches the grid.
+#
+# WHERE THE STATUS TEXT ACTUALLY LANDS: the fixture log under
+# $ZAG_SIM_MCP_HOME/.zag/logs/<uuid>.log, as a line like
+#   [lua_user] info: [notify] MCP: 0/2 servers, 0 tools
+#   ○ fake (not connected)
+#   ○ jsonsrv (not connected)
+# The header N/2 count and both server names (fake from config.lua, jsonsrv
+# from .mcp.json) are asserted by inspecting that log post-run. The fixture
+# HOME is a fixed path so the log is findable.
+#
+# A /mcp that wedged the detach worker, crashed on the .mcp.json merge, or
+# left the TUI unresponsive would surface here as a non-clean exit (the final
+# /quit + wait_exit would time out or report a crash).
+
+set env ZAG_SIM_MCP_HOME=/tmp/zag-sim-mcp-status-home
+set env ZAG_SIM_MCP_PROJECT_DIR=/tmp/zag-sim-mcp-status-proj
+spawn ./src/sim/scenarios/testdata/mcp_launch.sh
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "/mcp" <Enter>
+# /mcp routes through a zag.detach worker; give it a moment to run and notify.
+# We can't anchor on the status text (see header), so settle on idle instead.
+wait_idle 2s 8s
+snapshot after_mcp
+send "/quit" <Enter>
+wait_exit

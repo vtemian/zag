@@ -1,0 +1,29 @@
+# Direct tools: the second half of the ordered pair. MUST run after
+# mcp_cache_seed.zsm (same fixture HOME, inherits the cache it wrote). Burns
+# one real LLM turn.
+#
+# Launched with ZAG_SIM_MCP_KEEP_HOME=1 (do NOT wipe -> the seed's
+# mcp-metadata.json survives) and ZAG_SIM_MCP_DIRECT=1 (settings.direct_tools =
+# true). With a valid cache entry for fake and tool_prefix = "none",
+# M._register_direct_tools registers get_token as a FIRST-CLASS tool at startup
+# -- the model calls it directly, NOT through the `mcp` proxy.
+#
+# The prompt tells the model to call the tool literally named get_token (no
+# mention of `mcp`, no mention of the token). Anchoring on the magic token
+# proves the direct tool executed and round-tripped to fake-mcp.sh.
+#
+# The "did NOT go through the proxy" claim is not grid-visible. It is verified
+# post-run by inspecting the artifacts session.jsonl: the tool_use name must be
+# `get_token`, not `mcp`. The scenario itself only anchors the token.
+
+set env ZAG_SIM_MCP_HOME=/tmp/zag-sim-mcp-direct-home
+set env ZAG_SIM_MCP_KEEP_HOME=1
+set env ZAG_SIM_MCP_DIRECT=1
+spawn ./src/sim/scenarios/testdata/mcp_launch.sh
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Call the tool named get_token with empty arguments {}. Then print the tool's exact output verbatim in your reply." <Enter>
+wait_text /zag-mcp-token-7Q3/ 90s
+snapshot direct_final
+send "/quit" <Enter>
+wait_exit
