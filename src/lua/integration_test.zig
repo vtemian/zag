@@ -889,6 +889,170 @@ test "cancelled workflow child fires SubagentEnd exactly once with is_error=true
     );
 }
 
+/// Stub provider that hands back a single `probe` tool_use on its FIRST
+/// streaming call, then plain text on every later call. The tool the child
+/// runs sets the runner's cancel flag, so the loop's next top-of-turn check
+/// returns cleanly between turns — the masking window. A second call would
+/// mean the loop ran turn 2: the text "should never run" is a tripwire.
+/// Duplicated from `tools/task.zig` (the same shape `StubTextProvider` is
+/// duplicated across both files); no shared test-utils module exists.
+const ProbeThenTextProvider = struct {
+    calls: u32 = 0,
+    alloc: std.mem.Allocator,
+    content_buf: ?[]types.ContentBlock = null,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "probe_then_text",
+    };
+
+    fn callImpl(_: *anyopaque, _: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        unreachable;
+    }
+
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *ProbeThenTextProvider = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.calls == 1) {
+            const blocks = self.alloc.alloc(types.ContentBlock, 1) catch return error.OutOfMemory;
+            blocks[0] = .{ .tool_use = .{ .id = "probe_1", .name = "probe", .input_raw = "{}" } };
+            self.content_buf = blocks;
+            return .{ .content = blocks, .stop_reason = .tool_use, .input_tokens = 1, .output_tokens = 1 };
+        }
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = "should never run" });
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+
+    fn provider(self: *ProbeThenTextProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *ProbeThenTextProvider) void {
+        if (self.content_buf) |b| self.alloc.free(b);
+    }
+};
+
+/// Stub tool that simulates Ctrl+C landing while a tool batch runs: it sets
+/// the runner's cancel flag, so the agent loop's NEXT top-of-turn check
+/// observes it and returns cleanly — the between-turns window.
+const CancelProbeTool = struct {
+    fn executeFn(
+        input_raw: []const u8,
+        allocator: std.mem.Allocator,
+        cancel: ?*std.atomic.Value(bool),
+    ) types.ToolError!types.ToolResult {
+        _ = input_raw;
+        _ = allocator;
+        if (cancel) |c| c.store(true, .release);
+        return .{ .content = "ok", .is_error = false, .owned = false };
+    }
+
+    const probe_definition = types.ToolDefinition{
+        .name = "probe",
+        .description = "Test tool that requests cancellation.",
+        .input_schema_json =
+        \\{"type":"object","properties":{},"additionalProperties":false}
+        ,
+    };
+
+    const tool = types.Tool{ .definition = probe_definition, .execute = &executeFn };
+};
+
+test "a child cancelled between turns fires SubagentEnd is_error=true and a failed task result" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = ProbeThenTextProvider{ .alloc = allocator };
+    defer stub.deinit();
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    // The child inherits the parent's tools (spec.tools = null), so the
+    // cancel-setting probe must live on the parent registry.
+    try parent_registry.register(CancelProbeTool.tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    try installLifecycleHookLog(&engine, &child_registry);
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "probe_then_text",
+        .model_spec = .{ .provider_name = "probe_then_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var fixture = WorkflowSpawnFixture{ .engine = &engine, .registry = &child_registry, .ctx = &ctx };
+    workflow_spawn_fixture = &fixture;
+    defer workflow_spawn_fixture = null;
+
+    engine.lua.pushFunction(zlua.wrap(testSpawnChild));
+    engine.lua.setGlobal("_test_spawn_child");
+
+    // Coroutine body: spawn+await the child, then stash the worker's
+    // Lua-visible result so we can assert is_error on the task return table.
+    try engine.lua.doString(
+        \\function test_workflow()
+        \\  local res = _test_spawn_child()
+        \\  _test_workflow_result = { summary = res.summary, is_error = res.is_error }
+        \\end
+    );
+    _ = try engine.lua.getGlobal("test_workflow");
+    _ = try engine.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+
+    // Turn 2 never ran: the cancel was observed at the top of the loop,
+    // proving the between-turns window (not a mid-stream abort).
+    try testing.expectEqual(@as(u32, 1), stub.calls);
+
+    // SubagentEnd fires exactly once with is_error=true (same shape as the
+    // mid-stream cancel test): the synthetic `.err` made the child's tree the
+    // single cancellation truth, so every tree-tail consumer agrees.
+    try runLua(&engine,
+        \\local spawns, ends, errored = 0, 0, nil
+        \\for _, e in ipairs(_G.hook_log) do
+        \\    if e.event == "spawn" then spawns = spawns + 1 end
+        \\    if e.event == "end" then ends = ends + 1; errored = e.is_error end
+        \\end
+        \\assert(spawns == 1, "expected exactly 1 spawn, got " .. tostring(spawns))
+        \\assert(ends == 1, "expected exactly 1 end, got " .. tostring(ends))
+        \\assert(errored == true, "between-turns cancelled child must end with is_error=true")
+    );
+
+    // The worker's task return table also carries is_error=true (the
+    // slot.value.is_error signal the workflow tool documents).
+    _ = try engine.lua.getGlobal("_test_workflow_result");
+    defer engine.lua.pop(1);
+    _ = engine.lua.getField(-1, "is_error");
+    try testing.expect(engine.lua.toBoolean(-1));
+    engine.lua.pop(1);
+}
+
 /// Test-only park-mode spawn: build a ChildAgent via `start` and register it
 /// with an `OnDone.park` ResetEvent, exactly as the `task` tool does
 /// (`tools/task.zig:166`). Returns the child + its park event so the caller
@@ -1258,6 +1422,176 @@ test "startWorkflowScript runs a script that spawns two subagents and aggregates
 
     // Everything drained: no live tasks, registry empty, no leak at deinit.
     try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+}
+
+test "a zag.detach survivor's workflow_ctx is severed when the root retires" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    // Declared AFTER `engine` so its deinit defer runs after `engine.deinitAsync`.
+    // A child registry IS present so that BEFORE the fix the detached worker's
+    // `zag.task` reaches the spawn path (it does not refuse) and the live ctx is
+    // dereferenced — the bug — while AFTER the fix the severed null `workflow_ctx`
+    // makes `zag.task` refuse before touching ctx.
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = &engine,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // The root detaches a worker gated on `_G.go`, then returns immediately so
+    // the orchestration root retires while the worker is still parked. After the
+    // root retires, the worker's `workflow_ctx` borrow points at a frame the tool
+    // is about to abandon: a later `zag.task` must hit the soft refusal, not a
+    // stale-ctx deref. pcall keeps the coroutine from erroring (no log noise).
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\zag.detach(function()
+        \\  while not _G.go do zag.sleep(5) end
+        \\  local ok, err = pcall(function() return zag.task({ prompt = "x" }) end)
+        \\  _G.detach_err = tostring(err)
+        \\end)
+        \\return "root done"
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+
+    // 1. Run the root to retire: `req.done` fires, the sever runs in the same
+    //    main-thread retire sequence.
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expectEqualStrings("root done", result);
+    // The detached worker is still parked (gated on `_G.go`).
+    try testing.expect(engine.tasks.count() > 0);
+
+    // 2. Release the worker; pump until it runs `zag.task` and retires.
+    try runLua(&engine, "_G.go = true");
+    const deadline = clock.milliTimestamp() + 4000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        engine.pumpCompletions();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+
+    // 3. The survivor's `zag.task` must have refused with the soft workflow-ctx
+    //    error — proving the borrow was severed, not dereferenced. `_G.detach_err`
+    //    is reachable as a plain global.
+    _ = try engine.lua.getGlobal("detach_err");
+    const detach_err = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, detach_err, "requires a workflow context") != null);
+    engine.lua.pop(1);
+
+    try testing.expect(child_registry.isEmpty());
+}
+
+test "an unjoined spawn survivor's workflow_ctx is severed when the root retires" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = &engine,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // Twin of the detach test for the second survivor class: a `zag.spawn` child
+    // with no `:join()`. It is parented to the spawner's scope, so the root retire
+    // BOTH re-parents it to root (the existing block) AND severs its borrow (the
+    // new block) in the same call. Pinning both classes guarantees the sever runs
+    // in the same retire that re-parents.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\zag.spawn(function()
+        \\  while not _G.go do zag.sleep(5) end
+        \\  local ok, err = pcall(function() return zag.task({ prompt = "x" }) end)
+        \\  _G.spawn_err = tostring(err)
+        \\end)
+        \\return "root done"
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expectEqualStrings("root done", result);
+    try testing.expect(engine.tasks.count() > 0);
+
+    try runLua(&engine, "_G.go = true");
+    const deadline = clock.milliTimestamp() + 4000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        engine.pumpCompletions();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+
+    _ = try engine.lua.getGlobal("spawn_err");
+    const spawn_err = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, spawn_err, "requires a workflow context") != null);
+    engine.lua.pop(1);
+
     try testing.expect(child_registry.isEmpty());
 }
 

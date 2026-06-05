@@ -390,6 +390,16 @@ pub const LuaEngine = struct {
         /// node groups under the workflow call. Borrows the parked agent-thread
         /// frame (park-until-retire, same lifetime argument as `workflow_ctx`).
         spawning_tool_use_id: ?[]const u8 = null,
+        /// Identifies which workflow invocation this task belongs to: the
+        /// orchestration root's own `thread_ref`, inherited by every
+        /// `zag.spawn`/`zag.detach` descendant alongside `workflow_ctx`. When the
+        /// root retires, `retireTask` scans for this value and severs the cohort's
+        /// `workflow_ctx`/`spawning_tool_use_id` borrows (the parked frame they
+        /// point into is about to be abandoned). `-1` = not workflow-spawned.
+        /// Registry refs are reused after unref, but a reused ref can only collide
+        /// with cohorts whose root already retired (and was already severed), so a
+        /// stale match is an idempotent re-null, never a wrong sever.
+        workflow_root_ref: i32 = -1,
         /// Non-null only on the top-level workflow-script coroutine: the
         /// request whose `result`/`done` the script's return value fills.
         /// `resumeTask`'s `.ok` arm reads the coroutine's returned string into
@@ -1182,6 +1192,7 @@ pub const LuaEngine = struct {
         const parent: ?*async_scope.Scope = if (parent_task) |t| t.scope else null;
         const inherited_workflow_ctx: ?*const tools_mod.TaskContext = if (parent_task) |t| t.workflow_ctx else null;
         const inherited_spawning_id: ?[]const u8 = if (parent_task) |t| t.spawning_tool_use_id else null;
+        const inherited_root_ref: i32 = if (parent_task) |t| t.workflow_root_ref else -1;
 
         // spawnCoroutine operates on `engine.lua`'s stack. When zag.spawn
         // is called from inside another coroutine, [fn, args...] live on
@@ -1190,7 +1201,7 @@ pub const LuaEngine = struct {
             co.xMove(engine.lua, nargs + 1);
         }
 
-        const thread_ref = engine.spawnCoroutineInheriting(nargs, parent, inherited_workflow_ctx, inherited_spawning_id) catch |err| switch (err) {
+        const thread_ref = engine.spawnCoroutineInheriting(nargs, parent, inherited_workflow_ctx, inherited_spawning_id, inherited_root_ref) catch |err| switch (err) {
             error.AsyncRuntimeNotReady => co.raiseErrorStr(
                 "zag.spawn: async runtime not ready (use it from a hook or tool, not at config top level)",
                 .{},
@@ -1229,11 +1240,12 @@ pub const LuaEngine = struct {
             if (detach_parent_task) |t| t.workflow_ctx else null;
         const inherited_spawning_id: ?[]const u8 =
             if (detach_parent_task) |t| t.spawning_tool_use_id else null;
+        const inherited_root_ref: i32 = if (detach_parent_task) |t| t.workflow_root_ref else -1;
 
         if (co != engine.lua) {
             co.xMove(engine.lua, nargs + 1);
         }
-        _ = engine.spawnCoroutineInheriting(nargs, null, inherited_workflow_ctx, inherited_spawning_id) catch |err| switch (err) {
+        _ = engine.spawnCoroutineInheriting(nargs, null, inherited_workflow_ctx, inherited_spawning_id, inherited_root_ref) catch |err| switch (err) {
             error.AsyncRuntimeNotReady => co.raiseErrorStr(
                 "zag.detach: async runtime not ready (use it from a hook or tool, not at config top level)",
                 .{},
@@ -3164,7 +3176,7 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null, null, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null, -1, null, null);
     }
 
     /// Spawn a coroutine that inherits a workflow context from its spawner.
@@ -3180,8 +3192,9 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         workflow_ctx: ?*const tools_mod.TaskContext,
         spawning_tool_use_id: ?[]const u8,
+        workflow_root_ref: i32,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, spawning_tool_use_id, null, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, spawning_tool_use_id, workflow_root_ref, null, null);
     }
 
     /// Spawn a coroutine already bound to a `PendingFire`. The binding is set
@@ -3197,7 +3210,7 @@ pub const LuaEngine = struct {
         pf: *PendingFire,
     ) !i32 {
         pf.outstanding += 1;
-        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null, null, null) catch |err| {
+        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null, -1, null, null) catch |err| {
             // The spawn never registered the task (so retireTask will not run
             // for it); undo the bump so the guard release still reaches 0.
             pf.outstanding -= 1;
@@ -3446,7 +3459,7 @@ pub const LuaEngine = struct {
         // (so its return value is captured). Both are set before the first
         // resume inside spawnCoroutineFull, so even a no-yield script that
         // returns immediately has its result captured.
-        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req.spawning_tool_use_id, req, null) catch |err| {
+        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req.spawning_tool_use_id, -1, req, null) catch |err| {
             // The spawn never registered a task (so retireTask cannot complete
             // the request); complete it here. The chunk on the stack was either
             // consumed by spawnCoroutineFull (on the xMove) or left on a failure
@@ -3515,7 +3528,7 @@ pub const LuaEngine = struct {
         // coroutine (nargs = 1) and tags it with the request so the return
         // value is captured even for a no-yield tool that retires inside the
         // spawn.
-        _ = self.spawnCoroutineFull(1, self.root_scope, null, null, null, null, null, null, req) catch |err| {
+        _ = self.spawnCoroutineFull(1, self.root_scope, null, null, null, null, null, -1, null, req) catch |err| {
             // The spawn never registered a task (so retireTask cannot complete
             // the request); complete it here. The fn+arg on the stack were
             // either consumed by spawnCoroutineFull (on the xMove) or left on a
@@ -3578,6 +3591,7 @@ pub const LuaEngine = struct {
         pending_fire: ?*PendingFire,
         workflow_ctx: ?*const tools_mod.TaskContext,
         spawning_tool_use_id: ?[]const u8,
+        workflow_root_ref: i32,
         workflow_request: ?*WorkflowRequest,
         lua_tool_request: ?*Hooks.LuaToolRequest,
     ) !i32 {
@@ -3622,6 +3636,9 @@ pub const LuaEngine = struct {
             // Carried alongside `workflow_ctx` so the spawned child's
             // `subagent_link` node groups under the workflow tool call.
             .spawning_tool_use_id = spawning_tool_use_id,
+            // The orchestration root's cohort id is its own thread_ref; inherited
+            // children carry the value the spawner passed.
+            .workflow_root_ref = if (workflow_request != null) thread_ref else workflow_root_ref,
             // Set before the first resume so a no-yield workflow script that
             // retires inside this spawn still has its return value captured by
             // resumeTask's `.ok` arm.
@@ -3894,6 +3911,28 @@ pub const LuaEngine = struct {
 
         _ = self.tasks.remove(task.thread_ref);
         self.lua.unref(zlua.registry_index, task.thread_ref);
+
+        // The orchestration root is retiring: the parked tool frame its cohort's
+        // `workflow_ctx`/`spawning_tool_use_id` borrow (park-until-retire,
+        // workflow.zig) is about to be abandoned. Sever the borrows on every
+        // surviving cohort member NOW, in this same synchronous main-thread
+        // sequence — before any other coroutine can resume — so a survivor's next
+        // `zag.task` hits the soft "requires a workflow context" refusal instead
+        // of dereferencing freed AgentRunner storage. Root detection is
+        // `workflow_root_ref == thread_ref` (self-assigned at spawn);
+        // `workflow_request` is already nulled on the success path so it cannot
+        // be the test here. Same family as the e735c79 sever-at-owner-death fix.
+        if (task.workflow_root_ref == task.thread_ref) {
+            var sever_it = self.tasks.iterator();
+            while (sever_it.next()) |entry| {
+                const t = entry.value_ptr.*;
+                if (t.workflow_root_ref == task.thread_ref) {
+                    t.workflow_ctx = null;
+                    t.spawning_tool_use_id = null;
+                    t.workflow_root_ref = -1;
+                }
+            }
+        }
 
         // Re-parent any still-live children to the root scope so that
         // fire-and-forget spawn / detach can outlive their parent without
@@ -7321,6 +7360,300 @@ test "zag.workflow.pipeline threads stage outputs and respects the cap" {
     eng.lua.pop(1);
     try std.testing.expect(hwm >= 1);
     try std.testing.expect(hwm <= 2);
+}
+
+test "zag.race on empty input returns (nil, 'empty', nil)" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Empty input short-circuits before any spawn: the early-return arm at
+    // combinators.lua:68. No worker, no pump iterations, no tasks.
+    try eng.lua.doString(
+        \\function test_race_empty()
+        \\  local v, err, idx = zag.race({})
+        \\  _re_v_is_nil = (v == nil)
+        \\  _re_err = err
+        \\  _re_idx_is_nil = (idx == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_race_empty");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_re_v_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_re_err");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "empty"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_re_idx_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.race losers never overwrite the winner after they are cancelled" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Fast worker (5ms) wins; the slow worker (600ms -- matching the jitter
+    // margin of the existing race test) is cancelled after the winner is known.
+    // Cancelling a SLEEPING worker does NOT kill it: the aborted sleep job
+    // resumes the coroutine with (nil, "cancelled"), so the loser's post-sleep
+    // body still runs to completion (documented behavior). _loser_ran proves
+    // that resume happened. The invariant under test is the winner GUARD at
+    // combinators.lua:80 (`if winner_idx == nil`): the resumed loser must not
+    // clobber the already-recorded winner value/index.
+    try eng.lua.doString(
+        \\function test_race_losers()
+        \\  _loser_ran = false
+        \\  local v, err, idx = zag.race({
+        \\    function() zag.sleep(5); return "fast" end,
+        \\    function() zag.sleep(600); _loser_ran = true; return "slow" end,
+        \\  })
+        \\  _rl_winner = v
+        \\  _rl_err_is_nil = (err == nil)
+        \\  _rl_idx = idx
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_race_losers");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    // The winner is unchanged despite the loser resuming and finishing.
+    _ = try eng.lua.getGlobal("_rl_winner");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "fast"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_rl_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_rl_idx");
+    try std.testing.expectEqual(@as(i64, 1), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    // The loser DID run after its sleep was aborted (resume-on-cancel), but the
+    // winner guard kept its return from overwriting the winner above.
+    _ = try eng.lua.getGlobal("_loser_ran");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.workflow.pipeline short-circuits an item on a stage error" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // Item 2's stage 1 returns (nil, "boom"): the per-item loop records the
+    // error and breaks, so stage 2 must NOT run for item 2 (the short-circuit
+    // at combinators.lua:229-232). _stage2_runs counts stage-2 invocations and
+    // must be 2 (items 1 and 3 only). Slots stay input-aligned: r[1].value=11,
+    // r[2]={nil, "boom"}, r[3].value=31. Run under cap=2 so the short-circuit
+    // is exercised across the sliding-window refill, not just a single batch.
+    try eng.lua.doString(
+        \\function test_pipeline_err()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  _stage2_runs = 0
+        \\  local stage1 = function(x)
+        \\    if x == 2 then return nil, "boom" end
+        \\    return x * 10, nil
+        \\  end
+        \\  local stage2 = function(x)
+        \\    _stage2_runs = _stage2_runs + 1
+        \\    return x + 1, nil
+        \\  end
+        \\  local r = zag.workflow.pipeline({ 1, 2, 3 }, stage1, stage2)
+        \\  _ple_count = #r
+        \\  _ple_v1 = r[1].value
+        \\  _ple_e1_is_nil = (r[1].err == nil)
+        \\  _ple_v2_is_nil = (r[2].value == nil)
+        \\  _ple_e2 = r[2].err
+        \\  _ple_v3 = r[3].value
+        \\  _ple_e3_is_nil = (r[3].err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_pipeline_err");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_ple_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_v1");
+    try std.testing.expectEqual(@as(i64, 11), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_e1_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_v2_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_e2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "boom"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_v3");
+    try std.testing.expectEqual(@as(i64, 31), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_e3_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    // Stage 2 ran for items 1 and 3 only; item 2 short-circuited.
+    _ = try eng.lua.getGlobal("_stage2_runs");
+    try std.testing.expectEqual(@as(i64, 2), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.all synthesizes a failure slot for a worker that errors before writing" {
+    // The erroring worker triggers log.warn("coroutine errored: ...") at
+    // LuaEngine.zig:3678 via std.log.scoped(.lua). The unit-test binary uses
+    // Zig's default log handler (not main.zig's file_log.handler), so without
+    // this gate the warning leaks to stderr. Suppress it to keep test output
+    // pristine -- the warning is intentional (the slot-nil synthesis only fires
+    // because the coroutine errored). Matches the repo's established pattern.
+    std.testing.log_level = .err;
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // The second worker raises a Lua error before assigning its results slot.
+    // resumeTask catches it (LuaEngine.zig:3676), retires the task WITHOUT
+    // writing the slot, and the joiner's `results[i] == nil` branch synthesizes
+    // { value = nil, err = "cancelled" } (combinators.lua:52-57). The "cancelled"
+    // text is the fallback even though the worker ERRORED (join reports no cancel
+    // error); pinning this misleading-but-current label is intentional --
+    // renaming it is a deliberate future decision, not a test bug.
+    try eng.lua.doString(
+        \\function test_all_err()
+        \\  local r = zag.all({
+        \\    function() return "ok", nil end,
+        \\    function() error("boom") end,
+        \\  })
+        \\  _ae_v1 = r[1].value
+        \\  _ae_e1_is_nil = (r[1].err == nil)
+        \\  _ae_v2_is_nil = (r[2].value == nil)
+        \\  _ae_e2 = r[2].err
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_all_err");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_ae_v1");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "ok"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ae_e1_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ae_v2_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ae_e2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "cancelled"));
+    eng.lua.pop(1);
+}
+
+test "zag.workflow.parallel synthesis keeps slots aligned across the window refill" {
+    // Same expected "coroutine errored" warning as the zag.all twin above:
+    // gate it to .err so the intentional warning does not leak to stderr.
+    std.testing.log_level = .err;
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // Same slot-nil synthesis path, but through run_windowed (combinators.lua:
+    // 183-194) under a cap below the worker count, so the erroring worker (slot
+    // 2) sits in the middle of a sliding-window refill. The synthesized failure
+    // slot must still land at index 2 with the surviving workers in slots 1/3 --
+    // proving the window's join/refill bookkeeping preserves input alignment when
+    // a worker never writes its slot.
+    try eng.lua.doString(
+        \\function test_parallel_err()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  local r = zag.workflow.parallel({
+        \\    function() zag.sleep(5); return "one", nil end,
+        \\    function() error("boom") end,
+        \\    function() zag.sleep(5); return "three", nil end,
+        \\  })
+        \\  _pe_count = #r
+        \\  _pe_v1 = r[1].value
+        \\  _pe_v2_is_nil = (r[2].value == nil)
+        \\  _pe_e2 = r[2].err
+        \\  _pe_v3 = r[3].value
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_parallel_err");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_pe_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_v1");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "one"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_v2_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_e2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "cancelled"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_v3");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "three"));
+    eng.lua.pop(1);
 }
 
 test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {

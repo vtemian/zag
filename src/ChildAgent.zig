@@ -242,8 +242,12 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
 }
 
 /// Join the agent thread + tear down ChildAgent-owned state. Idempotent via
-/// the `retired` latch. MUST run on the main thread, AFTER the agent thread
-/// is joined (the registry drain joins it). Teardown order matches the old
+/// the `retired` latch. MUST run AFTER the child's agent thread is joined
+/// (the registry drain joins it in workflow mode; the park-mode `task` tool's
+/// drain/park does before its worker-thread `defer` runs). Makes no Lua/VM
+/// calls, so it is NOT pinned to the main thread — keep it that way: adding
+/// any main-thread-only op here would break the park-mode path. Teardown
+/// order matches the old
 /// `runChild` defer order (deepest first): `child_runner.deinit()` first
 /// (joins the thread, frees the wire arena + queue via the per-payload
 /// `freeOwned` path — no cross-allocator free), then `child_sink.deinit()`,
