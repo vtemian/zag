@@ -1,0 +1,27 @@
+# Cache seed: the first half of the ordered pair that proves MCP direct tools.
+# Burns one real LLM turn. This is the mcp_tool_use happy-path flow (model
+# drives the `mcp` proxy, which lazy-connects to fake-mcp.sh and round-trips
+# get_token) -- but pinned to a dedicated fixture HOME that the direct half
+# reuses. The side effect that matters: ensure_connected_and_fresh persists
+# fake's tool metadata to $HOME/.cache/zag/mcp-metadata.json via cache_put.
+#
+# This half WIPES its HOME fresh at start (no ZAG_SIM_MCP_KEEP_HOME), so the
+# cache reflects exactly this run. mcp_direct_tools.zsm then runs with
+# ZAG_SIM_MCP_KEEP_HOME=1 against the SAME HOME, inheriting that cache.
+#
+# config_hash (the cache key) is over the server `command` argv only, so both
+# halves must use the default fake-mcp.sh (no ZAG_SIM_MCP_SERVER override) for
+# the direct half to find a valid cache entry.
+#
+# Anchors on the magic token, which appears in NO prompt: a match proves the
+# real round-trip happened and (therefore) the cache got written.
+
+set env ZAG_SIM_MCP_HOME=/tmp/zag-sim-mcp-direct-home
+spawn ./src/sim/scenarios/testdata/mcp_launch.sh
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Use the mcp tool to call the MCP tool named get_token on the server named fake (call it as mcp with server set to fake and tool set to get_token and args set to {}). Then print the tool's exact output verbatim in your reply." <Enter>
+wait_text /zag-mcp-token-7Q3/ 90s
+snapshot seed_final
+send "/quit" <Enter>
+wait_exit

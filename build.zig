@@ -146,6 +146,8 @@ pub fn build(b: *std.Build) void {
                     "src/sim/scenarios/multi_turn_context.zsm",
                     "src/sim/scenarios/mid_turn_interrupt.zsm",
                     "src/sim/scenarios/mcp_tool_use.zsm",
+                    "src/sim/scenarios/mcp_command_status.zsm",
+                    "src/sim/scenarios/mcp_server_death.zsm",
                 };
                 var prev_step: *std.Build.Step = b.getInstallStep();
                 for (independent_scenarios) |path| {
@@ -163,7 +165,17 @@ pub fn build(b: *std.Build) void {
                 const last_cmd = b.addRunArtifact(sim_exe);
                 last_cmd.addArgs(&.{ "run", "src/sim/scenarios/resume_last.zsm" });
                 last_cmd.step.dependOn(&seed_cmd.step);
-                sim_e2e_step.dependOn(&last_cmd.step);
+
+                // mcp_cache_seed must run before mcp_direct_tools (same fixture
+                // HOME: the seed writes the metadata cache, the direct half
+                // reads it). Chain them on top of the resume pair.
+                const mcp_seed_cmd = b.addRunArtifact(sim_exe);
+                mcp_seed_cmd.addArgs(&.{ "run", "src/sim/scenarios/mcp_cache_seed.zsm" });
+                mcp_seed_cmd.step.dependOn(&last_cmd.step);
+                const mcp_direct_cmd = b.addRunArtifact(sim_exe);
+                mcp_direct_cmd.addArgs(&.{ "run", "src/sim/scenarios/mcp_direct_tools.zsm" });
+                mcp_direct_cmd.step.dependOn(&mcp_seed_cmd.step);
+                sim_e2e_step.dependOn(&mcp_direct_cmd.step);
             }
         }
     }

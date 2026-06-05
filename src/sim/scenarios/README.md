@@ -38,6 +38,32 @@ parser, tool dispatch, conversation history, slash commands).
 | `slash_quit.zsm`                | `/quit` exits cleanly, zero LLM cost |
 | `resume_seed.zsm`               | Plants a deterministic seed message and quits (writes a session) |
 | `resume_last.zsm`               | `zag --last` re-renders the seed message; run right after `resume_seed.zsm` |
+| `mcp_tool_use.zsm`              | Model drives the `mcp` proxy; stdio JSON-RPC round-trip surfaces a magic token |
+| `mcp_command_status.zsm`       | `/mcp` status + `.mcp.json` auto-merge; deterministic, no LLM (see note below) |
+| `mcp_cache_seed.zsm`           | Proxy call writes the metadata cache; first half of the direct-tools pair |
+| `mcp_direct_tools.zsm`         | Cached server registers its tool as first-class; run right after `mcp_cache_seed.zsm` |
+| `mcp_server_death.zsm`         | Server EOFs mid `tools/call`; the error surfaces to the model, zag stays up |
+
+### MCP fixtures
+
+The MCP scenarios share one parameterized launcher,
+`testdata/mcp_launch.sh`, which builds a throwaway fixture HOME (real
+config.lua `dofile`'d for provider/auth, plus stdio MCP server(s) backed by
+`testdata/fake-mcp.sh`). Behaviour is selected via env vars set in each `.zsm`
+before `spawn`: `ZAG_SIM_MCP_HOME` (fixture HOME root),
+`ZAG_SIM_MCP_KEEP_HOME` (preserve the cache across the seed -> direct pair),
+`ZAG_SIM_MCP_SERVER` (swap in a server variant, e.g. `fake-mcp-die.sh`),
+`ZAG_SIM_MCP_DIRECT` (set `direct_tools = true`), and `ZAG_SIM_MCP_PROJECT_DIR`
+(a project dir with a `.mcp.json` declaring a second server, cd'd into before
+exec). See the launcher header for the full contract.
+
+> **Note on `/mcp` output.** `zag.notify` (the channel `/mcp` uses) routes to
+> the file log, not the conversation grid, so `mcp_command_status.zsm` cannot
+> `wait_text` on the status header / server names. It asserts the command runs
+> and the TUI survives; the `MCP: N/2 servers` header and the `fake` + `jsonsrv`
+> names are verified by inspecting `$ZAG_SIM_MCP_HOME/.zag/logs/<uuid>.log`
+> post-run. Likewise `mcp_direct_tools.zsm` proves the direct (non-proxy) path
+> by checking that `session.jsonl`'s `tool_name` is `get_token`, not `mcp`.
 
 ## Conventions
 
