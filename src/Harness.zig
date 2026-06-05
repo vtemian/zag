@@ -507,8 +507,45 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     var capture = Trajectory.Capture.init(gpa);
     defer capture.deinit();
 
-    const started_at = clock.milliTimestamp();
-    try capture.beginTurn(started_at);
+    // One captured turn per LLM round-trip. The turn opens lazily on the
+    // first streamed content event (text/thinking delta or a streaming-preview
+    // tool_start) and closes on the `.llm_done` event with that call's real
+    // metrics. Executed tool calls and their results arrive after the turn
+    // closes and attach to the just-closed turn (see `Capture.addToolCall`).
+    var turn_open = false;
+    const ensureTurnOpen = struct {
+        fn open(cap: *Trajectory.Capture, open_flag: *bool) void {
+            if (open_flag.*) return;
+            cap.beginTurn(clock.milliTimestamp()) catch |err| {
+                log.warn("capture beginTurn failed: {s}", .{@errorName(err)});
+                return;
+            };
+            open_flag.* = true;
+        }
+    }.open;
+    // Close the open turn with ATIF metrics derived from one LLM call's
+    // authoritative usage: prompt/cached tokens mapped per the model's cache
+    // wire semantics, completion tokens straight from the call, cost looked up
+    // from the rate card (null when the model is unknown).
+    const closeTurnWithUsage = struct {
+        fn close(
+            cap: *Trajectory.Capture,
+            registry: *const llm.Registry,
+            model_id: []const u8,
+            usage: llm.Usage,
+        ) void {
+            const overlaps = llm.cost.cachedOverlapsInput(registry, model_id);
+            const tokens = llm.cost.atifTokenCounts(usage, overlaps);
+            cap.endTurn(.{
+                .prompt_tokens = tokens.prompt_tokens,
+                .completion_tokens = usage.output_tokens,
+                .cached_tokens = tokens.cached_tokens,
+                .cost_usd = llm.cost.estimateCost(registry, model_id, usage),
+            }) catch |err| {
+                log.warn("capture endTurn failed: {s}", .{@errorName(err)});
+            };
+        }
+    }.close;
 
     const spec = llm.resolveModelSpec(deps.endpoint_registry, deps.model_id);
     try deps.runner.submit(.{
@@ -528,16 +565,6 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     // free back through the arena (a no-op; the bytes are reclaimed at
     // arena.deinit) and never through `gpa`, where it would be cross-
     // allocator UB the DebugAllocator aborts on as "Invalid free".
-
-    // Synthetic ids for tool_start events without a provider-assigned call_id
-    // (streaming previews). FIFO-correlated with tool_result events that also
-    // lack an id.
-    var synth_counter: u32 = 0;
-    var pending_synth: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (pending_synth.items) |id| gpa.free(id);
-        pending_synth.deinit(gpa);
-    }
 
     var agent_err: ?[]const u8 = null;
     defer if (agent_err) |e| gpa.free(e);
@@ -594,6 +621,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
             switch (ev) {
                 .text_delta => |t| {
                     defer t.free();
+                    ensureTurnOpen(&capture, &turn_open);
                     capture.addTextDelta(t.bytes) catch |err| {
                         log.warn("capture dropped text delta: {s}", .{@errorName(err)});
                     };
@@ -609,23 +637,20 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                         if (s.call_id) |id| id.free();
                         if (s.input_raw) |raw| raw.free();
                     }
-                    const args_json = if (s.input_raw) |raw| raw.bytes else "{}";
-                    const tool_id = if (s.call_id) |id| id.bytes else blk: {
-                        synth_counter += 1;
-                        var buf: [16]u8 = undefined;
-                        const synth = std.fmt.bufPrint(&buf, "t{d}", .{synth_counter}) catch "t?";
-                        const owned = gpa.dupe(u8, synth) catch {
-                            break :blk "t?";
+                    // A streaming preview (null call_id, no assembled arguments)
+                    // only signals that the current round-trip produced content,
+                    // so it just opens the turn. The executed call (real
+                    // provider id + arguments) is the one recorded; it arrives
+                    // after `.llm_done` closes the turn and so attaches to the
+                    // just-closed turn via `Capture.addToolCall`.
+                    if (s.call_id) |id| {
+                        const args_json = if (s.input_raw) |raw| raw.bytes else "{}";
+                        capture.addToolCall(id.bytes, s.name.bytes, args_json) catch |err| {
+                            log.warn("capture dropped tool call: {s}", .{@errorName(err)});
                         };
-                        pending_synth.append(gpa, owned) catch {
-                            gpa.free(owned);
-                            break :blk "t?";
-                        };
-                        break :blk owned;
-                    };
-                    capture.addToolCall(tool_id, s.name.bytes, args_json) catch |err| {
-                        log.warn("capture dropped tool call: {s}", .{@errorName(err)});
-                    };
+                    } else {
+                        ensureTurnOpen(&capture, &turn_open);
+                    }
                 },
                 .tool_result => |r| {
                     // tool_result is always duped on the runner GPA by
@@ -635,19 +660,11 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                         r.content.free();
                         if (r.call_id) |id| id.free();
                     }
-                    // FIFO-match null-id results against the oldest outstanding
-                    // synthetic id. Parallel calls without provider ids
-                    // collapse to best-effort correlation. `Capture.addToolResult`
-                    // dupes the id string into its arena, so we free the synth
-                    // owner after the call returns.
-                    var synth_owned: ?[]const u8 = null;
-                    defer if (synth_owned) |id| gpa.free(id);
-                    const tool_id = if (r.call_id) |id| id.bytes else blk: {
-                        if (pending_synth.items.len == 0) break :blk "";
-                        const id = pending_synth.orderedRemove(0);
-                        synth_owned = id;
-                        break :blk id;
-                    };
+                    // Executed tool results always carry the provider call_id;
+                    // `Capture.addToolResult` pairs it to the matching tool_call
+                    // in the just-closed turn. An absent id leaves the result
+                    // uncorrelated rather than crashing.
+                    const tool_id = if (r.call_id) |id| id.bytes else "";
                     capture.addToolResult(tool_id, r.content.bytes, r.is_error) catch |err| {
                         log.warn("capture dropped tool result: {s}", .{@errorName(err)});
                     };
@@ -656,19 +673,57 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     defer text.free();
                 },
                 .usage => {
-                    // Live output-token counter for the interactive working
-                    // line; headless eval captures the authoritative total
-                    // from the final response, so nothing to do here.
+                    // Drives the interactive TUI's live output-token counter
+                    // only. Headless per-step metrics ride the authoritative
+                    // `.llm_done` event instead (this `.usage` payload carries
+                    // output tokens alone), so nothing to do here.
                 },
-                .llm_done => {
-                    // Authoritative per-call usage. Headless trajectory
-                    // metrics wiring lands in a later task; no-op for now.
+                .llm_done => |u| {
+                    // One LLM round-trip completed; close its turn with the
+                    // authoritative usage. A mid-stream cancel or abort returns
+                    // a zero-count response: when every field is zero there is
+                    // nothing real to record.
+                    const has_usage = u.input_tokens > 0 or u.output_tokens > 0 or
+                        u.cache_creation_tokens > 0 or u.cache_read_tokens > 0;
+                    const usage: llm.Usage = .{
+                        .input_tokens = u.input_tokens,
+                        .output_tokens = u.output_tokens,
+                        .cache_creation_tokens = u.cache_creation_tokens,
+                        .cache_read_tokens = u.cache_read_tokens,
+                    };
+                    if (turn_open) {
+                        if (has_usage) {
+                            closeTurnWithUsage(&capture, deps.endpoint_registry, deps.model_id, usage);
+                        } else {
+                            capture.endTurn(null) catch |err| {
+                                log.warn("capture endTurn failed: {s}", .{@errorName(err)});
+                            };
+                        }
+                        turn_open = false;
+                    } else if (has_usage) {
+                        // A real call that streamed no content (e.g. an
+                        // immediate tool_use with no prose) still completed an
+                        // inference, so open-then-close keeps agent steps
+                        // aligned with LLM calls. An all-zero call produced
+                        // nothing real; skip it rather than fabricate a step.
+                        ensureTurnOpen(&capture, &turn_open);
+                        if (turn_open) {
+                            closeTurnWithUsage(&capture, deps.endpoint_registry, deps.model_id, usage);
+                            turn_open = false;
+                        }
+                    }
                 },
                 .done => {
-                    const metrics: Trajectory.TurnMetrics = .{};
-                    capture.endTurn(metrics) catch |err| {
-                        log.warn("capture endTurn failed: {s}", .{@errorName(err)});
-                    };
+                    // `.llm_done` already closed the last round-trip's turn
+                    // with real metrics. Close a still-open turn (a final call
+                    // that streamed content but emitted no `.llm_done`) without
+                    // fabricated metrics so the step carries no `metrics` key.
+                    if (turn_open) {
+                        capture.endTurn(null) catch |err| {
+                            log.warn("capture endTurn failed: {s}", .{@errorName(err)});
+                        };
+                        turn_open = false;
+                    }
                     for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned();
                     if (deps.runner.agent_thread) |t| t.join();
                     deps.runner.agent_thread = null;
@@ -681,7 +736,13 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     agent_err = gpa.dupe(u8, text.bytes) catch null;
                     text.free();
                     for (drain_buf[idx + 1 .. count]) |tail| tail.freeOwned();
-                    capture.endTurn(.{}) catch {};
+                    // An error-closed turn carries no real metrics; `null`
+                    // leaves the step's `metrics` key absent rather than
+                    // emitting fabricated zeros.
+                    if (turn_open) {
+                        capture.endTurn(null) catch {};
+                        turn_open = false;
+                    }
                     if (deps.runner.agent_thread) |t| t.join();
                     deps.runner.agent_thread = null;
                     deps.runner.event_queue.deinit();
@@ -712,6 +773,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                 },
                 .thinking_delta => |td| {
                     defer td.text.free();
+                    ensureTurnOpen(&capture, &turn_open);
                     capture.addThinkingDelta(td.text.bytes) catch |err| {
                         log.warn("capture dropped thinking delta: {s}", .{@errorName(err)});
                     };
