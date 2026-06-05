@@ -505,6 +505,7 @@ fn threadMain(
     var detail = llm.error_detail.ErrorDetail.init(allocator);
     defer detail.deinit();
 
+    var loop_errored = false;
     agent.runLoopStreaming(
         messages,
         registry,
@@ -520,6 +521,7 @@ fn threadMain(
         &detail,
         output_schema,
     ) catch |err| {
+        loop_errored = true;
         // The message sits in the queue until drained; allocate owned
         // bytes. On an allocation failure the drop is recorded on the
         // queue counter and `.done` is still pushed so the UI returns to
@@ -533,6 +535,29 @@ fn threadMain(
         // it to that allocator for the queue's self-owning free path.
         queue.tryPush(.{ .err = .{ .bytes = message, .allocator = allocator } });
     };
+
+    // A child cancelled between turns returns CLEANLY from the loop (the
+    // agent.zig top-of-turn check returns void), so no `.err` event marks
+    // the cancellation and every tree-tail consumer (ChildAgent.result,
+    // SubagentEnd, the subagent_link wire projection) reads the run as a
+    // successful empty result. Push the same `.err` shape the mid-stream
+    // cancel path produces so the child's tree stays the single
+    // cancellation truth. Children only: the top-level runner
+    // (task_depth == 0) keeps its silent Ctrl+C contract (clean `.done` ->
+    // idle, no failed status, no error node). Accepted race: a child that
+    // finishes its work in the same instant cancel lands is reported
+    // cancelled; the window is microseconds and the parent did ask to
+    // cancel.
+    const is_child = if (task_ctx) |tc| tc.task_depth > 0 else false;
+    if (!loop_errored and is_child and cancel.load(.acquire)) {
+        if (formatAgentErrorMessage(error.Cancelled, model_spec.provider_name, allocator, &detail)) |message| {
+            queue.tryPush(.{ .err = .{ .bytes = message, .allocator = allocator } });
+        } else |_| {
+            // OOM: mirror the catch arm's drop-and-continue. The `.done`
+            // below still fires so the run does not hang.
+            _ = queue.dropped.fetchAdd(1, .monotonic);
+        }
+    }
     // Status transitions are announced from the main-thread drain arms
     // (`.err` -> failed, `.done` -> idle) where the Lua VM lives. The
     // agent thread must never fire a hook itself: Lua is pinned to the
