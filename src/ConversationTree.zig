@@ -135,6 +135,17 @@ pub const Node = struct {
     /// when no id was supplied or the backward scan found no match
     /// (graceful: a resumed/legacy tree renders ungrouped).
     spawning_tool_node: ?*Node = null,
+    /// Type-erased back-pointer to the Conversation that owns this
+    /// `.tool_call` node, stamped onto a `workflow` tool_call the first
+    /// time a subagent is linked to it (see `Conversation.spawnSubagentLinked`).
+    /// The workflow header renderer casts it back to `*const Conversation`
+    /// to scan `root_children` for the link nodes pointing at this node and
+    /// derive the live N/M done count. Borrowed, NOT freed: the Conversation
+    /// outlives its own tree. Null on tool_calls with no linked children
+    /// (the header renders its plain, unchanged form). Stored as
+    /// `*anyopaque` so ConversationTree avoids a circular import on
+    /// Conversation, mirroring `subagent_parent`.
+    workflow_owner: ?*const anyopaque = null,
 
     /// Release all memory owned by this node and its descendants. The
     /// buffer-level `NodeLineCache` owns any cached spans keyed by this

@@ -1343,8 +1343,16 @@ pub fn spawnSubagentLinked(
         // Resolve the spawning tool_call node by scanning the root children
         // backwards: the orchestrating `workflow` (or `task`) call is the most
         // recent root tool_call carrying this id. The pointer is borrowed; it
-        // lives until the tree deinits.
+        // lives until the tree deinits. When two tool_calls share an id the
+        // reverse scan resolves to the most recent (BufferSink overwrite
+        // semantics); attribution follows that most-recent call by design.
         node.spawning_tool_node = self.findToolCallByIdReverse(id);
+        // Stamp the owning Conversation onto the spawning tool_call so its
+        // header renderer can scan our `root_children` for the link nodes
+        // grouped under it. Borrowed; the Conversation outlives its tree.
+        if (node.spawning_tool_node) |tool_node| {
+            tool_node.workflow_owner = @ptrCast(self);
+        }
     }
     // Type-erased back-pointer so NodeRenderer can resolve the child
     // by index without ConversationTree pulling in Conversation as a
@@ -1394,6 +1402,16 @@ fn notifyChildChanged(self: *Conversation) void {
             link_node.markDirty();
             p.tree.dirty_nodes.push(link_node.id);
             p.tree.generation +%= 1;
+            // The workflow tool_call that spawned this link renders a live
+            // "N/M done" header derived from the link's child state. The
+            // header is cached by (node.id, content_version), so a child
+            // mutation that does not bump the workflow node leaves the count
+            // stale forever. Bump it on the same trio as the link node.
+            if (link_node.spawning_tool_node) |workflow_node| {
+                workflow_node.markDirty();
+                p.tree.dirty_nodes.push(workflow_node.id);
+                p.tree.generation +%= 1;
+            }
         }
         current = p;
     }
@@ -3269,6 +3287,29 @@ test "spawnSubagentLinked stamps the spawning tool_use_id and resolves the workf
     try std.testing.expectEqualStrings("wf_abc", link_node.spawning_tool_use_id.?);
     // The backward scan resolved the workflow node by matching tool_use_id.
     try std.testing.expectEqual(wf, link_node.spawning_tool_node.?);
+    // The workflow node also gained the owning-Conversation backpointer the
+    // header renderer scans `root_children` through.
+    try std.testing.expect(wf.workflow_owner != null);
+}
+
+test "child mutation bumps the spawning workflow node's content_version" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    const wf = try conv.appendToolCallNode(null, "workflow", "wf_abc", "{\"script\":\"...\"}");
+    const child = try conv.spawnSubagentLinked("scout", "go", "wf_abc");
+    const link_node = conv.tree.root_children.items[1];
+
+    const wf_before = wf.content_version;
+    const link_before = link_node.content_version;
+
+    // A write into the child's tree must invalidate BOTH the link node (its
+    // status line) AND the workflow node (its live N/M done header); without
+    // the workflow bump the cached header serves a stale count forever.
+    _ = try child.appendNode(null, .assistant_text, "done");
+
+    try std.testing.expectEqual(link_before +% 1, link_node.content_version);
+    try std.testing.expectEqual(wf_before +% 1, wf.content_version);
 }
 
 test "spawnSubagentLinked with a null id leaves both stamps null" {

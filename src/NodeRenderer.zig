@@ -612,16 +612,19 @@ fn firstJsonStringValue(value: std.json.Value) []const u8 {
     return "";
 }
 
-/// Emit a `Name(arg)` tool-call header line. The leading bullet is supplied
-/// by the gutter at composite time; this is the label only. The composed
-/// label is duped into `allocator` and flagged `owned` so the cache (or
-/// test cleanup) frees it when the line is dropped.
+/// Emit a `Name(arg)<suffix>` tool-call header line. The leading bullet is
+/// supplied by the gutter at composite time; this is the label only. The
+/// composed label is duped into `allocator` and flagged `owned` so the cache
+/// (or test cleanup) frees it when the line is dropped. `suffix` is appended
+/// after the closing paren (e.g. the workflow ` 2/4 done` count); pass `""`
+/// for the plain `Name(arg)` header.
 fn appendToolHeader(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
     name: []const u8,
     arg: []const u8,
+    suffix: []const u8,
 ) !void {
     const accent = theme.highlights.tool_call;
     var label: std.ArrayList(u8) = .empty;
@@ -634,6 +637,7 @@ fn appendToolHeader(
     try label.append(allocator, '(');
     try label.appendSlice(allocator, arg);
     try label.append(allocator, ')');
+    try label.appendSlice(allocator, suffix);
     const owned = try allocator.dupe(u8, label.items);
     const spans = try allocator.alloc(StyledSpan, 1);
     spans[0] = .{ .text = owned, .style = accent, .owned = true };
@@ -723,7 +727,7 @@ fn renderEditBlock(
     const old_text = jsonString(root, "old_text") orelse "";
     const new_text = jsonString(root, "new_text") orelse "";
 
-    try appendToolHeader(lines, allocator, theme, "edit", path);
+    try appendToolHeader(lines, allocator, theme, "edit", path, "");
 
     const remove_style = theme.highlights.diff_remove;
     const add_style = theme.highlights.diff_add;
@@ -743,7 +747,7 @@ fn renderWriteBlock(
     const path = jsonString(root, "path") orelse return false;
     const content = jsonString(root, "content") orelse "";
 
-    try appendToolHeader(lines, allocator, theme, "write", path);
+    try appendToolHeader(lines, allocator, theme, "write", path, "");
 
     var body_index: usize = 0;
     _ = try appendMarkedLines(
@@ -770,7 +774,7 @@ fn renderBashBlock(
 ) !bool {
     const cmd = jsonString(root, "command") orelse return false;
 
-    try appendToolHeader(lines, allocator, theme, "bash", cmd);
+    try appendToolHeader(lines, allocator, theme, "bash", cmd, "");
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
@@ -802,7 +806,7 @@ fn renderReadBlock(
 ) !bool {
     const path = jsonString(root, "path") orelse return false;
 
-    try appendToolHeader(lines, allocator, theme, "read", path);
+    try appendToolHeader(lines, allocator, theme, "read", path, "");
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
@@ -824,9 +828,53 @@ fn renderReadBlock(
     return true;
 }
 
+/// Finished/total counts of the subagents a `workflow` tool_call spawned.
+/// `total` is the number of `subagent_link` nodes in the owning
+/// Conversation's `root_children` whose `spawning_tool_node` is this node;
+/// `done` is how many of those have finished (status `done` or `failed`).
+/// Returns null when the node carries no `workflow_owner` (no linked
+/// children), so the header renders its plain, unchanged form.
+///
+/// Once the workflow tool_call has its own `tool_result` child the call has
+/// returned, so every linked child is final: `done` is forced to `total`.
+const WorkflowDoneCounts = struct { done: usize, total: usize };
+
+fn workflowDoneCounts(node: *const Node) ?WorkflowDoneCounts {
+    const owner_opaque = node.workflow_owner orelse return null;
+    const owner: *const Conversation = @ptrCast(@alignCast(owner_opaque));
+
+    var total: usize = 0;
+    var done: usize = 0;
+    for (owner.tree.root_children.items) |link| {
+        if (link.node_type != .subagent_link) continue;
+        const spawn = link.spawning_tool_node orelse continue;
+        if (spawn != node) continue;
+        total += 1;
+        const status = subagentStatus(link);
+        if (std.mem.eql(u8, status, "done") or std.mem.eql(u8, status, "failed")) {
+            done += 1;
+        }
+    }
+    if (total == 0) return null;
+
+    // The workflow call's own tool_result means the call returned; all
+    // linked children are accounted final regardless of their tail tick.
+    for (node.children.items) |child| {
+        if (child.node_type == .tool_result) {
+            done = total;
+            break;
+        }
+    }
+    return .{ .done = done, .total = total };
+}
+
 /// Render a `workflow` tool call as a foldable Lua code block. The header
 /// reports the script length (`Workflow(N lines)`) rather than the script
-/// text, so the generic `firstJsonStringValue` flattening never runs.
+/// text, so the generic `firstJsonStringValue` flattening never runs. When
+/// the call has linked children the header gains a live ` X/M done` suffix
+/// (`Workflow(12 lines) 2/4 done`), computed at render time from the link
+/// nodes grouped under this node. The suffix only changes the header TEXT,
+/// not the line count, so the lockstep with `richToolCallLineCount` holds.
 ///
 /// Collapsed: header plus one fold hint naming the hidden script lines.
 /// Expanded: header plus one `md_code_block`-styled line per script source
@@ -844,7 +892,14 @@ fn renderWorkflowBlock(
 
     const arg = try std.fmt.allocPrint(allocator, "{d} lines", .{script_lines});
     defer allocator.free(arg);
-    try appendToolHeader(lines, allocator, theme, "workflow", arg);
+    // Live ` X/M done` suffix when this call has linked children. Empty
+    // otherwise, so the header reads `Workflow(N lines)` unchanged.
+    var suffix_buf: [64]u8 = undefined;
+    const suffix: []const u8 = if (workflowDoneCounts(node)) |counts|
+        std.fmt.bufPrint(&suffix_buf, " {d}/{d} done", .{ counts.done, counts.total }) catch ""
+    else
+        "";
+    try appendToolHeader(lines, allocator, theme, "workflow", arg, suffix);
 
     if (node.collapsed) {
         try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, script_lines, theme, 0);
@@ -939,7 +994,7 @@ fn renderDefault(
                     null;
                 defer if (parsed) |*p| p.deinit();
                 const arg: []const u8 = if (parsed) |p| firstJsonStringValue(p.value) else "";
-                try appendToolHeader(lines, allocator, theme, content, arg);
+                try appendToolHeader(lines, allocator, theme, content, arg, "");
             }
             const hidden = hiddenToolResultLineCount(node, registry);
             if (hidden == 0) return;
@@ -1916,5 +1971,120 @@ test "workflow tool_call over 16KiB keeps line count and render in lockstep" {
 
         try std.testing.expectEqual(@as(usize, 1 + line_count), lines.items.len);
         try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+    }
+}
+
+/// Render `node` (a workflow tool_call) and return the header line's text.
+/// Caller frees the returned slice. Also asserts the header is exactly one
+/// line and that the rendered line count matches `lineCountForNode` (the
+/// lockstep invariant: the done-count suffix changes only text, not lines).
+fn renderWorkflowHeaderText(
+    cb: *@import("Conversation.zig"),
+    node: *const Node,
+    theme: *const Theme,
+    allocator: Allocator,
+) ![]const u8 {
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(node, &lines, allocator, theme, &cb.buffer_registry);
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+    return lines.items[0].toText(allocator);
+}
+
+test "workflow header shows live N/M done as linked children finish" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    // A collapsed workflow tool_call (header is the only line that carries
+    // the count) plus two children linked to it by its tool_use_id.
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    const child_a = try cb.spawnSubagentLinked("childA", "", "wf1");
+    const child_b = try cb.spawnSubagentLinked("childB", "", "wf1");
+    // Both links resolved this workflow node and stamped its owner.
+    try std.testing.expect(wf.workflow_owner != null);
+
+    const theme = Theme.defaultTheme();
+
+    // Both children `ready` -> 0/2 done.
+    {
+        const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2 lines) 0/2 done", header);
+    }
+
+    // Drive child A to `done` (tail is assistant_text) -> 1/2 done.
+    _ = try child_a.appendNode(null, .assistant_text, "done A");
+    {
+        const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2 lines) 1/2 done", header);
+    }
+
+    // Drive child B to `failed` (tail is err) -> 2/2 done (failed counts).
+    _ = try child_b.appendNode(null, .err, "boom B");
+    {
+        const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2 lines) 2/2 done", header);
+    }
+}
+
+test "workflow header reads M/M done once the workflow tool_result lands" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+
+    const theme = Theme.defaultTheme();
+
+    // No child finished, but the workflow call returned: all children final.
+    _ = try cb.appendNode(wf, .tool_result, "workflow complete");
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines) 2/2 done", header);
+}
+
+test "workflow header unchanged when no children are linked" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    // No spawnSubagentLinked: workflow_owner stays null.
+    try std.testing.expect(wf.workflow_owner == null);
+
+    const theme = Theme.defaultTheme();
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines)", header);
+}
+
+test "workflow header re-render with markDirty between leaks nothing" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+
+    const theme = Theme.defaultTheme();
+    // The done-count suffix is synthesized into an owned span; render twice
+    // (with a dirty bump between) and free each pass to catch a leak.
+    inline for (0..2) |_| {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(wf, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+        wf.markDirty();
     }
 }
