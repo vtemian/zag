@@ -7362,6 +7362,300 @@ test "zag.workflow.pipeline threads stage outputs and respects the cap" {
     try std.testing.expect(hwm <= 2);
 }
 
+test "zag.race on empty input returns (nil, 'empty', nil)" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Empty input short-circuits before any spawn: the early-return arm at
+    // combinators.lua:68. No worker, no pump iterations, no tasks.
+    try eng.lua.doString(
+        \\function test_race_empty()
+        \\  local v, err, idx = zag.race({})
+        \\  _re_v_is_nil = (v == nil)
+        \\  _re_err = err
+        \\  _re_idx_is_nil = (idx == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_race_empty");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_re_v_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_re_err");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "empty"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_re_idx_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.race losers never overwrite the winner after they are cancelled" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // Fast worker (5ms) wins; the slow worker (600ms -- matching the jitter
+    // margin of the existing race test) is cancelled after the winner is known.
+    // Cancelling a SLEEPING worker does NOT kill it: the aborted sleep job
+    // resumes the coroutine with (nil, "cancelled"), so the loser's post-sleep
+    // body still runs to completion (documented behavior). _loser_ran proves
+    // that resume happened. The invariant under test is the winner GUARD at
+    // combinators.lua:80 (`if winner_idx == nil`): the resumed loser must not
+    // clobber the already-recorded winner value/index.
+    try eng.lua.doString(
+        \\function test_race_losers()
+        \\  _loser_ran = false
+        \\  local v, err, idx = zag.race({
+        \\    function() zag.sleep(5); return "fast" end,
+        \\    function() zag.sleep(600); _loser_ran = true; return "slow" end,
+        \\  })
+        \\  _rl_winner = v
+        \\  _rl_err_is_nil = (err == nil)
+        \\  _rl_idx = idx
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_race_losers");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    // The winner is unchanged despite the loser resuming and finishing.
+    _ = try eng.lua.getGlobal("_rl_winner");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "fast"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_rl_err_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_rl_idx");
+    try std.testing.expectEqual(@as(i64, 1), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    // The loser DID run after its sleep was aborted (resume-on-cancel), but the
+    // winner guard kept its return from overwriting the winner above.
+    _ = try eng.lua.getGlobal("_loser_ran");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.workflow.pipeline short-circuits an item on a stage error" {
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // Item 2's stage 1 returns (nil, "boom"): the per-item loop records the
+    // error and breaks, so stage 2 must NOT run for item 2 (the short-circuit
+    // at combinators.lua:229-232). _stage2_runs counts stage-2 invocations and
+    // must be 2 (items 1 and 3 only). Slots stay input-aligned: r[1].value=11,
+    // r[2]={nil, "boom"}, r[3].value=31. Run under cap=2 so the short-circuit
+    // is exercised across the sliding-window refill, not just a single batch.
+    try eng.lua.doString(
+        \\function test_pipeline_err()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  _stage2_runs = 0
+        \\  local stage1 = function(x)
+        \\    if x == 2 then return nil, "boom" end
+        \\    return x * 10, nil
+        \\  end
+        \\  local stage2 = function(x)
+        \\    _stage2_runs = _stage2_runs + 1
+        \\    return x + 1, nil
+        \\  end
+        \\  local r = zag.workflow.pipeline({ 1, 2, 3 }, stage1, stage2)
+        \\  _ple_count = #r
+        \\  _ple_v1 = r[1].value
+        \\  _ple_e1_is_nil = (r[1].err == nil)
+        \\  _ple_v2_is_nil = (r[2].value == nil)
+        \\  _ple_e2 = r[2].err
+        \\  _ple_v3 = r[3].value
+        \\  _ple_e3_is_nil = (r[3].err == nil)
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_pipeline_err");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_ple_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_v1");
+    try std.testing.expectEqual(@as(i64, 11), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_e1_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_v2_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_e2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "boom"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_v3");
+    try std.testing.expectEqual(@as(i64, 31), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ple_e3_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    // Stage 2 ran for items 1 and 3 only; item 2 short-circuited.
+    _ = try eng.lua.getGlobal("_stage2_runs");
+    try std.testing.expectEqual(@as(i64, 2), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+}
+
+test "zag.all synthesizes a failure slot for a worker that errors before writing" {
+    // The erroring worker triggers log.warn("coroutine errored: ...") at
+    // LuaEngine.zig:3678 via std.log.scoped(.lua). The unit-test binary uses
+    // Zig's default log handler (not main.zig's file_log.handler), so without
+    // this gate the warning leaks to stderr. Suppress it to keep test output
+    // pristine -- the warning is intentional (the slot-nil synthesis only fires
+    // because the coroutine errored). Matches the repo's established pattern.
+    std.testing.log_level = .err;
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(2, 16);
+    defer eng.deinitAsync();
+
+    // The second worker raises a Lua error before assigning its results slot.
+    // resumeTask catches it (LuaEngine.zig:3676), retires the task WITHOUT
+    // writing the slot, and the joiner's `results[i] == nil` branch synthesizes
+    // { value = nil, err = "cancelled" } (combinators.lua:52-57). The "cancelled"
+    // text is the fallback even though the worker ERRORED (join reports no cancel
+    // error); pinning this misleading-but-current label is intentional --
+    // renaming it is a deliberate future decision, not a test bug.
+    try eng.lua.doString(
+        \\function test_all_err()
+        \\  local r = zag.all({
+        \\    function() return "ok", nil end,
+        \\    function() error("boom") end,
+        \\  })
+        \\  _ae_v1 = r[1].value
+        \\  _ae_e1_is_nil = (r[1].err == nil)
+        \\  _ae_v2_is_nil = (r[2].value == nil)
+        \\  _ae_e2 = r[2].err
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_all_err");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_ae_v1");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "ok"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ae_e1_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ae_v2_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_ae_e2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "cancelled"));
+    eng.lua.pop(1);
+}
+
+test "zag.workflow.parallel synthesis keeps slots aligned across the window refill" {
+    // Same expected "coroutine errored" warning as the zag.all twin above:
+    // gate it to .err so the intentional warning does not leak to stderr.
+    std.testing.log_level = .err;
+    var eng = try LuaEngine.init(std.testing.allocator);
+    defer eng.deinit();
+    eng.storeSelfPointer();
+    try eng.initAsync(4, 32);
+    defer eng.deinitAsync();
+
+    // Same slot-nil synthesis path, but through run_windowed (combinators.lua:
+    // 183-194) under a cap below the worker count, so the erroring worker (slot
+    // 2) sits in the middle of a sliding-window refill. The synthesized failure
+    // slot must still land at index 2 with the surviving workers in slots 1/3 --
+    // proving the window's join/refill bookkeeping preserves input alignment when
+    // a worker never writes its slot.
+    try eng.lua.doString(
+        \\function test_parallel_err()
+        \\  zag.workflow.set_max_fanout(2)
+        \\  local r = zag.workflow.parallel({
+        \\    function() zag.sleep(5); return "one", nil end,
+        \\    function() error("boom") end,
+        \\    function() zag.sleep(5); return "three", nil end,
+        \\  })
+        \\  _pe_count = #r
+        \\  _pe_v1 = r[1].value
+        \\  _pe_v2_is_nil = (r[2].value == nil)
+        \\  _pe_e2 = r[2].err
+        \\  _pe_v3 = r[3].value
+        \\end
+    );
+    _ = try eng.lua.getGlobal("test_parallel_err");
+    _ = try eng.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 4000;
+    while (eng.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        if (eng.async_runtime.?.completions.pop()) |job| {
+            try eng.resumeFromJob(job);
+        } else {
+            clock.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), eng.tasks.count());
+
+    _ = try eng.lua.getGlobal("_pe_count");
+    try std.testing.expectEqual(@as(i64, 3), try eng.lua.toInteger(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_v1");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "one"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_v2_is_nil");
+    try std.testing.expect(eng.lua.toBoolean(-1));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_e2");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "cancelled"));
+    eng.lua.pop(1);
+    _ = try eng.lua.getGlobal("_pe_v3");
+    try std.testing.expect(std.mem.eql(u8, try eng.lua.toString(-1), "three"));
+    eng.lua.pop(1);
+}
+
 test "zag.cmd({/bin/echo,hello}) returns result table with stdout" {
     var eng = try LuaEngine.init(std.testing.allocator);
     defer eng.deinit();
