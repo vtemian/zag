@@ -3618,6 +3618,15 @@ pub const LuaEngine = struct {
                 completeLuaToolRequestOwned(req, msg, true);
                 task.lua_tool_request = null;
             }
+            // Same shape for a workflow-script coroutine: the model reads
+            // this tool result, and can only fix its script when the message
+            // names what broke (line numbers, the failing op). retireTask's
+            // generic arm then only covers cancellation and non-resume
+            // teardown.
+            if (task.workflow_request) |req| {
+                completeWorkflowRequestOwned(req, msg, true);
+                task.workflow_request = null;
+            }
             task.co.pop(1);
             self.retireTask(task);
             return;
@@ -3767,10 +3776,12 @@ pub const LuaEngine = struct {
 
         // A workflow-script coroutine reaching retire WITHOUT having captured
         // its return (normal completion nulls `workflow_request` first) means it
-        // is being torn down by a runtime error or cancellation. Complete the
-        // request with an error so the parked agent thread unwinds instead of
-        // hanging on `done`. The message distinguishes cancel from a Lua error
-        // (already logged by the resume-error branch).
+        // is being torn down by cancellation or a non-resume teardown path.
+        // A Lua runtime error never lands here: the resume-error branch in
+        // `resumeFromJob` completes the request with the actual error text
+        // (so the model can fix its script) and nulls the field. Complete
+        // with an error so the parked agent thread unwinds instead of
+        // hanging on `done`.
         if (task.workflow_request) |req| {
             const msg: []const u8 = if (was_cancelled) "cancelled" else "workflow script error";
             completeWorkflowRequestOwned(req, msg, true);
