@@ -1,6 +1,6 @@
 # /mcp status command, deterministic and LLM-free. Proves the .mcp.json
 # auto-merge, the /mcp command path, and the zag.detach status worker survive
-# end to end without crashing the TUI.
+# end to end, AND that the status text now reaches the grid as a toast.
 #
 # Setup (via the parameterized launcher): a fixture HOME plus a project dir
 # whose .mcp.json declares a SECOND server (jsonsrv, standard command-string +
@@ -8,27 +8,28 @@
 # project dir before exec'ing zag, so zag's cwd-relative .mcp.json read merges
 # jsonsrv on the first coroutine-context config load (which /mcp triggers).
 #
-# WHAT THIS SCENARIO CAN ASSERT ON THE GRID: only that the command ran and the
-# TUI survived. zag.notify (the channel /mcp uses for its status text) routes
-# to the file log, NOT the conversation grid -- there is no grid-visible
-# rendering of notify output today (LuaEngine.zagNotifyFn writes to the
-# .lua_user log scope; a future phase will push it to a compositor toast). The
-# probe-verified grid stays on the welcome screen after /mcp. So a wait_text on
-# "MCP: ", "jsonsrv", or "fake" against the grid would always time out, NOT
-# because the plumbing is broken but because the text never reaches the grid.
+# GRID-VISIBLE STATUS: zag.notify (the channel /mcp uses) now renders as a
+# transient top-right toast in the TUI, on top of the still-written .lua_user
+# log line. The status text lands in that toast, so we anchor on it directly.
+# wait_text is SUBSTRING-ONLY (the /.../ delimiters are stripped, no regex):
+#   * "MCP: " (uppercase, colon-space) cannot collide with the typed lowercase
+#     "/mcp" prompt echo -- it only appears in the toast header.
+#   * "jsonsrv" is never typed; it comes solely from the merged .mcp.json, so a
+#     match proves the merge ran and the status reached the grid.
+# Toast ttl for an info-level notify is 4s, so the wait_text steps sit
+# immediately after the /mcp send to catch the toast inside its lifetime.
 #
-# WHERE THE STATUS TEXT ACTUALLY LANDS: the fixture log under
-# $ZAG_SIM_MCP_HOME/.zag/logs/<uuid>.log, as a line like
+# The status text is also still in the fixture log under
+# $ZAG_SIM_MCP_HOME/.zag/logs/<uuid>.log as
 #   [lua_user] info: [notify] MCP: 0/2 servers, 0 tools
 #   ○ fake (not connected)
 #   ○ jsonsrv (not connected)
-# The header N/2 count and both server names (fake from config.lua, jsonsrv
-# from .mcp.json) are asserted by inspecting that log post-run. The fixture
-# HOME is a fixed path so the log is findable.
+# (the toast is transient; the log is the durable record). The grid assertion
+# below is the stronger of the two, so the log-side check is left as this note.
 #
 # A /mcp that wedged the detach worker, crashed on the .mcp.json merge, or
-# left the TUI unresponsive would surface here as a non-clean exit (the final
-# /quit + wait_exit would time out or report a crash).
+# left the TUI unresponsive would surface here as a wait_text timeout or a
+# non-clean exit (the final /quit + wait_exit would time out or report a crash).
 
 set env ZAG_SIM_MCP_HOME=/tmp/zag-sim-mcp-status-home
 set env ZAG_SIM_MCP_PROJECT_DIR=/tmp/zag-sim-mcp-status-proj
@@ -36,9 +37,10 @@ spawn ./src/sim/scenarios/testdata/mcp_launch.sh
 wait_text /Welcome to zag/
 wait_idle 500ms
 send "/mcp" <Enter>
-# /mcp routes through a zag.detach worker; give it a moment to run and notify.
-# We can't anchor on the status text (see header), so settle on idle instead.
-wait_idle 2s 8s
+# /mcp routes through a zag.detach worker; the toast appears once the worker
+# notifies. Anchor on the toast header and the merge-only server name.
+wait_text /MCP: / 8s
+wait_text /jsonsrv/ 8s
 snapshot after_mcp
 send "/quit" <Enter>
 wait_exit
