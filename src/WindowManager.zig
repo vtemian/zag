@@ -5541,6 +5541,83 @@ test "workflow_panes _on_end hops to a ready (just-spawned) sibling" {
     try std.testing.expectEqual(beta, live.single.?);
 }
 
+test "workflow_panes cycle steps through running children and wraps" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    try engine.lua.doString("_G.wp = require('zag.builtin.workflow_panes')");
+
+    // Three children, ALL running: a tail `.status` node makes subagentStatus
+    // report "running" (not `.assistant_text`, which would be "done").
+    const a = try f.root_conv.spawnSubagent("a", "");
+    const b = try f.root_conv.spawnSubagent("b", "");
+    const c = try f.root_conv.spawnSubagent("c", "");
+    _ = try a.appendNode(null, .status, "working");
+    _ = try b.appendNode(null, .status, "working");
+    _ = try c.appendNode(null, .status, "working");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+
+    // Open the view on the first child via the spawn hook.
+    var spawn1: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "a", .index = 1, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn1);
+    try std.testing.expectEqual(a, liveSubagentViews(&f.wm).single.?);
+
+    // Cycle: a -> b -> c -> wraps back to a. running[(i % #running) + 1].
+    try engine.lua.doString("_G.wp.cycle()");
+    try std.testing.expectEqual(b, liveSubagentViews(&f.wm).single.?);
+
+    try engine.lua.doString("_G.wp.cycle()");
+    try std.testing.expectEqual(c, liveSubagentViews(&f.wm).single.?);
+
+    try engine.lua.doString("_G.wp.cycle()");
+    try std.testing.expectEqual(a, liveSubagentViews(&f.wm).single.?);
+}
+
+test "workflow_panes cycle falls back to the first running child when the shown child finished" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    try engine.lua.doString("_G.wp = require('zag.builtin.workflow_panes')");
+
+    const a = try f.root_conv.spawnSubagent("a", "");
+    const b = try f.root_conv.spawnSubagent("b", "");
+    const c = try f.root_conv.spawnSubagent("c", "");
+    // All three start running so the view opens on `a` (index 1).
+    _ = try a.appendNode(null, .status, "working");
+    _ = try b.appendNode(null, .status, "working");
+    _ = try c.appendNode(null, .status, "working");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+
+    var spawn1: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "a", .index = 1, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn1);
+    try std.testing.expectEqual(a, liveSubagentViews(&f.wm).single.?);
+
+    // `a` (the shown child) finishes; b and c stay running. The cycle's
+    // current_index (1) is no longer in the running set {2, 3}, so the loop
+    // never matches and `next_idx` stays its default running[1] -> b, NOT c.
+    _ = try a.appendNode(null, .assistant_text, "a done");
+    try engine.lua.doString("_G.wp.cycle()");
+    try std.testing.expectEqual(b, liveSubagentViews(&f.wm).single.?);
+}
+
 test "executeAction lua_callback runs the Lua function via the engine" {
     const allocator = std.testing.allocator;
 
