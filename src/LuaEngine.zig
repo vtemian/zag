@@ -3912,6 +3912,28 @@ pub const LuaEngine = struct {
         _ = self.tasks.remove(task.thread_ref);
         self.lua.unref(zlua.registry_index, task.thread_ref);
 
+        // The orchestration root is retiring: the parked tool frame its cohort's
+        // `workflow_ctx`/`spawning_tool_use_id` borrow (park-until-retire,
+        // workflow.zig) is about to be abandoned. Sever the borrows on every
+        // surviving cohort member NOW, in this same synchronous main-thread
+        // sequence — before any other coroutine can resume — so a survivor's next
+        // `zag.task` hits the soft "requires a workflow context" refusal instead
+        // of dereferencing freed AgentRunner storage. Root detection is
+        // `workflow_root_ref == thread_ref` (self-assigned at spawn);
+        // `workflow_request` is already nulled on the success path so it cannot
+        // be the test here. Same family as the e735c79 sever-at-owner-death fix.
+        if (task.workflow_root_ref == task.thread_ref) {
+            var sever_it = self.tasks.iterator();
+            while (sever_it.next()) |entry| {
+                const t = entry.value_ptr.*;
+                if (t.workflow_root_ref == task.thread_ref) {
+                    t.workflow_ctx = null;
+                    t.spawning_tool_use_id = null;
+                    t.workflow_root_ref = -1;
+                }
+            }
+        }
+
         // Re-parent any still-live children to the root scope so that
         // fire-and-forget spawn / detach can outlive their parent without
         // triggering the Scope orphan invariant.
