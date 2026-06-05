@@ -687,6 +687,78 @@ test "bash group-kills sandboxed grandchild on cancel" {
     try std.testing.expectEqualStrings("error: cancelled", result.?.content);
 }
 
+test "bash group-kills sandboxed grandchild on timeout" {
+    // Same strict-mode topology as the cancel test above (sandbox wrapper is
+    // the direct child, /bin/sh the grandchild), but the kill is driven by the
+    // wall-clock timeout instead of a cancel flag. The shell echoes its own pid
+    // and a backgrounded sleeper's pid, then blocks far past the 500ms deadline.
+    // The timeout path's group SIGKILL (bash.zig:201) must reap both: a
+    // child-only kill would leave the sleeping grandchild alive and detectable
+    // below. This is the regression guard for the timeout branch of the group
+    // kill.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var strict: Config = .{ .permissive = false };
+    bindConfig(&strict);
+    defer bindConfig(null);
+
+    // Background sleeper keeps the process group alive; `wait` parks the shell
+    // until the (never-arriving) sleep finishes, so only the timeout returns it.
+    const json =
+        \\{"command":"sleep 30 & echo sleeper:$! ; echo shell:$$ ; wait","timeout_ms":500}
+    ;
+
+    var timer = try clock.Timer.start();
+    const result = try execute(json, allocator, null);
+    const elapsed_ns = timer.read();
+    defer if (result.owned) allocator.free(result.content);
+
+    // 3s ceiling like the cancel grandchild test: the sandbox wrapper adds
+    // startup latency over the permissive path.
+    try std.testing.expect(elapsed_ns < 3 * std.time.ns_per_s);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 500ms") != null);
+
+    // The partial stdout carries the two pids the shell printed before it
+    // blocked; harvest them and prove both are gone. `execute` only waits on
+    // (and reaps) the direct child, so the reparented descendants are reaped by
+    // launchd after the group kill — poll with a deadline rather than assuming
+    // an instant reap, and never sleep blindly.
+    const shell_pid = try parseLabeledPid(result.content, "shell:");
+    const sleeper_pid = try parseLabeledPid(result.content, "sleeper:");
+    try std.testing.expect(shell_pid != sleeper_pid);
+    try expectReapedWithin(shell_pid, 3 * std.time.ns_per_s);
+    try expectReapedWithin(sleeper_pid, 3 * std.time.ns_per_s);
+}
+
+/// Extract the integer pid printed as `<label><pid>\n` somewhere in `text`.
+fn parseLabeledPid(text: []const u8, label: []const u8) !std.posix.pid_t {
+    const start = std.mem.indexOf(u8, text, label) orelse return error.PidNotFound;
+    var i = start + label.len;
+    const digits_start = i;
+    while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {}
+    if (i == digits_start) return error.PidNotFound;
+    return std.fmt.parseInt(std.posix.pid_t, text[digits_start..i], 10);
+}
+
+/// Poll `kill(pid, 0)` until it reports the process no longer exists, up to
+/// `deadline_ns`. Signal 0 is the existence probe: SUCCESS means the pid is
+/// still live (or a yet-unreaped zombie), `ProcessNotFound` means it is gone.
+fn expectReapedWithin(pid: std.posix.pid_t, deadline_ns: u64) !void {
+    const probe: std.posix.SIG = @enumFromInt(0);
+    var timer = try clock.Timer.start();
+    while (timer.read() < deadline_ns) {
+        std.posix.kill(pid, probe) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        clock.sleep(20 * std.time.ns_per_ms);
+    }
+    return error.ProcessStillAlive;
+}
+
 test "bash truncates stdout instead of erroring on overflow" {
     const allocator = std.testing.allocator;
     // Print ~1.3 MiB of A's via /dev/zero + tr to make it printable.

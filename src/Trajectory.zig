@@ -447,7 +447,11 @@ pub const Capture = struct {
         try turn.reasoning_text.append(self.arena.allocator(), '\n');
     }
 
-    /// Record a tool invocation on the current turn. All three strings are
+    /// Record a tool invocation. Executed tool calls arrive after the
+    /// assistant turn closes (the agent loop closes the turn on each LLM
+    /// round-trip before dispatching tools), so when no turn is open this
+    /// attaches to the most recently opened turn, mirroring `addToolResult`.
+    /// While a turn is open it attaches to that turn. All three strings are
     /// duped into the arena.
     pub fn addToolCall(
         self: *Capture,
@@ -455,7 +459,10 @@ pub const Capture = struct {
         name: []const u8,
         args_json: []const u8,
     ) !void {
-        const turn = self.cur orelse return error.NoActiveTurn;
+        const turn = self.cur orelse blk: {
+            if (self.turns.items.len == 0) return error.NoActiveTurn;
+            break :blk &self.turns.items[self.turns.items.len - 1];
+        };
         const arena_alloc = self.arena.allocator();
         try turn.tool_calls.append(arena_alloc, .{
             .tool_call_id = try arena_alloc.dupe(u8, id),
@@ -486,9 +493,11 @@ pub const Capture = struct {
         });
     }
 
-    /// Close the current turn, attaching `metrics` to it. Subsequent
-    /// `addTextDelta` calls before another `beginTurn` will fail.
-    pub fn endTurn(self: *Capture, metrics: TurnMetrics) !void {
+    /// Close the current turn, attaching `metrics` to it. A null `metrics`
+    /// leaves the turn (and its serialized step) without a `metrics` field,
+    /// which is how error-closed turns avoid emitting fabricated zeros.
+    /// Subsequent `addTextDelta` calls before another `beginTurn` will fail.
+    pub fn endTurn(self: *Capture, metrics: ?TurnMetrics) !void {
         const turn = self.cur orelse return error.NoActiveTurn;
         turn.metrics = metrics;
         self.cur = null;
@@ -776,6 +785,63 @@ test "build leaves final_metrics null when no turn has metrics" {
     defer freeTrajectory(traj, std.testing.allocator);
 
     try std.testing.expect(traj.final_metrics == null);
+}
+
+test "endTurn with null metrics leaves step metrics absent" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addTextDelta("x");
+    try cap.endTurn(null);
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "openai/gpt-4o",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expect(traj.steps[2].metrics == null);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try serialize(traj, std.testing.allocator, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"metrics\"") == null);
+}
+
+test "addToolCall after endTurn attaches to the last closed turn" {
+    // The reworked headless harness closes the assistant turn on each LLM
+    // round-trip BEFORE recording the executed tool calls, so a tool call can
+    // arrive after `endTurn`. It must attach to the last closed turn (the one
+    // that emitted it) so the validator's same-step source_call_id pairing
+    // holds, mirroring how tool results already attach.
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addTextDelta("call it");
+    try cap.endTurn(.{ .completion_tokens = 5 });
+    try cap.addToolCall("bash:0", "bash", "{\"cmd\":\"ls\"}");
+    try cap.addToolResult("bash:0", "a\nb", false);
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "openai/gpt-4o",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), traj.steps.len);
+    const step = traj.steps[2];
+    try std.testing.expect(step.tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), step.tool_calls.?.len);
+    try std.testing.expectEqualStrings("bash:0", step.tool_calls.?[0].tool_call_id);
+    try std.testing.expect(step.observation != null);
+    try std.testing.expectEqual(@as(usize, 1), step.observation.?.results.len);
+    try std.testing.expectEqualStrings("bash:0", step.observation.?.results[0].source_call_id.?);
 }
 
 test "Capture.beginTurn errors when a turn is already active" {
