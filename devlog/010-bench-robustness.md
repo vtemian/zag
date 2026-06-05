@@ -19,9 +19,15 @@ Follow-up to 009. The five robustness bugs that cost ~13 Terminal-Bench tasks ar
 
 Each round of live verification found the next layer: the bench keeps being the best fuzzer this codebase has had.
 
+## Subset re-run results (same day)
+
+The 11 robustness casualties that never had a fair post-fix attempt, re-run with the fixed binary: **7 solved** (`query-optimize`, `code-from-image`, `configure-git-webserver`, `financial-document-processor`, `llm-inference-batching-scheduler`, `portfolio-optimization`, `qemu-startup`), 4 honest failures, zero silent exits, zero wedges. Best-known cumulative score moves from 32/80 (40.0%) to **39/81 (48.1%)**. Caveat: that number mixes binary versions across runs; a clean leaderboard-style figure needs one uniform full re-run.
+
+Worth noting: on a quiet machine the transport flakiness never fired at all (zero retries logged) — the original transport deaths were load-correlated. The retry machinery remains the right insurance for overnight and concurrent runs.
+
 ## Still open
 
-- Re-run the full suite for a new score (expectation from 009: mid-50s vs the 40.0% baseline).
+- One uniform full-suite run for a clean score (expectation: high-40s to mid-50s).
 - Trajectory metrics (`capture.endTurn` usage totals) and ATIF step-per-round-trip.
 - Adapter nit: harbor's timeout kill also kills the log-copy shell, so timed-out trials lose `zag-internal.log` (fix with a `trap`).
 - amd64/leaderboard path (binary builds and boots under qemu-user; Rosetta cannot load Zig static binaries — known `bss_size overflow` emulator bug).
