@@ -1261,6 +1261,145 @@ test "startWorkflowScript runs a script that spawns two subagents and aggregates
     try testing.expect(child_registry.isEmpty());
 }
 
+/// Return the first `.subagent_link` node in `conv`'s root children, or null.
+fn firstLinkNode(conv: *Conversation) ?*Conversation.Node {
+    for (conv.tree.root_children.items) |node| {
+        if (node.node_type == .subagent_link) return node;
+    }
+    return null;
+}
+
+test "a zag.task spawn inside a workflow stamps the workflow tool_use_id on the link node" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    // The workflow tool_call node the spawned child must group under.
+    const wf_node = try parent_conv.appendToolCallNode(null, "workflow", "wf_known", "{\"script\":\"...\"}");
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // The WorkflowRequest carries the spawning `workflow` call's id, exactly as
+    // the workflow tool captures it from `tools.current_tool_use_id`.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\local a = zag.task{ prompt = "first" }
+        \\return a.summary
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+        .spawning_tool_use_id = "wf_known",
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+    try testing.expect(!req.is_error);
+    if (req.result) |r| allocator.free(r);
+
+    const link_node = firstLinkNode(&parent_conv) orelse return error.NoLinkNode;
+    try testing.expect(link_node.spawning_tool_use_id != null);
+    try testing.expectEqualStrings("wf_known", link_node.spawning_tool_use_id.?);
+    try testing.expectEqual(wf_node, link_node.spawning_tool_node.?);
+
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+}
+
+test "a combinator worker spawned via zag.spawn inherits the workflow tool_use_id" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    const wf_node = try parent_conv.appendToolCallNode(null, "workflow", "wf_known", "{\"script\":\"...\"}");
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // The script spawns a combinator worker via `zag.spawn`; the worker calls
+    // `zag.task`. The worker must INHERIT the workflow's spawning id so its
+    // child groups under the workflow call just like a direct zag.task spawn.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\local t = zag.spawn(function()
+        \\  return zag.task{ prompt = "worker child" }.summary
+        \\end)
+        \\local ok = t:join()
+        \\return tostring(ok)
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+        .spawning_tool_use_id = "wf_known",
+    };
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+    try testing.expect(!req.is_error);
+    if (req.result) |r| allocator.free(r);
+
+    const link_node = firstLinkNode(&parent_conv) orelse return error.NoLinkNode;
+    try testing.expect(link_node.spawning_tool_use_id != null);
+    try testing.expectEqualStrings("wf_known", link_node.spawning_tool_use_id.?);
+    try testing.expectEqual(wf_node, link_node.spawning_tool_node.?);
+
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+}
+
 test "zag.task with a schema returns a decoded output table the script branches on" {
     const allocator = testing.allocator;
 

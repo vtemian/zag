@@ -3118,6 +3118,11 @@ fn runToolStep(
             // into `payload_alloc` immediately so the arena can be torn
             // down at worker exit without leaving dangling pointers in
             // events or in the returned result.
+            // Bind the call's id for the spawn primitives (`task`/`workflow`)
+            // so they can stamp it onto the `subagent_link` node they create.
+            // Scoped to the synchronous execute; `tc.id` lives across it.
+            tools.current_tool_use_id = tc.id;
+            defer tools.current_tool_use_id = null;
             var final: ToolCallResult = blk: {
                 if (registry.execute(tc.name, effective_input, allocator, cancel)) |ok| {
                     defer if (ok.owned) allocator.free(ok.content);

@@ -121,6 +121,31 @@ pub const Node = struct {
     /// which carries the subagent system-prompt prefix that
     /// `tools/task.zig` prepends.
     subagent_prompt: ?[]const u8 = null,
+    /// The `tool_use_id` of the tool call that spawned this subagent
+    /// (the orchestrating `workflow` call, or the `task` call itself).
+    /// Owned; freed by `deinit`. Valid only when
+    /// `node_type == .subagent_link`. A later render milestone groups
+    /// link nodes under their spawning tool call by this id. Null when
+    /// the spawn carried no call context (legacy / non-tool spawns).
+    spawning_tool_use_id: ?[]const u8 = null,
+    /// The resolved tool_call `Node` matching `spawning_tool_use_id`,
+    /// found by scanning the owning tree's root children backwards at
+    /// spawn time. Borrowed, NOT freed: nodes live until the tree
+    /// deinits (the same lifetime class as `subagent_parent`). Null
+    /// when no id was supplied or the backward scan found no match
+    /// (graceful: a resumed/legacy tree renders ungrouped).
+    spawning_tool_node: ?*Node = null,
+    /// Type-erased back-pointer to the Conversation that owns this
+    /// `.tool_call` node, stamped onto a `workflow` tool_call the first
+    /// time a subagent is linked to it (see `Conversation.spawnSubagentLinked`).
+    /// The workflow header renderer casts it back to `*const Conversation`
+    /// to scan `root_children` for the link nodes pointing at this node and
+    /// derive the live N/M done count. Borrowed, NOT freed: the Conversation
+    /// outlives its own tree. Null on tool_calls with no linked children
+    /// (the header renders its plain, unchanged form). Stored as
+    /// `*anyopaque` so ConversationTree avoids a circular import on
+    /// Conversation, mirroring `subagent_parent`.
+    workflow_owner: ?*const anyopaque = null,
 
     /// Release all memory owned by this node and its descendants. The
     /// buffer-level `NodeLineCache` owns any cached spans keyed by this
@@ -137,6 +162,7 @@ pub const Node = struct {
         if (self.tool_input_raw) |input| allocator.free(input);
         if (self.subagent_name) |name| allocator.free(name);
         if (self.subagent_prompt) |p| allocator.free(p);
+        if (self.spawning_tool_use_id) |id| allocator.free(id);
     }
 
     /// Mark this node's content as changed, invalidating any cache entry

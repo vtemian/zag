@@ -401,6 +401,24 @@ fn richToolCallLineCount(node: *const Node, registry: *const BufferRegistry) ?us
     const tool_name = node.custom_tag orelse return null;
     const raw = node.tool_input_raw orelse return null;
 
+    // Workflow is dispatched BEFORE the bounded full-tree parse below: a
+    // workflow script is unbounded model output, so a >16 KiB input would
+    // overflow the FBA and bail to null here while `renderWorkflowBlock`
+    // (real, unbounded allocator) renders the full body — diverging the
+    // count from the render and corrupting scroll math. The workflow arm
+    // instead counts the decoded script lines with a streaming scanner that
+    // needs only O(nesting-depth) memory regardless of script size. This is
+    // the shared source of truth `renderWorkflowBlock` also derives its line
+    // count from (both count newlines in the same decoded `script` value),
+    // so the two paths agree for ANY size.
+    if (std.mem.eql(u8, tool_name, "workflow")) {
+        const script_lines = workflowScriptLineCount(raw) orelse return null;
+        // Collapsed: header + one fold hint. Expanded: header + one line
+        // per script source line. Mirror of `renderWorkflowBlock`.
+        if (node.collapsed) return 2;
+        return 1 + script_lines;
+    }
+
     // 16 KiB is enough for the four built-in tools' inputs in practice
     // (Anthropic caps `bash.command` at 16 KiB, `edit.new_text` is
     // bounded by the file body). When the buffer overflows we bail to
@@ -431,6 +449,97 @@ fn richToolCallLineCount(node: *const Node, registry: *const BufferRegistry) ?us
         return 1 + bodyLineCount(node, registry, read_inline_lines);
     }
     return null;
+}
+
+/// Count the display lines of the decoded top-level `script` string in a
+/// `workflow` tool call's raw JSON input. Returns null when `raw` is not a
+/// JSON object, has no string-valued `script` key, or is malformed (the
+/// caller then falls back to the generic header count).
+///
+/// This is the SINGLE source of truth for the workflow script line count:
+/// both `richToolCallLineCount` (above) and `renderWorkflowBlock` derive
+/// their line counts from it, so the count path and the render path can
+/// never diverge regardless of script size. It uses `std.json.Scanner`,
+/// which streams the input and only allocates O(nesting-depth) bookkeeping,
+/// so a multi-megabyte script counts in bounded memory — unlike a full
+/// value-tree parse through a fixed scratch buffer, which would overflow
+/// and silently mis-count.
+///
+/// The line rule matches `lineCount`: one line per non-empty value plus one
+/// per interior `\n`, with a trailing `\n` not adding a final empty line.
+fn workflowScriptLineCount(raw: []const u8) ?usize {
+    var scanner: std.json.Scanner = .initCompleteInput(std.heap.page_allocator, raw);
+    defer scanner.deinit();
+
+    // Walk to the top-level `script` value. `string_is_object_key` separates
+    // an object key from a string value at the same nesting depth.
+    if ((scanner.next() catch return null) != .object_begin) return null;
+    while (true) {
+        const key_tok = scanner.next() catch return null;
+        switch (key_tok) {
+            .object_end => return null, // no `script` key
+            .string => |key| {
+                if (std.mem.eql(u8, key, "script")) break;
+                // Not our key: skip its value (recursively, for objects/arrays).
+                scanner.skipValue() catch return null;
+            },
+            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
+                // A key spanning escape/buffer boundaries can't be "script"
+                // in one token; drain to its `.string` terminator then skip
+                // the value. (Object keys with escapes are rare but legal.)
+                const finished = drainStringToken(&scanner) catch return null;
+                _ = finished;
+                scanner.skipValue() catch return null;
+            },
+            else => return null, // malformed: object key must be a string
+        }
+    }
+
+    // `script`'s value must be a string; count newlines in its decoded form.
+    var lines: usize = 0;
+    var saw_any = false;
+    var last_was_newline = false;
+    while (true) {
+        const tok = scanner.next() catch return null;
+        const chunk: []const u8 = switch (tok) {
+            .string => |s| s,
+            .partial_string => |s| s,
+            .partial_string_escaped_1 => |*b| b[0..],
+            .partial_string_escaped_2 => |*b| b[0..],
+            .partial_string_escaped_3 => |*b| b[0..],
+            .partial_string_escaped_4 => |*b| b[0..],
+            else => return null, // value was not a string
+        };
+        for (chunk) |c| {
+            saw_any = true;
+            if (c == '\n') {
+                lines += 1;
+                last_was_newline = true;
+            } else {
+                last_was_newline = false;
+            }
+        }
+        if (tok == .string) break;
+    }
+    if (!saw_any) return 0;
+    // First line is implicit (one line of content before any `\n`); a
+    // trailing `\n` does not open a new empty line.
+    var count = lines + 1;
+    if (last_was_newline) count -= 1;
+    return count;
+}
+
+/// Drain a string that began with a `.partial_string*` token up to and
+/// including its terminating `.string` token. Returns true on a clean
+/// terminator. Used to skip over object keys that span escape boundaries.
+fn drainStringToken(scanner: *std.json.Scanner) !bool {
+    while (true) {
+        switch (try scanner.next()) {
+            .string => return true,
+            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {},
+            else => return false,
+        }
+    }
 }
 
 /// Body line count for bash/read: the tool_result child's content
@@ -476,6 +585,8 @@ fn renderRichToolCall(
         return renderBashBlock(node, lines, allocator, theme, registry, &root);
     } else if (std.mem.eql(u8, tool_name, "read")) {
         return renderReadBlock(node, lines, allocator, theme, registry, &root);
+    } else if (std.mem.eql(u8, tool_name, "workflow")) {
+        return renderWorkflowBlock(node, lines, allocator, theme, &root);
     }
     return false;
 }
@@ -501,16 +612,19 @@ fn firstJsonStringValue(value: std.json.Value) []const u8 {
     return "";
 }
 
-/// Emit a `Name(arg)` tool-call header line. The leading bullet is supplied
-/// by the gutter at composite time; this is the label only. The composed
-/// label is duped into `allocator` and flagged `owned` so the cache (or
-/// test cleanup) frees it when the line is dropped.
+/// Emit a `Name(arg)<suffix>` tool-call header line. The leading bullet is
+/// supplied by the gutter at composite time; this is the label only. The
+/// composed label is duped into `allocator` and flagged `owned` so the cache
+/// (or test cleanup) frees it when the line is dropped. `suffix` is appended
+/// after the closing paren (e.g. the workflow ` 2/4 done` count); pass `""`
+/// for the plain `Name(arg)` header.
 fn appendToolHeader(
     lines: *std.ArrayList(StyledLine),
     allocator: Allocator,
     theme: *const Theme,
     name: []const u8,
     arg: []const u8,
+    suffix: []const u8,
 ) !void {
     const accent = theme.highlights.tool_call;
     var label: std.ArrayList(u8) = .empty;
@@ -523,6 +637,7 @@ fn appendToolHeader(
     try label.append(allocator, '(');
     try label.appendSlice(allocator, arg);
     try label.append(allocator, ')');
+    try label.appendSlice(allocator, suffix);
     const owned = try allocator.dupe(u8, label.items);
     const spans = try allocator.alloc(StyledSpan, 1);
     spans[0] = .{ .text = owned, .style = accent, .owned = true };
@@ -612,7 +727,7 @@ fn renderEditBlock(
     const old_text = jsonString(root, "old_text") orelse "";
     const new_text = jsonString(root, "new_text") orelse "";
 
-    try appendToolHeader(lines, allocator, theme, "edit", path);
+    try appendToolHeader(lines, allocator, theme, "edit", path, "");
 
     const remove_style = theme.highlights.diff_remove;
     const add_style = theme.highlights.diff_add;
@@ -632,7 +747,7 @@ fn renderWriteBlock(
     const path = jsonString(root, "path") orelse return false;
     const content = jsonString(root, "content") orelse "";
 
-    try appendToolHeader(lines, allocator, theme, "write", path);
+    try appendToolHeader(lines, allocator, theme, "write", path, "");
 
     var body_index: usize = 0;
     _ = try appendMarkedLines(
@@ -659,7 +774,7 @@ fn renderBashBlock(
 ) !bool {
     const cmd = jsonString(root, "command") orelse return false;
 
-    try appendToolHeader(lines, allocator, theme, "bash", cmd);
+    try appendToolHeader(lines, allocator, theme, "bash", cmd, "");
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
@@ -691,7 +806,7 @@ fn renderReadBlock(
 ) !bool {
     const path = jsonString(root, "path") orelse return false;
 
-    try appendToolHeader(lines, allocator, theme, "read", path);
+    try appendToolHeader(lines, allocator, theme, "read", path, "");
 
     const result_bytes = firstToolResultBytes(node, registry);
     const result_lines = lineCount(result_bytes);
@@ -709,6 +824,98 @@ fn renderReadBlock(
     );
     if (result_lines > emitted) {
         try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted, theme, body_index);
+    }
+    return true;
+}
+
+/// Finished/total counts of the subagents a `workflow` tool_call spawned.
+/// `total` is the number of `subagent_link` nodes in the owning
+/// Conversation's `root_children` whose `spawning_tool_node` is this node;
+/// `done` is how many of those have finished (status `done` or `failed`).
+/// Returns null when the node carries no `workflow_owner` (no linked
+/// children), so the header renders its plain, unchanged form.
+///
+/// Once the workflow tool_call has its own `tool_result` child the call has
+/// returned, so every linked child is final: `done` is forced to `total`.
+const WorkflowDoneCounts = struct { done: usize, total: usize };
+
+fn workflowDoneCounts(node: *const Node) ?WorkflowDoneCounts {
+    const owner_opaque = node.workflow_owner orelse return null;
+    const owner: *const Conversation = @ptrCast(@alignCast(owner_opaque));
+
+    var total: usize = 0;
+    var done: usize = 0;
+    for (owner.tree.root_children.items) |link| {
+        if (link.node_type != .subagent_link) continue;
+        const spawn = link.spawning_tool_node orelse continue;
+        if (spawn != node) continue;
+        total += 1;
+        const status = subagentStatus(link);
+        if (std.mem.eql(u8, status, "done") or std.mem.eql(u8, status, "failed")) {
+            done += 1;
+        }
+    }
+    if (total == 0) return null;
+
+    // The workflow call's own tool_result means the call returned; all
+    // linked children are accounted final regardless of their tail tick.
+    for (node.children.items) |child| {
+        if (child.node_type == .tool_result) {
+            done = total;
+            break;
+        }
+    }
+    return .{ .done = done, .total = total };
+}
+
+/// Render a `workflow` tool call as a foldable Lua code block. The header
+/// reports the script length (`Workflow(N lines)`) rather than the script
+/// text, so the generic `firstJsonStringValue` flattening never runs. When
+/// the call has linked children the header gains a live ` X/M done` suffix
+/// (`Workflow(12 lines) 2/4 done`), computed at render time from the link
+/// nodes grouped under this node. The suffix only changes the header TEXT,
+/// not the line count, so the lockstep with `richToolCallLineCount` holds.
+///
+/// Collapsed: header plus one fold hint naming the hidden script lines.
+/// Expanded: header plus one `md_code_block`-styled line per script source
+/// line. Each script line is duped into `allocator` as an owned span so it
+/// outlives the parse arena that backs `script`.
+fn renderWorkflowBlock(
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    root: *const std.json.ObjectMap,
+) !bool {
+    const script = jsonString(root, "script") orelse return false;
+    const script_lines = lineCount(script);
+
+    const arg = try std.fmt.allocPrint(allocator, "{d} lines", .{script_lines});
+    defer allocator.free(arg);
+    // Live ` X/M done` suffix when this call has linked children. Empty
+    // otherwise, so the header reads `Workflow(N lines)` unchanged.
+    var suffix_buf: [64]u8 = undefined;
+    const suffix: []const u8 = if (workflowDoneCounts(node)) |counts|
+        std.fmt.bufPrint(&suffix_buf, " {d}/{d} done", .{ counts.done, counts.total }) catch ""
+    else
+        "";
+    try appendToolHeader(lines, allocator, theme, "workflow", arg, suffix);
+
+    if (node.collapsed) {
+        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, script_lines, theme, 0);
+        return true;
+    }
+
+    const style = theme.highlights.md_code_block;
+    var rest: []const u8 = script;
+    while (rest.len > 0) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const segment = if (nl) |n| rest[0..n] else rest;
+        const owned = try allocator.dupe(u8, segment);
+        const spans = try allocator.alloc(StyledSpan, 1);
+        spans[0] = .{ .text = owned, .style = style, .owned = true };
+        try lines.append(allocator, .{ .spans = spans });
+        rest = if (nl) |n| rest[n + 1 ..] else &.{};
     }
     return true;
 }
@@ -787,7 +994,7 @@ fn renderDefault(
                     null;
                 defer if (parsed) |*p| p.deinit();
                 const arg: []const u8 = if (parsed) |p| firstJsonStringValue(p.value) else "";
-                try appendToolHeader(lines, allocator, theme, content, arg);
+                try appendToolHeader(lines, allocator, theme, content, arg, "");
             }
             const hidden = hiddenToolResultLineCount(node, registry);
             if (hidden == 0) return;
@@ -837,19 +1044,34 @@ fn renderDefault(
             return;
         },
         .subagent_link => {
-            // Placeholder line: `[subagent: <name>] <status>`. All four
-            // span texts are borrowed: `subagent_open`/`subagent_close`
-            // and `subagentStatus` return static slices, and the name
-            // is owned by the node (freed in `Node.deinit` after the
-            // line cache wipes its entry).
+            // Placeholder line: `[subagent: <name>] <status>`. The text
+            // spans are borrowed: `subagent_open`/`subagent_close` and
+            // `subagentStatus` return static slices, and the name is owned
+            // by the node (freed in `Node.deinit` after the line cache wipes
+            // its entry).
+            //
+            // A link spawned by a workflow tool call (`spawning_tool_node`
+            // set) is prefixed with the `  └ ` connector so it reads as
+            // grouped under its workflow header; plain links render flush.
+            // The prefix only adds spans, never a line, so the lineCount of 1
+            // is unchanged.
             const style = theme.highlights.subagent_placeholder;
             const name = node.subagent_name orelse Prefixes.subagent_unnamed;
             const status = subagentStatus(node);
-            const spans = try allocator.alloc(StyledSpan, 4);
-            spans[0] = .{ .text = Prefixes.subagent_open, .style = style };
-            spans[1] = .{ .text = name, .style = style };
-            spans[2] = .{ .text = Prefixes.subagent_close, .style = style };
-            spans[3] = .{ .text = status, .style = style };
+            const grouped = node.spawning_tool_node != null;
+            const span_count: usize = if (grouped) 6 else 4;
+            const spans = try allocator.alloc(StyledSpan, span_count);
+            var i: usize = 0;
+            if (grouped) {
+                spans[i] = .{ .text = Gutter.blank_seg, .style = theme.highlights.tree_connector };
+                i += 1;
+                spans[i] = .{ .text = Gutter.branch_last, .style = theme.highlights.tree_connector };
+                i += 1;
+            }
+            spans[i] = .{ .text = Prefixes.subagent_open, .style = style };
+            spans[i + 1] = .{ .text = name, .style = style };
+            spans[i + 2] = .{ .text = Prefixes.subagent_close, .style = style };
+            spans[i + 3] = .{ .text = status, .style = style };
             try lines.append(allocator, .{ .spans = spans });
             return;
         },
@@ -1583,4 +1805,345 @@ test "lineCountForNode matches render() for collapsed tool_call with multi-line 
     defer Theme.freeStyledLines(&rich_lines, allocator);
     try renderDefault(bash, &rich_lines, allocator, &theme, &cb.buffer_registry);
     try std.testing.expectEqual(rich_lines.items.len, renderer.lineCountForNode(bash, &cb.buffer_registry));
+}
+
+test "workflow tool_call collapsed renders header plus fold hint" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    node.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+    // Header line plus one fold hint covering the hidden script body.
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines)", header);
+
+    const hint = try lines.items[1].toText(allocator);
+    defer allocator.free(hint);
+    try std.testing.expectEqualStrings("\u{2514} \u{2026} +2 lines (Ctrl-R to expand)", hint);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "workflow tool_call expanded renders script lines as a code block" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    node.collapsed = false;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+    // Header + one code-block line per script source line.
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines)", header);
+
+    const line0 = try lines.items[1].toText(allocator);
+    defer allocator.free(line0);
+    try std.testing.expectEqualStrings("local a = 1", line0);
+
+    const line1 = try lines.items[2].toText(allocator);
+    defer allocator.free(line1);
+    try std.testing.expectEqualStrings("return 'x'", line1);
+
+    // Script lines are styled as md_code_block, and NO span carries an
+    // embedded newline (the control-char staircase guard).
+    for (lines.items[1..]) |line| {
+        for (line.spans) |span| {
+            try std.testing.expect(std.mem.indexOfScalar(u8, span.text, '\n') == null);
+            try std.testing.expect(std.meta.eql(span.style, theme.highlights.md_code_block));
+        }
+    }
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "workflow render twice with markDirty between leaks nothing" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    node.collapsed = false;
+
+    const theme = Theme.defaultTheme();
+
+    inline for (0..2) |_| {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+        node.markDirty();
+    }
+}
+
+test "workflow tool_call with malformed script JSON falls back to generic header" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    // Missing `script` key: the workflow arm declines, the generic header
+    // path runs without crashing.
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"name\":\"build\"}");
+    node.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    // Generic `Name(arg)` header with the first string field as the arg.
+    try std.testing.expectEqualStrings("Workflow(build)", header);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "workflow tool_call over 16KiB keeps line count and render in lockstep" {
+    const allocator = std.testing.allocator;
+
+    // Build a script far larger than the 16 KiB FBA the generic count path
+    // uses. The old workflow count arm bailed to the generic 1-2 count on
+    // OOM while the renderer drew the full body, corrupting scroll math.
+    // A line is `local v<i> = <i>` (no JSON metacharacters but the inter-line
+    // `\n`), so the JSON wrapper only escapes the newlines.
+    const line_count = 2000; // ~16 chars/line -> ~32 KiB decoded script
+    const script = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        var buf: []const u8 = "";
+        for (0..line_count) |i| {
+            if (i != 0) buf = buf ++ "\n";
+            buf = buf ++ std.fmt.comptimePrint("local v{d} = {d}", .{ i, i });
+        }
+        break :blk buf;
+    };
+    // JSON-escape: replace each real newline with the two-byte `\n` escape.
+    const json_script = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        var out: []const u8 = "";
+        for (script) |c| {
+            out = out ++ (if (c == '\n') "\\n" else &[_]u8{c});
+        }
+        break :blk out;
+    };
+    const raw = "{\"script\":\"" ++ json_script ++ "\"}";
+    try std.testing.expect(raw.len > 16 * 1024);
+
+    const theme = Theme.defaultTheme();
+    const renderer = NodeRenderer.initDefault();
+
+    // Collapsed: count == rendered lines (header + fold hint == 2).
+    {
+        var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+        defer cb.deinit();
+        const node = try cb.appendToolCallNode(null, "workflow", "id1", raw);
+        node.collapsed = true;
+
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+        try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+        try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+
+        // The count arm actually parsed the big script (not the generic
+        // fallback): the fold-aware header must name all script lines.
+        const header = try lines.items[0].toText(allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2000 lines)", header);
+    }
+
+    // Expanded: count == rendered lines (header + one line per script line).
+    {
+        var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+        defer cb.deinit();
+        const node = try cb.appendToolCallNode(null, "workflow", "id1", raw);
+        node.collapsed = false;
+
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+        try std.testing.expectEqual(@as(usize, 1 + line_count), lines.items.len);
+        try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+    }
+}
+
+/// Render `node` (a workflow tool_call) and return the header line's text.
+/// Caller frees the returned slice. Also asserts the header is exactly one
+/// line and that the rendered line count matches `lineCountForNode` (the
+/// lockstep invariant: the done-count suffix changes only text, not lines).
+fn renderWorkflowHeaderText(
+    cb: *@import("Conversation.zig"),
+    node: *const Node,
+    theme: *const Theme,
+    allocator: Allocator,
+) ![]const u8 {
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+    try renderDefault(node, &lines, allocator, theme, &cb.buffer_registry);
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+    return lines.items[0].toText(allocator);
+}
+
+test "workflow header shows live N/M done as linked children finish" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    // A collapsed workflow tool_call (header is the only line that carries
+    // the count) plus two children linked to it by its tool_use_id.
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    const child_a = try cb.spawnSubagentLinked("childA", "", "wf1");
+    const child_b = try cb.spawnSubagentLinked("childB", "", "wf1");
+    // Both links resolved this workflow node and stamped its owner.
+    try std.testing.expect(wf.workflow_owner != null);
+
+    const theme = Theme.defaultTheme();
+
+    // Both children `ready` -> 0/2 done.
+    {
+        const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2 lines) 0/2 done", header);
+    }
+
+    // Drive child A to `done` (tail is assistant_text) -> 1/2 done.
+    _ = try child_a.appendNode(null, .assistant_text, "done A");
+    {
+        const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2 lines) 1/2 done", header);
+    }
+
+    // Drive child B to `failed` (tail is err) -> 2/2 done (failed counts).
+    _ = try child_b.appendNode(null, .err, "boom B");
+    {
+        const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2 lines) 2/2 done", header);
+    }
+}
+
+test "workflow header reads M/M done once the workflow tool_result lands" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+
+    const theme = Theme.defaultTheme();
+
+    // No child finished, but the workflow call returned: all children final.
+    _ = try cb.appendNode(wf, .tool_result, "workflow complete");
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines) 2/2 done", header);
+}
+
+test "workflow header unchanged when no children are linked" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    // No spawnSubagentLinked: workflow_owner stays null.
+    try std.testing.expect(wf.workflow_owner == null);
+
+    const theme = Theme.defaultTheme();
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines)", header);
+}
+
+test "workflow header re-render with markDirty between leaks nothing" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+
+    const theme = Theme.defaultTheme();
+    // The done-count suffix is synthesized into an owned span; render twice
+    // (with a dirty bump between) and free each pass to catch a leak.
+    inline for (0..2) |_| {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(wf, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+        wf.markDirty();
+    }
+}
+
+test "workflow-spawned subagent_link renders indented under its workflow" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "parent");
+    defer cb.deinit();
+
+    // A workflow tool_call and a child linked to it: the link is grouped.
+    _ = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"x\"}");
+    _ = try cb.spawnSubagentLinked("scout", "", "wf1");
+    // A plain link with no spawning workflow: rendered flush.
+    _ = try cb.spawnSubagent("solo", "");
+
+    const grouped_link = cb.tree.root_children.items[1];
+    const plain_link = cb.tree.root_children.items[2];
+    try std.testing.expect(grouped_link.spawning_tool_node != null);
+    try std.testing.expect(plain_link.spawning_tool_node == null);
+
+    const theme = Theme.defaultTheme();
+    const renderer = NodeRenderer.initDefault();
+
+    // Grouped: prefixed with the `  └ ` connector. Both children are empty
+    // (ready), so the status reads `ready`.
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(grouped_link, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+        try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(grouped_link, &cb.buffer_registry));
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("  \u{2514} [subagent: scout] ready", text);
+    }
+
+    // Plain: unchanged, no connector prefix.
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(plain_link, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("[subagent: solo] ready", text);
+    }
 }

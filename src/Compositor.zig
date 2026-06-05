@@ -3230,7 +3230,6 @@ test "bottom-anchored tail stays visible above the prompt block" {
     try std.testing.expect(found_row.? <= 14);
 }
 
-
 /// Stand up a single-leaf layout over `screen` for the toast tests. The
 /// root is stack-allocated so callers must not `Layout.deinit`; floats
 /// default empty. Returns the layout plus the leaf node for draft wiring.
