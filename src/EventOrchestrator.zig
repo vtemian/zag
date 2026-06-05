@@ -280,6 +280,18 @@ pub fn deinit(self: *EventOrchestrator) void {
     self.shutdownAgents();
     // shutdownAgents drives every in-flight child to completion, so the
     // registry is empty here; deinit only frees its backing ArrayList.
+    // Sever every engine borrow of orchestrator-owned storage before it is
+    // freed: `lua_engine.deinitAsync` runs after `orchestrator.destroy`
+    // (LIFO defer order in main.zig) and may resume parked coroutines whose
+    // bindings reach these pointers. The fields are optional and every deref
+    // site uses `orelse`, so nulling degrades those paths to clean no-ops:
+    // the children are already drained above, and a shutdown-time coroutine
+    // has no live window manager to talk to.
+    if (self.lua_engine) |eng| {
+        eng.child_runner_registry = null;
+        eng.window_manager = null;
+        eng.buffer_registry = null;
+    }
     self.child_runner_registry.deinit();
     self.window_manager.deinit();
 }
@@ -455,27 +467,24 @@ fn tick(
         drainWakePipe(self.wake_read_fd);
     }
 
-    // Poll for input (outside frame span, so wait doesn't count)
-    const maybe_event = parser.pollOnce(posix.STDIN_FILENO, clock.milliTimestamp());
-
-    // Resize: merge SIGWINCH and in-band CSI sources so handleResize
-    // is called at most once per tick.
-    const sigwinch_size = self.terminal.checkResize();
-    const input_size: ?Terminal.Size = if (maybe_event) |ev| switch (ev) {
-        .resize => |sz| blk: {
-            self.terminal.size = .{ .rows = sz.rows, .cols = sz.cols };
-            break :blk .{ .cols = sz.cols, .rows = sz.rows };
-        },
-        else => null,
-    } else null;
-
-    if (input_size orelse sigwinch_size) |new_size| {
-        try self.window_manager.handleResize(new_size.cols, new_size.rows);
-    }
-
-    if (maybe_event) |event| {
+    // Drain every input event ready this tick. pollOnce parses one event
+    // per call and only reads more bytes once its buffer has no complete
+    // event, so a fast burst (sim sends, paste-speed input) is consumed
+    // here instead of accumulating into the parser's overflow reset.
+    // Bounded so a pathological flood cannot starve the rest of the tick.
+    var input_size: ?Terminal.Size = null;
+    // A non-mouse input event this tick forces a composite even if no
+    // pane is otherwise dirty (mouse-only motion does not redraw chrome).
+    var non_mouse_input = false;
+    var input_guard: usize = 0;
+    while (input_guard < 4096) : (input_guard += 1) {
+        const event = parser.pollOnce(posix.STDIN_FILENO, clock.milliTimestamp()) orelse break;
+        if (event != .mouse) non_mouse_input = true;
         switch (event) {
-            .resize => {},
+            .resize => |sz| {
+                self.terminal.size = .{ .rows = sz.rows, .cols = sz.cols };
+                input_size = .{ .cols = sz.cols, .rows = sz.rows };
+            },
             .key => |k| {
                 if (self.handleKey(k) == .quit) running.* = false;
             },
@@ -489,6 +498,14 @@ fn tick(
             .focus_out => log.debug("terminal focus_out", .{}),
             else => {},
         }
+        if (!running.*) break;
+    }
+
+    // Resize: merge SIGWINCH and in-band CSI sources so handleResize
+    // is called at most once per tick.
+    const sigwinch_size = self.terminal.checkResize();
+    if (input_size orelse sigwinch_size) |new_size| {
+        try self.window_manager.handleResize(new_size.cols, new_size.rows);
     }
 
     // CRITICAL ORDERING: pump Lua async completions BEFORE per-pane drains.
@@ -584,7 +601,7 @@ fn tick(
 
     const any_dirty = self.anyPaneDirty();
     const frame_dirty = any_dirty or self.window_manager.compositor.layout_dirty or
-        (maybe_event != null and maybe_event.? != .mouse) or time_dirty or
+        non_mouse_input or time_dirty or
         workingLineNeedsClear(agent_running, self.last_rendered_working_secs);
 
     if (!frame_dirty) {

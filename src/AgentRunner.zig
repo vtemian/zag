@@ -659,16 +659,19 @@ pub fn serviceRoundTripEvent(
             return true;
         },
         .lua_tool_request => |req| {
+            // startLuaToolCall only SPAWNS the tool coroutine and returns; we do
+            // NOT fire req.done here — the coroutine's retire path (normal
+            // return, runtime error, or cancellation) completes the request and
+            // fires done later, while the tool thread parks on it and the main
+            // loop pumps the coroutine (so its execute fn may yield on
+            // zag.cmd/zag.http/zag.sleep). With no engine the tool cannot run;
+            // fail the request so the tool thread unwinds.
             if (engine) |eng| {
-                if (eng.executeTool(req.tool_name, req.input_raw, req.allocator)) |result| {
-                    req.result_content = result.content;
-                    req.result_is_error = result.is_error;
-                    req.result_owned = result.owned;
-                } else |err| {
-                    req.error_name = @errorName(err);
-                }
+                eng.startLuaToolCall(req);
+            } else {
+                req.error_name = "no engine on this driver";
+                req.done.set();
             }
-            req.done.set();
             return true;
         },
         .layout_request => |req| {
@@ -1732,6 +1735,11 @@ test "lua_tool_request round-trips via main thread" {
     var engine = try LuaEngine.init(alloc);
     defer engine.deinit();
     engine.storeSelfPointer();
+    // Lua tools run as coroutines now; the async runtime must be up. `echo`
+    // does not yield, so it retires synchronously on the first resume inside
+    // `serviceRoundTripEvent`, firing `done` within this single dispatch call.
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
     try engine.lua.doString(
         \\zag.tool({
         \\  name = "echo",

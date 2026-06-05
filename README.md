@@ -3,13 +3,10 @@
 > A composable agent development environment. Built in Zig.
 
 <!--
-To make the demo video playable inline on GitHub:
-1. Open any issue or PR on this repo
-2. Drag /Users/whitemonk/Downloads/zag-demo.mp4 into the comment box
-3. GitHub will upload it and generate a URL like https://user-images.githubusercontent.com/...
-4. Replace the <video> src below with that URL
+Demo video: drag the mp4 into any issue/PR comment box on this repo, copy the
+generated user-images.githubusercontent.com URL, and add it here as
+<video src="..." autoplay loop muted playsinline width="100%"></video>
 -->
-<video src="/Users/whitemonk/Downloads/zag-demo.mp4" autoplay loop muted playsinline width="100%"></video>
 
 Zag is an AI coding agent where the **window system is the platform**. Splits, focus, and buffers are primitives. Everything above that — from the session tree to how agent responses render to which system prompt a model gets — is a plugin.
 
@@ -20,7 +17,7 @@ Think **Neovim's architecture, applied to AI agents**.
 ## Quickstart
 
 ```bash
-# Build (Zig 0.15.2)
+# Build (Zig 0.16.0)
 zig build
 
 # Run — first boot launches an onboarding wizard
@@ -201,6 +198,24 @@ The plugin is pure Lua over three runtime primitives, so you can write your own 
 - `zag.pane.subagents(pane_id)` — enumerate a parent's children as `{ index, name, status }`, with `status` one of `ready` / `running` / `done` / `failed`.
 
 `zag.layout.close(pane_id)` detaches a view (the underlying child transcript is never freed by the close; reattach later dedups onto it).
+
+---
+
+## MCP servers
+
+zag is an [MCP](https://modelcontextprotocol.io) client. Declare servers in `config.lua` and the agent reaches their tools through a single `mcp` gateway tool, about 200 tokens, instead of 150 to 300 tokens of schema per individual tool. Connections are lazy, metadata is cached on disk, and stdio, Streamable HTTP, and OAuth-protected servers all work.
+
+```lua
+local mcp = require("zag.mcp")
+mcp.setup{
+  servers = {
+    context7 = { command = { "npx", "-y", "@upstash/context7-mcp" } },
+    linear   = { url = "https://mcp.linear.app/sse", auth = "oauth" },
+  },
+}
+```
+
+The model discovers tools with `mcp({ search = "..." })` and calls them with `mcp({ tool = "...", args = "{...}" })`. Servers with a small, stable surface can register their tools directly instead. Full reference, OAuth setup, and troubleshooting in [`docs/mcp.md`](docs/mcp.md).
 
 ---
 

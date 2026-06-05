@@ -315,26 +315,23 @@ pub fn luaToolExecute(
         },
     };
     // Poll `done` on a 50ms cadence so a cancelled turn does not park a tool
-    // worker on a slow Lua tool. Mirrors the round-trip in `agent.marshalRequest`.
+    // worker forever. The tool now runs as a main-thread coroutine that may be
+    // parked on its own I/O, so `done` can be far away; on the first cancel we
+    // forward the request's atomic flag ONCE (mirroring the workflow tool's park
+    // loop). The engine's per-tick main-thread sweep
+    // (`cancelInFlightWorkflowChildren`) observes it and cancels the tool
+    // coroutine's scope ON MAIN, where the scope's lifetime is controlled; the
+    // retire path then completes the request with an error. We keep waiting for
+    // `done` so we never abandon the parked frame the coroutine borrows.
+    var cancel_forwarded = false;
     while (true) {
         if (req.done.timedWait(50 * std.time.ns_per_ms)) |_| {
             break;
         } else |_| {
             if (cancel) |c| {
-                if (c.load(.acquire)) {
-                    // The main thread may still be inside `executeTool` writing
-                    // `req.result_content` with `allocator`. Wait for `done`
-                    // before touching the result, then release any owned content
-                    // with the producing allocator (never queue.allocator).
-                    req.done.wait();
-                    if (req.result_owned) {
-                        if (req.result_content) |content| allocator.free(content);
-                    }
-                    return .{
-                        .content = "error: lua tool cancelled",
-                        .is_error = true,
-                        .owned = false,
-                    };
+                if (!cancel_forwarded and c.load(.acquire)) {
+                    req.cancel_requested.store(true, .release);
+                    cancel_forwarded = true;
                 }
             }
         }

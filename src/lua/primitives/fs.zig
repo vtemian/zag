@@ -90,6 +90,12 @@ pub fn executeWrite(alloc: Allocator, job: *Job) void {
                 return;
             };
             defer file.close(io);
+            if (spec.file_mode) |m| {
+                file.setPermissions(io, std.Io.File.Permissions.fromMode(m)) catch |err| {
+                    setFsErr(alloc, job, err);
+                    return;
+                };
+            }
             file.writeStreamingAll(io, spec.content) catch |err| {
                 setFsErr(alloc, job, err);
                 return;
@@ -104,6 +110,12 @@ pub fn executeWrite(alloc: Allocator, job: *Job) void {
                 return;
             };
             defer file.close(io);
+            if (spec.file_mode) |m| {
+                file.setPermissions(io, std.Io.File.Permissions.fromMode(m)) catch |err| {
+                    setFsErr(alloc, job, err);
+                    return;
+                };
+            }
 
             const st = file.stat(io) catch |err| {
                 setFsErr(alloc, job, err);
@@ -327,6 +339,72 @@ test "executeRead returns not_found for missing file" {
     try testing.expect(job.err_tag != null);
     try testing.expectEqual(job_mod.ErrTag.not_found, job.err_tag.?);
     if (job.err_detail) |d| alloc.free(d);
+}
+
+test "executeWrite applies an explicit mode to the created file" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try makeTmpAbs(&tmp, "secret.txt", &pbuf);
+
+    var job = Job{
+        .kind = .{ .fs_write = .{
+            .path = path,
+            .content = "secret",
+            .mode = .overwrite,
+            .file_mode = 0o600,
+        } },
+        .thread_ref = 0,
+        .scope = root,
+    };
+    executeWrite(alloc, &job);
+    try testing.expect(job.err_tag == null);
+
+    const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode())) & 0o777);
+}
+
+test "executeWrite without file_mode preserves an existing file's mode" {
+    const alloc = testing.allocator;
+    const root = try Scope.init(alloc, null);
+    defer root.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try makeTmpAbs(&tmp, "preexisting.txt", &pbuf);
+
+    // Pre-create the file with a distinctive non-default mode, then
+    // overwrite WITHOUT file_mode. The default path must not chmod, so
+    // the pre-existing 0o640 survives the overwrite (createFile with
+    // truncate keeps the inode's mode).
+    {
+        const f = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer f.close(std.testing.io);
+        try f.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o640));
+    }
+
+    var job = Job{
+        .kind = .{ .fs_write = .{
+            .path = path,
+            .content = "hello",
+            .mode = .overwrite,
+            .file_mode = null,
+        } },
+        .thread_ref = 0,
+        .scope = root,
+    };
+    executeWrite(alloc, &job);
+    try testing.expect(job.err_tag == null);
+
+    const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try testing.expectEqual(@as(u32, 0o640), @as(u32, @intCast(st.permissions.toMode())) & 0o777);
 }
 
 test "executeStat reports kind and size" {

@@ -18,7 +18,7 @@ zig build run -- --headless --instruction-file=prompt.txt --trajectory-out=traj.
                                   # single-shot eval run, writes ATIF-v1.2 JSON
 ```
 
-Requires: Zig 0.15+. Dependencies: ziglua (Lua 5.4, compiled from source).
+Requires: Zig 0.16+. Dependencies: ziglua (Lua 5.4, compiled from source).
 
 ## Configuration
 

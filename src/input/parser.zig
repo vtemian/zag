@@ -220,9 +220,12 @@ pub const Parser = struct {
     /// Non-blocking read from `fd`, feed into the pending buffer, then
     /// return the next event if one is ready (or produced by timeout).
     ///
-    /// Safe to call in a polling loop. Returns null when no event is
-    /// available; the caller should poll the fd again later.
+    /// Drains buffered events BEFORE reading again: reading
+    /// unconditionally lets a fast burst outpace one-event-per-call
+    /// consumption and overflow `pending`, whose reset discards typed
+    /// bytes. Callers loop until null to consume everything ready.
     pub fn pollOnce(self: *Parser, fd: std.posix.fd_t, now_ms: i64) ?Event {
+        if (self.nextEvent(now_ms)) |ev| return ev;
         var buf: [READ_BUF_SIZE]u8 = undefined;
         const n = wake_pipe.read(fd, &buf) catch |err| switch (err) {
             error.WouldBlock => 0,

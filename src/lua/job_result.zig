@@ -131,6 +131,27 @@ pub fn pushJobResultOntoStack(allocator: Allocator, co: *Lua, job: *async_job.Jo
             co.pushNil();
             return 2;
         },
+        .http_callback_done => |r| {
+            // zag.http.await_callback success: build a string->string
+            // table of the URL-decoded query params, then free the
+            // worker-owned slices. Failure (timeout / cancelled) went
+            // through the generic err_tag branch above, so a job that
+            // reaches here always carries a (possibly empty) param set.
+            co.newTable();
+            for (r.params) |param| {
+                _ = co.pushString(param.name);
+                _ = co.pushString(param.value);
+                co.setTable(-3);
+            }
+            for (r.params) |param| {
+                allocator.free(param.name);
+                allocator.free(param.value);
+            }
+            if (r.params.len > 0) allocator.free(r.params);
+
+            co.pushNil();
+            return 2;
+        },
         .http_get, .http_post => {
             // On success the worker populated job.result.http with
             // a heap-allocated body (on engine allocator). In v1
@@ -290,6 +311,37 @@ pub fn pushJobResultOntoStack(allocator: Allocator, co: *Lua, job: *async_job.Jo
             co.pushNil();
             return 2;
         },
+    }
+}
+
+/// Free the worker-owned payload slices of a result that will never be
+/// pushed onto Lua (the awaiting coroutine was force-retired at engine
+/// teardown before the completion could be drained). Mirrors the inline
+/// frees `pushJobResultOntoStack` performs after Lua copies each slice;
+/// keep the two in sync when a result kind gains an owned slice.
+pub fn freeAbandonedResult(allocator: Allocator, result: async_job.JobResult) void {
+    switch (result) {
+        .empty, .fs_stat => {},
+        .cmd_exec => |r| {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        },
+        .http => |r| {
+            // Guard the outer-slice free so the v1 `&.{}` sentinel (no
+            // backing allocation) doesn't hit the allocator.
+            allocator.free(r.body);
+            for (r.headers) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            if (r.headers.len > 0) allocator.free(r.headers);
+        },
+        .fs_read => |r| allocator.free(r.bytes),
+        .fs_list => |r| {
+            for (r.entries) |entry| allocator.free(entry.name);
+            if (r.entries.len > 0) allocator.free(r.entries);
+        },
+        .llm_complete => |r| allocator.free(r.text),
     }
 }
 
