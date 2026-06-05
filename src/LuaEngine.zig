@@ -2397,7 +2397,9 @@ pub const LuaEngine = struct {
     /// `zag.notify(msg, opts?)`: write the message to `.lua_user` as an info
     /// line prefixed with `[notify]` (the persistent record), and -- when a
     /// WindowManager is wired (interactive TUI) -- also surface it as a
-    /// transient top-right toast tiered by `opts.level`. The headless
+    /// transient top-right toast. `opts.level` selects the tier and its
+    /// auto-dismiss time: "info" (default) 4s, "warn"/"warning" 8s,
+    /// "error"/"err" 15s; an unknown level falls back to info. The headless
     /// Harness leaves `window_manager` null, so notify is log-only there,
     /// exactly as before.
     fn zagNotifyFn(co: *Lua) i32 {
