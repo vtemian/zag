@@ -126,6 +126,45 @@ pub fn estimateCost(
     return total;
 }
 
+/// ATIF metrics semantics: prompt_tokens counts ALL input tokens
+/// (cached and uncached); cached_tokens is the subset served from cache.
+/// OpenAI-style wires already fold cached tokens into `input_tokens`
+/// (`cached_overlaps_input = true`), so `input_tokens` is the full prompt
+/// count. Anthropic-style wires report `input_tokens` excluding cache
+/// read/creation, so those are added back. Saturating addition mirrors the
+/// saturating subtraction in `estimateCost`: malformed reports clamp rather
+/// than wrap.
+pub fn atifTokenCounts(usage: Usage, cached_overlaps_input: bool) struct {
+    prompt_tokens: u32,
+    cached_tokens: u32,
+} {
+    const prompt = if (cached_overlaps_input)
+        usage.input_tokens
+    else
+        usage.input_tokens +| usage.cache_read_tokens +| usage.cache_creation_tokens;
+    return .{ .prompt_tokens = prompt, .cached_tokens = usage.cache_read_tokens };
+}
+
+/// Resolve the wire's cache semantics for `"provider/model"`, mirroring the
+/// exact rate-card lookup `estimateCost` uses. Returns the endpoint's
+/// `wire_semantics.cached_overlaps_input`; a failed lookup (unknown provider
+/// or model) defaults to `true`, the OpenAI-style wire that is the codebase
+/// default for unmetered models.
+pub fn cachedOverlapsInput(registry: *const Registry, provider_model: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, provider_model, '/') orelse return true;
+    const provider_name = provider_model[0..slash];
+    const model_id = provider_model[slash + 1 ..];
+
+    const endpoint = registry.find(provider_name) orelse return true;
+
+    for (endpoint.models) |m| {
+        if (std.mem.eql(u8, m.id, model_id)) {
+            return endpoint.wire_semantics.cached_overlaps_input;
+        }
+    }
+    return true;
+}
+
 // -- Tests -------------------------------------------------------------------
 
 /// Stub factory used by test fixtures in this file. Cost estimation never
@@ -402,6 +441,85 @@ test "cost: cached_overlaps_input read from endpoint.wire_semantics, not seriali
     // 1.0 * 1.0 + 0.5 * 0.25 = 1.125
     const additive_cost = estimateCost(&reg, "additive-test/m", usage).?;
     try std.testing.expectApproxEqAbs(@as(f64, 1.125), additive_cost, 0.001);
+}
+
+test "atifTokenCounts with overlapping cache semantics passes input through" {
+    // OpenAI-style wire: input_tokens already includes cached. prompt_tokens
+    // is the reported input total; cached_tokens is the cache-read subset.
+    const counts = atifTokenCounts(.{
+        .input_tokens = 100,
+        .output_tokens = 50,
+        .cache_creation_tokens = 0,
+        .cache_read_tokens = 40,
+    }, true);
+    try std.testing.expectEqual(@as(u32, 100), counts.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 40), counts.cached_tokens);
+}
+
+test "atifTokenCounts with non-overlapping semantics folds cache into prompt" {
+    // Anthropic-style wire: input_tokens excludes cache read/creation, so
+    // prompt_tokens must add them back to count ALL input tokens.
+    const counts = atifTokenCounts(.{
+        .input_tokens = 60,
+        .output_tokens = 50,
+        .cache_creation_tokens = 10,
+        .cache_read_tokens = 40,
+    }, false);
+    try std.testing.expectEqual(@as(u32, 110), counts.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 40), counts.cached_tokens);
+}
+
+test "cachedOverlapsInput reflects endpoint wire semantics, defaults true for unknown" {
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    const openai_ep: Endpoint = .{
+        .name = "overlap-lookup",
+        .factory = testStubFactory,
+        .wire_semantics = .{ .cached_overlaps_input = true },
+        .url = "https://x",
+        .auth = .bearer,
+        .headers = &.{},
+        .default_model = "gpt-test",
+        .models = &.{
+            .{
+                .id = "gpt-test",
+                .context_window = 1000,
+                .max_output_tokens = 100,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 4.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 0.25,
+            },
+        },
+    };
+    try reg.add(try openai_ep.dupe(std.testing.allocator));
+
+    const anthropic_ep: Endpoint = .{
+        .name = "additive-lookup",
+        .factory = testStubFactory,
+        .url = "https://x",
+        .auth = .x_api_key,
+        .headers = &.{},
+        .default_model = "claude-test",
+        .models = &.{
+            .{
+                .id = "claude-test",
+                .context_window = 1000,
+                .max_output_tokens = 100,
+                .input_per_mtok = 1.0,
+                .output_per_mtok = 4.0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = 0.25,
+            },
+        },
+    };
+    try reg.add(try anthropic_ep.dupe(std.testing.allocator));
+
+    try std.testing.expect(cachedOverlapsInput(&reg, "overlap-lookup/gpt-test"));
+    try std.testing.expect(!cachedOverlapsInput(&reg, "additive-lookup/claude-test"));
+    // Unknown provider/model defaults to OpenAI-style overlap.
+    try std.testing.expect(cachedOverlapsInput(&reg, "no-such-provider/no-such-model"));
 }
 
 test {

@@ -867,7 +867,7 @@ comptime {
     // Round-trip variants need to be added to the switch below so a
     // worker parked on req.done.wait() unblocks during shutdown.
     const variant_count = @typeInfo(agent_events.AgentEvent).@"union".fields.len;
-    if (variant_count != 22) {
+    if (variant_count != 23) {
         @compileError("AgentEvent variant count changed; update drainPendingRoundTrips");
     }
 }
@@ -941,6 +941,7 @@ fn drainPendingRoundTrips(queue: *agent_events.EventQueue, _: std.mem.Allocator)
             .tool_result,
             .info,
             .usage,
+            .llm_done,
             .done,
             .err,
             .reset_assistant_text,
@@ -1188,6 +1189,9 @@ pub fn handleAgentEvent(self: *AgentRunner, event: agent_events.AgentEvent) void
             // conversation node, not persisted, not forwarded to the sink.
             self.output_tokens.store(u.output_tokens, .release);
         },
+        // Authoritative per-call usage consumed only by headless trajectory
+        // capture; the live UI counter rides `.usage` above.
+        .llm_done => {},
         .done => {
             if (self.lua_engine) |eng| {
                 var payload: Hooks.HookPayload = .{ .agent_done = {} };
