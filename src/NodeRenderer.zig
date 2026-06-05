@@ -401,6 +401,24 @@ fn richToolCallLineCount(node: *const Node, registry: *const BufferRegistry) ?us
     const tool_name = node.custom_tag orelse return null;
     const raw = node.tool_input_raw orelse return null;
 
+    // Workflow is dispatched BEFORE the bounded full-tree parse below: a
+    // workflow script is unbounded model output, so a >16 KiB input would
+    // overflow the FBA and bail to null here while `renderWorkflowBlock`
+    // (real, unbounded allocator) renders the full body — diverging the
+    // count from the render and corrupting scroll math. The workflow arm
+    // instead counts the decoded script lines with a streaming scanner that
+    // needs only O(nesting-depth) memory regardless of script size. This is
+    // the shared source of truth `renderWorkflowBlock` also derives its line
+    // count from (both count newlines in the same decoded `script` value),
+    // so the two paths agree for ANY size.
+    if (std.mem.eql(u8, tool_name, "workflow")) {
+        const script_lines = workflowScriptLineCount(raw) orelse return null;
+        // Collapsed: header + one fold hint. Expanded: header + one line
+        // per script source line. Mirror of `renderWorkflowBlock`.
+        if (node.collapsed) return 2;
+        return 1 + script_lines;
+    }
+
     // 16 KiB is enough for the four built-in tools' inputs in practice
     // (Anthropic caps `bash.command` at 16 KiB, `edit.new_text` is
     // bounded by the file body). When the buffer overflows we bail to
@@ -429,14 +447,99 @@ fn richToolCallLineCount(node: *const Node, registry: *const BufferRegistry) ?us
     } else if (std.mem.eql(u8, tool_name, "read")) {
         if (jsonString(&root, "path") == null) return null;
         return 1 + bodyLineCount(node, registry, read_inline_lines);
-    } else if (std.mem.eql(u8, tool_name, "workflow")) {
-        const script = jsonString(&root, "script") orelse return null;
-        // Collapsed: header + one fold hint. Expanded: header + one line
-        // per script source line. Mirror of `renderWorkflowBlock`.
-        if (node.collapsed) return 2;
-        return 1 + lineCount(script);
     }
     return null;
+}
+
+/// Count the display lines of the decoded top-level `script` string in a
+/// `workflow` tool call's raw JSON input. Returns null when `raw` is not a
+/// JSON object, has no string-valued `script` key, or is malformed (the
+/// caller then falls back to the generic header count).
+///
+/// This is the SINGLE source of truth for the workflow script line count:
+/// both `richToolCallLineCount` (above) and `renderWorkflowBlock` derive
+/// their line counts from it, so the count path and the render path can
+/// never diverge regardless of script size. It uses `std.json.Scanner`,
+/// which streams the input and only allocates O(nesting-depth) bookkeeping,
+/// so a multi-megabyte script counts in bounded memory — unlike a full
+/// value-tree parse through a fixed scratch buffer, which would overflow
+/// and silently mis-count.
+///
+/// The line rule matches `lineCount`: one line per non-empty value plus one
+/// per interior `\n`, with a trailing `\n` not adding a final empty line.
+fn workflowScriptLineCount(raw: []const u8) ?usize {
+    var scanner: std.json.Scanner = .initCompleteInput(std.heap.page_allocator, raw);
+    defer scanner.deinit();
+
+    // Walk to the top-level `script` value. `string_is_object_key` separates
+    // an object key from a string value at the same nesting depth.
+    if ((scanner.next() catch return null) != .object_begin) return null;
+    while (true) {
+        const key_tok = scanner.next() catch return null;
+        switch (key_tok) {
+            .object_end => return null, // no `script` key
+            .string => |key| {
+                if (std.mem.eql(u8, key, "script")) break;
+                // Not our key: skip its value (recursively, for objects/arrays).
+                scanner.skipValue() catch return null;
+            },
+            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
+                // A key spanning escape/buffer boundaries can't be "script"
+                // in one token; drain to its `.string` terminator then skip
+                // the value. (Object keys with escapes are rare but legal.)
+                const finished = drainStringToken(&scanner) catch return null;
+                _ = finished;
+                scanner.skipValue() catch return null;
+            },
+            else => return null, // malformed: object key must be a string
+        }
+    }
+
+    // `script`'s value must be a string; count newlines in its decoded form.
+    var lines: usize = 0;
+    var saw_any = false;
+    var last_was_newline = false;
+    while (true) {
+        const tok = scanner.next() catch return null;
+        const chunk: []const u8 = switch (tok) {
+            .string => |s| s,
+            .partial_string => |s| s,
+            .partial_string_escaped_1 => |*b| b[0..],
+            .partial_string_escaped_2 => |*b| b[0..],
+            .partial_string_escaped_3 => |*b| b[0..],
+            .partial_string_escaped_4 => |*b| b[0..],
+            else => return null, // value was not a string
+        };
+        for (chunk) |c| {
+            saw_any = true;
+            if (c == '\n') {
+                lines += 1;
+                last_was_newline = true;
+            } else {
+                last_was_newline = false;
+            }
+        }
+        if (tok == .string) break;
+    }
+    if (!saw_any) return 0;
+    // First line is implicit (one line of content before any `\n`); a
+    // trailing `\n` does not open a new empty line.
+    var count = lines + 1;
+    if (last_was_newline) count -= 1;
+    return count;
+}
+
+/// Drain a string that began with a `.partial_string*` token up to and
+/// including its terminating `.string` token. Returns true on a clean
+/// terminator. Used to skip over object keys that span escape boundaries.
+fn drainStringToken(scanner: *std.json.Scanner) !bool {
+    while (true) {
+        switch (try scanner.next()) {
+            .string => return true,
+            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {},
+            else => return false,
+        }
+    }
 }
 
 /// Body line count for bash/read: the tool_result child's content
@@ -1744,4 +1847,74 @@ test "workflow tool_call with malformed script JSON falls back to generic header
 
     const renderer = NodeRenderer.initDefault();
     try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "workflow tool_call over 16KiB keeps line count and render in lockstep" {
+    const allocator = std.testing.allocator;
+
+    // Build a script far larger than the 16 KiB FBA the generic count path
+    // uses. The old workflow count arm bailed to the generic 1-2 count on
+    // OOM while the renderer drew the full body, corrupting scroll math.
+    // A line is `local v<i> = <i>` (no JSON metacharacters but the inter-line
+    // `\n`), so the JSON wrapper only escapes the newlines.
+    const line_count = 2000; // ~16 chars/line -> ~32 KiB decoded script
+    const script = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        var buf: []const u8 = "";
+        for (0..line_count) |i| {
+            if (i != 0) buf = buf ++ "\n";
+            buf = buf ++ std.fmt.comptimePrint("local v{d} = {d}", .{ i, i });
+        }
+        break :blk buf;
+    };
+    // JSON-escape: replace each real newline with the two-byte `\n` escape.
+    const json_script = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        var out: []const u8 = "";
+        for (script) |c| {
+            out = out ++ (if (c == '\n') "\\n" else &[_]u8{c});
+        }
+        break :blk out;
+    };
+    const raw = "{\"script\":\"" ++ json_script ++ "\"}";
+    try std.testing.expect(raw.len > 16 * 1024);
+
+    const theme = Theme.defaultTheme();
+    const renderer = NodeRenderer.initDefault();
+
+    // Collapsed: count == rendered lines (header + fold hint == 2).
+    {
+        var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+        defer cb.deinit();
+        const node = try cb.appendToolCallNode(null, "workflow", "id1", raw);
+        node.collapsed = true;
+
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+        try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+        try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+
+        // The count arm actually parsed the big script (not the generic
+        // fallback): the fold-aware header must name all script lines.
+        const header = try lines.items[0].toText(allocator);
+        defer allocator.free(header);
+        try std.testing.expectEqualStrings("Workflow(2000 lines)", header);
+    }
+
+    // Expanded: count == rendered lines (header + one line per script line).
+    {
+        var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+        defer cb.deinit();
+        const node = try cb.appendToolCallNode(null, "workflow", "id1", raw);
+        node.collapsed = false;
+
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+
+        try std.testing.expectEqual(@as(usize, 1 + line_count), lines.items.len);
+        try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+    }
 }
