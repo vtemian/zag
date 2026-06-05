@@ -1044,19 +1044,34 @@ fn renderDefault(
             return;
         },
         .subagent_link => {
-            // Placeholder line: `[subagent: <name>] <status>`. All four
-            // span texts are borrowed: `subagent_open`/`subagent_close`
-            // and `subagentStatus` return static slices, and the name
-            // is owned by the node (freed in `Node.deinit` after the
-            // line cache wipes its entry).
+            // Placeholder line: `[subagent: <name>] <status>`. The text
+            // spans are borrowed: `subagent_open`/`subagent_close` and
+            // `subagentStatus` return static slices, and the name is owned
+            // by the node (freed in `Node.deinit` after the line cache wipes
+            // its entry).
+            //
+            // A link spawned by a workflow tool call (`spawning_tool_node`
+            // set) is prefixed with the `  └ ` connector so it reads as
+            // grouped under its workflow header; plain links render flush.
+            // The prefix only adds spans, never a line, so the lineCount of 1
+            // is unchanged.
             const style = theme.highlights.subagent_placeholder;
             const name = node.subagent_name orelse Prefixes.subagent_unnamed;
             const status = subagentStatus(node);
-            const spans = try allocator.alloc(StyledSpan, 4);
-            spans[0] = .{ .text = Prefixes.subagent_open, .style = style };
-            spans[1] = .{ .text = name, .style = style };
-            spans[2] = .{ .text = Prefixes.subagent_close, .style = style };
-            spans[3] = .{ .text = status, .style = style };
+            const grouped = node.spawning_tool_node != null;
+            const span_count: usize = if (grouped) 6 else 4;
+            const spans = try allocator.alloc(StyledSpan, span_count);
+            var i: usize = 0;
+            if (grouped) {
+                spans[i] = .{ .text = Gutter.blank_seg, .style = theme.highlights.tree_connector };
+                i += 1;
+                spans[i] = .{ .text = Gutter.branch_last, .style = theme.highlights.tree_connector };
+                i += 1;
+            }
+            spans[i] = .{ .text = Prefixes.subagent_open, .style = style };
+            spans[i + 1] = .{ .text = name, .style = style };
+            spans[i + 2] = .{ .text = Prefixes.subagent_close, .style = style };
+            spans[i + 3] = .{ .text = status, .style = style };
             try lines.append(allocator, .{ .spans = spans });
             return;
         },
@@ -2086,5 +2101,49 @@ test "workflow header re-render with markDirty between leaks nothing" {
         try renderDefault(wf, &lines, allocator, &theme, &cb.buffer_registry);
         try std.testing.expectEqual(@as(usize, 2), lines.items.len);
         wf.markDirty();
+    }
+}
+
+test "workflow-spawned subagent_link renders indented under its workflow" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "parent");
+    defer cb.deinit();
+
+    // A workflow tool_call and a child linked to it: the link is grouped.
+    _ = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"x\"}");
+    _ = try cb.spawnSubagentLinked("scout", "", "wf1");
+    // A plain link with no spawning workflow: rendered flush.
+    _ = try cb.spawnSubagent("solo", "");
+
+    const grouped_link = cb.tree.root_children.items[1];
+    const plain_link = cb.tree.root_children.items[2];
+    try std.testing.expect(grouped_link.spawning_tool_node != null);
+    try std.testing.expect(plain_link.spawning_tool_node == null);
+
+    const theme = Theme.defaultTheme();
+    const renderer = NodeRenderer.initDefault();
+
+    // Grouped: prefixed with the `  └ ` connector. Both children are empty
+    // (ready), so the status reads `ready`.
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(grouped_link, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+        try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(grouped_link, &cb.buffer_registry));
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("  \u{2514} [subagent: scout] ready", text);
+    }
+
+    // Plain: unchanged, no connector prefix.
+    {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(plain_link, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+        const text = try lines.items[0].toText(allocator);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("[subagent: solo] ready", text);
     }
 }
