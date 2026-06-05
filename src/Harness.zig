@@ -685,7 +685,15 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     done = true;
                     break;
                 },
-                .reset_assistant_text => {},
+                .reset_assistant_text => {
+                    // An LLM retry abandoned the partial output of the wedged
+                    // attempt (text and/or reasoning). Drop it from the capture
+                    // so the recovered attempt's content is not concatenated to
+                    // the discarded partial in the trajectory.
+                    capture.resetTurnContent() catch |err| {
+                        log.warn("capture reset failed: {s}", .{@errorName(err)});
+                    };
+                },
                 .compaction_summary_delta => |text| {
                     // Headless eval drops compaction-summary streaming
                     // deltas; the final compacted history is what the

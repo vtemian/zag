@@ -113,9 +113,27 @@ pub const BufferSink = struct {
                 self.last_assistant_node = self.current_assistant_node;
             },
             .assistant_reset => {
+                // A reasoning model that wedged mid-thought left a live
+                // `current_thinking_node` whose reasoning belongs to the
+                // discarded attempt. Drop it so the retried attempt's
+                // thinking_delta opens a fresh node instead of appending to
+                // the abandoned reasoning (doubled reasoning in the UI).
+                // Capture whether it nests under the assistant node BEFORE
+                // removing that node: `removeNode` frees the whole subtree,
+                // so a thinking child is already gone and re-removing it
+                // would double-free.
+                const stale_thinking = self.current_thinking_node;
+                const thinking_under_assistant = if (stale_thinking) |t|
+                    t.parent != null and t.parent == self.current_assistant_node
+                else
+                    false;
                 if (self.current_assistant_node) |node| {
                     self.buffer.tree.removeNode(node);
                     self.current_assistant_node = null;
+                }
+                if (stale_thinking) |node| {
+                    if (!thinking_under_assistant) self.buffer.tree.removeNode(node);
+                    self.current_thinking_node = null;
                 }
                 // `removeNode` calls `allocator.destroy` on the node, so
                 // `last_assistant_node` (which mirrored the same pointer in
@@ -580,4 +598,67 @@ test "assistant_reset clears last_assistant_node so thinking_delta cannot follow
     try std.testing.expectEqual(@as(usize, 2), roots.len);
     try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
     try std.testing.expectEqual(Conversation.NodeType.thinking, roots[1].node_type);
+}
+
+test "assistant_reset drops a thinking-only partial so the retry's reasoning is not doubled" {
+    // A reasoning model that wedged mid-thought streamed only thinking_delta
+    // (no assistant text) before the attempt died. Without dropping
+    // `current_thinking_node`, the retry's thinking_delta would append to the
+    // discarded attempt's node (doubled reasoning) AND leave the wedged
+    // attempt's reasoning visible as a stale root node.
+    const allocator = std.testing.allocator;
+
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .run_start = .{ .user_text = "hello" } });
+    // Wedged attempt: reasoning only, no assistant text, no thinking_stop.
+    s.push(.{ .thinking_delta = .{ .text = "first-thought" } });
+    s.push(.assistant_reset);
+    // Retry: fresh reasoning, then the real answer.
+    s.push(.{ .thinking_delta = .{ .text = "second-thought" } });
+    s.push(.thinking_stop);
+    s.push(.{ .assistant_delta = .{ .text = "answer" } });
+    s.push(.run_end);
+
+    // Exactly one thinking node survives (the retry's), plus the user message
+    // and the assistant answer. The wedged attempt's reasoning was removed.
+    const roots = cb.tree.root_children.items;
+    try std.testing.expectEqual(@as(usize, 3), roots.len);
+    try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
+    try std.testing.expectEqual(Conversation.NodeType.thinking, roots[1].node_type);
+    try std.testing.expectEqualStrings("second-thought", cb.nodeText(roots[1]));
+    try std.testing.expectEqual(Conversation.NodeType.assistant_text, roots[2].node_type);
+}
+
+test "assistant_reset removing an assistant with a thinking child does not double-free" {
+    // Post-response reasoning nests the thinking node UNDER the assistant_text
+    // node. `removeNode(assistant)` frees the whole subtree, so the reset must
+    // NOT also `removeNode` the thinking child or it double-frees. Run under
+    // the testing allocator so a regression trips an invalid-free/UAF.
+    const allocator = std.testing.allocator;
+
+    var cb = try Conversation.init(allocator, 1, "test");
+    defer cb.deinit();
+
+    var bs = BufferSink.init(allocator, &cb);
+    defer bs.deinit();
+    const s = bs.sink();
+
+    s.push(.{ .run_start = .{ .user_text = "hello" } });
+    s.push(.{ .assistant_delta = .{ .text = "draft" } });
+    // Post-response thinking parents UNDER the assistant_text node.
+    s.push(.{ .thinking_delta = .{ .text = "afterthought" } });
+    s.push(.assistant_reset);
+    s.push(.run_end);
+
+    // Both the assistant_text and its thinking child were removed together;
+    // only the user message remains.
+    const roots = cb.tree.root_children.items;
+    try std.testing.expectEqual(@as(usize, 1), roots.len);
+    try std.testing.expectEqual(Conversation.NodeType.user_message, roots[0].node_type);
 }

@@ -3463,6 +3463,95 @@ test "callLlm does not outer-retry a billing-classified ApiError" {
     try std.testing.expectEqual(@as(u32, 1), stub.streaming_calls);
 }
 
+/// Streams a thinking_delta ONLY (no text) on its first outer attempt, then
+/// fails with `error.ApiError` (transport class) on both the streaming and
+/// non-streaming paths; recovers on the second outer attempt by streaming a
+/// thinking_delta plus a text_delta and succeeding. Models the kimi/moonshot
+/// reasoning wedge: a turn that emits reasoning, then dies mid-thought before
+/// any visible text. The first attempt's thinking must be discarded
+/// (reset_assistant_text) so the recovered turn's reasoning is not doubled.
+const ThinkingOnlyThenRecoverProvider = struct {
+    streaming_calls: u32 = 0,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "thinking_only_then_recover_stub",
+    };
+    fn callImpl(_: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        // Non-streaming fallback also fails so the outer loop is the only
+        // recovery path (mirrors BothPathsFailProvider).
+        if (req.error_detail_out) |out| out.setClass(.{ .transport = .{} });
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *ThinkingOnlyThenRecoverProvider = @ptrCast(@alignCast(ptr));
+        self.streaming_calls += 1;
+        if (self.streaming_calls == 1) {
+            // First attempt: reasoning only, then wedge with a retryable error.
+            req.callback.on_event(req.callback.ctx, .{ .thinking_delta = .{ .text = "first-thought" } });
+            if (req.error_detail_out) |out| out.setClass(.{ .transport = .{} });
+            return error.ApiError;
+        }
+        // Second attempt: reasoning again, then a visible reply, then succeed.
+        req.callback.on_event(req.callback.ctx, .{ .thinking_delta = .{ .text = "second-thought" } });
+        req.callback.on_event(req.callback.ctx, .{ .text_delta = "recovered" });
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+    fn provider(self: *ThinkingOnlyThenRecoverProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "callLlm resets thinking-only partial across an outer retry" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    var stub = ThinkingOnlyThenRecoverProvider{};
+    const p = stub.provider();
+    const resp = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, &detail);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
+    // One failed (thinking-only) outer attempt + one successful = two calls.
+    try std.testing.expectEqual(@as(u32, 2), stub.streaming_calls);
+
+    var buf: [16]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    var reset_index: ?usize = null;
+    var first_thought_index: ?usize = null;
+    var second_thought_index: ?usize = null;
+    var saw_reply = false;
+    for (buf[0..n], 0..) |ev, i| {
+        switch (ev) {
+            .reset_assistant_text => reset_index = i,
+            .thinking_delta => |td| {
+                if (std.mem.eql(u8, td.text.bytes, "first-thought")) first_thought_index = i;
+                if (std.mem.eql(u8, td.text.bytes, "second-thought")) second_thought_index = i;
+            },
+            .text_delta => |t| if (std.mem.eql(u8, t.bytes, "recovered")) {
+                saw_reply = true;
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    // The recovered turn's reasoning and reply both made it through.
+    try std.testing.expect(second_thought_index != null);
+    try std.testing.expect(saw_reply);
+    // A reset fired between the wedged attempt's thinking and the recovery's
+    // thinking, so the stale reasoning node is discarded instead of doubled.
+    try std.testing.expect(reset_index != null);
+    try std.testing.expect(first_thought_index != null);
+    try std.testing.expect(reset_index.? > first_thought_index.?);
+    try std.testing.expect(reset_index.? < second_thought_index.?);
+}
+
 // ============================================================================
 // Structured output via forced terminal tool_use (Milestone G)
 // ============================================================================

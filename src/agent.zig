@@ -1037,10 +1037,14 @@ pub fn callLlm(
         if (error_detail_out) |out| out.reset();
         // If a prior attempt streamed partial content, discard it before
         // re-attempting so the UI/trajectory never see doubled output (same
-        // reset the non-streaming fallback uses on its success path).
-        if (stream_ctx.text_count > 0) {
+        // reset the non-streaming fallback uses on its success path). Gated
+        // on `emitted_any`, not `text_count`: a reasoning model that wedged
+        // mid-thought emitted only thinking_delta (text_count == 0) yet still
+        // left a live thinking node the next attempt would append to.
+        if (stream_ctx.emitted_any) {
             queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
             stream_ctx.text_count = 0;
+            stream_ctx.emitted_any = false;
         }
 
         // The inner sequence: streaming attempt with its own pre-first-token
@@ -1077,7 +1081,7 @@ pub fn callLlm(
                     // the reset must fire on the fatal-propagate path too, not only
                     // when the fallback runs).
                     if (!isStreamingRetryable(streaming_err)) {
-                        if (stream_ctx.text_count > 0) {
+                        if (stream_ctx.emitted_any) {
                             queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
                         }
                         break :inner streaming_err;
@@ -1094,9 +1098,10 @@ pub fn callLlm(
                         .error_detail_out = error_detail_out,
                     };
                     const fallback = provider.call(&req) catch |fallback_err| break :inner fallback_err;
-                    // If streaming already rendered partial text, discard it so the
-                    // full fallback response doesn't appear concatenated to the partial.
-                    if (stream_ctx.text_count > 0) {
+                    // If streaming already rendered partial content (text or
+                    // reasoning), discard it so the full fallback response
+                    // doesn't appear concatenated to the partial.
+                    if (stream_ctx.emitted_any) {
                         queue.pushWithBackpressure(.reset_assistant_text, agent_events.default_backpressure_ms) catch {};
                     }
                     // Push text to queue since streaming callback didn't fire (or was reset)
@@ -2199,6 +2204,12 @@ fn forceCompactForOverflow(
     } else |err| {
         log.warn("overflow recovery: summarization failed ({s}); trying drop-oldest", .{@errorName(err)});
     }
+
+    // Ctrl+C during the summarization LLM call is the user aborting the turn,
+    // not a request to fall through to lossy drop-oldest. Re-check before the
+    // next stage so cancellation stops here instead of trimming history the
+    // user no longer wants sent.
+    if (cancel.load(.acquire)) return messages.items.len != before;
 
     // Stage 2: drop-oldest against the model window. Lossy but deterministic.
     if (context_window > 0) {

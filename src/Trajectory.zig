@@ -424,6 +424,19 @@ pub const Capture = struct {
         try turn.reasoning_text.appendSlice(self.arena.allocator(), delta);
     }
 
+    /// Discard the current turn's accumulated assistant output (both visible
+    /// text and reasoning). Mirrors the `reset_assistant_text` event: an LLM
+    /// retry abandons the partial output of the wedged attempt, so the capture
+    /// must drop it too or the recovered attempt's text/reasoning appends to
+    /// the discarded partial (doubled output in the trajectory). The arena
+    /// keeps the dropped bytes until deinit; `clearRetainingCapacity` only
+    /// rewinds the per-turn ArrayLists, which is the intended cheap reset.
+    pub fn resetTurnContent(self: *Capture) !void {
+        const turn = self.cur orelse return error.NoActiveTurn;
+        turn.text.clearRetainingCapacity();
+        turn.reasoning_text.clearRetainingCapacity();
+    }
+
     /// Mark the end of a thinking block. Multiple blocks within one turn are
     /// joined by a single `\n` separator so consumers can tell them apart.
     /// No-op when the turn has no reasoning text yet (idempotent).
@@ -984,6 +997,43 @@ test "Capture joins multiple thinking blocks with a newline separator" {
     defer freeTrajectory(traj, std.testing.allocator);
 
     try std.testing.expectEqualStrings("first block\nsecond block", traj.steps[2].reasoning_content.?);
+}
+
+test "resetTurnContent drops the wedged attempt's text and reasoning before recovery" {
+    // A reasoning model wedged mid-thought: it streamed reasoning (and maybe a
+    // little text) before the attempt died, then the retry re-streamed both.
+    // Without the reset, the capture would concatenate both attempts; with it,
+    // only the recovered attempt's content survives.
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    // Wedged attempt: reasoning + partial text, then the retry resets it.
+    try cap.addThinkingDelta("first-thought");
+    try cap.addTextDelta("partial");
+    try cap.resetTurnContent();
+    // Recovered attempt: fresh reasoning and the real answer.
+    try cap.addThinkingDelta("second-thought");
+    try cap.addThinkingStop();
+    try cap.addTextDelta("the answer is 42");
+    try cap.endTurn(.{});
+
+    const traj = try cap.build(std.testing.allocator, .{
+        .session_id = "s",
+        .agent = .{ .name = "zag", .version = "0.1.0" },
+        .system_prompt = "",
+        .user_instruction = "",
+        .model = "anthropic/claude-sonnet-4-20250514",
+    });
+    defer freeTrajectory(traj, std.testing.allocator);
+
+    try std.testing.expectEqualStrings("the answer is 42", traj.steps[2].message);
+    try std.testing.expectEqualStrings("second-thought", traj.steps[2].reasoning_content.?);
+}
+
+test "resetTurnContent without an active turn surfaces NoActiveTurn" {
+    var cap = Capture.init(std.testing.allocator);
+    defer cap.deinit();
+    try std.testing.expectError(error.NoActiveTurn, cap.resetTurnContent());
 }
 
 test "build omits reasoning_content when no thinking was captured" {
