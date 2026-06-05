@@ -23,6 +23,8 @@ pub const EventKind = enum {
     session_list_changed,
     pane_focused,
     layout_resize,
+    subagent_spawn,
+    subagent_end,
 };
 
 /// Map a Lua-facing event name like "ToolPre" to an EventKind.
@@ -41,6 +43,8 @@ pub fn parseEventName(name: []const u8) ?EventKind {
         .{ "SessionListChanged", .session_list_changed },
         .{ "PaneFocused", .pane_focused },
         .{ "LayoutResize", .layout_resize },
+        .{ "SubagentSpawn", .subagent_spawn },
+        .{ "SubagentEnd", .subagent_end },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, entry[0], name)) return entry[1];
@@ -154,6 +158,31 @@ pub const HookPayload = union(EventKind) {
         cols: u16,
         /// New terminal height in cells, post-recalculate.
         rows: u16,
+    },
+    /// Observer-only: a workflow/task subagent became visible on the main
+    /// thread (its first `ChildRunnerRegistry.drainAll` observation).
+    /// Fired exactly once per child; pairs 1-1 with `subagent_end`. Not in
+    /// the veto allow-list -- plugins observe, they cannot cancel spawns.
+    subagent_spawn: struct {
+        /// The child's spec name (e.g. "codereview"). Borrowed; valid for
+        /// the duration of the hook fire only.
+        name: []const u8,
+        /// 1-based position of the child among its parent's subagents.
+        index: i64,
+        /// Stable layout handle of the parent's pane, formatted via
+        /// `NodeRegistry.formatId`, or an empty string when the parent has
+        /// no live tile (headless). Borrowed; fire-scoped.
+        parent_pane: []const u8,
+    },
+    /// Observer-only: a subagent retired (normal completion, cancel,
+    /// orphan, or shutdown). Fired exactly once per child, after its
+    /// registry handle is removed and before the `OnDone` switch runs.
+    subagent_end: struct {
+        name: []const u8,
+        index: i64,
+        parent_pane: []const u8,
+        /// True when the child finished in an error/cancelled state.
+        is_error: bool,
     },
 
     pub fn kind(self: HookPayload) EventKind {
@@ -349,6 +378,8 @@ test "parseEventName maps all known event strings" {
     try std.testing.expectEqual(Hooks.EventKind.session_list_changed, Hooks.parseEventName("SessionListChanged").?);
     try std.testing.expectEqual(Hooks.EventKind.pane_focused, Hooks.parseEventName("PaneFocused").?);
     try std.testing.expectEqual(Hooks.EventKind.layout_resize, Hooks.parseEventName("LayoutResize").?);
+    try std.testing.expectEqual(Hooks.EventKind.subagent_spawn, Hooks.parseEventName("SubagentSpawn").?);
+    try std.testing.expectEqual(Hooks.EventKind.subagent_end, Hooks.parseEventName("SubagentEnd").?);
     try std.testing.expect(Hooks.parseEventName("Nope") == null);
 }
 

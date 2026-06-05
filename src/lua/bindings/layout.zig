@@ -1236,6 +1236,124 @@ fn zagPaneSessionIdFn(lua: *Lua) i32 {
     return 1;
 }
 
+/// `zag.pane.subagents(pane_id)`: enumerate the subagents of `pane_id`'s
+/// conversation as an array of `{ index, name, status }`, where `index`
+/// is 1-based (Lua convention), `name` is the child's spawn name, and
+/// `status` is one of `ready` / `running` / `done` / `failed` derived
+/// from the child's tree tail via `Conversation.subagentStatus` (the
+/// single source of truth the transcript's `subagent_link` renderer also
+/// reads). Returns an empty array when the pane has no conversation or no
+/// children. Raises on an unknown pane id or headless (no WM).
+fn zagPaneSubagentsFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const wm = engine.window_manager orelse {
+        lua.raiseErrorStr("zag.pane.subagents: no window manager bound", .{});
+    };
+    const handle = requireLayoutHandle(lua, 1, "zag.pane.subagents");
+    const pane = wm.paneFromHandle(handle) catch |err| {
+        var buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.pane.subagents: {s}", .{@errorName(err)}) catch "zag.pane.subagents failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+
+    lua.newTable();
+    const conv = pane.conversation orelse return 1; // empty array
+    for (conv.subagents.items, 0..) |child, i| {
+        lua.newTable();
+        lua.pushInteger(@intCast(i + 1)); // 1-based for Lua
+        lua.setField(-2, "index");
+        _ = lua.pushString(child.name);
+        lua.setField(-2, "name");
+        _ = lua.pushString(child.subagentStatus());
+        lua.setField(-2, "status");
+        lua.rawSetIndex(-2, @intCast(i + 1));
+    }
+    return 1;
+}
+
+/// `zag.pane.attach_subagent(parent_pane_id, child_index, opts?) -> pane_id`:
+/// open a live borrowed view of the `child_index`-th subagent of
+/// `parent_pane_id`'s conversation and return the new view pane's handle
+/// string. `child_index` is 1-based (Lua convention), converted to the
+/// 0-based index `attachSubagentView` expects. `opts.dest` is `"split"`
+/// (default) or `"float"`; `opts.focus` (default false) decides whether
+/// the view grabs focus -- false is the non-focus-stealing default a
+/// plugin wants when attaching mid-typing. Dedup is by construction:
+/// attaching the same child twice returns the same handle. Raises on an
+/// unknown pane, a pane with no conversation, an out-of-range index, an
+/// unknown `dest`, or headless (no WM).
+fn zagPaneAttachSubagentFn(lua: *Lua) i32 {
+    const engine = LuaEngine.getEngineFromState(lua);
+    const wm = engine.window_manager orelse {
+        lua.raiseErrorStr("zag.pane.attach_subagent: no window manager bound", .{});
+    };
+    const handle = requireLayoutHandle(lua, 1, "zag.pane.attach_subagent");
+
+    if (lua.typeOf(2) != .number) {
+        lua.raiseErrorStr("zag.pane.attach_subagent: child_index must be an integer", .{});
+    }
+    const index_lua = lua.toInteger(2) catch {
+        lua.raiseErrorStr("zag.pane.attach_subagent: child_index must be an integer", .{});
+    };
+    if (index_lua < 1) {
+        lua.raiseErrorStr("zag.pane.attach_subagent: child_index must be >= 1 (1-based)", .{});
+    }
+
+    var dest: WindowManager.AttachDest = .split;
+    var focus = false;
+    if (lua.isTable(3)) {
+        _ = lua.getField(3, "dest");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .string => {
+                const d = lua.toString(-1) catch {
+                    lua.raiseErrorStr("zag.pane.attach_subagent: dest must be a string", .{});
+                };
+                if (std.mem.eql(u8, d, "split")) {
+                    dest = .split;
+                } else if (std.mem.eql(u8, d, "float")) {
+                    dest = .float;
+                } else {
+                    lua.raiseErrorStr("zag.pane.attach_subagent: dest must be \"split\" or \"float\"", .{});
+                }
+            },
+            else => lua.raiseErrorStr("zag.pane.attach_subagent: dest must be a string", .{}),
+        }
+        lua.pop(1);
+
+        _ = lua.getField(3, "focus");
+        switch (lua.typeOf(-1)) {
+            .nil, .none => {},
+            .boolean => focus = lua.toBoolean(-1),
+            else => lua.raiseErrorStr("zag.pane.attach_subagent: focus must be a boolean", .{}),
+        }
+        lua.pop(1);
+    }
+
+    const pane = wm.paneFromHandle(handle) catch |err| {
+        var buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.pane.attach_subagent: {s}", .{@errorName(err)}) catch "zag.pane.attach_subagent failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+    const parent_conv = pane.conversation orelse {
+        lua.raiseErrorStr("zag.pane.attach_subagent: pane has no conversation", .{});
+    };
+
+    // Lua passes 1-based; attachSubagentView (and subagents.items) is 0-based.
+    const child_index: usize = @intCast(index_lua - 1);
+    const new_handle = wm.attachSubagentView(parent_conv, child_index, dest, focus) catch |err| {
+        var buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "zag.pane.attach_subagent: {s}", .{@errorName(err)}) catch "zag.pane.attach_subagent failed";
+        lua.raiseErrorStr("%s", .{msg.ptr});
+    };
+    const new_id = NodeRegistry.formatId(engine.allocator, new_handle) catch {
+        lua.raiseErrorStr("zag.pane.attach_subagent: id format failed", .{});
+    };
+    defer engine.allocator.free(new_id);
+    _ = lua.pushString(new_id);
+    return 1;
+}
+
 /// Register the `zag.layout` subtable. Caller has the `zag` table at
 /// stack top; on return the `zag` table is still at stack top with
 /// `layout` attached. Mirrors the original registration order from
@@ -1284,5 +1402,9 @@ pub fn registerPaneTable(lua: *Lua) void {
     lua.setField(-2, "replace_draft_range");
     lua.pushFunction(zlua.wrap(zagPaneSessionIdFn));
     lua.setField(-2, "session_id");
+    lua.pushFunction(zlua.wrap(zagPaneSubagentsFn));
+    lua.setField(-2, "subagents");
+    lua.pushFunction(zlua.wrap(zagPaneAttachSubagentFn));
+    lua.setField(-2, "attach_subagent");
     lua.setField(-2, "pane"); // zag.pane = pane_table; [zag_table]
 }

@@ -53,6 +53,40 @@ fn zagWorkflowMaxFanoutFn(lua: *Lua) !i32 {
     return 1;
 }
 
+/// Zig function backing `zag.workflow.set_panes(enabled)`. Writes the bool the
+/// `zag.builtin.workflow_panes` plugin reads to decide whether to open a live
+/// borrowed child-view pane while a workflow runs. Any Lua value is coerced to
+/// a boolean (Lua truthiness), matching the toggle's "off = no pane" contract.
+fn zagWorkflowSetPanesFn(lua: *Lua) !i32 {
+    const enabled = lua.toBoolean(1);
+
+    _ = lua.getField(zlua.registry_index, "_zag_engine");
+    const ptr = lua.toPointer(-1) catch {
+        log.warn("zag.workflow.set_panes(): engine pointer not set (call storeSelfPointer first)", .{});
+        return error.LuaError;
+    };
+    lua.pop(1);
+    const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+    engine.workflow_panes_enabled = enabled;
+    return 0;
+}
+
+/// Zig function backing `zag.workflow.panes()`. Returns the live
+/// workflow-pane-enabled bool the plugin's spawn handler gates on.
+fn zagWorkflowPanesFn(lua: *Lua) !i32 {
+    _ = lua.getField(zlua.registry_index, "_zag_engine");
+    const ptr = lua.toPointer(-1) catch {
+        log.warn("zag.workflow.panes(): engine pointer not set (call storeSelfPointer first)", .{});
+        return error.LuaError;
+    };
+    lua.pop(1);
+    const engine: *LuaEngine = @ptrCast(@alignCast(@constCast(ptr)));
+
+    lua.pushBoolean(engine.workflow_panes_enabled);
+    return 1;
+}
+
 /// Build the `zag.workflow` subtable on the `zag` table. Caller has the `zag`
 /// table at stack top; on return the `zag` table is still at stack top with
 /// `workflow` attached. The `parallel`/`pipeline` combinators are layered onto
@@ -63,5 +97,9 @@ pub fn registerOn(lua: *Lua) void {
     lua.setField(-2, "set_max_fanout");
     lua.pushFunction(zlua.wrap(zagWorkflowMaxFanoutFn));
     lua.setField(-2, "max_fanout");
+    lua.pushFunction(zlua.wrap(zagWorkflowSetPanesFn));
+    lua.setField(-2, "set_panes");
+    lua.pushFunction(zlua.wrap(zagWorkflowPanesFn));
+    lua.setField(-2, "panes");
     lua.setField(-2, "workflow"); // zag.workflow = workflow_table; [zag_table]
 }

@@ -296,6 +296,10 @@ fn testSpawnChild(co: *Lua) i32 {
             .child = child,
             .resume_fn = LuaEngine.resumeWorkflowChild,
         } },
+        // Carry the child identity on the handle too (B1), so the lifecycle
+        // sink in drainAll fires SubagentSpawn/SubagentEnd. The production
+        // register sites (task.zig, bindings/task.zig) do the same.
+        .child = child,
     }) catch {
         co.raiseErrorStr("registry.register failed", .{});
     };
@@ -695,6 +699,424 @@ test "onChildRetiredOnMain persists task_end on the task-gone/orphaned path (rea
         allocator.free(loaded);
     }
     try assertTaskStartEndPair(loaded);
+}
+
+// -- Subagent lifecycle hooks (Milestone B2) --------------------------------
+
+/// Wire the lifecycle sink to the engine so drainAll fires SubagentSpawn /
+/// SubagentEnd, and install a Lua hook log that records each fire as
+/// `{ event, name, index, is_error }`. Mirrors the EventOrchestrator.create
+/// wiring, which the headless harness skips.
+fn installLifecycleHookLog(engine: *LuaEngine, registry: *ChildRunnerRegistry) !void {
+    registry.lifecycle_sink = .{
+        .ctx = engine,
+        .on_spawn = LuaEngine.fireSubagentSpawn,
+        .on_end = LuaEngine.fireSubagentEnd,
+    };
+    try runLua(engine,
+        \\_G.hook_log = {}
+        \\zag.hook("SubagentSpawn", function(evt)
+        \\    table.insert(_G.hook_log, {
+        \\        event = "spawn", name = evt.name, index = evt.index,
+        \\        parent_pane = evt.parent_pane,
+        \\    })
+        \\end)
+        \\zag.hook("SubagentEnd", function(evt)
+        \\    table.insert(_G.hook_log, {
+        \\        event = "end", name = evt.name, index = evt.index,
+        \\        is_error = evt.is_error, parent_pane = evt.parent_pane,
+        \\    })
+        \\end)
+    );
+}
+
+/// Pump drainAll until the registry empties (every child retired) or the
+/// deadline passes. Used by the lifecycle-hook tests, which need the child's
+/// agent thread joined and its end-fire delivered.
+fn pumpUntilEmpty(registry: *ChildRunnerRegistry, deadline_ms: i64) void {
+    while (!registry.isEmpty() and clock.milliTimestamp() < deadline_ms) {
+        registry.drainAll();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+}
+
+test "zag.task child fires SubagentSpawn once then SubagentEnd once (is_error=false)" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "child summary text" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    try installLifecycleHookLog(&engine, &child_registry);
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var fixture = WorkflowSpawnFixture{ .engine = &engine, .registry = &child_registry, .ctx = &ctx };
+    workflow_spawn_fixture = &fixture;
+    defer workflow_spawn_fixture = null;
+
+    engine.lua.pushFunction(zlua.wrap(testSpawnChild));
+    engine.lua.setGlobal("_test_spawn_child");
+
+    try engine.lua.doString(
+        \\function test_workflow() _test_spawn_child() end
+    );
+    _ = try engine.lua.getGlobal("test_workflow");
+    _ = try engine.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+
+    // Exactly one spawn followed by one end; matching name/index; not errored.
+    // The fixture spawns a child named "tester" at subagent index 0 (1-based 1).
+    try runLua(&engine,
+        \\assert(#_G.hook_log == 2,
+        \\       "expected 2 lifecycle fires, got " .. tostring(#_G.hook_log))
+        \\local s, e = _G.hook_log[1], _G.hook_log[2]
+        \\assert(s.event == "spawn", "first fire must be spawn, got " .. tostring(s.event))
+        \\assert(e.event == "end", "second fire must be end, got " .. tostring(e.event))
+        \\assert(s.name == "tester", "spawn name: " .. tostring(s.name))
+        \\assert(e.name == "tester", "end name: " .. tostring(e.name))
+        \\assert(s.index == 1, "spawn index (1-based): " .. tostring(s.index))
+        \\assert(e.index == 1, "end index (1-based): " .. tostring(e.index))
+        \\assert(e.is_error == false, "end is_error must be false")
+        \\-- Headless: no live parent pane, so parent_pane is the empty string.
+        \\assert(s.parent_pane == "", "headless parent_pane must be empty: " .. tostring(s.parent_pane))
+    );
+}
+
+test "cancelled workflow child fires SubagentEnd exactly once with is_error=true" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+
+    var stub = GatedCancelProvider{};
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+    engine.child_runner_registry = &child_registry;
+
+    try installLifecycleHookLog(&engine, &child_registry);
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "gated_cancel",
+        .model_spec = .{ .provider_name = "gated_cancel", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var fixture = WorkflowSpawnFixture{ .engine = &engine, .registry = &child_registry, .ctx = &ctx };
+    workflow_spawn_fixture = &fixture;
+    defer workflow_spawn_fixture = null;
+
+    engine.lua.pushFunction(zlua.wrap(testSpawnChild));
+    engine.lua.setGlobal("_test_spawn_child");
+
+    try engine.lua.doString(
+        \\function test_workflow() _test_spawn_child() end
+    );
+    _ = try engine.lua.getGlobal("test_workflow");
+    _ = try engine.spawnCoroutine(0, null);
+
+    // The child is registered and parked; drain once so the spawn fire lands
+    // while the gated provider still spins (the child has not finished).
+    child_registry.drainAll();
+    try testing.expect(!child_registry.isEmpty());
+
+    // Shutdown cancels the gated child; drainAll then joins it and fires end.
+    engine.deinitAsync();
+    try testing.expect(child_registry.isEmpty());
+
+    // Exactly one spawn and one end; the cancelled child errored.
+    try runLua(&engine,
+        \\local spawns, ends, errored = 0, 0, nil
+        \\for _, e in ipairs(_G.hook_log) do
+        \\    if e.event == "spawn" then spawns = spawns + 1 end
+        \\    if e.event == "end" then ends = ends + 1; errored = e.is_error end
+        \\end
+        \\assert(spawns == 1, "expected exactly 1 spawn, got " .. tostring(spawns))
+        \\assert(ends == 1, "expected exactly 1 end, got " .. tostring(ends))
+        \\assert(errored == true, "cancelled child must end with is_error=true")
+    );
+}
+
+/// Test-only park-mode spawn: build a ChildAgent via `start` and register it
+/// with an `OnDone.park` ResetEvent, exactly as the `task` tool does
+/// (`tools/task.zig:166`). Returns the child + its park event so the caller
+/// drives drainAll until done, then deinits. Park and workflow modes share the
+/// drainAll fire point, so this exercises the same spawn/end hooks under the
+/// other OnDone arm.
+const ParkChild = struct {
+    child: *ChildAgent,
+    done: *sync.ResetEvent,
+};
+
+fn spawnParkChild(engine: *LuaEngine, registry: *ChildRunnerRegistry, ctx: *const tools.TaskContext, done: *sync.ResetEvent) !*ChildAgent {
+    const child = try engine.allocator.create(ChildAgent);
+    errdefer engine.allocator.destroy(child);
+    child.* = .{
+        .allocator = ctx.allocator,
+        .child_registry = undefined,
+        .child_sink = undefined,
+        .child_runner = undefined,
+        .child_conv = undefined,
+        .task_start_id = null,
+        .session_handle = ctx.session_handle,
+        .spec = .{ .system_prompt = "You are a test subagent.", .prompt = "do the thing", .tools = null, .name = "parker" },
+        .spec_arena = std.heap.ArenaAllocator.init(ctx.allocator),
+        .resume_thread_ref = -1,
+    };
+    child.start(ctx) catch |err| {
+        child.spec_arena.deinit();
+        engine.allocator.destroy(child);
+        return err;
+    };
+    try registry.register(.{
+        .runner = &child.child_runner,
+        .on_done = .{ .park = done },
+        .child = child,
+    });
+    return child;
+}
+
+test "park-mode task child fires both SubagentSpawn and SubagentEnd" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "park child summary" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    try installLifecycleHookLog(&engine, &child_registry);
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var done: sync.ResetEvent = .{};
+    const child = try spawnParkChild(&engine, &child_registry, &ctx, &done);
+    defer {
+        child.deinit();
+        allocator.destroy(child);
+    }
+
+    pumpUntilEmpty(&child_registry, clock.milliTimestamp() + 2000);
+    try testing.expect(done.isSet());
+    try testing.expect(child_registry.isEmpty());
+
+    try runLua(&engine,
+        \\local spawns, ends = 0, 0
+        \\for _, e in ipairs(_G.hook_log) do
+        \\    if e.event == "spawn" then spawns = spawns + 1 end
+        \\    if e.event == "end" then ends = ends + 1 end
+        \\end
+        \\assert(spawns == 1, "park child must fire exactly 1 spawn, got " .. tostring(spawns))
+        \\assert(ends == 1, "park child must fire exactly 1 end, got " .. tostring(ends))
+    );
+}
+
+test "a SubagentSpawn hook that raises does not break the drain; the child still retires" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "child summary" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    // A raising spawn hook: the dispatcher must guard it (a flaky plugin can
+    // never wedge the drain), so the child must still retire normally.
+    child_registry.lifecycle_sink = .{
+        .ctx = &engine,
+        .on_spawn = LuaEngine.fireSubagentSpawn,
+        .on_end = LuaEngine.fireSubagentEnd,
+    };
+    try runLua(&engine,
+        \\_G.end_fired = false
+        \\zag.hook("SubagentSpawn", function(evt) error("boom from a bad plugin") end)
+        \\zag.hook("SubagentEnd", function(evt) _G.end_fired = true end)
+    );
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = null,
+    };
+
+    var fixture = WorkflowSpawnFixture{ .engine = &engine, .registry = &child_registry, .ctx = &ctx };
+    workflow_spawn_fixture = &fixture;
+    defer workflow_spawn_fixture = null;
+
+    engine.lua.pushFunction(zlua.wrap(testSpawnChild));
+    engine.lua.setGlobal("_test_spawn_child");
+
+    try engine.lua.doString(
+        \\function test_workflow() _test_spawn_child() end
+    );
+    _ = try engine.lua.getGlobal("test_workflow");
+    _ = try engine.spawnCoroutine(0, null);
+
+    const deadline = clock.milliTimestamp() + 2000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+
+    // The raising spawn hook did not wedge the drain: the coroutine retired and
+    // the end hook still fired.
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+    try testing.expect(child_registry.isEmpty());
+    try runLua(&engine,
+        \\assert(_G.end_fired == true,
+        \\       "the child must retire and fire SubagentEnd even after a raising spawn hook")
+    );
+}
+
+test "workflow_panes plugin stays inert on a headless engine (no window manager)" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // Load the plugin into a headless engine: no window_manager is bound, so
+    // every zag.pane.* / zag.layout.* call raises. The plugin must subscribe
+    // its hooks and survive a spawn/end fire without raising and without
+    // opening a view (parent_pane is the empty string in headless mode).
+    try runLua(&engine, "_G.wp = require('zag.builtin.workflow_panes')");
+
+    // Fire a spawn then an end exactly as the registry sink would, but with the
+    // headless empty-string parent_pane. fireHook must not propagate any error.
+    var spawn: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "alpha", .index = 1, .parent_pane = "" } };
+    _ = try engine.fireHook(&spawn);
+    var end: Hooks.HookPayload = .{ .subagent_end = .{ .name = "alpha", .index = 1, .parent_pane = "", .is_error = false } };
+    _ = try engine.fireHook(&end);
+
+    // The plugin tracked nothing: no view pane id, no parent pane.
+    try runLua(&engine,
+        \\local s = _G.wp._state_for_test()
+        \\assert(s.view_pane == nil, "headless: no view pane must be opened")
+        \\assert(s.current_index == nil, "headless: nothing should be tracked")
+    );
+}
+
+test "workflow_panes teardown removes the registered hooks and keymaps" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // require-time registration populates the id lists (keymap/hook bindings
+    // do not need a window manager, so they register even headless).
+    try runLua(&engine, "_G.wp = require('zag.builtin.workflow_panes')");
+    try runLua(&engine,
+        \\local s = _G.wp._state_for_test()
+        \\assert(#s.hook_ids == 2, "expected 2 hook ids after require, got " .. tostring(#s.hook_ids))
+        \\assert(#s.keymap_ids == 1, "expected 1 keymap id (normal mode only), got " .. tostring(#s.keymap_ids))
+    );
+
+    // teardown consumes both id lists; the function must exist and work even
+    // though no production call site invokes it today.
+    try runLua(&engine,
+        \\_G.wp.teardown()
+        \\local s = _G.wp._state_for_test()
+        \\assert(#s.hook_ids == 0, "teardown must clear hook_ids")
+        \\assert(#s.keymap_ids == 0, "teardown must clear keymap_ids")
+        \\assert(s.view_pane == nil, "teardown must close any view")
+    );
 }
 
 // -- zag.task binding misuse guards (Milestone E1) --------------------------

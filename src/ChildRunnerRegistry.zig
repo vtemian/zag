@@ -59,17 +59,50 @@ pub const OnDone = union(enum) {
     };
 };
 
+/// Injected observer for child spawn/retire, so the registry can drive the
+/// subagent lifecycle hooks without importing LuaEngine (which would form a
+/// cycle: LuaEngine -> ChildAgent -> this registry). `ctx` is the LuaEngine;
+/// the callbacks cast `child` (an opaque `*ChildAgent`) back to its concrete
+/// type, build the hook payload, and fire it. Both run on the main drain
+/// thread with NO registry lock held.
+pub const LifecycleSink = struct {
+    ctx: *anyopaque,
+    /// Fired once per child, on its first `drainAll` observation, before that
+    /// child's events are drained.
+    on_spawn: *const fn (ctx: *anyopaque, child: *anyopaque) void,
+    /// Fired once per child, after its handle is removed and before the
+    /// `OnDone` completion runs (the child is still live exactly there).
+    /// The error/cancel state is NOT passed: it is a property of the child's
+    /// conversation (`childErroredForTask`), reachable only by the adapter
+    /// that casts `child` back to the concrete `*ChildAgent`. Deriving it in
+    /// the registry would require importing ChildAgent and re-form the very
+    /// cycle this opaque-pointer design avoids, so the adapter computes it.
+    on_end: *const fn (ctx: *anyopaque, child: *anyopaque) void,
+};
+
 /// One in-flight child. `runner` references storage that stays alive until the
 /// child finishes (parent-thread stack for park, the heap ChildAgent for
 /// workflow). `on_done` decides what happens when the child finishes.
 pub const Handle = struct {
     runner: *AgentRunner,
     on_done: OnDone,
+    /// The `*ChildAgent` behind this runner, kept opaque to preserve this
+    /// module's no-import design (importing ChildAgent would form a cycle). It
+    /// is the identity payload the subagent lifecycle hooks read (name, child
+    /// conversation, spec) when they fire from `drainAll`.
+    child: ?*anyopaque = null,
+    /// Set by `drainAll` once the spawn lifecycle event has fired for this
+    /// handle, so the spawn announce happens exactly once per child.
+    announced: bool = false,
 };
 
 mutex: sync.Mutex = .{},
 entries: std.ArrayList(Handle) = .empty,
 allocator: Allocator,
+/// Optional observer for subagent spawn/retire. Wired by
+/// `EventOrchestrator.create` to the LuaEngine adapter; null in headless or
+/// pre-wiring contexts (drainAll then just skips the fires).
+lifecycle_sink: ?LifecycleSink = null,
 
 pub fn init(allocator: Allocator) ChildRunnerRegistry {
     return .{ .allocator = allocator };
@@ -128,17 +161,37 @@ pub fn drainAll(self: *ChildRunnerRegistry) void {
     // mutex across Lua dispatch / thread join. If more children are in flight
     // than the cap, drain the first batch and defer the rest to the next tick.
     var snapshot: [drain_runner_cap]Handle = undefined;
+    // Parallel flag: this child crossed unannounced->announced in THIS pass, so
+    // its spawn fire is owed (and owed exactly once). Computed under the lock
+    // where `announced` is persisted back onto the stored entry.
+    var fire_spawn: [drain_runner_cap]bool = undefined;
     var len: usize = 0;
     {
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.entries.items) |handle| {
+        for (self.entries.items, 0..) |*handle, idx| {
             if (len >= drain_runner_cap) {
                 log.warn("drainAll: more than {d} children, deferring rest to next tick", .{drain_runner_cap});
                 break;
             }
-            snapshot[len] = handle;
+            // Persist `announced` on the STORED entry (handle is a pointer into
+            // self.entries), so a deferred-to-next-tick child is not announced
+            // twice and the snapshot copy reflects the post-mark state. Spawn
+            // fires only when a sink is wired and the handle carries identity.
+            const owe_spawn = self.lifecycle_sink != null and handle.child != null and !handle.announced;
+            if (owe_spawn) self.entries.items[idx].announced = true;
+            snapshot[len] = handle.*;
+            fire_spawn[len] = owe_spawn;
             len += 1;
+        }
+    }
+
+    // Spawn fires happen with NO lock held, on the main thread, before each
+    // child's events are drained.
+    if (self.lifecycle_sink) |sink| {
+        for (snapshot[0..len], 0..) |handle, i| {
+            if (!fire_spawn[i]) continue;
+            sink.on_spawn(sink.ctx, handle.child.?);
         }
     }
 
@@ -154,6 +207,16 @@ pub fn drainAll(self: *ChildRunnerRegistry) void {
         self.mutex.lock();
         self.removeLocked(handle.runner);
         self.mutex.unlock();
+        // End fire: after removeLocked, STRICTLY BEFORE the OnDone switch.
+        // The reviewer verified the ChildAgent is still live exactly here in
+        // both modes; after done.set()/resume_fn it may be freed. No lock
+        // held. Defensive: a handle with no identity (child == null) and no
+        // sink skip the fire (they also never fired spawn).
+        if (self.lifecycle_sink) |sink| {
+            if (handle.child) |child| {
+                sink.on_end(sink.ctx, child);
+            }
+        }
         // No lock held here, on the main thread, after the child thread was
         // joined by drainEvents: the contract every completion path expects.
         switch (handle.on_done) {
@@ -202,6 +265,31 @@ test "register then remove by pointer empties the registry" {
     // Removing an absent runner is a no-op.
     reg.remove(&runner_a);
     try testing.expect(reg.isEmpty());
+}
+
+test "a registered handle carries the child identity and starts unannounced" {
+    const testing = std.testing;
+    var reg = ChildRunnerRegistry.init(testing.allocator);
+    defer reg.deinit();
+
+    var runner: AgentRunner = undefined;
+    var done: sync.ResetEvent = .{};
+    // A distinct heap object stands in for the *ChildAgent; the registry treats
+    // it as opaque and never dereferences it.
+    const child_marker = try testing.allocator.create(u8);
+    defer testing.allocator.destroy(child_marker);
+
+    try reg.register(.{
+        .runner = &runner,
+        .on_done = .{ .park = &done },
+        .child = child_marker,
+    });
+
+    try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
+    const handle = reg.entries.items[0];
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(child_marker)), handle.child);
+    // The spawn lifecycle event has not fired yet for a freshly registered child.
+    try testing.expect(!handle.announced);
 }
 
 const Conversation = @import("Conversation.zig");

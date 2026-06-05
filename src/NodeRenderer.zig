@@ -79,13 +79,11 @@ fn subagentStatus(node: *const Node) []const u8 {
     const parent: *const Conversation = @ptrCast(@alignCast(parent_opaque));
     if (node.subagent_index >= parent.subagents.items.len) return "missing";
     const child = parent.subagents.items[node.subagent_index];
-    if (child.tree.root_children.items.len == 0) return "ready";
-    const tail = child.tree.root_children.items[child.tree.root_children.items.len - 1];
-    return switch (tail.node_type) {
-        .err => "failed",
-        .assistant_text => "done",
-        else => "running",
-    };
+    // Tail-check the child's tree (ready/running/done/failed); the
+    // `missing` arm above is renderer-specific (the link node may outlive
+    // its child slot during a stale render). `Conversation.subagentStatus`
+    // is the shared source of truth, also read by `zag.pane.subagents`.
+    return child.subagentStatus();
 }
 
 /// Pre-baked decimal digit strings for the most common collapsed-tool hint

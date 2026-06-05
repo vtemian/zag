@@ -140,6 +140,7 @@ pub fn zagTaskFn(co: *Lua) i32 {
             .child = child,
             .resume_fn = LuaEngine.resumeWorkflowChild,
         } },
+        .child = child,
     }) catch {
         // Registration failed: the child started but will never be drained.
         // Tear it down (deinit joins its agent thread) and report.

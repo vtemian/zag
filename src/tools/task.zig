@@ -163,7 +163,7 @@ fn runChild(
     // never touches the VM off the main thread.
     if (ctx.child_registry) |registry| {
         var child_done: sync.ResetEvent = .{};
-        try registry.register(.{ .runner = &child.child_runner, .on_done = .{ .park = &child_done } });
+        try registry.register(.{ .runner = &child.child_runner, .on_done = .{ .park = &child_done }, .child = child });
         // No errdefer-remove needed: registration cannot fail after this
         // point, and the main thread always removes the entry on the child's
         // `.done` (threadMain guarantees a `.done` even on error).
@@ -241,7 +241,8 @@ pub const definition = types.ToolDefinition{
     .name = "task",
     .description = "Spawn one subagent to handle a self-contained sub-problem and return its result. " ++
         "Describe the subagent inline: give it a `prompt` (the task), optionally a `system` persona, " ++
-        "a `tools` allowlist (a subset of your tools; omit to inherit all of them), and a `name` for the " ++
+        "a `tools` allowlist (a subset of your tools; omit to inherit all of them except the screen-driving " ++
+        "tools, which subagents never get), and a `name` for the " ++
         "transcript. The call blocks until the subagent finishes; it returns the subagent's final summary, " ++
         "or, when you pass a JSON `schema`, the subagent's validated JSON output as the tool result.",
     .prompt_snippet = "Spawn an inline subagent with a prompt (and optional system/tools/schema)",
@@ -251,7 +252,7 @@ pub const definition = types.ToolDefinition{
     \\  "properties": {
     \\    "prompt": { "type": "string", "description": "The task for the subagent." },
     \\    "system": { "type": "string", "description": "Optional system/persona prompt prepended to the task." },
-    \\    "tools":  { "type": "array", "items": { "type": "string" }, "description": "Optional allowlist of tool names the subagent may use; omit to inherit all of yours." },
+    \\    "tools":  { "type": "array", "items": { "type": "string" }, "description": "Optional allowlist of tool names the subagent may use; omit to inherit all of yours except the screen-driving tools (layout_tree/focus/split/close/resize, pane_read), which subagents never get." },
     \\    "model":  { "type": "string", "description": "Optional model override (carried but not yet honored; the subagent uses the parent's model)." },
     \\    "schema": { "type": "string", "description": "Optional JSON schema string. When set, the subagent is forced to emit a single matching JSON object, returned as the validated tool result." },
     \\    "name":   { "type": "string", "description": "Optional display name for the subagent in the transcript (default \"subagent\")." }

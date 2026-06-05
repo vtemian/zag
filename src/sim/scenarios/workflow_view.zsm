@@ -1,0 +1,27 @@
+# Window-platform workflow view: a workflow child streams into a live
+# borrowed pane opened by the workflow_panes builtin plugin.
+#
+# What this DOES verify, end to end against the real provider:
+# - the model-driven workflow tool runs a zag.task child,
+# - the SubagentSpawn hook fires and the plugin attaches the borrowed view
+#   (the child's bash OUTPUT reaching the grid is the discriminator: the
+#   token wfv-1729 appears nowhere in the script text the parent transcript
+#   shows, and the script returns a fixed 'WFV-OK' so the parent model never
+#   learns the value; the only way wfv-1729 lands on screen is the view pane
+#   rendering the live child conversation),
+# - the subagent link line flips to done when the child retires.
+#
+# What this does NOT verify: focus neutrality and <C-t> cycling (grid text
+# cannot express focus; cycling needs 2+ live children, which costs more
+# tokens than this probe is worth).
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Call the workflow tool with EXACTLY this Lua script, unmodified, as the script argument: local r = zag.task{ name = 'wfv-a', prompt = 'Use the bash tool to run exactly this command: echo wfv-$((1700+29)) and then state its output.', tools = {'bash'} } if r.is_error then return 'WFV-ERR' end return 'WFV-OK'" <Enter>
+wait_text /[subagent: wfv-a]/ 120s
+wait_text /wfv-1729/ 180s
+wait_text /[subagent: wfv-a] done/ 180s
+snapshot view
+send "/quit" <Enter>
+wait_exit

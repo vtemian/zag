@@ -28,6 +28,7 @@ pub const entries = [_]Entry{
     .{ .name = "zag.providers.ollama", .code = @embedFile("zag/providers/ollama.lua") },
     .{ .name = "zag.builtin.model_picker", .code = @embedFile("zag/builtin/model_picker.lua") },
     .{ .name = "zag.builtin.sessions", .code = @embedFile("zag/builtin/sessions.lua") },
+    .{ .name = "zag.builtin.workflow_panes", .code = @embedFile("zag/builtin/workflow_panes.lua") },
     .{ .name = "zag.diagrams", .code = @embedFile("zag/diagrams.lua") },
     .{ .name = "zag.tools.render_diagram", .code = @embedFile("zag/tools/render_diagram.lua") },
     .{ .name = "zag.layers.env", .code = @embedFile("zag/layers/env.lua") },
@@ -57,7 +58,7 @@ pub fn find(name: []const u8) ?Entry {
 
 test "entries manifest includes every stdlib provider and builtin" {
     // Compile-time count check. Bump when adding a new embedded module.
-    try std.testing.expectEqual(@as(usize, 27), entries.len);
+    try std.testing.expectEqual(@as(usize, 28), entries.len);
 }
 
 test "find returns the entry for the builtin model picker" {
@@ -70,6 +71,13 @@ test "find returns the entry for the sessions sidebar" {
     const e = find("zag.builtin.sessions").?;
     try std.testing.expectEqualStrings("zag.builtin.sessions", e.name);
     try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.command") != null);
+}
+
+test "find returns the entry for the workflow-panes plugin" {
+    const e = find("zag.builtin.workflow_panes").?;
+    try std.testing.expectEqualStrings("zag.builtin.workflow_panes", e.name);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "zag.command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e.code, "attach_subagent") != null);
 }
 
 test "find returns the entry for a known provider" {

@@ -262,6 +262,21 @@ pub fn result(self: *ChildAgent, arena: Allocator) !ChildResult {
     };
 }
 
+/// The screen-driving tools a child can never use: it runs with no
+/// window_manager, so every layout dispatch errors. Children do not drive
+/// the screen; the workflow-panes plugin does. The window system is the
+/// platform, not a tool the model reaches for. These are excluded from the
+/// inherit-all arm only; an author who explicitly allowlists one still
+/// gets it.
+const screen_tool_names = std.StaticStringMap(void).initComptime(.{
+    .{"layout_tree"},
+    .{"layout_focus"},
+    .{"layout_split"},
+    .{"layout_close"},
+    .{"layout_resize"},
+    .{"pane_read"},
+});
+
 /// Build a fresh Registry that exposes only the tools visible through the
 /// allowlist. `runLoopStreaming` needs a concrete `*const Registry` rather
 /// than a `Subset`, so we materialise one. The owner deinits it after the
@@ -281,9 +296,11 @@ pub fn buildChildRegistry(
         return child;
     }
 
-    // Null allowlist inherits every parent tool verbatim.
+    // Null allowlist inherits every parent tool verbatim, save the
+    // screen-driving tools the child can never dispatch.
     var it = parent.tools.iterator();
     while (it.next()) |entry| {
+        if (screen_tool_names.has(entry.key_ptr.*)) continue;
         try child.register(entry.value_ptr.*);
     }
     return child;
@@ -352,6 +369,47 @@ const StubTextProvider = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 };
+
+test "buildChildRegistry: inherit-all arm drops the screen-driving tools" {
+    const allocator = testing.allocator;
+
+    // A default registry advertises read + bash + the six screen tools
+    // (layout_tree/focus/split/close/resize, pane_read).
+    var parent = try tools.createDefaultRegistry(allocator);
+    defer parent.deinit();
+
+    // Null allowlist = inherit-all. The child must keep ordinary work tools
+    // but never inherit a screen tool: it runs with no window_manager, so
+    // every layout dispatch would error.
+    var child = try buildChildRegistry(allocator, &parent, null);
+    defer child.deinit();
+
+    try testing.expect(child.get("read") != null);
+    try testing.expect(child.get("bash") != null);
+
+    const screen_tools = [_][]const u8{
+        "layout_tree", "layout_focus", "layout_split",
+        "layout_close", "layout_resize", "pane_read",
+    };
+    for (screen_tools) |name| {
+        try testing.expect(child.get(name) == null);
+    }
+}
+
+test "buildChildRegistry: explicit allowlist still honors an opt-in screen tool" {
+    const allocator = testing.allocator;
+
+    var parent = try tools.createDefaultRegistry(allocator);
+    defer parent.deinit();
+
+    // An author who explicitly allowlists a screen tool keeps it: the
+    // exclusion lives only in the inherit-all arm.
+    const allowlist = [_][]const u8{"pane_read"};
+    var child = try buildChildRegistry(allocator, &parent, &allowlist);
+    defer child.deinit();
+
+    try testing.expect(child.get("pane_read") != null);
+}
 
 test "ChildAgent starts, drains to completion, and reports the summary" {
     const allocator = testing.allocator;
