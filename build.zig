@@ -145,6 +145,7 @@ pub fn build(b: *std.Build) void {
                     "src/sim/scenarios/tool_deep_conversation.zsm",
                     "src/sim/scenarios/multi_turn_context.zsm",
                     "src/sim/scenarios/mid_turn_interrupt.zsm",
+                    "src/sim/scenarios/mcp_tool_use.zsm",
                 };
                 var prev_step: *std.Build.Step = b.getInstallStep();
                 for (independent_scenarios) |path| {

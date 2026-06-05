@@ -1,0 +1,25 @@
+# MCP proxy tool, end-to-end through the real provider. The launcher script
+# builds a throwaway fixture HOME (real config.lua dofile'd for provider/auth,
+# plus one stdio MCP server backed by testdata/fake-mcp.sh) and exec's zag
+# there, so the real ~/.config/zag is never touched.
+#
+# Anchoring: wait_text is a substring match over the visible grid, and the
+# typed prompt echoes there in ~10ms. So the asserted text must appear in NO
+# prompt. The MCP tool's get_token returns the magic string
+# zag-mcp-token-7Q3, which the prompt deliberately never names: a match can
+# only mean the model drove the `mcp` proxy tool, the proxy lazy-connected to
+# fake-mcp.sh, and the server's tools/call result surfaced back in the reply.
+# A regression in MCP plumbing (proxy registration, stdio JSON-RPC, lazy
+# connect, content rendering) would instead time out at wait_text.
+#
+# The generous 90s deadline clears a reasoning model's first-token latency
+# plus a tool round-trip plus the follow-up answer turn.
+
+spawn ./src/sim/scenarios/testdata/mcp_launch.sh
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Use the mcp tool to call the MCP tool named get_token on the server named fake (call it as mcp with server set to fake and tool set to get_token and args set to {}). Then print the tool's exact output verbatim in your reply." <Enter>
+wait_text /zag-mcp-token-7Q3/ 90s
+snapshot final
+send "/quit" <Enter>
+wait_exit
