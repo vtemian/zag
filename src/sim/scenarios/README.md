@@ -37,6 +37,7 @@ parser, tool dispatch, conversation history, slash commands).
 | `mid_turn_interrupt.zsm`        | Ctrl+C mid-stream cancels, follow-up prompt recovers |
 | `slash_quit.zsm`                | `/quit` exits cleanly, zero LLM cost |
 | `workflow_view.zsm`             | workflow tool spawns a child; the workflow_panes plugin opens a live borrowed view pane (child bash output on the grid is the proof) |
+| `workflow_parallel_subagents.zsm` | zag.workflow.parallel fans out two child agents; the joined result must surface in the parent transcript (pins the prompt-reserve window fix) |
 | `resume_seed.zsm`               | Plants a deterministic seed message and quits (writes a session) |
 | `resume_last.zsm`               | `zag --last` re-renders the seed message; run right after `resume_seed.zsm` |
 | `mcp_tool_use.zsm`              | Model drives the `mcp` proxy; stdio JSON-RPC round-trip surfaces a magic token |
@@ -65,6 +66,26 @@ exec). See the launcher header for the full contract.
 > names are verified by inspecting `$ZAG_SIM_MCP_HOME/.zag/logs/<uuid>.log`
 > post-run. Likewise `mcp_direct_tools.zsm` proves the direct (non-proxy) path
 > by checking that `session.jsonl`'s `tool_name` is `get_token`, not `mcp`.
+
+## Token cost
+
+A full `ZAG_E2E=1` sweep is roughly **45-55 provider requests**, most of them
+small (a few KB of context each). Rules of thumb when budgeting a run:
+
+- Every scenario that submits at least one prompt also triggers the async
+  session-naming hook: one extra small request per scenario.
+- Each tool round-trip is an extra request on top of the user turn
+  (`tool_deep_conversation` is the heaviest single-session scenario at
+  ~8 requests; `tool_use_bash` is ~2 plus naming).
+- Workflow scenarios multiply by child count: `workflow_parallel_subagents`
+  runs the parent plus two child agent sessions (~5 requests plus naming).
+- Free: `slash_quit` (zero LLM calls), `mcp_command_status` (deterministic,
+  no model), and `resume_last` (re-renders a session written by
+  `resume_seed`, no new turn).
+
+When iterating on one regression, run that single scenario by hand instead
+of the sweep; the per-scenario cost is cents, the habit of sweeping after
+every tweak is not.
 
 ## Conventions
 
