@@ -262,6 +262,198 @@ test "runLoopStreaming constructs Telemetry per turn with session_id and provide
     try std.testing.expectEqual(@as(u32, 1), capture.captured_turn);
 }
 
+/// Returns `error.ApiError` with a `.context_overflow` class on the first
+/// streaming call, then succeeds (end_turn) once the agent loop force-compacts
+/// and re-sends. Proves the reactive overflow recovery path in runLoopStreaming.
+const OverflowThenRecoverProvider = struct {
+    call_count: u32 = 0,
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "overflow_then_recover",
+    };
+    fn callImpl(ptr: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *OverflowThenRecoverProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (req.error_detail_out) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *OverflowThenRecoverProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (self.call_count == 1) {
+            if (req.error_detail_out) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+            return error.ApiError;
+        }
+        return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+    }
+    fn provider(self: *OverflowThenRecoverProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "runLoopStreaming force-compacts and re-sends once on a context-overflow rejection" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned();
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    // Seed several small messages so drop-oldest has a prefix to trim. The
+    // window is tiny so the drop-oldest budget collapses to 1 and trims all
+    // but the most recent message; summarization's 20k keep-recent leaves
+    // every message in the "recent" window, so it returns null without ever
+    // calling the provider — drop-oldest is the recovery that fires.
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(allocator);
+        messages.deinit(allocator);
+    }
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |label| {
+        const text = try allocator.dupe(u8, label);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try messages.append(allocator, .{ .role = .user, .content = blocks });
+    }
+    const messages_before = messages.items.len;
+
+    const spec: llm.ModelSpec = .{ .provider_name = "stubprov", .model_id = "stubmodel-1", .context_window = 50 };
+    var stub = OverflowThenRecoverProvider{};
+    const p = stub.provider();
+
+    try agent.runLoopStreaming(
+        &messages,
+        &registry,
+        p,
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-overflow",
+        &detail,
+        null,
+    );
+
+    // The first attempt overflowed on BOTH the streaming call and callLlm's
+    // non-streaming fallback (2 calls, both ApiError/context_overflow), then
+    // recovery trimmed history and the re-sent streaming call succeeded (3rd).
+    try std.testing.expectEqual(@as(u32, 3), stub.call_count);
+    // Drop-oldest ran: fewer messages survived than we seeded (plus the
+    // single assistant turn the successful retry appended).
+    try std.testing.expect(messages.items.len < messages_before + 1);
+    // A drop_oldest compaction_event was emitted during recovery.
+    var saw_drop = false;
+    var buf: [64]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .compaction_event => |c| if (std.mem.eql(u8, c.outcome, "drop_oldest")) {
+                saw_drop = true;
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    try std.testing.expect(saw_drop);
+}
+
+/// Always rejects with a `.context_overflow` ApiError. Proves the reactive
+/// recovery retries at most once and then propagates, never looping forever.
+const AlwaysOverflowProvider = struct {
+    call_count: u32 = 0,
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "always_overflow",
+    };
+    fn setOverflow(req_detail: ?*llm.error_detail.ErrorDetail) void {
+        if (req_detail) |out| out.setClass(.{ .context_overflow = .{ .provider_message = "exceeded model token limit" } });
+    }
+    fn callImpl(ptr: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *AlwaysOverflowProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        setOverflow(req.error_detail_out);
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *AlwaysOverflowProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        setOverflow(req.error_detail_out);
+        return error.ApiError;
+    }
+    fn provider(self: *AlwaysOverflowProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "runLoopStreaming propagates a second context-overflow instead of looping" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned();
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(allocator);
+        messages.deinit(allocator);
+    }
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |label| {
+        const text = try allocator.dupe(u8, label);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try messages.append(allocator, .{ .role = .user, .content = blocks });
+    }
+
+    const spec: llm.ModelSpec = .{ .provider_name = "stubprov", .model_id = "stubmodel-1", .context_window = 50 };
+    var stub = AlwaysOverflowProvider{};
+    const p = stub.provider();
+
+    const result = agent.runLoopStreaming(
+        &messages,
+        &registry,
+        p,
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-overflow2",
+        &detail,
+        null,
+    );
+    try std.testing.expectError(error.ApiError, result);
+    // First attempt: streaming + fallback (2). One forced compaction. Second
+    // attempt: streaming + fallback (2). Then overflow_retried blocks further
+    // retries. Bounded at 4 provider calls — never an infinite loop.
+    try std.testing.expectEqual(@as(u32, 4), stub.call_count);
+}
+
 // ============================================================================
 // Test helpers for parallel tool execution + executeTools/jit/transform tests
 // Moved from src/agent.zig in audit step J.

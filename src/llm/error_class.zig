@@ -499,6 +499,14 @@ test "classify: plain 429 stays rate_limit" {
     try testing.expect(class == .rate_limit);
 }
 
+test "classify: moonshot token-limit 400 is context_overflow" {
+    // Verbatim envelope from the reshard-c4-data bench failure. Pinned so the
+    // "exceeded model token limit" pattern keeps mapping to context_overflow,
+    // which the agent loop's reactive compact-and-retry keys on.
+    const body = "{\"error\":{\"message\":\"Invalid request: Your request exceeded model token limit: 262144 (requested: 346239)\",\"type\":\"invalid_request_error\"}}";
+    try testing.expect(classify(400, body, &.{}) == .context_overflow);
+}
+
 test "OVERFLOW_PATTERNS each matches a synthetic body" {
     inline for (OVERFLOW_PATTERNS) |pat| {
         const body = try std.fmt.allocPrint(

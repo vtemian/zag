@@ -97,6 +97,15 @@ fn retryBackoffMs(retry_index: u8, retry_after_ms: ?u32) u64 {
     };
 }
 
+/// Whether the agent loop may force-compact and re-send after the provider
+/// rejected a request as context-overflow. The proactive estimator gate
+/// already runs every turn; this is the reactive net for when the estimate
+/// undershot. Allowed exactly once per turn: a second overflow on the same
+/// turn means even the compacted history doesn't fit, so the failure is real.
+fn overflowRetryAllowed(already_retried: bool) bool {
+    return !already_retried;
+}
+
 /// Runs the streaming agent loop: call LLM, execute tools, repeat until
 /// the model produces a text-only response or the cancel flag is set.
 /// Pushes events to the queue for UI updates. Returns errors to the caller
@@ -473,7 +482,47 @@ pub fn runLoopStreaming(
             );
         defer if (filtered_owned) |d| allocator.free(d);
 
-        const response = try callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, forced_tool_choice, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out);
+        // Reactive context-overflow recovery wraps the call: the proactive
+        // estimator can undershoot (chars/4 on mixed/binary tool output), so
+        // when the provider itself rejects the request as context-overflow we
+        // force-compact and re-send ONCE before giving up. A second overflow
+        // means even the trimmed history doesn't fit, so it propagates.
+        var overflow_retried = false;
+        const response = overflow_loop: while (true) {
+            break :overflow_loop callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, forced_tool_choice, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out) catch |call_err| {
+                const overflowed = call_err == error.ApiError and
+                    if (error_detail_out) |d| d.class == .context_overflow else false;
+                if (overflowed and overflowRetryAllowed(overflow_retried) and !cancel.load(.acquire)) {
+                    const keep_recent: u32 = if (lua_engine) |e| e.compact_keep_recent_tokens else DEFAULT_KEEP_RECENT_TOKENS;
+                    log.warn("provider rejected request as context-overflow; force-compacting and re-sending once", .{});
+                    const shrank = forceCompactForOverflow(
+                        messages,
+                        provider,
+                        model_spec.context_window,
+                        reserve_tokens,
+                        keep_recent,
+                        allocator,
+                        queue,
+                        cancel,
+                    ) catch |compact_err| {
+                        log.warn("overflow recovery compaction failed: {s}", .{@errorName(compact_err)});
+                        return call_err;
+                    };
+                    overflow_retried = true;
+                    if (shrank) {
+                        // History changed: the prior usage anchor no longer
+                        // maps onto the new shape, so the next estimate must
+                        // walk from scratch.
+                        last_usage_anchor = null;
+                        last_usage_index = null;
+                        continue :overflow_loop;
+                    }
+                    // Nothing left to trim; the overflow is unrecoverable.
+                    return call_err;
+                }
+                return call_err;
+            };
+        };
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
@@ -1696,6 +1745,11 @@ test "retry backoff schedule honors retry-after and caps" {
     try std.testing.expectEqual(@as(u64, 60000), retryBackoffMs(1, 300000)); // capped at 60s
 }
 
+test "overflow retry: allowed once, refused after the first attempt" {
+    try std.testing.expect(overflowRetryAllowed(false));
+    try std.testing.expect(!overflowRetryAllowed(true));
+}
+
 test "estimateContextTokens no anchor, no messages returns zero" {
     const est = estimateContextTokens(&.{}, null, null);
     try std.testing.expectEqual(@as(u32, 0), est.total);
@@ -2098,6 +2152,79 @@ pub fn dropOldestMessages(
         messages.items[drop_count..],
     );
     messages.shrinkRetainingCapacity(remaining);
+}
+
+/// Reactively shrink `messages` after the provider rejected a request as
+/// context-overflow. Unlike the proactive cascade at the top of the loop,
+/// this fires UNCONDITIONALLY — the provider already told us the request
+/// overflowed, so we don't consult the (undershooting) estimator. Runs Zig
+/// structured summarization first; if that doesn't shrink the history,
+/// falls back to drop-oldest against the model window. Returns true when it
+/// actually changed `messages`, so the caller knows a re-send can help.
+/// `context_window` of 0 disables drop-oldest's budget math (summarization
+/// can still fire). Caller owns `messages` storage and content.
+fn forceCompactForOverflow(
+    messages: *std.ArrayList(types.Message),
+    provider: llm.Provider,
+    context_window: u32,
+    reserve_tokens: u32,
+    keep_recent_tokens: u32,
+    allocator: Allocator,
+    queue: *agent_events.EventQueue,
+    cancel: *agent_events.CancelFlag,
+) !bool {
+    const before = messages.items.len;
+
+    // Stage 1: structured summarization (lossy-but-coherent). Best effort;
+    // a network/auth failure here falls through to drop-oldest.
+    if (runDefaultSummarization(
+        messages.items,
+        provider,
+        keep_recent_tokens,
+        allocator,
+        queue,
+        cancel,
+    )) |maybe_replacement| {
+        if (maybe_replacement) |replacement| {
+            Metrics.recordCompactionZigSummary();
+            try installCompactReplacement(messages, allocator, replacement);
+            queue.pushWithBackpressure(.{ .compaction_event = .{
+                .outcome = "summarized",
+                .messages_before = @intCast(before),
+                .messages_after = @intCast(messages.items.len),
+                .estimate_tokens = estimateContextTokens(messages.items, null, null).total,
+            } }, agent_events.default_backpressure_ms) catch {};
+            return true;
+        }
+    } else |err| {
+        log.warn("overflow recovery: summarization failed ({s}); trying drop-oldest", .{@errorName(err)});
+    }
+
+    // Stage 2: drop-oldest against the model window. Lossy but deterministic.
+    if (context_window > 0) {
+        const budget: u32 = if (context_window > reserve_tokens)
+            context_window - reserve_tokens
+        else
+            1;
+        const cut = findCutPoint(messages.items, budget);
+        if (cut.first_kept > 0) {
+            Metrics.recordCompactionDropOldest();
+            log.warn(
+                "overflow recovery: drop-oldest trimming {d} of {d} messages",
+                .{ cut.first_kept, messages.items.len },
+            );
+            try dropOldestMessages(messages, allocator, cut.first_kept);
+            queue.pushWithBackpressure(.{ .compaction_event = .{
+                .outcome = "drop_oldest",
+                .messages_before = @intCast(before),
+                .messages_after = @intCast(messages.items.len),
+                .estimate_tokens = estimateContextTokens(messages.items, null, null).total,
+            } }, agent_events.default_backpressure_ms) catch {};
+            return true;
+        }
+    }
+
+    return messages.items.len != before;
 }
 
 test "dropOldestMessages removes a prefix and shifts survivors left" {

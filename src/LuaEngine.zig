@@ -13120,6 +13120,26 @@ test "bootstrapStdlibProviders populates an empty engine registry" {
     try std.testing.expectEqual(std.meta.Tag(llm.Endpoint.Auth).oauth, std.meta.activeTag(oauth_ep.auth));
 }
 
+test "resolveModelSpec carries the declared context_window after stdlib bootstrap" {
+    // The headless agent loop resolves its ModelSpec through this exact seam:
+    // main() bootstraps the stdlib providers into providers_registry, then
+    // Harness calls llm.resolveModelSpec(&registry, model_id). fireCompact
+    // short-circuits on a zero context_window, so a 262144-token window MUST
+    // survive the Lua-table -> Endpoint.models -> ModelSpec round-trip, or the
+    // overflow guard never fires headless and oversized requests reach the
+    // provider (the reshard-c4-data bench failure).
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    _ = engine.bootstrapStdlibProviders();
+
+    const spec = llm.resolveModelSpec(&engine.providers_registry, "moonshot/kimi-k2.6");
+    try std.testing.expectEqualStrings("moonshot", spec.provider_name);
+    try std.testing.expectEqualStrings("kimi-k2.6", spec.model_id);
+    try std.testing.expectEqual(@as(u32, 262144), spec.context_window);
+}
+
 test "bootstrap is a no-op when config.lua already populated the registry" {
     // User with an explicit `require("zag.providers.anthropic")` in their
     // config.lua: the registry is non-empty, so the bootstrap fallback must
