@@ -325,15 +325,30 @@ pub fn runLoopStreaming(
             },
         }
 
-        // Pre-flight cap with three-stage fallback. The Lua strategy may
-        // have declined or shrunk less than needed. Try Zig-side
-        // structured summarization next; only fall back to drop-oldest
-        // when the summarizer itself fails (network/auth/etc.). Refuse
+        // Pre-flight cap with a four-stage fallback. The Lua strategy may
+        // have declined or shrunk less than needed. Truncate oversized tool
+        // results first (the only stage that can shrink recent bulk output),
+        // then Zig-side structured summarization, then drop-oldest. Refuse
         // the turn only when even the trimmed history overflows. v2
-        // `.cancel` opts out of stages 2 and 3 but the pre-flight refuse
+        // `.cancel` opts out of the fallback stages but the pre-flight refuse
         // still applies so an overflow can't escape.
         if (model_spec.context_window > 0) {
             var post = estimateContextTokens(messages.items, last_usage_anchor, last_usage_index);
+            if (post.total > model_spec.context_window and !compaction_was_cancelled) {
+                // Stage 1: truncate oversized tool results. Runs before
+                // summarization because the overflow profile this path was
+                // built for is a handful of giant RECENT tool_result dumps:
+                // summarization keeps recent messages and drop-oldest only
+                // reaches OLD ones, so neither shrinks the bloat. Truncation
+                // is lossless for the head/tail the model usually needs and,
+                // when it fits, spares a doomed summarization LLM round-trip
+                // that would re-send the same oversized history. Mirrors the
+                // reactive `forceCompactForOverflow` ordering.
+                if (try truncateOversizedToolResults(messages.items, allocator)) {
+                    compact_outcome_tag = "truncated_tool_results";
+                    post = estimateContextTokens(messages.items, last_usage_anchor, last_usage_index);
+                }
+            }
             if (post.total > model_spec.context_window and !compaction_was_cancelled) {
                 // Stage 2: Zig-default structured summarization. Streams
                 // via `provider.callStreaming` on the agent thread; the
