@@ -2208,6 +2208,12 @@ pub fn paneHandleForConversation(self: *WindowManager, conv: *Conversation) ?Nod
         if (self.root_pane.handle) |h| return h;
     }
     for (self.extra_panes.items) |entry| {
+        // Skip borrowed views: their `pane.conversation` points at a child
+        // they merely DISPLAY, not own. Resolving a parent leaf onto a view
+        // pane makes a nested workflow attach/close against its own view
+        // (thrash). Defensively skip null-conversation entries too.
+        if (entry.is_subagent_view) continue;
+        if (entry.pane.conversation == null) continue;
         if (entry.pane.conversation == conv) {
             if (entry.pane.handle) |h| return h;
         }
@@ -5027,6 +5033,33 @@ test "divorce sweep leaves unrelated subagent views untouched" {
     try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
     try std.testing.expectEqual(root_child, f.wm.extra_panes.items[0].pane.conversation.?);
     try std.testing.expectEqual(@as(usize, 0), f.wm.extra_floats.items.len);
+}
+
+test "paneHandleForConversation skips a borrowed view of the queried child" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    // A child borrowed into a view pane. The view's `pane.conversation`
+    // points at the child, but the entry is `is_subagent_view`: it is a
+    // borrowed display, not the child's own owning pane. Resolving a
+    // parent leaf for a nested workflow that child runs must NOT land on
+    // this view pane (doing so makes the plugin attach/close against its
+    // own view -- the thrash this guard prevents).
+    const child = try f.root_conv.spawnSubagent("child", "");
+    _ = try f.wm.attachSubagentView(&f.root_conv, 0, .split, false);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+    try std.testing.expect(f.wm.extra_panes.items[0].is_subagent_view);
+    try std.testing.expectEqual(child, f.wm.extra_panes.items[0].pane.conversation.?);
+
+    // The child owns no real pane (only the borrowed view shows it), so
+    // the lookup must report no owning leaf -- never the view's handle.
+    try std.testing.expectEqual(@as(?NodeRegistry.Handle, null), f.wm.paneHandleForConversation(child));
+
+    // The root still resolves to its own live tile (the guard does not
+    // break ordinary, non-view lookups).
+    try std.testing.expectEqual(f.wm.root_pane.handle.?, f.wm.paneHandleForConversation(&f.root_conv).?);
 }
 
 // -- zag.pane.subagents / zag.pane.attach_subagent (Milestone C3) ------------
