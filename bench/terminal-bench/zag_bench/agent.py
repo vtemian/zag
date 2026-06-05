@@ -127,16 +127,17 @@ class ZagAgent(BaseInstalledAgent):
 
         # zag is silent on stdout; its diagnostics go to $HOME/.zag/logs.
         # Copy that log into /logs/agent so harbor collects it, preserving
-        # zag's exit code (pipefail carries it through the tee).
+        # zag's exit code (pipefail carries it through the tee). The copy is
+        # trapped on EXIT/TERM/INT so a harbor timeout kill or container
+        # teardown still flushes the log instead of losing it.
         await self.exec_as_agent(
             environment,
             command=(
+                "trap 'cat \"$HOME\"/.zag/logs/*.log >> /logs/agent/zag-internal.log 2>/dev/null' EXIT TERM INT; "
                 f"{_CONTAINER_BIN} --headless "
                 f"--instruction-file={_CONTAINER_INSTRUCTION} "
                 f"--trajectory-out={_CONTAINER_TRAJECTORY} "
-                f"--no-session 2>&1 | stdbuf -oL tee {_CONTAINER_LOG}; "
-                'rc=$?; cat "$HOME"/.zag/logs/*.log >> /logs/agent/zag-internal.log 2>/dev/null; '
-                "exit $rc"
+                f"--no-session 2>&1 | stdbuf -oL tee {_CONTAINER_LOG}"
             ),
             env={"ZAG_BENCH_MODEL": self.model_name},
         )
