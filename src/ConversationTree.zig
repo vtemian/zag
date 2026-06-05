@@ -99,6 +99,17 @@ pub const Node = struct {
     /// Only meaningful when node_type == .tool_result.
     tool_result_is_error: bool = false,
 
+    /// Wall-clock creation time (`clock.milliTimestamp()`), stamped on the
+    /// live stream at the moment a `tool_call` node or its `tool_result`
+    /// child is appended (see `sinks/BufferSink.zig`). A plain value with
+    /// no ownership. The workflow header renderer reads it to show live
+    /// elapsed on a running call (`now - created_at_ms`) and a frozen
+    /// duration once the call returns (`result.created_at_ms -
+    /// node.created_at_ms`). Left 0 on the replay path: a resumed
+    /// transcript carries no original wall-clock, so it simply renders no
+    /// elapsed (graceful).
+    created_at_ms: i64 = 0,
+
     /// Index into the owning Conversation's `subagents` list. Valid
     /// only when `node_type == .subagent_link`.
     subagent_index: u32 = 0,

@@ -640,6 +640,16 @@ fn tick(
     const time_dirty = agent_running and (self.last_rendered_working_secs == null or
         self.last_rendered_working_secs.? != current_secs);
 
+    // The displayed second advanced while an agent runs: invalidate the
+    // cached header of every running workflow tool_call in the focused pane
+    // so its live elapsed re-renders this frame. The header cache is keyed by
+    // content_version, so without this bump the composite below HITS the
+    // stale line and the second freezes. Cheap: only on a second-boundary
+    // tick, O(root_children), and a no-op when no workflow is running.
+    if (time_dirty) {
+        if (focused.conversation) |conv| conv.touchRunningWorkflows();
+    }
+
     const any_dirty = self.anyPaneDirty();
     const frame_dirty = any_dirty or self.window_manager.compositor.layout_dirty or
         non_mouse_input or time_dirty or

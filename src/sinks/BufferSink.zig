@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const clock = @import("../clock.zig");
 const Conversation = @import("../Conversation.zig");
 const ConversationTree = @import("../ConversationTree.zig");
 const Node = Conversation.Node;
@@ -188,6 +189,10 @@ pub const BufferSink = struct {
                 // inline instead of the generic `[tool] <name>` header.
                 const node = self.buffer.appendToolCallNode(null, e.name, e.call_id, e.input_raw) catch return;
                 node.collapsed = true;
+                // Stamp the live wall-clock so the workflow header can show
+                // elapsed since the call opened. The replay path appends
+                // through Conversation directly and leaves this 0 (no elapsed).
+                node.created_at_ms = clock.milliTimestamp();
                 self.last_tool_call = node;
                 if (e.call_id) |id| {
                     const gop = self.pending_tool_calls.getOrPut(self.alloc, id) catch return;
@@ -222,12 +227,12 @@ pub const BufferSink = struct {
                 } orelse return;
                 const result_node = self.buffer.appendNode(parent, .tool_result, e.content) catch return;
                 result_node.tool_result_is_error = e.is_error;
-                // Bump the parent so the cached one-line tool_call rendering
-                // refreshes into the collapsed-with-hint two-line rendering
-                // now that a non-empty tool_result child exists.
-                parent.markDirty();
-                self.buffer.tree.generation +%= 1;
-                self.buffer.tree.dirty_nodes.push(parent.id);
+                // Stamp the result so the workflow header can freeze its
+                // duration as `in Ns` (result.created_at_ms - parent.created_at_ms).
+                // `appendNode` bumps the parent's content_version on the dirty
+                // trio for any tool_result child, so the cached one-line
+                // tool_call header refreshes into the collapsed-with-hint form.
+                result_node.created_at_ms = clock.milliTimestamp();
             },
             .run_end => {
                 // Clear the full correlation state, not just the live

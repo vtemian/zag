@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const clock = @import("clock.zig");
 const Conversation = @import("Conversation.zig");
 const BufferRegistry = @import("BufferRegistry.zig");
 const Gutter = @import("Gutter.zig");
@@ -868,6 +869,50 @@ fn workflowDoneCounts(node: *const Node) ?WorkflowDoneCounts {
     return .{ .done = done, .total = total };
 }
 
+/// Build the header suffix for a workflow call that has linked children:
+/// ` X/M done` plus an optional timing tail. The tail is:
+///
+///   * ` (43s)` while the call is RUNNING (no `tool_result` child yet) and
+///     the node carries a live `created_at_ms`, computed as
+///     `now - node.created_at_ms` to seconds resolution.
+///   * ` in 96s` once the call has RETURNED (a `tool_result` child exists),
+///     frozen at `result.created_at_ms - node.created_at_ms`.
+///   * no tail at all when the relevant stamp is 0 (replay-style nodes carry
+///     no wall-clock, so elapsed is simply omitted — graceful).
+///
+/// Writes into `buf` and returns the written slice; `buf` must fit the
+/// longest form (the caller sizes it).
+fn workflowSuffix(buf: []u8, node: *const Node, counts: WorkflowDoneCounts) ![]const u8 {
+    const result_node: ?*const Node = blk: {
+        for (node.children.items) |child| {
+            if (child.node_type == .tool_result) break :blk child;
+        }
+        break :blk null;
+    };
+
+    if (result_node) |result| {
+        // Finished: freeze the duration from the two stamps. Omit when
+        // either stamp is missing (0) or the math would be non-positive.
+        if (node.created_at_ms != 0 and result.created_at_ms != 0 and
+            result.created_at_ms > node.created_at_ms)
+        {
+            const secs = @divFloor(result.created_at_ms - node.created_at_ms, 1000);
+            return std.fmt.bufPrint(buf, " {d}/{d} done in {d}s", .{ counts.done, counts.total, secs });
+        }
+        return std.fmt.bufPrint(buf, " {d}/{d} done", .{ counts.done, counts.total });
+    }
+
+    // Running: show elapsed since the call opened, when stamped.
+    if (node.created_at_ms != 0) {
+        const elapsed_ms = clock.milliTimestamp() - node.created_at_ms;
+        if (elapsed_ms > 0) {
+            const secs = @divFloor(elapsed_ms, 1000);
+            return std.fmt.bufPrint(buf, " {d}/{d} done ({d}s)", .{ counts.done, counts.total, secs });
+        }
+    }
+    return std.fmt.bufPrint(buf, " {d}/{d} done", .{ counts.done, counts.total });
+}
+
 /// Render a `workflow` tool call as a foldable Lua code block. The header
 /// reports the script length (`Workflow(N lines)`) rather than the script
 /// text, so the generic `firstJsonStringValue` flattening never runs. When
@@ -892,11 +937,14 @@ fn renderWorkflowBlock(
 
     const arg = try std.fmt.allocPrint(allocator, "{d} lines", .{script_lines});
     defer allocator.free(arg);
-    // Live ` X/M done` suffix when this call has linked children. Empty
-    // otherwise, so the header reads `Workflow(N lines)` unchanged.
-    var suffix_buf: [64]u8 = undefined;
+    // Live ` X/M done` suffix when this call has linked children, plus a
+    // timing tail: ` (43s)` while running, ` in 96s` once the call returned.
+    // Empty otherwise, so the header reads `Workflow(N lines)` unchanged.
+    // The buffer fits the longest form (counts + ` done` + a timing word +
+    // a multi-digit second count) with comfortable margin.
+    var suffix_buf: [96]u8 = undefined;
     const suffix: []const u8 = if (workflowDoneCounts(node)) |counts|
-        std.fmt.bufPrint(&suffix_buf, " {d}/{d} done", .{ counts.done, counts.total }) catch ""
+        workflowSuffix(&suffix_buf, node, counts) catch ""
     else
         "";
     try appendToolHeader(lines, allocator, theme, "workflow", arg, suffix);
@@ -2064,6 +2112,105 @@ test "workflow header reads M/M done once the workflow tool_result lands" {
     const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
     defer allocator.free(header);
     try std.testing.expectEqualStrings("Workflow(2 lines) 2/2 done", header);
+}
+
+test "workflow header shows live elapsed while running" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+
+    // Stamp the workflow node 5s in the past; no tool_result child means the
+    // call is still running, so the header appends `(5s)` after the count.
+    wf.created_at_ms = clock.milliTimestamp() - 5_000;
+
+    const theme = Theme.defaultTheme();
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines) 0/2 done (5s)", header);
+}
+
+test "workflow header omits elapsed while running when created_at_ms is unstamped" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    // Replay-style node: created_at_ms stays 0, so no elapsed is shown even
+    // while the call has not returned (graceful resumed-transcript render).
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+
+    const theme = Theme.defaultTheme();
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines) 0/2 done", header);
+}
+
+test "workflow header freezes the duration once the tool_result lands" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+    wf.created_at_ms = 1_000_000;
+
+    // The workflow returned: a tool_result child stamped 96s after the call
+    // freezes the header to `in 96s` (result.created_at_ms - node.created_at_ms).
+    const result = try cb.appendNode(wf, .tool_result, "workflow complete");
+    result.created_at_ms = 1_096_000;
+
+    const theme = Theme.defaultTheme();
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines) 2/2 done in 96s", header);
+}
+
+test "workflow header omits the frozen duration when either stamp is 0" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    _ = try cb.spawnSubagentLinked("childB", "", "wf1");
+    // Node stamped, result NOT stamped (replay-style result): no duration.
+    wf.created_at_ms = 1_000_000;
+    _ = try cb.appendNode(wf, .tool_result, "workflow complete");
+
+    const theme = Theme.defaultTheme();
+    const header = try renderWorkflowHeaderText(&cb, wf, &theme, allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines) 2/2 done", header);
+}
+
+test "appending a workflow tool_result bumps the node so the header repaints" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const wf = try cb.appendToolCallNode(null, "workflow", "wf1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    wf.collapsed = true;
+    _ = try cb.spawnSubagentLinked("childA", "", "wf1");
+    wf.created_at_ms = 1_000_000;
+
+    // The displayed text flips from `(Ns)` (running) to `in Ns` (frozen) when
+    // the result lands. The cache is keyed by (id, content_version), so the
+    // result-append MUST bump the workflow node or the stale running header
+    // is served forever (the working-line-lingers family). Pin the bump here.
+    const before = wf.content_version;
+    const result = try cb.appendNode(wf, .tool_result, "workflow complete");
+    result.created_at_ms = 1_042_000;
+    try std.testing.expect(wf.content_version != before);
 }
 
 test "workflow header unchanged when no children are linked" {
