@@ -257,6 +257,63 @@ pub fn writeJsonString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// Write `s` as a JSON string (with surrounding quotes), substituting U+FFFD
+/// for any byte that is not part of a valid UTF-8 sequence.
+///
+/// For valid UTF-8 input this produces byte-identical output to
+/// `std.json.Stringify.value` with default options: multibyte sequences pass
+/// through as raw bytes, and `"`, `\`, `\b`, `\f`, `\n`, `\r`, `\t`, plus the
+/// remaining C0 control characters are escaped the same way. Tool output can
+/// carry invalid UTF-8 (e.g. bash grepping a binary file); without this
+/// substitution `std.json.Stringify.value` emits such a slice as a JSON array
+/// of byte numbers, which strict providers reject ("number is not acceptable").
+pub fn writeSanitizedJsonString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    var i: usize = 0;
+    while (i < s.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+            // Invalid leading byte: emit one replacement character, skip a byte.
+            try w.writeAll("\u{FFFD}");
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + seq_len])) {
+            // Truncated or otherwise invalid sequence: replace a single byte.
+            try w.writeAll("\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        if (seq_len == 1) {
+            try writeJsonEscapedByte(w, s[i]);
+        } else {
+            try w.writeAll(s[i .. i + seq_len]);
+        }
+        i += seq_len;
+    }
+    try w.writeByte('"');
+}
+
+/// Escape a single ASCII byte the way JSON requires, matching
+/// `std.json.Stringify`'s default (non-`escape_unicode`) encoding.
+fn writeJsonEscapedByte(w: anytype, c: u8) !void {
+    switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        0x08 => try w.writeAll("\\b"),
+        0x0C => try w.writeAll("\\f"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => {
+            if (c < 0x20) {
+                try w.print("\\u{x:0>4}", .{@as(u16, c)});
+            } else {
+                try w.writeByte(c);
+            }
+        },
+    }
+}
+
 // -- Tests ------------------------------------------------------------------
 
 test {
@@ -361,6 +418,51 @@ test "writeJsonString escapes control characters below 0x20" {
     try writeJsonString(&w, &[_]u8{0x01});
     const result = w.buffered();
     try std.testing.expectEqualStrings("\"\\u0001\"", result);
+}
+
+test "writeSanitizedJsonString is byte-identical to Stringify.value for valid utf-8" {
+    // Covers ASCII, escapes, multibyte UTF-8, and the \b/\f named escapes that
+    // distinguish std.json's encoding from writeJsonStringContents.
+    const fixture: []const u8 = "exit 0\nstdout: héllo \"quotes\"\n\ttab\tαβγ 日本語 🦀 \x08bs \x0cff \x01ctrl";
+
+    var sanitized: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sanitized.deinit();
+    try writeSanitizedJsonString(&sanitized.writer, fixture);
+
+    var reference: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer reference.deinit();
+    try std.json.Stringify.value(fixture, .{}, &reference.writer);
+
+    try std.testing.expectEqualStrings(reference.written(), sanitized.written());
+}
+
+test "writeSanitizedJsonString replaces invalid utf-8 with U+FFFD and stays parseable" {
+    const bad: []const u8 = "exit code: 0\nstdout:\n\xff\xfegarbage\x80tail";
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeSanitizedJsonString(&out.writer, bad);
+
+    // Must parse back as a single JSON string (not an array of byte numbers).
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .string);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.string, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.string, "garbage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.string, "tail") != null);
+}
+
+test "writeSanitizedJsonString handles a truncated multibyte sequence at end" {
+    // Leading byte of a 3-byte sequence with no continuation bytes.
+    const bad: []const u8 = "ok\xe2";
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeSanitizedJsonString(&out.writer, bad);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("ok\u{FFFD}", parsed.value.string);
 }
 
 test "LlmResponse defaults token counts to zero" {
