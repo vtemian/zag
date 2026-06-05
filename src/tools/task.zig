@@ -280,6 +280,9 @@ test {
 const testing = std.testing;
 const llm = @import("../llm.zig");
 const ChildRunnerRegistry = @import("../ChildRunnerRegistry.zig");
+const AgentRunner = @import("../AgentRunner.zig");
+const Sink = @import("../Sink.zig").Sink;
+const SinkEvent = @import("../Sink.zig").Event;
 
 /// Stub provider that streams a single assistant text delta then ends the
 /// turn. The streamed-accumulator fallback in the agent loop assembles the
@@ -758,5 +761,80 @@ test "task reports a child cancelled between turns as an error result" {
     try testing.expect(std.mem.indexOf(u8, result.content, "Cancelled") != null);
     // Turn 2 never ran: the cancel was observed at the top of the loop,
     // proving the between-turns window (not a mid-stream abort).
+    try testing.expectEqual(@as(u32, 1), stub.calls);
+}
+
+/// Sink that counts the events Task 8 cares about: `error_event` (the synthetic
+/// `.err` arm a child run would emit) and `run_end` (a clean settle). Lets the
+/// test prove a TOP-LEVEL run produces no error node.
+const EventCountingSink = struct {
+    error_events: u32 = 0,
+    run_ends: u32 = 0,
+
+    fn pushVT(ptr: *anyopaque, event: SinkEvent) void {
+        const self: *EventCountingSink = @ptrCast(@alignCast(ptr));
+        switch (event) {
+            .error_event => self.error_events += 1,
+            .run_end => self.run_ends += 1,
+            else => {},
+        }
+    }
+    fn deinitVT(_: *anyopaque) void {}
+    const vtable: Sink.VTable = .{ .push = pushVT, .deinit = deinitVT };
+
+    fn sink(self: *EventCountingSink) Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "top-level cancel between turns settles silently with no err event" {
+    const allocator = testing.allocator;
+
+    var stub = ProbeThenTextProvider{ .alloc = allocator };
+    defer stub.deinit();
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register(CancelProbeTool.tool);
+
+    var conv = try Conversation.init(allocator, 0, "test-top-level");
+    defer conv.deinit();
+
+    var counting = EventCountingSink{};
+    // A top-level runner: task_depth stays at its 0 default, so the
+    // child-gated synthetic `.err` must NOT fire on a clean between-turns
+    // cancel — the silent Ctrl+C contract.
+    var runner = AgentRunner.init(allocator, counting.sink(), &conv);
+    defer runner.deinit();
+    try testing.expectEqual(@as(u8, 0), runner.task_depth);
+
+    try runner.submitInput("go");
+    try runner.submit(.{
+        .allocator = allocator,
+        .wake_write_fd = 0,
+        .lua_engine = null,
+        .provider = stub.provider(),
+        .model_spec = .{ .provider_name = "probe_then_text", .model_id = "stub-1" },
+        .registry = &registry,
+        .session_id = "",
+        .child_registry = null,
+    });
+
+    // Drain to completion: the probe tool sets cancel, the loop returns
+    // cleanly between turns, threadMain pushes only `.done` (no `.err` for a
+    // depth-0 runner). Deadline-bounded liveness, never an elapsed assertion.
+    const deadline = clock.milliTimestamp() + 4000;
+    while (clock.milliTimestamp() < deadline) {
+        const r = runner.drainEvents();
+        if (r.finished) break;
+        if (!r.any_drained) clock.sleep(5 * std.time.ns_per_ms);
+    }
+
+    // The run settled to done/idle exactly as before the change: a single
+    // `run_end`, no error node, and the agent thread joined.
+    try testing.expect(!runner.isAgentRunning());
+    try testing.expectEqual(@as(u32, 0), counting.error_events);
+    try testing.expectEqual(@as(u32, 1), counting.run_ends);
+    // Turn 2 never ran: cancel was observed at the top of the loop.
     try testing.expectEqual(@as(u32, 1), stub.calls);
 }
