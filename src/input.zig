@@ -1030,6 +1030,70 @@ test "pollOnce drains a 210-byte burst with zero loss" {
     try std.testing.expectEqualSlices(u8, &burst, collected[0..collected_len]);
 }
 
+test "pollOnce drains a mixed burst (CSI + UTF-8) with zero loss" {
+    // Companion to the plain-ASCII burst test: sequences that ACCUMULATE in
+    // `pending` (a CSI arrow straddling reads, a multi-byte codepoint) must
+    // also survive a single >PARSER_BUF_SIZE write without the overflow
+    // reset discarding anything. Expected events are built alongside the
+    // burst bytes; `up_marker` stands in for the arrow so one flat
+    // codepoint list can assert order and count exactly.
+    const up_marker: u21 = 0x10FFFF;
+    const pipe = try wake_pipe.open();
+    const read_fd = pipe[0];
+    const write_fd = pipe[1];
+    defer wake_pipe.close(read_fd);
+    defer wake_pipe.close(write_fd);
+
+    var burst: std.ArrayList(u8) = .empty;
+    defer burst.deinit(std.testing.allocator);
+    var expected: std.ArrayList(u21) = .empty;
+    defer expected.deinit(std.testing.allocator);
+
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        const c: u8 = 'a' + @as(u8, @intCast(i % 26));
+        try burst.append(std.testing.allocator, c);
+        try expected.append(std.testing.allocator, c);
+    }
+    try burst.appendSlice(std.testing.allocator, "\x1b[A");
+    try expected.append(std.testing.allocator, up_marker);
+    i = 0;
+    while (i < 80) : (i += 1) {
+        const c: u8 = 'A' + @as(u8, @intCast(i % 26));
+        try burst.append(std.testing.allocator, c);
+        try expected.append(std.testing.allocator, c);
+    }
+    try burst.appendSlice(std.testing.allocator, "\xC3\xA9"); // é
+    try expected.append(std.testing.allocator, 0xE9);
+    i = 0;
+    while (i < 60) : (i += 1) {
+        const c: u8 = '0' + @as(u8, @intCast(i % 10));
+        try burst.append(std.testing.allocator, c);
+        try expected.append(std.testing.allocator, c);
+    }
+    try std.testing.expect(burst.items.len > parser_mod.PARSER_BUF_SIZE);
+
+    _ = try wake_pipe.write(write_fd, burst.items);
+
+    var p: Parser = .{};
+    var collected: std.ArrayList(u21) = .empty;
+    defer collected.deinit(std.testing.allocator);
+    var guard: usize = 0;
+    while (guard < 4096) : (guard += 1) {
+        const ev = p.pollOnce(read_fd, 0) orelse break;
+        switch (ev) {
+            .key => |k| switch (k.key) {
+                .char => |cp| try collected.append(std.testing.allocator, cp),
+                .up => try collected.append(std.testing.allocator, up_marker),
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    try std.testing.expectEqualSlices(u21, expected.items, collected.items);
+}
+
 test "Parser: bare-ESC from a single byte without timeout returns null" {
     // With now_ms equal to pending_since_ms (0ms elapsed), we must not
     // emit bare-ESC yet. Only Task 4's timeout path produces it.
