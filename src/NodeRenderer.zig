@@ -429,6 +429,12 @@ fn richToolCallLineCount(node: *const Node, registry: *const BufferRegistry) ?us
     } else if (std.mem.eql(u8, tool_name, "read")) {
         if (jsonString(&root, "path") == null) return null;
         return 1 + bodyLineCount(node, registry, read_inline_lines);
+    } else if (std.mem.eql(u8, tool_name, "workflow")) {
+        const script = jsonString(&root, "script") orelse return null;
+        // Collapsed: header + one fold hint. Expanded: header + one line
+        // per script source line. Mirror of `renderWorkflowBlock`.
+        if (node.collapsed) return 2;
+        return 1 + lineCount(script);
     }
     return null;
 }
@@ -476,6 +482,8 @@ fn renderRichToolCall(
         return renderBashBlock(node, lines, allocator, theme, registry, &root);
     } else if (std.mem.eql(u8, tool_name, "read")) {
         return renderReadBlock(node, lines, allocator, theme, registry, &root);
+    } else if (std.mem.eql(u8, tool_name, "workflow")) {
+        return renderWorkflowBlock(node, lines, allocator, theme, &root);
     }
     return false;
 }
@@ -709,6 +717,47 @@ fn renderReadBlock(
     );
     if (result_lines > emitted) {
         try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, result_lines - emitted, theme, body_index);
+    }
+    return true;
+}
+
+/// Render a `workflow` tool call as a foldable Lua code block. The header
+/// reports the script length (`Workflow(N lines)`) rather than the script
+/// text, so the generic `firstJsonStringValue` flattening never runs.
+///
+/// Collapsed: header plus one fold hint naming the hidden script lines.
+/// Expanded: header plus one `md_code_block`-styled line per script source
+/// line. Each script line is duped into `allocator` as an owned span so it
+/// outlives the parse arena that backs `script`.
+fn renderWorkflowBlock(
+    node: *const Node,
+    lines: *std.ArrayList(StyledLine),
+    allocator: Allocator,
+    theme: *const Theme,
+    root: *const std.json.ObjectMap,
+) !bool {
+    const script = jsonString(root, "script") orelse return false;
+    const script_lines = lineCount(script);
+
+    const arg = try std.fmt.allocPrint(allocator, "{d} lines", .{script_lines});
+    defer allocator.free(arg);
+    try appendToolHeader(lines, allocator, theme, "workflow", arg);
+
+    if (node.collapsed) {
+        try appendInlineExpandHint(lines, allocator, theme.highlights.tool_result, script_lines, theme, 0);
+        return true;
+    }
+
+    const style = theme.highlights.md_code_block;
+    var rest: []const u8 = script;
+    while (rest.len > 0) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const segment = if (nl) |n| rest[0..n] else rest;
+        const owned = try allocator.dupe(u8, segment);
+        const spans = try allocator.alloc(StyledSpan, 1);
+        spans[0] = .{ .text = owned, .style = style, .owned = true };
+        try lines.append(allocator, .{ .spans = spans });
+        rest = if (nl) |n| rest[n + 1 ..] else &.{};
     }
     return true;
 }
@@ -1583,4 +1632,116 @@ test "lineCountForNode matches render() for collapsed tool_call with multi-line 
     defer Theme.freeStyledLines(&rich_lines, allocator);
     try renderDefault(bash, &rich_lines, allocator, &theme, &cb.buffer_registry);
     try std.testing.expectEqual(rich_lines.items.len, renderer.lineCountForNode(bash, &cb.buffer_registry));
+}
+
+test "workflow tool_call collapsed renders header plus fold hint" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    node.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+    // Header line plus one fold hint covering the hidden script body.
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines)", header);
+
+    const hint = try lines.items[1].toText(allocator);
+    defer allocator.free(hint);
+    try std.testing.expectEqualStrings("\u{2514} \u{2026} +2 lines (Ctrl-R to expand)", hint);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "workflow tool_call expanded renders script lines as a code block" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    node.collapsed = false;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+    // Header + one code-block line per script source line.
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    try std.testing.expectEqualStrings("Workflow(2 lines)", header);
+
+    const line0 = try lines.items[1].toText(allocator);
+    defer allocator.free(line0);
+    try std.testing.expectEqualStrings("local a = 1", line0);
+
+    const line1 = try lines.items[2].toText(allocator);
+    defer allocator.free(line1);
+    try std.testing.expectEqualStrings("return 'x'", line1);
+
+    // Script lines are styled as md_code_block, and NO span carries an
+    // embedded newline (the control-char staircase guard).
+    for (lines.items[1..]) |line| {
+        for (line.spans) |span| {
+            try std.testing.expect(std.mem.indexOfScalar(u8, span.text, '\n') == null);
+            try std.testing.expect(std.meta.eql(span.style, theme.highlights.md_code_block));
+        }
+    }
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
+}
+
+test "workflow render twice with markDirty between leaks nothing" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"script\":\"local a = 1\\nreturn 'x'\"}");
+    node.collapsed = false;
+
+    const theme = Theme.defaultTheme();
+
+    inline for (0..2) |_| {
+        var lines: std.ArrayList(StyledLine) = .empty;
+        defer Theme.freeStyledLines(&lines, allocator);
+        try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+        try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+        node.markDirty();
+    }
+}
+
+test "workflow tool_call with malformed script JSON falls back to generic header" {
+    const allocator = std.testing.allocator;
+    var cb = try @import("Conversation.zig").init(allocator, 0, "test");
+    defer cb.deinit();
+
+    // Missing `script` key: the workflow arm declines, the generic header
+    // path runs without crashing.
+    const node = try cb.appendToolCallNode(null, "workflow", "id1", "{\"name\":\"build\"}");
+    node.collapsed = true;
+
+    const theme = Theme.defaultTheme();
+    var lines: std.ArrayList(StyledLine) = .empty;
+    defer Theme.freeStyledLines(&lines, allocator);
+
+    try renderDefault(node, &lines, allocator, &theme, &cb.buffer_registry);
+    const header = try lines.items[0].toText(allocator);
+    defer allocator.free(header);
+    // Generic `Name(arg)` header with the first string field as the arg.
+    try std.testing.expectEqualStrings("Workflow(build)", header);
+
+    const renderer = NodeRenderer.initDefault();
+    try std.testing.expectEqual(lines.items.len, renderer.lineCountForNode(node, &cb.buffer_registry));
 }
