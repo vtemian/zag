@@ -660,7 +660,8 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                         r.content.free();
                         if (r.call_id) |id| id.free();
                     }
-                    // Executed tool results always carry the provider call_id;
+                    // Executed tool results carry a provider-assigned call_id
+                    // (possibly empty if the provider never sent an id delta);
                     // `Capture.addToolResult` pairs it to the matching tool_call
                     // in the just-closed turn. An absent id leaves the result
                     // uncorrelated rather than crashing.
@@ -701,11 +702,14 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                         }
                         turn_open = false;
                     } else if (has_usage) {
-                        // A real call that streamed no content (e.g. an
-                        // immediate tool_use with no prose) still completed an
-                        // inference, so open-then-close keeps agent steps
-                        // aligned with LLM calls. An all-zero call produced
-                        // nothing real; skip it rather than fabricate a step.
+                        // A real call that emitted no content events still
+                        // completed an inference — concretely, the
+                        // non-streaming fallback pushes only text blocks, so a
+                        // tool-use-only fallback response opens no turn.
+                        // Open-then-close keeps agent steps aligned with LLM
+                        // calls so the executed tool_call attaches here, not to
+                        // the previous step. An all-zero call produced nothing
+                        // real; skip it rather than fabricate a step.
                         ensureTurnOpen(&capture, &turn_open);
                         if (turn_open) {
                             closeTurnWithUsage(&capture, deps.endpoint_registry, deps.model_id, usage);
