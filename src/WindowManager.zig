@@ -9545,6 +9545,72 @@ test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-k
     }
 }
 
+test "zag.notify with a window manager pushes a toast with the parsed level" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\zag.notify("disk full", { level = "error" })
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), f.wm.toasts_len);
+    try std.testing.expectEqual(ToastLevel.err, f.wm.toasts[0].level);
+    try std.testing.expectEqualStrings("disk full", f.wm.toasts[0].message);
+}
+
+test "zag.notify without a window manager stays log-only and does not crash" {
+    const allocator = std.testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    // Mirror the headless Harness path: main.zig calls loadBuiltinPlugins()
+    // (which stores the engine self-pointer the bindings need) but never
+    // wires a window_manager. notify must therefore stay log-only without
+    // raising.
+    engine.loadBuiltinPlugins();
+    try std.testing.expect(engine.window_manager == null);
+
+    try engine.lua.doString(
+        \\zag.notify("headless message")
+        \\zag.notify("with level", { level = "warn" })
+    );
+    // No crash, no toast state to inspect (there is no WM). Reaching here
+    // is the assertion.
+}
+
+test "zag.notify unknown level falls back to info" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\zag.notify("mystery", { level = "banana" })
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), f.wm.toasts_len);
+    try std.testing.expectEqual(ToastLevel.info, f.wm.toasts[0].level);
+}
+
+test "zag.notify accepts warn, warning, error, and err level aliases" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\zag.notify("a", { level = "warn" })
+        \\zag.notify("b", { level = "warning" })
+        \\zag.notify("c", { level = "err" })
+    );
+    // First three are visible (max_visible_toasts == 3).
+    try std.testing.expectEqual(@as(usize, 3), f.wm.toasts_len);
+    try std.testing.expectEqual(ToastLevel.warn, f.wm.toasts[0].level);
+    try std.testing.expectEqual(ToastLevel.warn, f.wm.toasts[1].level);
+    try std.testing.expectEqual(ToastLevel.err, f.wm.toasts[2].level);
+}
+
 test "splitFocusedWithSession attaches loaded session to a new pane" {
     const allocator = std.testing.allocator;
 
