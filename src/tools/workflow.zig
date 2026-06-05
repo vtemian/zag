@@ -88,6 +88,11 @@ pub fn execute(
         .script = parsed.value.script,
         .ctx = ctx,
         .allocator = allocator,
+        // Capture the spawning call's id so the script's `zag.task` spawns
+        // group their `subagent_link` nodes under this workflow tool call.
+        // Borrows this dispatch frame's id (alive for the park-until-retire
+        // window), set by `runToolStep` around `registry.execute`.
+        .spawning_tool_use_id = tools.current_tool_use_id,
     };
 
     // Round-trip to main: serviceRoundTripEvent's `.workflow_request` arm calls

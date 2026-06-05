@@ -16,6 +16,14 @@ const Allocator = std.mem.Allocator;
 /// allowing stateless function pointers to identify themselves.
 pub threadlocal var current_tool_name: ?[]const u8 = null;
 
+/// Thread-local provider `tool_use_id` of the tool call currently being
+/// dispatched. Set by the agent loop (`runToolStep`) around `registry.execute`
+/// on both the inline and parallel-worker paths, so the spawn primitives
+/// (`task` tool, `workflow` tool) can stamp the spawning call's id onto the
+/// `subagent_link` node they create. Borrows the dispatch frame's id slice,
+/// which outlives the synchronous tool execution. Null outside a dispatch.
+pub threadlocal var current_tool_use_id: ?[]const u8 = null;
+
 /// Thread-local event queue pointer used by `luaToolExecute` to round-trip
 /// a Lua tool call to the main thread. Set by the agent loop at the top
 /// of `runLoopStreaming` and by each parallel tool worker before calling

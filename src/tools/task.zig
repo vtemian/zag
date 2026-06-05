@@ -116,7 +116,9 @@ fn runChild(
     // before any dupe and release it on the failed-start path.
     child.spec_arena = std.heap.ArenaAllocator.init(allocator);
     const spec_arena = child.spec_arena.allocator();
-    const spec = buildSpec(spec_arena, input) catch {
+    // A `task`-tool spawn groups under ITS OWN call: read the dispatch-frame
+    // threadlocal (set by `runToolStep` around `registry.execute`) directly.
+    const spec = buildSpec(spec_arena, input, tools.current_tool_use_id) catch {
         child.spec_arena.deinit();
         return error.OutOfMemory;
     };
@@ -217,7 +219,7 @@ fn runChild(
 /// Dupe the inline `TaskInput` strings into `arena` and assemble a
 /// `ChildSpec`. The arena is the child's `spec_arena`, which outlives the run;
 /// the parsed JSON's borrowed bytes die when `execute` returns.
-fn buildSpec(arena: Allocator, input: TaskInput) !ChildAgent.ChildSpec {
+fn buildSpec(arena: Allocator, input: TaskInput, spawning_tool_use_id: ?[]const u8) !ChildAgent.ChildSpec {
     var tools_list: ?[]const []const u8 = null;
     if (input.tools) |list| {
         const dup = try arena.alloc([]const u8, list.len);
@@ -232,6 +234,7 @@ fn buildSpec(arena: Allocator, input: TaskInput) !ChildAgent.ChildSpec {
         .model = if (input.model) |m| try arena.dupe(u8, m) else null,
         .output_schema = if (input.schema) |s| try arena.dupe(u8, s) else null,
         .name = if (input.name) |n| try arena.dupe(u8, n) else "subagent",
+        .spawning_tool_use_id = if (spawning_tool_use_id) |id| try arena.dupe(u8, id) else null,
     };
 }
 
@@ -389,6 +392,35 @@ test "task spawns an inline subagent with the default name and inherited tools" 
     try testing.expectEqual(@as(usize, 2), stub.seen_tool_count);
     // The default-named subagent lands on the parent tree.
     try testing.expectEqual(@as(usize, 1), harness.parent_conv.subagents.items.len);
+}
+
+test "task park-mode stamps the link node with the task call's own tool_use_id" {
+    const allocator = testing.allocator;
+
+    var stub = StubTextProvider{ .response_text = "scout summary" };
+    var harness = try InlineHarness.init(allocator, stub.provider());
+    defer harness.deinit();
+    harness.bind();
+
+    // The agent loop publishes the `task` call's id on this threadlocal around
+    // `registry.execute`; mirror that here so the spawned link node resolves.
+    tools.current_tool_use_id = "task_call_1";
+    defer tools.current_tool_use_id = null;
+
+    // The parent tree carries the `task` tool_call node the spawn groups under.
+    const task_node = try harness.parent_conv.appendToolCallNode(null, "task", "task_call_1", "{\"prompt\":\"go\"}");
+
+    const result = try execute("{\"prompt\":\"go\"}", allocator, null);
+    defer if (result.owned) allocator.free(result.content);
+    try testing.expect(!result.is_error);
+
+    // The link node (second root child, after the task tool_call) carries the
+    // task call's own id and resolves back to the task tool_call node.
+    const link_node = harness.parent_conv.tree.root_children.items[1];
+    try testing.expectEqual(Conversation.NodeType.subagent_link, link_node.node_type);
+    try testing.expect(link_node.spawning_tool_use_id != null);
+    try testing.expectEqualStrings("task_call_1", link_node.spawning_tool_use_id.?);
+    try testing.expectEqual(task_node, link_node.spawning_tool_node.?);
 }
 
 test "task restricts tools via the inline allowlist and applies the system prefix" {

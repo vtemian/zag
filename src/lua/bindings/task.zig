@@ -99,7 +99,7 @@ pub fn zagTaskFn(co: *Lua) i32 {
     // Parse the spec table into the child's arena. On any failure, clean up
     // (arena + heap slot) BEFORE raising/returning so the longjmp/return never
     // strands the partial allocation.
-    const spec = parseSpec(co, child.spec_arena.allocator()) catch |err| {
+    var spec = parseSpec(co, child.spec_arena.allocator()) catch |err| {
         child.spec_arena.deinit();
         engine.allocator.destroy(child);
         switch (err) {
@@ -107,6 +107,17 @@ pub fn zagTaskFn(co: *Lua) i32 {
             error.OutOfMemory => co.raiseErrorStr("zag.task: spec dupe failed (OOM)", .{}),
         }
     };
+
+    // Carry the workflow's spawning tool_use_id (inherited onto this task by
+    // `startWorkflowScript`/`zag.spawn`) onto the spec, duped into the child's
+    // arena so it outlives the borrowed slice on the parked agent frame.
+    if (task.spawning_tool_use_id) |id| {
+        spec.spawning_tool_use_id = child.spec_arena.allocator().dupe(u8, id) catch {
+            child.spec_arena.deinit();
+            engine.allocator.destroy(child);
+            co.raiseErrorStr("zag.task: spawning id dupe failed (OOM)", .{});
+        };
+    }
 
     child.* = .{
         .allocator = ctx.allocator,
