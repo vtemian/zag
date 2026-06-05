@@ -1352,6 +1352,85 @@ test "a zag.detach survivor's workflow_ctx is severed when the root retires" {
     try testing.expect(child_registry.isEmpty());
 }
 
+test "an unjoined spawn survivor's workflow_ctx is severed when the root retires" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = &engine,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // Twin of the detach test for the second survivor class: a `zag.spawn` child
+    // with no `:join()`. It is parented to the spawner's scope, so the root retire
+    // BOTH re-parents it to root (the existing block) AND severs its borrow (the
+    // new block) in the same call. Pinning both classes guarantees the sever runs
+    // in the same retire that re-parents.
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\zag.spawn(function()
+        \\  while not _G.go do zag.sleep(5) end
+        \\  local ok, err = pcall(function() return zag.task({ prompt = "x" }) end)
+        \\  _G.spawn_err = tostring(err)
+        \\end)
+        \\return "root done"
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expectEqualStrings("root done", result);
+    try testing.expect(engine.tasks.count() > 0);
+
+    try runLua(&engine, "_G.go = true");
+    const deadline = clock.milliTimestamp() + 4000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        engine.pumpCompletions();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+
+    _ = try engine.lua.getGlobal("spawn_err");
+    const spawn_err = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, spawn_err, "requires a workflow context") != null);
+    engine.lua.pop(1);
+
+    try testing.expect(child_registry.isEmpty());
+}
+
 /// Return the first `.subagent_link` node in `conv`'s root children, or null.
 fn firstLinkNode(conv: *Conversation) ?*Conversation.Node {
     for (conv.tree.root_children.items) |node| {
