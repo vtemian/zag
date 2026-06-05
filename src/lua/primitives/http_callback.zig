@@ -368,8 +368,7 @@ pub const HttpCallbackListener = struct {
     fn writeSuccess(self: *HttpCallbackListener, conn: Io.net.Stream) void {
         _ = self;
         var hdr_buf: [256]u8 = undefined;
-        const head = std.fmt.bufPrint(&hdr_buf,
-            "HTTP/1.1 200 OK\r\n" ++
+        const head = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/html; charset=utf-8\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Connection: close\r\n\r\n", .{SUCCESS_BODY.len}) catch return;

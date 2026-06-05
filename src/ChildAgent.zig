@@ -388,7 +388,7 @@ test "buildChildRegistry: inherit-all arm drops the screen-driving tools" {
     try testing.expect(child.get("bash") != null);
 
     const screen_tools = [_][]const u8{
-        "layout_tree", "layout_focus", "layout_split",
+        "layout_tree",  "layout_focus",  "layout_split",
         "layout_close", "layout_resize", "pane_read",
     };
     for (screen_tools) |name| {

@@ -871,8 +871,7 @@ test "HttpStreamHandle POST sends method and body, streams response" {
 
             const body = if (header_end) |he| ctx.request[he..total] else "";
             var resp_buf: [4096]u8 = undefined;
-            const resp = std.fmt.bufPrint(&resp_buf,
-                "HTTP/1.1 200 OK\r\n" ++
+            const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\n" ++
                 "Content-Length: {d}\r\n" ++
                 "\r\n" ++
                 "{s}\n", .{ body.len + 1, body }) catch return;

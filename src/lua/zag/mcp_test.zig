@@ -1216,8 +1216,7 @@ test "mcp direct: exclude_tools filters a direct registration" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try setupDirectEngine(&engine, &tmp, &abs_buf,
-        "direct_tools = true, exclude_tools = { \"add\" }", 1000000);
+    try setupDirectEngine(&engine, &tmp, &abs_buf, "direct_tools = true, exclude_tools = { \"add\" }", 1000000);
 
     // Excluded: no direct tool, but the proxy remains.
     try testing.expect(hasTool(&engine, "mcp"));
@@ -1254,8 +1253,7 @@ test "mcp direct: array form registers only the listed tool" {
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
     // The cache only carries "add"; an array listing "add" registers it,
     // while an array listing something else registers nothing.
-    try setupDirectEngine(&engine, &tmp, &abs_buf,
-        "direct_tools = { \"add\" }", 1000000);
+    try setupDirectEngine(&engine, &tmp, &abs_buf, "direct_tools = { \"add\" }", 1000000);
     try testing.expect(hasTool(&engine, "fake_add"));
 
     var engine2 = try LuaEngine.init(testing.allocator);
@@ -1266,8 +1264,7 @@ test "mcp direct: array form registers only the listed tool" {
     var tmp2 = std.testing.tmpDir(.{});
     defer tmp2.cleanup();
     var abs_buf2: [std.fs.max_path_bytes]u8 = undefined;
-    try setupDirectEngine(&engine2, &tmp2, &abs_buf2,
-        "direct_tools = { \"nonexistent\" }", 1000000);
+    try setupDirectEngine(&engine2, &tmp2, &abs_buf2, "direct_tools = { \"nonexistent\" }", 1000000);
     try testing.expect(!hasTool(&engine2, "fake_add"));
 }
 
@@ -1697,8 +1694,7 @@ const HttpFixture = struct {
                     return;
                 },
                 else => {
-                    const init_body = std.fmt.bufPrint(&out,
-                        "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"http-fake\",\"version\":\"0\"}}}}}}", .{reqid}) catch return;
+                    const init_body = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"http-fake\",\"version\":\"0\"}}}}}}", .{reqid}) catch return;
                     ctx.writeJson(conn, init_body, true);
                     return;
                 },
@@ -1715,8 +1711,7 @@ const HttpFixture = struct {
         const is_list = std.mem.indexOf(u8, body, "\"tools/list\"") != null;
         if (is_list) {
             const seq = ctx.list_count.fetchAdd(1, .acq_rel);
-            const list_body = std.fmt.bufPrint(&out,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
+            const list_body = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
             switch (ctx.scenario) {
                 .json, .notification_202 => ctx.writeJson(conn, list_body, false),
                 .sse => ctx.writeSse(conn, list_body),
@@ -1742,8 +1737,7 @@ const HttpFixture = struct {
 
         _ = request;
         // Anything else: empty 200 JSON ok.
-        const empty = std.fmt.bufPrint(&out,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{reqid}) catch return;
+        const empty = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{reqid}) catch return;
         ctx.writeJson(conn, empty, false);
     }
 
@@ -1754,8 +1748,7 @@ const HttpFixture = struct {
             "Mcp-Session-Id: " ++ SESSION_ID ++ "\r\n"
         else
             "";
-        const resp = std.fmt.bufPrint(&out,
-            "HTTP/1.1 200 OK\r\n" ++
+        const resp = std.fmt.bufPrint(&out, "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: application/json\r\n" ++
             "{s}" ++
             "Content-Length: {d}\r\n\r\n{s}", .{ session_hdr, json.len, json }) catch return;
@@ -1769,8 +1762,7 @@ const HttpFixture = struct {
         // line to dispatch it, then EOF (chunked-less: rely on connection close
         // for the legacy reader, but here Content-Length frames it).
         const event = std.fmt.bufPrint(out[2048..], "event: message\ndata: {s}\n\n", .{json}) catch return;
-        const resp = std.fmt.bufPrint(out[0..2048],
-            "HTTP/1.1 200 OK\r\n" ++
+        const resp = std.fmt.bufPrint(out[0..2048], "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/event-stream\r\n" ++
             "Content-Length: {d}\r\n\r\n", .{event.len}) catch return;
         test_net.streamWriteAll(conn, resp) catch {};
@@ -2140,12 +2132,10 @@ const LegacySseFixture = struct {
         const reqid = HttpFixture.jsonRpcId(body) orelse "1";
         var out: [512]u8 = undefined;
         if (std.mem.indexOf(u8, body, "\"initialize\"") != null) {
-            const json = std.fmt.bufPrint(&out,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"legacy\",\"version\":\"0\"}}}}}}", .{reqid}) catch return;
+            const json = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"legacy\",\"version\":\"0\"}}}}}}", .{reqid}) catch return;
             ctx.enqueue(json);
         } else if (std.mem.indexOf(u8, body, "\"tools/list\"") != null) {
-            const json = std.fmt.bufPrint(&out,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
+            const json = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
             ctx.enqueue(json);
         }
         // notifications/initialized and anything else: nothing to enqueue.
@@ -2347,8 +2337,7 @@ const OAuthFixture = struct {
 
         if (std.mem.indexOf(u8, request, "/.well-known/oauth-protected-resource") != null) {
             var out: [256]u8 = undefined;
-            const json = std.fmt.bufPrint(&out,
-                "{{\"resource\":\"{s}/mcp\",\"authorization_servers\":[\"{s}\"]}}", .{ ctx.base(), ctx.base() }) catch return;
+            const json = std.fmt.bufPrint(&out, "{{\"resource\":\"{s}/mcp\",\"authorization_servers\":[\"{s}\"]}}", .{ ctx.base(), ctx.base() }) catch return;
             ctx.writeJson(conn, json);
             return;
         }
@@ -2356,8 +2345,7 @@ const OAuthFixture = struct {
             var out: [512]u8 = undefined;
             const token_ep: []const u8 = if (ctx.poison_token_endpoint) "http://203.0.113.5/token" else ctx.base();
             const token_suffix: []const u8 = if (ctx.poison_token_endpoint) "" else "/token";
-            const json = std.fmt.bufPrint(&out,
-                "{{\"issuer\":\"{s}\"," ++
+            const json = std.fmt.bufPrint(&out, "{{\"issuer\":\"{s}\"," ++
                 "\"authorization_endpoint\":\"{s}/authorize\"," ++
                 "\"token_endpoint\":\"{s}{s}\"," ++
                 "\"registration_endpoint\":\"{s}/register\"," ++
@@ -2403,8 +2391,7 @@ const OAuthFixture = struct {
             const has_bearer = HttpFixture.findHeaderValue(headers, "authorization") != null;
             if (!has_bearer) {
                 var out: [256]u8 = undefined;
-                const resp = std.fmt.bufPrint(&out,
-                    "HTTP/1.1 401 Unauthorized\r\n" ++
+                const resp = std.fmt.bufPrint(&out, "HTTP/1.1 401 Unauthorized\r\n" ++
                     "WWW-Authenticate: Bearer resource_metadata=\"{s}/.well-known/oauth-protected-resource\"\r\n" ++
                     "Content-Length: 0\r\n\r\n", .{ctx.base()}) catch return;
                 test_net.streamWriteAll(conn, resp) catch {};
@@ -2418,19 +2405,16 @@ const OAuthFixture = struct {
             }
             var out: [512]u8 = undefined;
             if (std.mem.indexOf(u8, body, "\"initialize\"") != null) {
-                const json = std.fmt.bufPrint(&out,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}}}}}}", .{reqid}) catch return;
+                const json = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{\"tools\":{{}}}}}}}}", .{reqid}) catch return;
                 ctx.writeJson(conn, json);
                 return;
             }
             if (std.mem.indexOf(u8, body, "\"tools/list\"") != null) {
-                const json = std.fmt.bufPrint(&out,
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
+                const json = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[{{\"name\":\"add\",\"description\":\"adds\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}", .{reqid}) catch return;
                 ctx.writeJson(conn, json);
                 return;
             }
-            const empty = std.fmt.bufPrint(&out,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{reqid}) catch return;
+            const empty = std.fmt.bufPrint(&out, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{reqid}) catch return;
             ctx.writeJson(conn, empty);
             return;
         }
@@ -2440,8 +2424,7 @@ const OAuthFixture = struct {
     fn writeJson(ctx: *OAuthFixture, conn: std.Io.net.Stream, json: []const u8) void {
         _ = ctx;
         var out: [4096]u8 = undefined;
-        const resp = std.fmt.bufPrint(&out,
-            "HTTP/1.1 200 OK\r\n" ++
+        const resp = std.fmt.bufPrint(&out, "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: application/json\r\n" ++
             "Content-Length: {d}\r\n\r\n{s}", .{ json.len, json }) catch return;
         test_net.streamWriteAll(conn, resp) catch {};
