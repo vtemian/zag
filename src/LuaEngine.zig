@@ -3427,7 +3427,16 @@ pub const LuaEngine = struct {
         // message we surface as the (error) tool result.
         self.lua.loadString(script_z) catch |err| {
             const msg = if (err == error.LuaSyntax) self.lua.toString(-1) catch "<unprintable>" else @errorName(err);
-            completeWorkflowRequestOwned(req, msg, true);
+            // The #1 script-compile footgun is a multi-line prompt inside a
+            // double-quoted Lua string, which fails with "unfinished string".
+            // Append the long-string fix so the model self-corrects when it
+            // reads this error back as the tool result.
+            var hint_buf: [512]u8 = undefined;
+            const surfaced = if (std.mem.indexOf(u8, msg, "unfinished string") != null)
+                std.fmt.bufPrint(&hint_buf, "{s} (hint: double-quoted Lua strings cannot span lines; write multi-line text as [[long strings]])", .{msg}) catch msg
+            else
+                msg;
+            completeWorkflowRequestOwned(req, surfaced, true);
             self.lua.setTop(0);
             return;
         };

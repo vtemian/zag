@@ -1832,6 +1832,72 @@ test "startWorkflowScript completes with is_error when the script raises at runt
     try testing.expectEqual(@as(u32, 0), engine.tasks.count());
 }
 
+test "startWorkflowScript hints long strings on an unfinished-string compile error" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    var stub = StubTextProvider{ .response_text = "x" };
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = stub.provider(),
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = null,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // A double-quoted Lua string with a raw newline is the #1 script-compile
+    // footgun (the model writes a multi-line prompt inside "..."). The compile
+    // error carries "unfinished string"; the result must also carry the
+    // long-string hint so the model self-corrects on the next turn.
+    var req = LuaEngine.WorkflowRequest{
+        .script = "local x = \"a\nb\"",
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&req);
+    try testing.expect(req.done.isSet());
+    try testing.expect(req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "unfinished string") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "[[long strings]]") != null);
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+
+    // A different compile error must NOT carry the hint: the long-string advice
+    // is only correct for the unfinished-string footgun.
+    var other = LuaEngine.WorkflowRequest{
+        .script = "local = ",
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+    engine.startWorkflowScript(&other);
+    try testing.expect(other.done.isSet());
+    try testing.expect(other.is_error);
+    const other_result = other.result orelse return error.NoResult;
+    defer allocator.free(other_result);
+    try testing.expect(std.mem.indexOf(u8, other_result, "unfinished string") == null);
+    try testing.expect(std.mem.indexOf(u8, other_result, "[[long strings]]") == null);
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+}
+
 // -- Lua tool coroutine + child process (Milestone A) -----------------------
 
 /// Drive a started Lua-tool coroutine to completion the way an agent driver's
