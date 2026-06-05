@@ -1686,7 +1686,10 @@ test "startWorkflowScript completes with is_error when the script raises at runt
     try testing.expect(req.is_error);
     const result = req.result orelse return error.NoResult;
     defer allocator.free(result);
-    try testing.expect(result.len > 0);
+    // The result must carry the actual Lua error, not a generic marker:
+    // the model reads this tool result and can only fix its script when
+    // the message names what broke (mirrors the lua_tool_request path).
+    try testing.expect(std.mem.indexOf(u8, result, "boom from the script") != null);
     try testing.expectEqual(@as(u32, 0), engine.tasks.count());
 }
 
