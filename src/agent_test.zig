@@ -600,6 +600,117 @@ test "runLoopStreaming truncates a giant tool_result on overflow and the retry s
     try std.testing.expect(!saw_other);
 }
 
+test "runLoopStreaming proactive cascade truncates a giant recent tool_result instead of refusing" {
+    const allocator = std.testing.allocator;
+
+    var registry = tools.Registry.init(allocator);
+    defer registry.deinit();
+    var queue = try agent_events.EventQueue.initBounded(allocator, 64);
+    defer {
+        var drain_buf: [64]agent_events.AgentEvent = undefined;
+        const n = queue.drain(&drain_buf);
+        for (drain_buf[0..n]) |ev| ev.freeOwned();
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var turn_in_progress = std.atomic.Value(bool).init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+
+    // The live train-fasttext profile: the pre-flight estimator trips at the
+    // top of the loop (no provider rejection yet) because a giant tool_result
+    // dominates the history. Summarization keeps recent messages and would only
+    // re-send the same oversized history; drop-oldest is a no-op here because
+    // the fat result sits below the keep-recent budget (findCutPoint returns
+    // first_kept == 0, so nothing is dropped). With neither lossy stage able to
+    // shrink it, the proactive cascade would refuse with ContextWindowExceeded
+    // BEFORE the first send. Truncation is the only stage that can shrink it.
+    var messages: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (messages.items) |m| m.deinit(allocator);
+        messages.deinit(allocator);
+    }
+    // 1140 KiB tool_result => ~291840 estimated tokens, over the 262144 window.
+    // After head(24 KiB)+tail(8 KiB) truncation it is ~8200 tokens, well under.
+    const fat_len: usize = 1140 * 1024;
+    {
+        const big = try allocator.alloc(u8, fat_len);
+        @memset(big, 'Z');
+        const id = try allocator.dupe(u8, "call_bash");
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .tool_result = .{ .tool_use_id = id, .content = big, .is_error = false } };
+        try messages.append(allocator, .{ .role = .user, .content = blocks });
+    }
+    // A couple of small follow-up turns so the fat result is below the
+    // keep-recent budget: walking back from the end, drop-oldest's budget is
+    // only crossed when it reaches the fat result at index 0, snapping the cut
+    // to 0 (drop-oldest skipped). This is the shape where drop-oldest provably
+    // cannot reach the window.
+    for ([_][]const u8{ "and then?", "looks good" }) |label| {
+        const text = try allocator.dupe(u8, label);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try messages.append(allocator, .{ .role = if (std.mem.eql(u8, label, "and then?")) .assistant else .user, .content = blocks });
+    }
+
+    // Production-scale window: above the post-truncation estimate (~8200) but
+    // below the original (~291840). The fat provider's threshold sits between
+    // the post-truncation size (~32 KiB) and the original 1140 KiB, so the sent
+    // request only fits once truncation has actually shrunk the result.
+    const spec: llm.ModelSpec = .{ .provider_name = "stubprov", .model_id = "stubmodel-1", .context_window = 262144 };
+    var stub = FatToolResultOverflowProvider{ .overflow_threshold = 64 * 1024 };
+    const p = stub.provider();
+
+    try agent.runLoopStreaming(
+        &messages,
+        &registry,
+        p,
+        allocator,
+        &queue,
+        &cancel,
+        null,
+        null,
+        &turn_in_progress,
+        spec,
+        "sess-proactive-truncate",
+        &detail,
+        null,
+    );
+
+    // Proactive truncation fired before the send, so the single streaming call
+    // saw an already-truncated history and succeeded. Because truncation brought
+    // the estimate under the window, summarization never fired (no doomed LLM
+    // round-trip) and there was no overflow rejection: exactly one provider call.
+    try std.testing.expectEqual(@as(u32, 1), stub.call_count);
+
+    // The giant tool_result was truncated below the model window.
+    const fat = messages.items[0].content[0].tool_result;
+    try std.testing.expect(fat.content.len < fat_len);
+    try std.testing.expect(std.mem.indexOf(u8, fat.content, "after context overflow") != null);
+
+    // A truncated_tool_results compaction_event was emitted during the
+    // proactive cascade, and the turn was NOT refused.
+    var saw_truncate = false;
+    var saw_refused = false;
+    var buf: [64]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .compaction_event => |c| {
+                if (std.mem.eql(u8, c.outcome, "truncated_tool_results")) {
+                    saw_truncate = true;
+                } else if (std.mem.eql(u8, c.outcome, "refused")) {
+                    saw_refused = true;
+                }
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    try std.testing.expect(saw_truncate);
+    try std.testing.expect(!saw_refused);
+}
+
 // ============================================================================
 // Test helpers for parallel tool execution + executeTools/jit/transform tests
 // Moved from src/agent.zig in audit step J.
