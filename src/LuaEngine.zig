@@ -382,6 +382,14 @@ pub const LuaEngine = struct {
         /// `startWorkflowScript`; inherited onto child coroutines spawned via
         /// `zag.spawn`/`zag.detach` so combinator workers can call `zag.task`.
         workflow_ctx: ?*const tools_mod.TaskContext = null,
+        /// The `tool_use_id` of the `workflow` tool call that spawned this
+        /// orchestration script, threaded from `WorkflowRequest` by
+        /// `startWorkflowScript` and inherited onto combinator workers via
+        /// `zag.spawn`/`zag.detach` exactly like `workflow_ctx`. The `zag.task`
+        /// binding reads it into the `ChildSpec` so the spawned `subagent_link`
+        /// node groups under the workflow call. Borrows the parked agent-thread
+        /// frame (park-until-retire, same lifetime argument as `workflow_ctx`).
+        spawning_tool_use_id: ?[]const u8 = null,
         /// Non-null only on the top-level workflow-script coroutine: the
         /// request whose `result`/`done` the script's return value fills.
         /// `resumeTask`'s `.ok` arm reads the coroutine's returned string into
@@ -426,6 +434,14 @@ pub const LuaEngine = struct {
         /// Context the script's `zag.task` calls borrow (provider, parent_conv,
         /// child_registry, wake_fd, task_depth, ...). Borrowed; outlives `done`.
         ctx: *const tools_mod.TaskContext,
+        /// The `tool_use_id` of the `workflow` tool call that started this
+        /// script, captured from the agent-thread `tools.current_tool_use_id`
+        /// threadlocal at dispatch. `startWorkflowScript` stows it on the
+        /// orchestration `Task`; `zag.task`/`zag.spawn` carry it onto each
+        /// spawned `subagent_link` node so children group under the workflow
+        /// call. Borrows the parked dispatch frame's id slice (park-until-retire,
+        /// the same lifetime argument as `ctx`). Null when unavailable.
+        spawning_tool_use_id: ?[]const u8 = null,
         /// Fired exactly once when the run completes (success or error).
         done: sync.ResetEvent = .{},
         /// The script's returned string on success; null on error or a script
@@ -1165,6 +1181,7 @@ pub const LuaEngine = struct {
         const parent_task = engine.taskForCoroutine(co);
         const parent: ?*async_scope.Scope = if (parent_task) |t| t.scope else null;
         const inherited_workflow_ctx: ?*const tools_mod.TaskContext = if (parent_task) |t| t.workflow_ctx else null;
+        const inherited_spawning_id: ?[]const u8 = if (parent_task) |t| t.spawning_tool_use_id else null;
 
         // spawnCoroutine operates on `engine.lua`'s stack. When zag.spawn
         // is called from inside another coroutine, [fn, args...] live on
@@ -1173,7 +1190,7 @@ pub const LuaEngine = struct {
             co.xMove(engine.lua, nargs + 1);
         }
 
-        const thread_ref = engine.spawnCoroutineInheriting(nargs, parent, inherited_workflow_ctx) catch |err| switch (err) {
+        const thread_ref = engine.spawnCoroutineInheriting(nargs, parent, inherited_workflow_ctx, inherited_spawning_id) catch |err| switch (err) {
             error.AsyncRuntimeNotReady => co.raiseErrorStr(
                 "zag.spawn: async runtime not ready (use it from a hook or tool, not at config top level)",
                 .{},
@@ -1207,13 +1224,16 @@ pub const LuaEngine = struct {
         // Detach parents to root (independent lifetime), but still inherits the
         // workflow context so a detached worker inside a workflow script can
         // call `zag.task`.
+        const detach_parent_task = engine.taskForCoroutine(co);
         const inherited_workflow_ctx: ?*const tools_mod.TaskContext =
-            if (engine.taskForCoroutine(co)) |t| t.workflow_ctx else null;
+            if (detach_parent_task) |t| t.workflow_ctx else null;
+        const inherited_spawning_id: ?[]const u8 =
+            if (detach_parent_task) |t| t.spawning_tool_use_id else null;
 
         if (co != engine.lua) {
             co.xMove(engine.lua, nargs + 1);
         }
-        _ = engine.spawnCoroutineInheriting(nargs, null, inherited_workflow_ctx) catch |err| switch (err) {
+        _ = engine.spawnCoroutineInheriting(nargs, null, inherited_workflow_ctx, inherited_spawning_id) catch |err| switch (err) {
             error.AsyncRuntimeNotReady => co.raiseErrorStr(
                 "zag.detach: async runtime not ready (use it from a hook or tool, not at config top level)",
                 .{},
@@ -3113,22 +3133,24 @@ pub const LuaEngine = struct {
         parent_scope: ?*async_scope.Scope,
         hook_payload: ?*Hooks.HookPayload,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, hook_payload, null, null, null, null, null, null);
     }
 
     /// Spawn a coroutine that inherits a workflow context from its spawner.
     /// Used by `zag.spawn`/`zag.detach` when the spawning coroutine is itself
     /// inside a workflow script: the child must carry `workflow_ctx` so its
-    /// own `zag.task` calls resolve a context. Set BEFORE the first resume so a
-    /// combinator worker that calls `zag.task` synchronously during its first
-    /// resume already sees the context.
+    /// own `zag.task` calls resolve a context, and `spawning_tool_use_id` so
+    /// those calls group their children under the workflow tool call. Set
+    /// BEFORE the first resume so a combinator worker that calls `zag.task`
+    /// synchronously during its first resume already sees both.
     fn spawnCoroutineInheriting(
         self: *LuaEngine,
         nargs: i32,
         parent_scope: ?*async_scope.Scope,
         workflow_ctx: ?*const tools_mod.TaskContext,
+        spawning_tool_use_id: ?[]const u8,
     ) !i32 {
-        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, null, null);
+        return self.spawnCoroutineFull(nargs, parent_scope, null, null, null, workflow_ctx, spawning_tool_use_id, null, null);
     }
 
     /// Spawn a coroutine already bound to a `PendingFire`. The binding is set
@@ -3144,7 +3166,7 @@ pub const LuaEngine = struct {
         pf: *PendingFire,
     ) !i32 {
         pf.outstanding += 1;
-        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null, null) catch |err| {
+        return self.spawnCoroutineFull(nargs, null, hook_payload, compact_request, pf, null, null, null, null) catch |err| {
             // The spawn never registered the task (so retireTask will not run
             // for it); undo the bump so the guard release still reaches 0.
             pf.outstanding -= 1;
@@ -3384,7 +3406,7 @@ pub const LuaEngine = struct {
         // (so its return value is captured). Both are set before the first
         // resume inside spawnCoroutineFull, so even a no-yield script that
         // returns immediately has its result captured.
-        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req, null) catch |err| {
+        _ = self.spawnCoroutineFull(0, self.root_scope, null, null, null, req.ctx, req.spawning_tool_use_id, req, null) catch |err| {
             // The spawn never registered a task (so retireTask cannot complete
             // the request); complete it here. The chunk on the stack was either
             // consumed by spawnCoroutineFull (on the xMove) or left on a failure
@@ -3453,7 +3475,7 @@ pub const LuaEngine = struct {
         // coroutine (nargs = 1) and tags it with the request so the return
         // value is captured even for a no-yield tool that retires inside the
         // spawn.
-        _ = self.spawnCoroutineFull(1, self.root_scope, null, null, null, null, null, req) catch |err| {
+        _ = self.spawnCoroutineFull(1, self.root_scope, null, null, null, null, null, null, req) catch |err| {
             // The spawn never registered a task (so retireTask cannot complete
             // the request); complete it here. The fn+arg on the stack were
             // either consumed by spawnCoroutineFull (on the xMove) or left on a
@@ -3515,6 +3537,7 @@ pub const LuaEngine = struct {
         compact_request: ?*agent_events.CompactRequest,
         pending_fire: ?*PendingFire,
         workflow_ctx: ?*const tools_mod.TaskContext,
+        spawning_tool_use_id: ?[]const u8,
         workflow_request: ?*WorkflowRequest,
         lua_tool_request: ?*Hooks.LuaToolRequest,
     ) !i32 {
@@ -3556,6 +3579,9 @@ pub const LuaEngine = struct {
             // Inherited from the spawner so combinator workers can call
             // `zag.task`. Set before the first resume below.
             .workflow_ctx = workflow_ctx,
+            // Carried alongside `workflow_ctx` so the spawned child's
+            // `subagent_link` node groups under the workflow tool call.
+            .spawning_tool_use_id = spawning_tool_use_id,
             // Set before the first resume so a no-yield workflow script that
             // retires inside this spawn still has its return value captured by
             // resumeTask's `.ok` arm.

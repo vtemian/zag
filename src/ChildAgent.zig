@@ -61,6 +61,13 @@ pub const ChildSpec = struct {
     output_schema: ?[]const u8 = null,
     /// Display name for the `subagent_link` tree node (observability).
     name: []const u8 = "subagent",
+    /// The `tool_use_id` of the tool call that spawned this child (the
+    /// orchestrating `workflow` call for the `zag.task` binding, or the `task`
+    /// call itself for the park-mode tool). Passed to `spawnSubagent` so the
+    /// `subagent_link` node groups under its spawning tool call. Duped into
+    /// `spec_arena` by the spawner like the other spec strings; null when the
+    /// spawn carried no call context.
+    spawning_tool_use_id: ?[]const u8 = null,
 };
 
 /// The derived outcome of a finished child run, used for the park/return
@@ -149,7 +156,7 @@ pub fn start(self: *ChildAgent, ctx: *const tools.TaskContext) !void {
     // parent's `subagents` list; we do NOT destroy it. The parent's `deinit`
     // walks subagents and frees the slot. The parent's tree gains a
     // `subagent_link` node referencing the new index.
-    self.child_conv = try ctx.parent_conv.spawnSubagent(self.spec.name, self.spec.prompt);
+    self.child_conv = try ctx.parent_conv.spawnSubagentLinked(self.spec.name, self.spec.prompt, self.spec.spawning_tool_use_id);
     // Pre-seed the child's persistence chain off the task_start ULID so the
     // child's first persisted event chains into the delegation scope.
     self.child_conv.last_persisted_id = self.task_start_id;
