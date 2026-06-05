@@ -507,6 +507,30 @@ fn runWithProvider(deps: HeadlessDeps) !void {
     var capture = Trajectory.Capture.init(gpa);
     defer capture.deinit();
 
+    // Build opts are fixed for the whole run. The trajectory file is
+    // rewritten after every round-trip close and tool result, not only at
+    // end of run: a harness timeout kill mid-run must still leave a
+    // complete, validator-clean file behind (a passing trial without a
+    // trajectory is a leaderboard-submission violation).
+    const traj_opts: Trajectory.BuildOpts = .{
+        .session_id = deps.session_id,
+        .agent = .{
+            .name = "zag",
+            .version = "0.1.0",
+            .model_name = deps.model_id,
+        },
+        .system_prompt = system_prompt,
+        .user_instruction = instruction,
+        .model = deps.model_id,
+    };
+    const snapshot = struct {
+        fn call(cap: *Trajectory.Capture, path: []const u8, opts: Trajectory.BuildOpts, alloc: Allocator) void {
+            writeTrajectorySnapshot(process_io.get(), alloc, cap, path, opts) catch |err| {
+                log.warn("trajectory snapshot failed: {s}", .{@errorName(err)});
+            };
+        }
+    }.call;
+
     // One captured turn per LLM round-trip. The turn opens lazily on the
     // first streamed content event (text/thinking delta or a streaming-preview
     // tool_start) and closes on the `.llm_done` event with that call's real
@@ -669,6 +693,9 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     capture.addToolResult(tool_id, r.content.bytes, r.is_error) catch |err| {
                         log.warn("capture dropped tool result: {s}", .{@errorName(err)});
                     };
+                    // Timeout kills land mid-tool-execution most often; keep
+                    // the on-disk trajectory current with each result.
+                    snapshot(&capture, deps.mode.trajectory_out, traj_opts, gpa);
                 },
                 .info => |text| {
                     defer text.free();
@@ -716,6 +743,7 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                             turn_open = false;
                         }
                     }
+                    snapshot(&capture, deps.mode.trajectory_out, traj_opts, gpa);
                 },
                 .done => {
                     // `.llm_done` already closed the last round-trip's turn
@@ -817,27 +845,9 @@ fn runWithProvider(deps: HeadlessDeps) !void {
         }
     }
 
-    const traj = try capture.build(gpa, .{
-        .session_id = deps.session_id,
-        .agent = .{
-            .name = "zag",
-            .version = "0.1.0",
-            .model_name = deps.model_id,
-        },
-        .system_prompt = system_prompt,
-        .user_instruction = instruction,
-        .model = deps.model_id,
-    });
-    defer Trajectory.freeTrajectory(traj, gpa);
+    try writeTrajectorySnapshot(process_io.get(), gpa, &capture, deps.mode.trajectory_out, traj_opts);
 
     const io = process_io.get();
-    const file = try std.Io.Dir.cwd().createFile(io, deps.mode.trajectory_out, .{ .truncate = true });
-    defer file.close(io);
-    var buffer: std.Io.Writer.Allocating = .init(gpa);
-    defer buffer.deinit();
-    try Trajectory.serialize(traj, gpa, &buffer.writer);
-    try file.writeStreamingAll(io, buffer.writer.buffered());
-
     if (agent_err) |e| {
         log.err("headless agent error: {s}", .{e});
         // The log line routes to ~/.zag/logs, which a bench harness or CI job
@@ -859,6 +869,33 @@ fn runWithProvider(deps: HeadlessDeps) !void {
 /// degrades to a fixed generic line rather than panicking.
 fn formatHeadlessFailure(buf: []u8, err_text: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "zag: agent failed: {s}\n", .{err_text}) catch "zag: agent failed\n";
+}
+
+/// Serialize the captured transcript as ATIF JSON to `path` via a sibling
+/// temp file plus rename, so a kill mid-write never leaves a torn or
+/// truncated trajectory for the harness to ingest.
+fn writeTrajectorySnapshot(
+    io: std.Io,
+    gpa: Allocator,
+    capture: *Trajectory.Capture,
+    path: []const u8,
+    opts: Trajectory.BuildOpts,
+) !void {
+    const traj = try capture.build(gpa, opts);
+    defer Trajectory.freeTrajectory(traj, gpa);
+
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: std.Io.Writer.Allocating = .init(gpa);
+        defer buffer.deinit();
+        try Trajectory.serialize(traj, gpa, &buffer.writer);
+        try file.writeStreamingAll(io, buffer.writer.buffered());
+    }
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
 }
 
 // -- Tests ------------------------------------------------------------------
@@ -1273,4 +1310,46 @@ test "injectReminders skips messages whose content is tool_result-only" {
         .tool_result => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "trajectory snapshot is atomic and replaces the previous snapshot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // writeTrajectorySnapshot resolves cwd-relative paths, so point cwd at a
+    // temp dir and restore it afterwards (same pattern as the AgentRunner
+    // session test).
+    const orig_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(orig_cwd);
+    defer std.process.setCurrentPath(std.testing.io, orig_cwd) catch {};
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+
+    var cap = Trajectory.Capture.init(allocator);
+    defer cap.deinit();
+    try cap.beginTurn(1000);
+    try cap.addTextDelta("step one");
+    try cap.endTurn(.{ .completion_tokens = 2 });
+
+    const opts: Trajectory.BuildOpts = .{
+        .session_id = "snap-test",
+        .agent = .{ .name = "zag", .version = "0.1.0", .model_name = "prov/model" },
+        .system_prompt = "sys",
+        .user_instruction = "do the thing",
+        .model = "prov/model",
+    };
+    try writeTrajectorySnapshot(std.testing.io, allocator, &cap, "traj.json", opts);
+
+    // The per-round-trip path renames over the existing file: a later
+    // snapshot must fully replace the earlier one.
+    try cap.beginTurn(2000);
+    try cap.addTextDelta("step two");
+    try cap.endTurn(.{ .completion_tokens = 3 });
+    try writeTrajectorySnapshot(std.testing.io, allocator, &cap, "traj.json", opts);
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "traj.json", allocator, .limited(1 << 20));
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "ATIF-v1.2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "step two") != null);
+    // No temp file may linger after a successful snapshot.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, "traj.json.tmp", .{}));
 }
