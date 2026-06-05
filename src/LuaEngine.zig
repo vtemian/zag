@@ -2382,19 +2382,50 @@ pub const LuaEngine = struct {
         return 0;
     }
 
-    /// `zag.notify(msg, opts?)`: v1 routes to `.lua_user` as an info line
-    /// prefixed with `[notify]`. A future phase will push these onto a
-    /// compositor notification queue and render them in the TUI; for now
-    /// plugin authors get a log-level signal they can see.
+    /// Map an `opts.level` string to a toast level. Accepts the canonical
+    /// names plus common aliases ("warning"/"err"); any unknown string
+    /// falls back to `.info` with a debug log rather than raising an error,
+    /// so a plugin typo degrades gracefully instead of breaking a notify.
+    fn parseToastLevel(name: []const u8) WindowManager.ToastLevel {
+        if (std.mem.eql(u8, name, "info")) return .info;
+        if (std.mem.eql(u8, name, "warn") or std.mem.eql(u8, name, "warning")) return .warn;
+        if (std.mem.eql(u8, name, "error") or std.mem.eql(u8, name, "err")) return .err;
+        user_log.debug("[notify] unknown level '{s}', defaulting to info", .{name});
+        return .info;
+    }
+
+    /// `zag.notify(msg, opts?)`: write the message to `.lua_user` as an info
+    /// line prefixed with `[notify]` (the persistent record), and -- when a
+    /// WindowManager is wired (interactive TUI) -- also surface it as a
+    /// transient top-right toast. `opts.level` selects the tier and its
+    /// auto-dismiss time: "info" (default) 4s, "warn"/"warning" 8s,
+    /// "error"/"err" 15s; an unknown level falls back to info. The headless
+    /// Harness leaves `window_manager` null, so notify is log-only there,
+    /// exactly as before.
     fn zagNotifyFn(co: *Lua) i32 {
         const msg = co.checkString(1);
-        // opts at slot 2 is optional and currently ignored. Peek `level`
-        // so typos surface in type-of-value errors later if we add it.
+
+        // opts.level is optional; default info. A non-string or absent
+        // level keeps the default. Parse failures never raise.
+        var level: WindowManager.ToastLevel = .info;
         if (co.isTable(2)) {
             _ = co.getField(2, "level");
+            if (co.isString(-1)) {
+                if (co.toString(-1)) |level_name| {
+                    level = parseToastLevel(level_name);
+                } else |_| {}
+            }
             co.pop(1);
         }
+
+        // The log line is unconditional: it is the durable record even when
+        // the toast auto-dismisses or no TUI is attached.
         user_log.info("[notify] {s}", .{msg});
+
+        const engine = getEngineFromState(co);
+        if (engine.window_manager) |wm| {
+            wm.pushToast(msg, level, clock.milliTimestamp());
+        }
         return 0;
     }
 

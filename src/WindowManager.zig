@@ -53,6 +53,43 @@ pub const AttachedSurface = struct {
     view: View,
 };
 
+/// Severity of a `zag.notify` toast. Each tier carries its own
+/// auto-dismiss time-to-live; higher severities linger longer.
+pub const ToastLevel = enum {
+    info,
+    warn,
+    err,
+
+    /// Auto-dismiss budget in milliseconds for this level.
+    pub fn ttlMs(self: ToastLevel) u32 {
+        return switch (self) {
+            .info => 4_000,
+            .warn => 8_000,
+            .err => 15_000,
+        };
+    }
+};
+
+/// One transient notification overlay.
+pub const Toast = struct {
+    /// Owned copy, freed on expiry / `deinitToasts` by the WindowManager
+    /// allocator.
+    message: []const u8,
+    level: ToastLevel,
+    created_at_ms: i64,
+};
+
+/// At most this many toasts render at once; excess queues FIFO.
+pub const max_visible_toasts = 3;
+/// Queue bound; pushing past it drops the OLDEST queued toast (logged).
+pub const max_queued_toasts = 16;
+/// Toast messages longer than this are truncated on copy; keeps a runaway
+/// notify payload from allocating without bound. Byte cap, not
+/// codepoint-safe: the tail may split a UTF-8 sequence, which is harmless
+/// because rendering only decodes the first ~40 display columns per line,
+/// far inside the intact prefix.
+const max_toast_message_bytes = 4096;
+
 /// Pane composition: a rendered Buffer plus the optional agent-pane
 /// pair (Conversation + AgentRunner). The `buffer` field is
 /// always valid; it carries the type-erased Buffer the compositor
@@ -491,6 +528,21 @@ next_scratch_id: u32 = 1,
 transient_status: [64]u8 = undefined,
 /// Number of valid bytes in `transient_status`; zero means no message is active.
 transient_status_len: u8 = 0,
+/// Toasts currently rendered, newest last. Each holds an owned message
+/// copy freed on expiry / `deinitToasts`. A plain array + count rather
+/// than a growable list: the cap is small and fixed, and this mirrors the
+/// `transient_status` shape above (Zig 0.16 dropped `std.BoundedArray`).
+toasts: [max_visible_toasts]Toast = undefined,
+/// Number of valid entries in `toasts`.
+toasts_len: usize = 0,
+/// FIFO of toasts waiting for a visible slot, oldest first. Overflow drops
+/// the oldest queued entry (logged), never the newest.
+toast_queue: [max_queued_toasts]Toast = undefined,
+/// Number of valid entries in `toast_queue`.
+toast_queue_len: usize = 0,
+/// Set by `pushToast`/`expireToasts` when the visible set changed; the
+/// orchestrator folds it into `frame_dirty` and clears it after composite.
+toasts_dirty: bool = false,
 /// Global editing mode. Insert = typing into input buffer;
 /// Normal = keymap bindings fire, typing is disabled.
 current_mode: Keymap.Mode = .insert,
@@ -606,6 +658,9 @@ pub fn inputParser(self: *WindowManager) *input.Parser {
 /// by the caller *before* this runs: runners hold buffers read by their
 /// worker until the join completes.
 pub fn deinit(self: *WindowManager) void {
+    // Toast messages are owned copies independent of pane/layout state;
+    // free them up front so no path below can leak them.
+    self.deinitToasts();
     // Free pane-local provider overrides after each runner's thread has
     // been joined but before the runner/view/session objects are
     // destroyed. The agent worker may hold a borrow of the provider for
@@ -1611,6 +1666,101 @@ pub fn formatSplitAnnounce(dest: []u8, scratch_id: u32) u8 {
 pub fn setPasteTruncatedStatus(self: *WindowManager, dropped: usize) void {
     const written = std.fmt.bufPrint(&self.transient_status, "paste truncated: {d} bytes dropped", .{dropped}) catch return;
     self.transient_status_len = @intCast(written.len);
+}
+
+// -- Toasts ------------------------------------------------------------------
+
+/// Copy `message` (truncated to `max_toast_message_bytes`) and enqueue a
+/// toast. When a visible slot is free it shows immediately; otherwise it
+/// joins the FIFO queue. A full queue drops its oldest entry (logged) so
+/// the newest notify is never the one discarded. An allocation failure is
+/// logged and dropped; a notify must never crash the UI. Marks the visible
+/// set dirty only when the visible toast count actually changed.
+pub fn pushToast(self: *WindowManager, message: []const u8, level: ToastLevel, now_ms: i64) void {
+    const copy_len = @min(message.len, max_toast_message_bytes);
+    const owned = self.allocator.dupe(u8, message[0..copy_len]) catch |err| {
+        log.warn("toast dropped (alloc failed): {}", .{err});
+        return;
+    };
+    const toast: Toast = .{ .message = owned, .level = level, .created_at_ms = now_ms };
+
+    if (self.toasts_len < max_visible_toasts) {
+        self.toasts[self.toasts_len] = toast;
+        self.toasts_len += 1;
+        self.toasts_dirty = true;
+        return;
+    }
+
+    // No visible slot: queue it. Drop the oldest queued toast first when
+    // the queue is already full so the cap holds and the newest survives.
+    if (self.toast_queue_len == max_queued_toasts) {
+        log.info("toast queue full; dropping oldest queued toast", .{});
+        self.allocator.free(self.toast_queue[0].message);
+        std.mem.copyForwards(Toast, self.toast_queue[0 .. max_queued_toasts - 1], self.toast_queue[1..max_queued_toasts]);
+        self.toast_queue_len -= 1;
+    }
+    self.toast_queue[self.toast_queue_len] = toast;
+    self.toast_queue_len += 1;
+}
+
+/// Drop visible toasts whose ttl elapsed, then promote queued toasts into
+/// the freed slots (a promoted toast gets `created_at_ms = now_ms` so it
+/// shows a full ttl from when it became visible). Returns true when the
+/// visible set changed, so the caller can mark the frame dirty.
+pub fn expireToasts(self: *WindowManager, now_ms: i64) bool {
+    var changed = false;
+
+    // Compact in place: keep toasts still within their ttl, free the rest.
+    var write: usize = 0;
+    var read: usize = 0;
+    while (read < self.toasts_len) : (read += 1) {
+        const t = self.toasts[read];
+        const elapsed = now_ms - t.created_at_ms;
+        const expired = elapsed >= 0 and @as(u64, @intCast(elapsed)) >= @as(u64, t.level.ttlMs());
+        if (expired) {
+            self.allocator.free(t.message);
+            changed = true;
+        } else {
+            self.toasts[write] = t;
+            write += 1;
+        }
+    }
+    self.toasts_len = write;
+
+    // Promote queued toasts (oldest first) into any freed visible slots.
+    while (self.toasts_len < max_visible_toasts and self.toast_queue_len > 0) {
+        var promoted = self.toast_queue[0];
+        promoted.created_at_ms = now_ms;
+        std.mem.copyForwards(Toast, self.toast_queue[0 .. self.toast_queue_len - 1], self.toast_queue[1..self.toast_queue_len]);
+        self.toast_queue_len -= 1;
+        self.toasts[self.toasts_len] = promoted;
+        self.toasts_len += 1;
+        changed = true;
+    }
+
+    if (changed) self.toasts_dirty = true;
+    return changed;
+}
+
+/// Milliseconds until the next visible toast expires, or null when no
+/// toasts are visible. A toast already past its ttl returns 0 (poll now).
+pub fn nextToastDeadlineMs(self: *const WindowManager, now_ms: i64) ?i64 {
+    var nearest: ?i64 = null;
+    for (self.toasts[0..self.toasts_len]) |t| {
+        const expires_at = t.created_at_ms + @as(i64, t.level.ttlMs());
+        const remaining = @max(@as(i64, 0), expires_at - now_ms);
+        if (nearest == null or remaining < nearest.?) nearest = remaining;
+    }
+    return nearest;
+}
+
+/// Free every owned toast message (visible and queued) and reset the
+/// counts. Called from `deinit`; safe to call on a zero-toast manager.
+pub fn deinitToasts(self: *WindowManager) void {
+    for (self.toasts[0..self.toasts_len]) |t| self.allocator.free(t.message);
+    for (self.toast_queue[0..self.toast_queue_len]) |t| self.allocator.free(t.message);
+    self.toasts_len = 0;
+    self.toast_queue_len = 0;
 }
 
 /// Create a new split pane: conversation + sink + runner + optional
@@ -9398,6 +9548,72 @@ test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-k
     }
 }
 
+test "zag.notify with a window manager pushes a toast with the parsed level" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\zag.notify("disk full", { level = "error" })
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), f.wm.toasts_len);
+    try std.testing.expectEqual(ToastLevel.err, f.wm.toasts[0].level);
+    try std.testing.expectEqualStrings("disk full", f.wm.toasts[0].message);
+}
+
+test "zag.notify without a window manager stays log-only and does not crash" {
+    const allocator = std.testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    // Mirror the headless Harness path: main.zig calls loadBuiltinPlugins()
+    // (which stores the engine self-pointer the bindings need) but never
+    // wires a window_manager. notify must therefore stay log-only without
+    // raising.
+    engine.loadBuiltinPlugins();
+    try std.testing.expect(engine.window_manager == null);
+
+    try engine.lua.doString(
+        \\zag.notify("headless message")
+        \\zag.notify("with level", { level = "warn" })
+    );
+    // No crash, no toast state to inspect (there is no WM). Reaching here
+    // is the assertion.
+}
+
+test "zag.notify unknown level falls back to info" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\zag.notify("mystery", { level = "banana" })
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), f.wm.toasts_len);
+    try std.testing.expectEqual(ToastLevel.info, f.wm.toasts[0].level);
+}
+
+test "zag.notify accepts warn, warning, error, and err level aliases" {
+    const allocator = std.testing.allocator;
+    var f: ModelPickerPluginFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    try f.engine.lua.doString(
+        \\zag.notify("a", { level = "warn" })
+        \\zag.notify("b", { level = "warning" })
+        \\zag.notify("c", { level = "err" })
+    );
+    // First three are visible (max_visible_toasts == 3).
+    try std.testing.expectEqual(@as(usize, 3), f.wm.toasts_len);
+    try std.testing.expectEqual(ToastLevel.warn, f.wm.toasts[0].level);
+    try std.testing.expectEqual(ToastLevel.warn, f.wm.toasts[1].level);
+    try std.testing.expectEqual(ToastLevel.err, f.wm.toasts[2].level);
+}
+
 test "splitFocusedWithSession attaches loaded session to a new pane" {
     const allocator = std.testing.allocator;
 
@@ -9846,4 +10062,102 @@ test "re-opening one of several resident sessions reattaches the right pane" {
     _ = try wm.splitFocusedWithSession(id_a);
     try std.testing.expectEqual(@as(usize, 2), wm.extra_panes.items.len);
     try std.testing.expectEqual(conv_a, wm.getFocusedPanePtr().conversation.?);
+}
+
+// -- Toast queue tests -------------------------------------------------------
+
+/// Minimal WindowManager carrying only the state the toast methods touch
+/// (the allocator and the two toast rings). The toast helpers never reach
+/// into panes/layout/registries, so the rest stays `undefined`; cleanup
+/// frees toast messages directly instead of running the full deinit walk.
+fn toastFixture(allocator: Allocator) WindowManager {
+    var wm: WindowManager = undefined;
+    wm.allocator = allocator;
+    wm.toasts_len = 0;
+    wm.toast_queue_len = 0;
+    wm.toasts_dirty = false;
+    return wm;
+}
+
+test "toasts: push fills visible slots then queues, expiry promotes" {
+    const allocator = std.testing.allocator;
+    var wm = toastFixture(allocator);
+    defer wm.deinitToasts();
+
+    wm.pushToast("a", .info, 1000);
+    wm.pushToast("b", .info, 1000);
+    wm.pushToast("c", .info, 1000);
+    wm.pushToast("d", .info, 1000); // queued past max_visible_toasts
+    try std.testing.expectEqual(@as(usize, 3), wm.toasts_len);
+    try std.testing.expectEqual(@as(usize, 1), wm.toast_queue_len);
+    // info ttl 4000: at 5001 "a".."c" expire, "d" promotes with a fresh ttl.
+    try std.testing.expect(wm.expireToasts(5001));
+    try std.testing.expectEqual(@as(usize, 1), wm.toasts_len);
+    try std.testing.expectEqualStrings("d", wm.toasts[0].message);
+    try std.testing.expectEqual(@as(i64, 5001), wm.toasts[0].created_at_ms);
+}
+
+test "toasts: nextToastDeadlineMs is the earliest expiry, null when empty" {
+    const allocator = std.testing.allocator;
+    var wm = toastFixture(allocator);
+    defer wm.deinitToasts();
+
+    try std.testing.expectEqual(@as(?i64, null), wm.nextToastDeadlineMs(0));
+
+    // Push at staggered times so the earliest expiry is the first toast's.
+    wm.pushToast("first", .info, 1000); // expires at 5000
+    wm.pushToast("second", .info, 2000); // expires at 6000
+    // At now=1500 the nearest expiry is 5000 - 1500 = 3500.
+    try std.testing.expectEqual(@as(?i64, 3500), wm.nextToastDeadlineMs(1500));
+}
+
+test "toasts: levels carry tiered ttls (4s/8s/15s)" {
+    try std.testing.expectEqual(@as(u32, 4_000), ToastLevel.info.ttlMs());
+    try std.testing.expectEqual(@as(u32, 8_000), ToastLevel.warn.ttlMs());
+    try std.testing.expectEqual(@as(u32, 15_000), ToastLevel.err.ttlMs());
+
+    const allocator = std.testing.allocator;
+    var wm = toastFixture(allocator);
+    defer wm.deinitToasts();
+
+    wm.pushToast("e", .err, 0); // ttl 15000
+    // Not yet expired at 14999, expired at 15001.
+    try std.testing.expect(!wm.expireToasts(14_999));
+    try std.testing.expectEqual(@as(usize, 1), wm.toasts_len);
+    try std.testing.expect(wm.expireToasts(15_001));
+    try std.testing.expectEqual(@as(usize, 0), wm.toasts_len);
+}
+
+test "toasts: queue overflow drops oldest queued, never crashes" {
+    const allocator = std.testing.allocator;
+    var wm = toastFixture(allocator);
+    defer wm.deinitToasts();
+
+    // Fill the visible set, then overflow the queue by one past its cap.
+    var i: usize = 0;
+    while (i < max_visible_toasts + max_queued_toasts + 1) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "t{d}", .{i}) catch unreachable;
+        wm.pushToast(name, .info, 1000);
+    }
+    try std.testing.expectEqual(@as(usize, max_visible_toasts), wm.toasts_len);
+    try std.testing.expectEqual(@as(usize, max_queued_toasts), wm.toast_queue_len);
+    // t3 was the first queued toast (right after the visible set filled).
+    // The final overflow push drops it, so t4 is now the oldest queued and
+    // the newest (t19) sits at the tail.
+    try std.testing.expectEqualStrings("t4", wm.toast_queue[0].message);
+    var last_buf: [16]u8 = undefined;
+    const last = std.fmt.bufPrint(&last_buf, "t{d}", .{max_visible_toasts + max_queued_toasts}) catch unreachable;
+    try std.testing.expectEqualStrings(last, wm.toast_queue[wm.toast_queue_len - 1].message);
+}
+
+test "toasts: message is an owned copy (mutate source after push, toast unchanged)" {
+    const allocator = std.testing.allocator;
+    var wm = toastFixture(allocator);
+    defer wm.deinitToasts();
+
+    var src = [_]u8{ 'h', 'i' };
+    wm.pushToast(&src, .info, 1000);
+    src[0] = 'X';
+    try std.testing.expectEqualStrings("hi", wm.toasts[0].message);
 }
