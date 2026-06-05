@@ -19,6 +19,7 @@ const View = @import("View.zig");
 const Conversation = @import("Conversation.zig");
 const ConversationTree = @import("ConversationTree.zig");
 const EventOrchestrator = @import("EventOrchestrator.zig");
+const WindowManager = @import("WindowManager.zig");
 const Theme = @import("Theme.zig");
 const Keymap = @import("Keymap.zig");
 const trace = @import("Metrics.zig");
@@ -62,6 +63,15 @@ last_status_key: StatusKey = .{},
 /// content underneath instead of freezing as a ghost.
 prev_float_rects: [max_tracked_floats]Layout.Rect = undefined,
 prev_float_count: usize = 0,
+/// Toast rects drawn on the previous frame. Toasts auto-dismiss without a
+/// layout change (the orchestrator's per-tick `expireToasts` sweep closes
+/// them), so a dismissed toast leaves cells the toast pass never clears -
+/// it only clears rects toasts occupy *now*. The exact twin of
+/// `prev_float_rects`: comparing against this snapshot lets `composite`
+/// force a full redraw so vacated toast cells repaint the tile content
+/// underneath instead of freezing as a ghost.
+prev_toast_rects: [WindowManager.max_visible_toasts]Layout.Rect = undefined,
+prev_toast_count: usize = 0,
 
 /// Cap on floats whose previous-frame rect is tracked for ghost
 /// detection. Matches `EventOrchestrator.max_visible_floats`; realistic
@@ -108,6 +118,11 @@ pub const InputState = struct {
     elapsed_ms: u64 = 0,
     /// Output tokens for the focused running pane (0 when none yet).
     output_tokens: u32 = 0,
+    /// Visible toast overlays, newest last. Drawn top-right after floats so
+    /// they win every overlapping cell. The orchestrator passes
+    /// `window_manager.toasts[0..toasts_len]`; tests pass a literal slice.
+    /// Empty by default so headless and unit-test call sites need no change.
+    toasts: []const WindowManager.Toast = &.{},
 };
 
 /// Per-frame leaf -> draft mapping. The owner (EventOrchestrator) builds
@@ -158,6 +173,16 @@ pub fn composite(
     // Must precede the `layout_dirty` read below.
     if (self.floatRectsChanged(float_drafts)) self.layout_dirty = true;
     self.recordFloatRects(float_drafts);
+
+    // Compute this frame's toast rects up front so the same geometry feeds
+    // both the ghost-prevention check and the draw pass below. A toast that
+    // dismissed or resized since last frame leaves vacated cells exactly
+    // like a moved float (see `prev_toast_rects`); force a full redraw when
+    // the set changed. Must also precede the `layout_dirty` read below.
+    var toast_rects_buf: [WindowManager.max_visible_toasts]Layout.Rect = undefined;
+    const toast_rects = self.computeToastRects(input.toasts, &toast_rects_buf);
+    if (self.toastRectsChanged(toast_rects)) self.layout_dirty = true;
+    self.recordToastRects(toast_rects);
 
     // Reset per-frame arena: the previous frame's output lists and any
     // spans arrays allocated for non-cached buffer paths are released
@@ -239,6 +264,16 @@ pub fn composite(
         defer s.end();
         self.drawFloats(float_drafts, input);
     }
+
+    // Toasts overlay everything, floats included: drawn after `drawFloats`
+    // so a transient notification wins every overlapping cell. Uses the
+    // rects computed at the top of this frame so the geometry matches the
+    // ghost-prevention snapshot exactly.
+    {
+        var s = trace.span("toasts");
+        defer s.end();
+        self.drawToasts(input.toasts, toast_rects);
+    }
 }
 
 /// True if this frame's float rects differ from the previous frame's, in
@@ -261,6 +296,195 @@ fn recordFloatRects(self: *Compositor, float_drafts: []const FloatDraft) void {
     const n = @min(float_drafts.len, max_tracked_floats);
     for (float_drafts[0..n], 0..) |fd, i| self.prev_float_rects[i] = fd.float.rect;
     self.prev_float_count = n;
+}
+
+/// True if this frame's toast rects differ from the previous frame's, in
+/// count or in any rect. The exact twin of `floatRectsChanged`; a toast
+/// that dismissed or moved between frames vacates cells the toast pass
+/// won't clear, so a change here drives a full redraw.
+fn toastRectsChanged(self: *const Compositor, toast_rects: []const Layout.Rect) bool {
+    if (toast_rects.len != self.prev_toast_count) return true;
+    for (toast_rects, 0..) |rect, i| {
+        if (!std.meta.eql(rect, self.prev_toast_rects[i])) return true;
+    }
+    return false;
+}
+
+/// Snapshot this frame's toast rects for next frame's `toastRectsChanged`
+/// comparison. The toast set never exceeds `max_visible_toasts`, so no cap
+/// clamp is needed (unlike the float twin).
+fn recordToastRects(self: *Compositor, toast_rects: []const Layout.Rect) void {
+    for (toast_rects, 0..) |rect, i| self.prev_toast_rects[i] = rect;
+    self.prev_toast_count = toast_rects.len;
+}
+
+// -- Toasts ------------------------------------------------------------------
+//
+// Toasts are transient notification overlays pinned to the top-right and
+// stacked downward, one blank row between each. They draw after `drawFloats`
+// so a toast wins every overlapping cell. Geometry mirrors the float ghost
+// discipline: rects computed once per frame feed both the change-detect
+// snapshot and the draw, so a dismissed toast repaints the cells underneath.
+
+/// Smallest screen width that fits a usable toast; below this we draw none.
+const min_toast_screen_width: u16 = 20;
+/// Hard cap on a toast's interior text width in cells.
+const max_toast_line_width: u16 = 40;
+/// Floor on a toast's interior text width so a one-char message still reads.
+const min_toast_line_width: u16 = 12;
+/// Hard cap on a toast's visible line count; overflow lines are dropped and
+/// the last visible line ends in an ellipsis.
+const max_toast_lines: u16 = 8;
+
+/// Compute the screen rect for each visible toast and write them into
+/// `out` (sized `max_visible_toasts`). Returns the filled prefix. Rects are
+/// right-aligned with a one-column right margin and stacked downward from
+/// row 1 (row 0 is owned by the top pane's frame border) with one blank row
+/// between toasts. Returns an empty slice when the screen is too narrow or
+/// no toasts are visible, so the ghost-prevention snapshot and the draw
+/// agree on "nothing here".
+fn computeToastRects(self: *const Compositor, toasts: []const WindowManager.Toast, out: []Layout.Rect) []const Layout.Rect {
+    if (toasts.len == 0 or self.screen.width < min_toast_screen_width) return out[0..0];
+
+    // Interior text width budget: clamp the longest line across all toasts
+    // to a single shared width so the stack reads as one column.
+    const cap: u16 = @min(max_toast_line_width, self.screen.width -| 4);
+    var interior: u16 = min_toast_line_width;
+    for (toasts) |t| {
+        var lines = std.mem.splitScalar(u8, t.message, '\n');
+        while (lines.next()) |line| {
+            const w: u16 = @intCast(@min(@as(usize, std.math.maxInt(u16)), width.displayWidth(line)));
+            if (w > interior) interior = w;
+        }
+    }
+    interior = std.math.clamp(interior, min_toast_line_width, cap);
+
+    const box_w: u16 = interior + 2; // +2 for the left/right border columns
+    // Rightmost box column sits one cell in from the right edge.
+    const rect_x: u16 = self.screen.width -| 1 -| box_w;
+
+    var count: usize = 0;
+    var next_y: u16 = 1;
+    for (toasts) |t| {
+        if (count >= out.len) break;
+        var line_count: u16 = 0;
+        var lines = std.mem.splitScalar(u8, t.message, '\n');
+        while (lines.next()) |_| line_count += 1;
+        const visible_lines: u16 = @min(line_count, max_toast_lines);
+        const box_h: u16 = visible_lines + 2; // +2 for the top/bottom border
+        // Stop stacking once a toast would run off the bottom of the screen.
+        if (next_y + box_h > self.screen.height) break;
+        out[count] = .{ .x = rect_x, .y = next_y, .width = box_w, .height = box_h };
+        count += 1;
+        next_y += box_h + 1; // one blank row between toasts
+    }
+    return out[0..count];
+}
+
+/// Resolved border + text style for a toast level. Border is colored by
+/// level (the strongest at-a-glance signal); the text inherits the theme
+/// default fg so the message stays readable on any theme.
+fn toastLevelStyle(self: *const Compositor, level: WindowManager.ToastLevel) Theme.ResolvedStyle {
+    const color = switch (level) {
+        .info => self.theme.colors.info,
+        .warn => self.theme.colors.warning,
+        .err => self.theme.colors.err,
+    };
+    return Theme.resolve(.{ .fg = color, .bold = true }, self.theme);
+}
+
+/// Draw each visible toast into its precomputed rect. Clears under the box
+/// (so tile content doesn't bleed through), paints a level-colored rounded
+/// border, then writes the message lines truncated to the interior width
+/// with a trailing ellipsis on overflow.
+fn drawToasts(self: *Compositor, toasts: []const WindowManager.Toast, rects: []const Layout.Rect) void {
+    const glyphs = self.glyphsForBorder(.rounded) orelse return;
+    const text_style = Theme.resolve(.{}, self.theme);
+
+    for (toasts, 0..) |t, i| {
+        if (i >= rects.len) break;
+        const rect = rects[i];
+        if (rect.width < 2 or rect.height < 2) continue;
+
+        const border = self.toastLevelStyle(t.level);
+        self.screen.clearRect(rect.y, rect.x, rect.width, rect.height);
+        self.drawToastBorder(rect, glyphs, border);
+
+        const interior_w: u16 = rect.width - 2;
+        const interior_rows: u16 = rect.height - 2;
+        var lines = std.mem.splitScalar(u8, t.message, '\n');
+        var row: u16 = 0;
+        while (row < interior_rows) : (row += 1) {
+            const line = lines.next() orelse break;
+            // The last interior row that has overflow lines behind it gets
+            // a trailing ellipsis to signal the toast was clipped.
+            const has_more = lines.rest().len > 0 or line.len > interior_w;
+            const clipped = (row == interior_rows - 1) and has_more;
+            var line_buf: [max_toast_line_width * 4]u8 = undefined;
+            const fitted = fitToastLine(&line_buf, line, interior_w, clipped);
+            _ = self.screen.writeStr(rect.y + 1 + row, rect.x + 1, fitted, text_style.screen_style, text_style.fg);
+        }
+    }
+}
+
+/// Paint a rounded box outline directly (instead of `drawRoundedBox`) so
+/// the border can carry a level color rather than the theme's pane-border
+/// highlight. No title; toasts don't have one.
+fn drawToastBorder(self: *Compositor, rect: Layout.Rect, glyphs: BorderGlyphs, border: Theme.ResolvedStyle) void {
+    const top = rect.y;
+    const bottom = rect.y + rect.height - 1;
+    const left = rect.x;
+    const right = rect.x + rect.width - 1;
+
+    self.paintCell(top, left, glyphs.top_left, border);
+    self.paintCell(top, right, glyphs.top_right, border);
+    self.paintCell(bottom, left, glyphs.bottom_left, border);
+    self.paintCell(bottom, right, glyphs.bottom_right, border);
+
+    var col: u16 = left + 1;
+    while (col < right) : (col += 1) {
+        self.paintCell(top, col, glyphs.horizontal, border);
+        self.paintCell(bottom, col, glyphs.horizontal, border);
+    }
+    var row: u16 = top + 1;
+    while (row < bottom) : (row += 1) {
+        self.paintCell(row, left, glyphs.vertical, border);
+        self.paintCell(row, right, glyphs.vertical, border);
+    }
+}
+
+/// Copy `line` into `dest`, truncating to `max` display columns. When the
+/// line overflows (or `force_ellipsis` is set because later lines were
+/// dropped) the tail is replaced with U+2026. Width-aware via the same
+/// cluster iterator the rest of the compositor uses.
+fn fitToastLine(dest: []u8, line: []const u8, max: u16, force_ellipsis: bool) []const u8 {
+    const ellipsis = "\u{2026}"; // 3 bytes UTF-8, 1 display column
+    const overflows = width.displayWidth(line) > max or force_ellipsis;
+    if (!overflows) {
+        const n = @min(line.len, dest.len);
+        @memcpy(dest[0..n], line[0..n]);
+        return dest[0..n];
+    }
+    if (max == 0) return dest[0..0];
+
+    // Keep clusters until one more would leave no room for the ellipsis.
+    const keep_cols: u16 = max - 1;
+    var view = std.unicode.Utf8View.initUnchecked(line);
+    var iter = view.iterator();
+    var used_cols: u16 = 0;
+    var len: usize = 0;
+    while (true) {
+        const start = iter.i;
+        const cluster = width.nextCluster(&iter) orelse break;
+        if (used_cols + cluster.width > keep_cols) break;
+        const bytes = line[start..][0..cluster.byte_len];
+        if (len + bytes.len + ellipsis.len > dest.len) break;
+        @memcpy(dest[len..][0..bytes.len], bytes);
+        len += bytes.len;
+        used_cols += cluster.width;
+    }
+    @memcpy(dest[len..][0..ellipsis.len], ellipsis);
+    return dest[0 .. len + ellipsis.len];
 }
 
 /// True when this leaf carries a Conversation prompt (and therefore
@@ -2922,4 +3146,176 @@ test "working line is wiped on the frame after agent_running flips false" {
         }
         try std.testing.expect(!saw_text);
     }
+}
+
+/// Stand up a single-leaf layout over `screen` for the toast tests. The
+/// root is stack-allocated so callers must not `Layout.deinit`; floats
+/// default empty. Returns the layout plus the leaf node for draft wiring.
+fn toastTestLayout(allocator: Allocator, screen_rect: Layout.Rect, cb: *Conversation, viewport: *Viewport, root_leaf: *Layout.LayoutNode) Layout {
+    root_leaf.* = .{ .leaf = .{
+        .view = cb.view(),
+        .viewport = viewport,
+        .buffer = cb.buf(),
+        .rect = screen_rect,
+    } };
+    return .{
+        .root = root_leaf,
+        .focused = root_leaf,
+        .allocator = allocator,
+    };
+}
+
+test "compositor: toast renders top-right and overlays floats" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var cb = try Conversation.init(allocator, 0, "root");
+    defer cb.deinit();
+    var viewport: Viewport = .{};
+    var root_leaf: Layout.LayoutNode = undefined;
+    var layout = toastTestLayout(allocator, .{ .x = 0, .y = 0, .width = 40, .height = 12 }, &cb, &viewport, &root_leaf);
+
+    const toasts = [_]WindowManager.Toast{
+        .{ .message = "saved", .level = .info, .created_at_ms = 0 },
+    };
+    compositor.composite(&layout, &.{}, &.{}, .{ .mode = .normal, .toasts = &toasts });
+
+    // The message text appears in the top-right quadrant of the grid.
+    var found = false;
+    for (0..6) |r| {
+        for (20..40) |c| {
+            if (screen.getCellConst(@intCast(r), @intCast(c)).codepoint == 's') {
+                found = true;
+                break;
+            }
+        }
+        if (found) break;
+    }
+    try std.testing.expect(found);
+}
+
+test "compositor: expired toast vacates its cells (no ghost)" {
+    // Regression for toast ghosting, the twin of the float-rect ghost: a
+    // toast dismissed between frames without a layout change leaves cells
+    // the toast pass only ever clears for the toast it draws *now*. The
+    // rect-tracking hook must force a full redraw so the vacated cells
+    // repaint the tile content underneath. This test fails if that hook
+    // is missing.
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 40, 12);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var cb = try Conversation.init(allocator, 0, "root");
+    defer cb.deinit();
+    var viewport: Viewport = .{};
+    var root_leaf: Layout.LayoutNode = undefined;
+    var layout = toastTestLayout(allocator, .{ .x = 0, .y = 0, .width = 40, .height = 12 }, &cb, &viewport, &root_leaf);
+
+    // Frame 1: a toast is visible top-right. For a short message the box is
+    // min-width (interior 12, outer 14), inset one col from the right edge,
+    // top row 1. Its top-right corner therefore lands at (1, 38) -- a cell
+    // the pane frame never owns (the pane's right border is col 39, and row
+    // 1 col 38 is plain pane interior), so this probe is toast-specific and
+    // cannot be confused with the surrounding pane chrome.
+    const toasts = [_]WindowManager.Toast{
+        .{ .message = "transient", .level = .info, .created_at_ms = 0 },
+    };
+    compositor.composite(&layout, &.{}, &.{}, .{ .mode = .normal, .toasts = &toasts });
+    const corner_row: u16 = 1;
+    const corner_col: u16 = 38;
+    try std.testing.expectEqual(theme.borders.top_right, screen.getCellConst(corner_row, corner_col).codepoint);
+
+    // Frame 2: the toast expired (empty set), no layout change signalled.
+    // The cell the border occupied must repaint to the underlying content
+    // (empty pane interior here), proving the rect-tracking hook forced a
+    // full redraw. Without the hook the corner glyph would freeze as a
+    // ghost.
+    compositor.layout_dirty = false;
+    compositor.composite(&layout, &.{}, &.{}, .{ .mode = .normal, .toasts = &.{} });
+    try std.testing.expect(screen.getCellConst(corner_row, corner_col).codepoint != theme.borders.top_right);
+}
+
+test "compositor: multi-line toast clamps width and height with ellipsis" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 60, 20);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var cb = try Conversation.init(allocator, 0, "root");
+    defer cb.deinit();
+    var viewport: Viewport = .{};
+    var root_leaf: Layout.LayoutNode = undefined;
+    var layout = toastTestLayout(allocator, .{ .x = 0, .y = 0, .width = 60, .height = 20 }, &cb, &viewport, &root_leaf);
+
+    // A message far wider than the 40-col cap and far taller than the
+    // 8-line cap. Render must not crash and must keep the box within the
+    // clamped bounds (no cell past the right edge, height bounded).
+    const long_msg = "this is a very long single line that exceeds the forty column clamp by a wide margin\nL1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10";
+    const toasts = [_]WindowManager.Toast{
+        .{ .message = long_msg, .level = .warn, .created_at_ms = 0 },
+    };
+    compositor.composite(&layout, &.{}, &.{}, .{ .mode = .normal, .toasts = &toasts });
+
+    // The box height is clamped: no toast border glyph appears below a
+    // reasonable bound (first toast top at row 1, max interior 8 lines +
+    // 2 border rows => bottom border at row <= 10).
+    var lowest_border_row: i32 = -1;
+    for (0..20) |r| {
+        for (40..60) |c| {
+            const cp = screen.getCellConst(@intCast(r), @intCast(c)).codepoint;
+            if (cp == theme.borders.bottom_left or cp == theme.borders.bottom_right or cp == theme.borders.horizontal) {
+                lowest_border_row = @intCast(r);
+            }
+        }
+    }
+    try std.testing.expect(lowest_border_row >= 0);
+    try std.testing.expect(lowest_border_row <= 11);
+}
+
+test "compositor: tiny screen renders no toast and does not crash" {
+    const allocator = std.testing.allocator;
+    var screen = try Screen.init(allocator, 16, 6);
+    defer screen.deinit();
+    const theme = Theme.defaultTheme();
+    var compositor = Compositor.init(&screen, allocator, &theme);
+    defer compositor.deinit();
+    compositor.layout_dirty = true;
+
+    var cb = try Conversation.init(allocator, 0, "root");
+    defer cb.deinit();
+    var viewport: Viewport = .{};
+    var root_leaf: Layout.LayoutNode = undefined;
+    var layout = toastTestLayout(allocator, .{ .x = 0, .y = 0, .width = 16, .height = 6 }, &cb, &viewport, &root_leaf);
+
+    // Width 16 < 20: drawToasts must skip entirely. The grid must therefore
+    // be byte-identical whether a toast is present or not (only the pane
+    // chrome shows either way). Render once with a toast and once without
+    // and compare; any difference would mean the toast leaked onto a screen
+    // too small to hold it.
+    const toasts = [_]WindowManager.Toast{
+        .{ .message = "ignored on a tiny screen", .level = .err, .created_at_ms = 0 },
+    };
+    compositor.composite(&layout, &.{}, &.{}, .{ .mode = .normal, .toasts = &toasts });
+    var with_toast: [16 * 6]u21 = undefined;
+    for (0..6) |r| for (0..16) |c| {
+        with_toast[r * 16 + c] = screen.getCellConst(@intCast(r), @intCast(c)).codepoint;
+    };
+
+    compositor.layout_dirty = true;
+    compositor.composite(&layout, &.{}, &.{}, .{ .mode = .normal, .toasts = &.{} });
+    for (0..6) |r| for (0..16) |c| {
+        try std.testing.expectEqual(with_toast[r * 16 + c], screen.getCellConst(@intCast(r), @intCast(c)).codepoint);
+    };
 }
