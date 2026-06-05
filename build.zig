@@ -148,6 +148,7 @@ pub fn build(b: *std.Build) void {
                     "src/sim/scenarios/mcp_tool_use.zsm",
                     "src/sim/scenarios/mcp_command_status.zsm",
                     "src/sim/scenarios/mcp_server_death.zsm",
+                    "src/sim/scenarios/workflow_parallel_subagents.zsm",
                 };
                 var prev_step: *std.Build.Step = b.getInstallStep();
                 for (independent_scenarios) |path| {
