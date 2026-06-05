@@ -1,0 +1,24 @@
+# Workflow tool e2e: the model writes a Lua orchestration script that
+# fans out two parallel subagents (zag.workflow.parallel + zag.task),
+# each shelling out for a deterministic token, and returns the joined
+# results. Exercises the whole dynamic-workflow stack end to end:
+# script execution on the main-thread coroutine, child AgentRunner
+# spawn/drain, borrowed-pane rendering, and result marshaling back into
+# the parent turn.
+#
+# Anchoring: the prompt names only REVERSED seeds; each child must
+# `rev` its seed via bash, so the waited tokens can only originate in
+# child tool output surfacing through the workflow result.
+
+spawn ./zig-out/bin/zag
+wait_text /Welcome to zag/
+wait_idle 500ms
+send "Use the workflow tool. The Lua script must call zag.workflow.parallel with two functions: the first runs zag.task with the prompt: run bash echo 7R-A-fw-gaz | rev and reply with only its stdout; it returns task.summary. The second is identical but with 4K-B-fw-gaz. parallel returns one slot per function shaped {value=..., err=...}, so the script must end with: return slots[1].value .. ' ' .. slots[2].value. After the tool finishes, repeat its result verbatim." <Enter>
+# Parent turn + two child turns: give the fan-out a generous deadline.
+wait_text /zag-wf-A-R7/ 180s
+wait_text /zag-wf-B-K4/ 30s
+# Let the parent turn finish streaming before quitting.
+wait_idle 2s 60s
+snapshot final
+send "/quit" <Enter>
+wait_exit 30s

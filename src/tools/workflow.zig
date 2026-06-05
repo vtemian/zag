@@ -145,6 +145,8 @@ pub const definition = types.ToolDefinition{
         "call zag.task{ prompt=, system=, tools=, model=, schema=, name= } to spawn a subagent " ++
         "(returns {summary, is_error}; with schema= also output, the decoded result table), and zag.workflow.parallel(fns) / " ++
         "zag.workflow.pipeline(items, stage1, ...) to fan out (bounded by zag.workflow.max_fanout()). " ++
+        "Both combinators return arrays of {value, err} slots: a zag.task result is slot.value.summary, not slot.summary. " ++
+        "Lua syntax: double-quoted strings cannot span lines; write multi-line prompts as [[long strings]]. " ++
         "Return a string; it becomes the tool result.",
     .prompt_snippet = "Orchestrate subagents via a Lua script (zag.task spawn + zag.workflow.parallel/pipeline)",
     .input_schema_json =

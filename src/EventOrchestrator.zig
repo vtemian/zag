@@ -344,15 +344,35 @@ fn drainWakePipe(fd: posix.fd_t) void {
 /// wait but never raises it, so the parser's contract (pinned by tests
 /// in `src/input/parser.zig:258-283`) is preserved.
 ///
-/// Inputs in milliseconds; `null` on either side means "no opinion".
-/// Returns `-1` (block forever) only when both inputs are absent.
-fn pollTimeoutWithHeartbeat(parser_timeout: ?i32, heartbeat_ms: ?i32) i32 {
-    if (parser_timeout) |pt| {
-        if (heartbeat_ms) |hb| return @min(pt, hb);
-        return pt;
-    }
-    if (heartbeat_ms) |hb| return hb;
-    return -1;
+/// Inputs in milliseconds; `null` on any source means "no opinion". The
+/// poll waits no longer than the nearest of: the parser's escape timeout,
+/// the working-line heartbeat, the nearest visible-toast expiry, and the
+/// nearest pending float `auto_close_ms`. The two time-driven UI deadlines
+/// are why a fully idle zag with a pending auto-close no longer blocks at
+/// `-1` forever (the latent bug: `sweepFloatsForAutoClose` / `expireToasts`
+/// never ran on an idle poll, so an `auto_close_ms` float/toast lingered
+/// until the next keypress).
+///
+/// Deadlines are clamped into i32 range and floored at 0 (an already-due
+/// deadline polls with timeout 0, draining now, never a negative wait).
+/// The parser drain-now signal (0) and the all-null block-forever result
+/// (`-1`) are both preserved.
+fn pollTimeoutMs(parser_timeout: ?i32, heartbeat_ms: ?i32, toast_deadline_ms: ?i64, float_deadline_ms: ?i64) i32 {
+    var result: ?i64 = null;
+    const fold = struct {
+        fn apply(acc: *?i64, candidate: i64) void {
+            const c = @max(@as(i64, 0), candidate);
+            acc.* = if (acc.*) |r| @min(r, c) else c;
+        }
+    }.apply;
+
+    if (parser_timeout) |pt| fold(&result, pt);
+    if (heartbeat_ms) |hb| fold(&result, hb);
+    if (toast_deadline_ms) |td| fold(&result, td);
+    if (float_deadline_ms) |fd| fold(&result, fd);
+
+    const r = result orelse return -1;
+    return @intCast(std.math.clamp(r, 0, std.math.maxInt(i32)));
 }
 
 /// True when the working line ("* Working… (Ns)") was painted on the last
@@ -453,9 +473,18 @@ fn tick(
     // ticks at 4 Hz even when events are silent or filtered. When
     // nothing is running, fall back to the parser's escape-timeout (or
     // -1 = block forever) so idle CPU stays at zero.
-    const parser_timeout = parser.pollTimeoutMs(clock.milliTimestamp());
+    const poll_now = clock.milliTimestamp();
+    const parser_timeout = parser.pollTimeoutMs(poll_now);
     const heartbeat_ms: ?i32 = if (self.anyAgentRunning()) 250 else null;
-    const poll_timeout = pollTimeoutWithHeartbeat(parser_timeout, heartbeat_ms);
+    // Also bound the wait by the nearest pending auto-close deadline so an
+    // idle zag wakes in time to dismiss a toast or an `auto_close_ms` float
+    // (otherwise the poll blocks at -1 and the sweep never runs).
+    const poll_timeout = pollTimeoutMs(
+        parser_timeout,
+        heartbeat_ms,
+        self.window_manager.nextToastDeadlineMs(poll_now),
+        self.nextFloatAutoCloseDeadlineMs(poll_now),
+    );
     _ = posix.poll(&fds, poll_timeout) catch {};
 
     // Time the rest of the tick so a multi-second main-thread blockage
@@ -578,6 +607,12 @@ fn tick(
     // frame and `layout_dirty` is set in time for the redraw below.
     self.sweepFloatsForAutoClose();
 
+    // Auto-dismiss expired toasts on the same per-tick cadence. expireToasts
+    // sets `window_manager.toasts_dirty` when the visible set changed; we
+    // fold that into `frame_dirty` below so a toast that auto-closes on an
+    // otherwise idle tick still forces the composite that erases it.
+    _ = self.window_manager.expireToasts(clock.milliTimestamp());
+
     // Check if any pane has pending visual changes. Each pane carries
     // its own `Viewport.isDirty(content_version)` which ORs the
     // content-version delta (any tree mutation bumps the buffer's
@@ -608,6 +643,7 @@ fn tick(
     const any_dirty = self.anyPaneDirty();
     const frame_dirty = any_dirty or self.window_manager.compositor.layout_dirty or
         non_mouse_input or time_dirty or
+        self.window_manager.toasts_dirty or
         workingLineNeedsClear(agent_running, self.last_rendered_working_secs);
 
     if (!frame_dirty) {
@@ -652,6 +688,7 @@ fn tick(
         .agent_running = agent_running,
         .elapsed_ms = elapsed_ms,
         .output_tokens = output_tokens,
+        .toasts = self.window_manager.toasts[0..self.window_manager.toasts_len],
     });
     var rendered_to_terminal = true;
     self.screen.render(self.stdout_file) catch |err| switch (err) {
@@ -663,6 +700,13 @@ fn tick(
     };
     if (rendered_to_terminal) {
         self.last_rendered_working_secs = if (agent_running) current_secs else null;
+        // The toast frame actually reached the terminal; clear the dirty
+        // flag so the next idle tick doesn't force a redundant composite.
+        // Guarded like the working-line reset above: a WriteTimeout-dropped
+        // frame must leave the flag set, or an idle loop never re-renders
+        // the erase frame and a dismissed toast ghosts on the physical
+        // terminal until the next keypress.
+        self.window_manager.toasts_dirty = false;
     }
 }
 
@@ -765,6 +809,23 @@ fn sweepFloatsForAutoClose(self: *EventOrchestrator) void {
             log.warn("auto-close failed for float n{d}: {}", .{ handle.index, err });
         };
     }
+}
+
+/// Milliseconds until the nearest pending float `auto_close_ms` deadline,
+/// or null when no float carries one. Iterates the same float set as
+/// `sweepFloatsForAutoClose`; a deadline already past clamps to 0. This is
+/// what lets `pollTimeoutMs` wake an idle zag in time to run the sweep,
+/// closing the latent bug where an `auto_close_ms` float blocked at a -1
+/// poll until the next keypress.
+fn nextFloatAutoCloseDeadlineMs(self: *const EventOrchestrator, now: i64) ?i64 {
+    var nearest: ?i64 = null;
+    for (self.window_manager.layout.floats.items) |f| {
+        const ms = f.config.auto_close_ms orelse continue;
+        const deadline = f.created_at_ms + @as(i64, ms);
+        const remaining = @max(@as(i64, 0), deadline - now);
+        if (nearest == null or remaining < nearest.?) nearest = remaining;
+    }
+    return nearest;
 }
 
 /// Build the per-frame `FloatDraft` slice from `Layout.floats` and the
@@ -2443,27 +2504,27 @@ test "handlePaste in normal mode with no truncation clears prior status" {
     try std.testing.expectEqual(@as(u8, 0), f.wm.transient_status_len);
 }
 
-test "pollTimeoutWithHeartbeat returns -1 when neither input is set" {
-    try std.testing.expectEqual(@as(i32, -1), pollTimeoutWithHeartbeat(null, null));
+test "pollTimeoutMs returns -1 when no source is set" {
+    try std.testing.expectEqual(@as(i32, -1), pollTimeoutMs(null, null, null, null));
 }
 
-test "pollTimeoutWithHeartbeat returns the heartbeat when parser has no pending bytes" {
-    try std.testing.expectEqual(@as(i32, 250), pollTimeoutWithHeartbeat(null, 250));
+test "pollTimeoutMs returns the heartbeat when parser has no pending bytes" {
+    try std.testing.expectEqual(@as(i32, 250), pollTimeoutMs(null, 250, null, null));
 }
 
-test "pollTimeoutWithHeartbeat returns the parser timeout when no agent is running" {
-    try std.testing.expectEqual(@as(i32, 50), pollTimeoutWithHeartbeat(50, null));
+test "pollTimeoutMs returns the parser timeout when no agent is running" {
+    try std.testing.expectEqual(@as(i32, 50), pollTimeoutMs(50, null, null, null));
 }
 
-test "pollTimeoutWithHeartbeat takes the smaller of parser and heartbeat" {
-    try std.testing.expectEqual(@as(i32, 50), pollTimeoutWithHeartbeat(50, 250));
-    try std.testing.expectEqual(@as(i32, 250), pollTimeoutWithHeartbeat(500, 250));
+test "pollTimeoutMs takes the smaller of parser and heartbeat" {
+    try std.testing.expectEqual(@as(i32, 50), pollTimeoutMs(50, 250, null, null));
+    try std.testing.expectEqual(@as(i32, 250), pollTimeoutMs(500, 250, null, null));
 }
 
-test "pollTimeoutWithHeartbeat preserves the parser's drain-now signal" {
+test "pollTimeoutMs preserves the parser's drain-now signal" {
     // parser.pollTimeoutMs returns 0 when a complete event is already queued.
     // The heartbeat must never delay that.
-    try std.testing.expectEqual(@as(i32, 0), pollTimeoutWithHeartbeat(0, 250));
+    try std.testing.expectEqual(@as(i32, 0), pollTimeoutMs(0, 250, null, null));
 }
 
 test "workingLineNeedsClear fires only on the stop frame after a working render" {
@@ -2477,4 +2538,90 @@ test "workingLineNeedsClear fires only on the stop frame after a working render"
     // (tracker still non-null): one composite must run to erase it.
     try std.testing.expect(workingLineNeedsClear(false, 5));
     try std.testing.expect(workingLineNeedsClear(false, 0));
+}
+
+test "pollTimeoutMs: pending toast deadline bounds an otherwise infinite poll" {
+    try std.testing.expectEqual(@as(i32, 1500), pollTimeoutMs(null, null, 1500, null));
+}
+
+test "pollTimeoutMs: pending float auto-close bounds the poll (latent idle bug)" {
+    try std.testing.expectEqual(@as(i32, 700), pollTimeoutMs(null, null, null, 700));
+}
+
+test "pollTimeoutMs: minimum of all sources wins; all-null stays -1; due deadlines clamp to 0" {
+    // All null: block forever, preserving the old pollTimeoutWithHeartbeat contract.
+    try std.testing.expectEqual(@as(i32, -1), pollTimeoutMs(null, null, null, null));
+    // Parser-only and heartbeat-only behave like the old combiner.
+    try std.testing.expectEqual(@as(i32, 50), pollTimeoutMs(50, null, null, null));
+    try std.testing.expectEqual(@as(i32, 250), pollTimeoutMs(null, 250, null, null));
+    // The smallest source wins across all four inputs.
+    try std.testing.expectEqual(@as(i32, 40), pollTimeoutMs(50, 250, 40, 700));
+    try std.testing.expectEqual(@as(i32, 60), pollTimeoutMs(500, 250, 300, 60));
+    // The parser drain-now signal (0) survives unchanged.
+    try std.testing.expectEqual(@as(i32, 0), pollTimeoutMs(0, 250, 1500, 700));
+    // An already-due deadline clamps to 0 (poll now), never negative.
+    try std.testing.expectEqual(@as(i32, 0), pollTimeoutMs(null, null, -5, null));
+    try std.testing.expectEqual(@as(i32, 0), pollTimeoutMs(null, null, null, 0));
+}
+
+test "nextFloatAutoCloseDeadlineMs reports the nearest pending auto-close" {
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    // No floats: no deadline.
+    try std.testing.expectEqual(@as(?i64, null), orch.nextFloatAutoCloseDeadlineMs(clock.milliTimestamp()));
+    f.wm.* = orch.window_manager;
+
+    const bh = try f.wm.buffer_registry.createScratch("toast");
+    const buf = try f.wm.buffer_registry.asBuffer(bh);
+    const buf_view = try f.wm.buffer_registry.asView(bh);
+    const handle = try f.wm.openFloatPane(.{ .buffer = buf, .view = buf_view }, .{ .x = 0, .y = 0, .width = 10, .height = 4 }, .{
+        .relative = .editor,
+        .width = 10,
+        .height = 4,
+        .auto_close_ms = 1000,
+        .enter = false,
+    });
+    // Pin created_at_ms so the remaining-time math is deterministic.
+    const created: i64 = 10_000;
+    f.layout.findFloat(handle).?.created_at_ms = created;
+
+    orch.window_manager = f.wm.*;
+    // At now = created + 300, the float closes in 1000 - 300 = 700 ms.
+    try std.testing.expectEqual(@as(?i64, 700), orch.nextFloatAutoCloseDeadlineMs(created + 300));
+    // Past the deadline clamps to 0, never negative.
+    try std.testing.expectEqual(@as(?i64, 0), orch.nextFloatAutoCloseDeadlineMs(created + 5000));
+    f.wm.* = orch.window_manager;
+}
+
+test "orchestrator: expired toast forces a composite on an otherwise idle tick" {
+    // The idle-skip trap (same family as workingLineNeedsClear): on a fully
+    // idle tick the loop returns early at `!frame_dirty`. An auto-dismissed
+    // toast must still force one composite to erase it. The sweep calls
+    // expireToasts, which sets `toasts_dirty`; the tick folds that flag into
+    // frame_dirty. Here we drive the sweep directly and assert the flag is
+    // raised, which is exactly what makes the idle frame render.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // A visible toast created far enough in the past that its info ttl
+    // (4000 ms) has elapsed.
+    f.wm.pushToast("done", .info, 0);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.toasts_len);
+    f.wm.toasts_dirty = false; // clear the push's dirty mark to isolate expiry
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    const expired = orch.window_manager.expireToasts(5000);
+    f.wm.* = orch.window_manager;
+
+    try std.testing.expect(expired);
+    try std.testing.expectEqual(@as(usize, 0), f.wm.toasts_len);
+    try std.testing.expect(f.wm.toasts_dirty);
 }

@@ -296,6 +296,12 @@ configured. They take no arguments:
 The status markers are `✓` connected, `○` cached or not connected, `⚠` needs
 auth, and `✗` failed.
 
+Output from `/mcp`, `/mcp-reconnect`, and `/mcp-tools` appears as a transient
+toast in the top-right corner that auto-dismisses (it is also written to the
+`.lua_user` log as the durable record). The toast is emitted through
+`zag.notify`, whose `opts.level` tier sets the dismiss time: `info` 4s (the
+default), `warn` 8s, `error` 15s.
+
 These commands are deliberately argument-free, because zag's slash dispatch is
 exact-match on the whole line. **Per-server** operations go through the proxy
 tool instead: `mcp({ connect = "linear" })` connects and refreshes one server's

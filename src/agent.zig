@@ -493,14 +493,11 @@ pub fn runLoopStreaming(
                 const overflowed = call_err == error.ApiError and
                     if (error_detail_out) |d| d.class == .context_overflow else false;
                 if (overflowed and overflowRetryAllowed(overflow_retried) and !cancel.load(.acquire)) {
-                    const keep_recent: u32 = if (lua_engine) |e| e.compact_keep_recent_tokens else DEFAULT_KEEP_RECENT_TOKENS;
                     log.warn("provider rejected request as context-overflow; force-compacting and re-sending once", .{});
                     const shrank = forceCompactForOverflow(
                         messages,
-                        provider,
                         model_spec.context_window,
                         reserve_tokens,
-                        keep_recent,
                         allocator,
                         queue,
                         cancel,
@@ -2159,56 +2156,110 @@ pub fn dropOldestMessages(
     messages.shrinkRetainingCapacity(remaining);
 }
 
+/// A tool_result content block larger than this is a candidate for
+/// head+tail truncation during overflow recovery. 32 KiB is well above
+/// any reasonable diagnostic snippet, so anything past it is bulk output
+/// (a multi-hundred-KB bash dump) whose middle the model rarely needs.
+const TOOL_RESULT_TRUNCATE_THRESHOLD: usize = 32 * 1024;
+/// Bytes of the original tool_result kept from the start when truncating.
+const TOOL_RESULT_TRUNCATE_HEAD: usize = 24 * 1024;
+/// Bytes of the original tool_result kept from the end when truncating.
+const TOOL_RESULT_TRUNCATE_TAIL: usize = 8 * 1024;
+
+/// Replace the content of any `.tool_result` block over
+/// `TOOL_RESULT_TRUNCATE_THRESHOLD` with its head + a marker + its tail,
+/// shrinking the recent bulk that drop-oldest can't reach (drop-oldest
+/// removes whole OLD messages, but an overflow driven by a few giant
+/// RECENT tool outputs lives below the window the keep-recent logic
+/// protects). Returns true if any block was truncated.
+///
+/// Ownership: each `tool_result.content` slice is individually owned by
+/// `allocator` (duped there in `executeTools`; freed there via
+/// `Message.deinit`/`ContentBlock.freeOwned`). We allocate the truncated
+/// copy from the same `allocator` and free the old slice through it
+/// exactly once — the identical discipline `dropOldestMessages` and
+/// `installCompactReplacement` use. Under the agent's wire-arena this
+/// free is a near-no-op (reclaimed wholesale at turn end); under the
+/// testing allocator it's a real free that keeps the leak/double-free
+/// checker green.
+fn truncateOversizedToolResults(
+    messages: []types.Message,
+    allocator: Allocator,
+) !bool {
+    var truncated_any = false;
+    for (messages) |msg| {
+        // `content` is `[]const ContentBlock`; mutate the live element in
+        // place via a non-const pointer to the slice's backing storage.
+        const blocks: []types.ContentBlock = @constCast(msg.content);
+        for (blocks) |*block| {
+            switch (block.*) {
+                .tool_result => |tr| {
+                    if (tr.content.len <= TOOL_RESULT_TRUNCATE_THRESHOLD) continue;
+                    const removed = tr.content.len - TOOL_RESULT_TRUNCATE_HEAD - TOOL_RESULT_TRUNCATE_TAIL;
+                    const head = tr.content[0..TOOL_RESULT_TRUNCATE_HEAD];
+                    const tail = tr.content[tr.content.len - TOOL_RESULT_TRUNCATE_TAIL ..];
+                    const new_content = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}\n[...zag: truncated {d} bytes after context overflow...]\n{s}",
+                        .{ head, removed, tail },
+                    );
+                    // Replacement is built; the old slice is now safe to free.
+                    allocator.free(tr.content);
+                    block.* = .{ .tool_result = .{
+                        .tool_use_id = tr.tool_use_id,
+                        .content = new_content,
+                        .is_error = tr.is_error,
+                    } };
+                    truncated_any = true;
+                },
+                else => {},
+            }
+        }
+    }
+    return truncated_any;
+}
+
 /// Reactively shrink `messages` after the provider rejected a request as
 /// context-overflow. Unlike the proactive cascade at the top of the loop,
 /// this fires UNCONDITIONALLY — the provider already told us the request
-/// overflowed, so we don't consult the (undershooting) estimator. Runs Zig
-/// structured summarization first; if that doesn't shrink the history,
-/// falls back to drop-oldest against the model window. Returns true when it
-/// actually changed `messages`, so the caller knows a re-send can help.
-/// `context_window` of 0 disables drop-oldest's budget math (summarization
-/// can still fire). Caller owns `messages` storage and content.
+/// overflowed, so we don't consult the (undershooting) estimator.
+///
+/// Truncating fat tool results runs first: in the overflow profile that
+/// motivated this path the bloat is a handful of RECENT giant tool_result
+/// dumps that drop-oldest can't reach and that summarization can't even
+/// attempt (it would re-send the same oversized history to the same model
+/// and 400 identically). If anything was truncated we return immediately;
+/// the re-send tells us whether that sufficed. Only when NOTHING is
+/// truncatable do we fall through to drop-oldest against the model window.
+/// Returns true when it actually changed `messages`, so the caller knows a
+/// re-send can help. `context_window` of 0 disables drop-oldest's budget
+/// math. Caller owns `messages` storage and content.
 fn forceCompactForOverflow(
     messages: *std.ArrayList(types.Message),
-    provider: llm.Provider,
     context_window: u32,
     reserve_tokens: u32,
-    keep_recent_tokens: u32,
     allocator: Allocator,
     queue: *agent_events.EventQueue,
     cancel: *agent_events.CancelFlag,
 ) !bool {
     const before = messages.items.len;
 
-    // Stage 1: structured summarization (lossy-but-coherent). Best effort;
-    // a network/auth failure here falls through to drop-oldest.
-    if (runDefaultSummarization(
-        messages.items,
-        provider,
-        keep_recent_tokens,
-        allocator,
-        queue,
-        cancel,
-    )) |maybe_replacement| {
-        if (maybe_replacement) |replacement| {
-            Metrics.recordCompactionZigSummary();
-            try installCompactReplacement(messages, allocator, replacement);
-            queue.pushWithBackpressure(.{ .compaction_event = .{
-                .outcome = "summarized",
-                .messages_before = @intCast(before),
-                .messages_after = @intCast(messages.items.len),
-                .estimate_tokens = estimateContextTokens(messages.items, null, null).total,
-            } }, agent_events.default_backpressure_ms) catch {};
-            return true;
-        }
-    } else |err| {
-        log.warn("overflow recovery: summarization failed ({s}); trying drop-oldest", .{@errorName(err)});
+    // Stage 1: truncate oversized tool results. Lossless for the head/tail
+    // the model usually needs, and the only stage that can shrink an
+    // overflow driven by recent bulk output below the protected window.
+    if (try truncateOversizedToolResults(messages.items, allocator)) {
+        queue.pushWithBackpressure(.{ .compaction_event = .{
+            .outcome = "truncated_tool_results",
+            .messages_before = @intCast(before),
+            .messages_after = @intCast(messages.items.len),
+            .estimate_tokens = estimateContextTokens(messages.items, null, null).total,
+        } }, agent_events.default_backpressure_ms) catch {};
+        return true;
     }
 
-    // Ctrl+C during the summarization LLM call is the user aborting the turn,
-    // not a request to fall through to lossy drop-oldest. Re-check before the
-    // next stage so cancellation stops here instead of trimming history the
-    // user no longer wants sent.
+    // Ctrl+C between stages is the user aborting the turn, not a request to
+    // fall through to lossy drop-oldest. Re-check so cancellation stops here
+    // instead of trimming history the user no longer wants sent.
     if (cancel.load(.acquire)) return messages.items.len != before;
 
     // Stage 2: drop-oldest against the model window. Lossy but deterministic.
@@ -2270,6 +2321,82 @@ test "dropOldestMessages with drop_count >= len clears the list" {
     try list.append(alloc, .{ .role = .user, .content = blocks });
     try dropOldestMessages(&list, alloc, 5);
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
+test "truncateOversizedToolResults shrinks fat tool results and leaves small ones" {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (list.items) |m| m.deinit(alloc);
+        list.deinit(alloc);
+    }
+
+    // Message 1: a small text block, untouched.
+    {
+        const text = try alloc.dupe(u8, "small user message");
+        const blocks = try alloc.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try list.append(alloc, .{ .role = .user, .content = blocks });
+    }
+    // Message 2: a 100 KiB tool_result that must be truncated.
+    const fat_len: usize = 100 * 1024;
+    {
+        const big = try alloc.alloc(u8, fat_len);
+        @memset(big, 'X');
+        const id = try alloc.dupe(u8, "call_big");
+        const blocks = try alloc.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .tool_result = .{ .tool_use_id = id, .content = big, .is_error = false } };
+        try list.append(alloc, .{ .role = .user, .content = blocks });
+    }
+    // Message 3: a small tool_result, left alone.
+    {
+        const ok = try alloc.dupe(u8, "ok");
+        const id = try alloc.dupe(u8, "call_small");
+        const blocks = try alloc.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .tool_result = .{ .tool_use_id = id, .content = ok, .is_error = false } };
+        try list.append(alloc, .{ .role = .user, .content = blocks });
+    }
+
+    const truncated = try truncateOversizedToolResults(list.items, alloc);
+    try std.testing.expect(truncated);
+
+    // Fat result is now head + marker + tail, far smaller than the original
+    // but at least as large as the kept head+tail.
+    const fat = list.items[1].content[0].tool_result;
+    try std.testing.expect(fat.content.len < fat_len);
+    try std.testing.expect(fat.content.len >= TOOL_RESULT_TRUNCATE_HEAD + TOOL_RESULT_TRUNCATE_TAIL);
+    const removed = fat_len - TOOL_RESULT_TRUNCATE_HEAD - TOOL_RESULT_TRUNCATE_TAIL;
+    var marker_buf: [64]u8 = undefined;
+    const marker = try std.fmt.bufPrint(&marker_buf, "truncated {d} bytes", .{removed});
+    try std.testing.expect(std.mem.indexOf(u8, fat.content, marker) != null);
+    try std.testing.expectEqualStrings("call_big", fat.tool_use_id);
+
+    // Small text and small tool_result untouched.
+    try std.testing.expectEqualStrings("small user message", list.items[0].content[0].text.text);
+    try std.testing.expectEqualStrings("ok", list.items[2].content[0].tool_result.content);
+}
+
+test "truncateOversizedToolResults returns false when nothing is over the threshold" {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayList(types.Message) = .empty;
+    defer {
+        for (list.items) |m| m.deinit(alloc);
+        list.deinit(alloc);
+    }
+    {
+        const text = try alloc.dupe(u8, "just text");
+        const blocks = try alloc.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = text } };
+        try list.append(alloc, .{ .role = .user, .content = blocks });
+    }
+    {
+        const ok = try alloc.dupe(u8, "small result");
+        const id = try alloc.dupe(u8, "call_1");
+        const blocks = try alloc.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .tool_result = .{ .tool_use_id = id, .content = ok, .is_error = false } };
+        try list.append(alloc, .{ .role = .user, .content = blocks });
+    }
+    try std.testing.expect(!try truncateOversizedToolResults(list.items, alloc));
 }
 
 /// Prefix wrapping a Zig-default compaction summary when it's injected
