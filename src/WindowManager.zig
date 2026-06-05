@@ -5331,6 +5331,66 @@ test "workflow_panes opens no pane when the knob is off" {
     try std.testing.expectEqual(@as(usize, 0), f.wm.extra_panes.items.len);
 }
 
+test "workflow_panes toggle is inert when the knob is off" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    try engine.lua.doString("_G.wp = require('zag.builtin.workflow_panes')");
+    // Disable the feature; the focused pane DOES host a live workflow (a
+    // child exists), so a knob-honoring toggle is the only reason no view
+    // opens. Without the gate, toggle would borrow a view here.
+    try engine.lua.doString("zag.workflow.set_panes(false)");
+    _ = try f.root_conv.spawnSubagent("alpha", "");
+
+    // Toggling the disabled plugin must open nothing.
+    try engine.lua.doString("_G.wp.toggle()");
+    try std.testing.expectEqual(@as(usize, 0), f.wm.extra_panes.items.len);
+}
+
+test "workflow_panes _on_end hops to a ready (just-spawned) sibling" {
+    const allocator = std.testing.allocator;
+    var f: SubagentViewFixture = undefined;
+    try buildSubagentViewFixture(allocator, &f);
+    defer f.deinit();
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    engine.window_manager = &f.wm;
+
+    try engine.lua.doString("require('zag.builtin.workflow_panes')");
+
+    // alpha gets a turn (running, then finishes); beta is a bare spawn marker
+    // with zero nodes -> status "ready". The view follows alpha first.
+    const alpha = try f.root_conv.spawnSubagent("alpha", "");
+    const beta = try f.root_conv.spawnSubagent("beta", "");
+    _ = try alpha.appendNode(null, .assistant_text, "alpha done");
+
+    const root_id = try rootPaneHandleString(allocator, &f.wm);
+    defer allocator.free(root_id);
+
+    var spawn1: Hooks.HookPayload = .{ .subagent_spawn = .{ .name = "alpha", .index = 1, .parent_pane = root_id } };
+    _ = try engine.fireHook(&spawn1);
+    try std.testing.expectEqual(alpha, liveSubagentViews(&f.wm).single.?);
+
+    // alpha ends while it is the shown child. beta is "ready", not "running":
+    // the hop must still land on it (the regression skipped ready siblings,
+    // leaving the view lingering on the finished alpha mid-workflow).
+    var end1: Hooks.HookPayload = .{ .subagent_end = .{ .name = "alpha", .index = 1, .parent_pane = root_id, .is_error = false } };
+    _ = try engine.fireHook(&end1);
+
+    const live = liveSubagentViews(&f.wm);
+    try std.testing.expectEqual(@as(usize, 1), live.count);
+    try std.testing.expectEqual(beta, live.single.?);
+}
+
 test "executeAction lua_callback runs the Lua function via the engine" {
     const allocator = std.testing.allocator;
 

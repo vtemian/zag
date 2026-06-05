@@ -1,9 +1,10 @@
 -- Builtin workflow-panes plugin. While a workflow runs, one live borrowed
 -- child-view pane follows the subagents: it opens on the first spawn, retargets
--- to the most recently spawned running child, and (when the shown child ends)
--- hops to another running sibling, finally lingering on the last transcript for
--- the user to dismiss. Toggle with `/workflow-panes` or `<C-t>`; disable
--- entirely with `zag.workflow.set_panes(false)`.
+-- to the most recently spawned child, and (when the shown child ends) hops to
+-- another active sibling (running or just-spawned), finally lingering on the
+-- last transcript for the user to dismiss. Toggle the view on/off with
+-- `/workflow-panes`; step among active children with `<C-t>` (normal mode).
+-- Disable the feature entirely with `zag.workflow.set_panes(false)`.
 --
 -- This is the product layer over three runtime primitives:
 --   * the SubagentSpawn / SubagentEnd lifecycle hooks (observer-only),
@@ -97,22 +98,30 @@ function M._on_spawn(payload)
 end
 
 -- SubagentEnd handler: if the child that just ended is the one on screen, hop
--- to the first still-running sibling; if none are running, leave the final
+-- to the first still-active sibling; if none are active, leave the final
 -- transcript up (the user dismisses it). Ends for children we are not showing
--- are ignored (the view stays on whatever it was following).
+-- are ignored (the view stays on whatever it was following). Bails when the
+-- feature is disabled (knob or session-suppressed) so a disabled plugin is
+-- fully inert.
 function M._on_end(payload)
     if state.suppressed then return end
+    local ok_enabled, enabled = pcall(zag.workflow.panes)
+    if not ok_enabled or not enabled then return end
     if not state.view_pane then return end
     if payload.index ~= state.current_index then return end
 
+    -- A sibling is "active" while it still has work in flight: a child mid-turn
+    -- ("running") OR a just-spawned child that has not produced a node yet
+    -- ("ready"). Hopping to a ready sibling keeps the view following the live
+    -- workflow instead of lingering on a finished child mid-run.
     local parent_pane = state.parent_pane
     for _, sub in ipairs(_subagents(parent_pane)) do
-        if sub.status == "running" then
+        if sub.status == "running" or sub.status == "ready" then
             _show(parent_pane, sub.index)
             return
         end
     end
-    -- No running sibling: linger on the final transcript. The view stays open
+    -- No active sibling: linger on the final transcript. The view stays open
     -- on `current_index`; the user dismisses it via `/workflow-panes` or the
     -- cycle key. (Auto-close is intentionally out of scope -- least surprising.)
 end
@@ -122,8 +131,12 @@ end
 -- workflow is live in the focused pane, reopen onto its first running (else
 -- last) child. With no active workflow the reopen is a quiet no-op: there is
 -- nothing to borrow, so the toggle just clears the suppressed flag and the
--- next spawn opens the view on its own.
+-- next spawn opens the view on its own. Inert when the feature is disabled via
+-- the knob: a disabled plugin neither opens nor closes a view.
 function M.toggle()
+    local ok_enabled, enabled = pcall(zag.workflow.panes)
+    if not ok_enabled or not enabled then return end
+
     if state.view_pane then
         _close_view()
         state.suppressed = true
@@ -198,21 +211,38 @@ function M._subscribe_hooks()
     end))
 end
 
--- Bind the cycle key. `<C-t>` is unclaimed: the default keymap (src/Keymap.zig
--- loadDefaults) binds only h/j/k/l/v/s/q/i/<CR> in normal mode and <Esc> in
--- insert; the sessions sidebar owns `<C-e>` and the model picker's `<C-P>` /
--- `<C-N>` are buffer-scoped to its popup. Bound in BOTH modes because zag boots
--- in insert (the prompt is focused), so a normal-only binding would force an
--- Esc before the cycle key worked. Users can rebind in config.lua.
+-- Bind the cycle key. `<C-t>` is unclaimed in normal mode: the default keymap
+-- (src/Keymap.zig loadDefaults) binds only h/j/k/l/v/s/q/i/<CR> in normal mode
+-- and <Esc> in insert; the sessions sidebar owns `<C-e>` and the model picker's
+-- `<C-P>` / `<C-N>` are buffer-scoped to its popup. NORMAL MODE ONLY: an insert
+-- binding would shadow readline's transpose-chars (<C-t>) while the user is
+-- typing in the prompt. Users can rebind in config.lua.
 function M._bind_keymaps()
-    for _, mode in ipairs({ "normal", "insert" }) do
-        local id = zag.keymap {
-            mode = mode,
-            key = "<C-t>",
-            fn = M.cycle,
-        }
-        table.insert(state.keymap_ids, id)
+    local id = zag.keymap {
+        mode = "normal",
+        key = "<C-t>",
+        fn = M.cycle,
+    }
+    table.insert(state.keymap_ids, id)
+end
+
+-- Tear the plugin down: close any open view, then remove every registered
+-- keymap and lifecycle hook (consuming the id lists so a re-subscribe starts
+-- clean). Mirrors the sessions sidebar's teardown bookkeeping. Each removal is
+-- pcall'd so a headless engine (no window manager / already-unbound id) stays
+-- quiet. There are no call sites today -- the plugin registers at require and
+-- lives for the engine's lifetime -- but the function must exist and work so
+-- the plugin can be torn down like the sidebar.
+function M.teardown()
+    _close_view()
+    for _, id in ipairs(state.keymap_ids) do
+        pcall(zag.keymap_remove, id)
     end
+    state.keymap_ids = {}
+    for _, id in ipairs(state.hook_ids) do
+        pcall(zag.hook_del, id)
+    end
+    state.hook_ids = {}
 end
 
 -- Test-only introspection so a test can assert on the view/parent/index

@@ -1093,6 +1093,32 @@ test "workflow_panes plugin stays inert on a headless engine (no window manager)
     );
 }
 
+test "workflow_panes teardown removes the registered hooks and keymaps" {
+    const allocator = testing.allocator;
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+
+    // require-time registration populates the id lists (keymap/hook bindings
+    // do not need a window manager, so they register even headless).
+    try runLua(&engine, "_G.wp = require('zag.builtin.workflow_panes')");
+    try runLua(&engine,
+        \\local s = _G.wp._state_for_test()
+        \\assert(#s.hook_ids == 2, "expected 2 hook ids after require, got " .. tostring(#s.hook_ids))
+        \\assert(#s.keymap_ids == 1, "expected 1 keymap id (normal mode only), got " .. tostring(#s.keymap_ids))
+    );
+
+    // teardown consumes both id lists; the function must exist and work even
+    // though no production call site invokes it today.
+    try runLua(&engine,
+        \\_G.wp.teardown()
+        \\local s = _G.wp._state_for_test()
+        \\assert(#s.hook_ids == 0, "teardown must clear hook_ids")
+        \\assert(#s.keymap_ids == 0, "teardown must clear keymap_ids")
+        \\assert(s.view_pane == nil, "teardown must close any view")
+    );
+}
+
 // -- zag.task binding misuse guards (Milestone E1) --------------------------
 
 test "zag.task is installed and raises when called outside a coroutine" {
