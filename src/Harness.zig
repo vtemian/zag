@@ -660,6 +660,10 @@ fn runWithProvider(deps: HeadlessDeps) !void {
                     // line; headless eval captures the authoritative total
                     // from the final response, so nothing to do here.
                 },
+                .llm_done => {
+                    // Authoritative per-call usage. Headless trajectory
+                    // metrics wiring lands in a later task; no-op for now.
+                },
                 .done => {
                     const metrics: Trajectory.TurnMetrics = .{};
                     capture.endTurn(metrics) catch |err| {

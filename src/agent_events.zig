@@ -95,6 +95,14 @@ pub const AgentEvent = union(enum) {
     /// not a conversation node, not persisted, not wire-projected. Carries
     /// only a value, so `freeOwned` frees nothing.
     usage: struct { output_tokens: u32 },
+    /// Authoritative per-LLM-call usage, emitted once when each provider
+    /// call completes. Scalar payload: nothing to free.
+    llm_done: struct {
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_creation_tokens: u32,
+        cache_read_tokens: u32,
+    },
     /// Agent loop completed successfully.
     done,
     /// An error occurred during agent execution.
@@ -249,8 +257,9 @@ pub const AgentEvent = union(enum) {
             // Hook/Lua round-trips hold borrowed pointers; caller owns
             // the request struct and its payload. No bytes to free here.
             // compaction_event borrows its outcome string from rodata
-            // and never owns allocations. usage carries only a u32.
-            .thinking_stop, .done, .reset_assistant_text, .compaction_event, .usage => {},
+            // and never owns allocations. usage carries only a u32;
+            // llm_done carries only scalar token counts.
+            .thinking_stop, .done, .reset_assistant_text, .compaction_event, .usage, .llm_done => {},
             // A dropped hook request leaves the firing thread parked
             // awaiting `done`; signal so it proceeds with `cancelled =
             // false` (the default) and the hook is treated as a no-op.

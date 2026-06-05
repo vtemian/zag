@@ -555,6 +555,17 @@ pub fn runLoopStreaming(
             last_usage_index = messages.items.len - 1;
         }
 
+        // Publish the authoritative per-call usage before any tool
+        // executes, so headless trajectory capture closes this LLM
+        // round-trip's step ahead of the executed tool events that
+        // follow. Scalar payload; nothing to free on a dropped push.
+        queue.pushWithBackpressure(.{ .llm_done = .{
+            .input_tokens = response.input_tokens,
+            .output_tokens = response.output_tokens,
+            .cache_creation_tokens = response.cache_creation_tokens,
+            .cache_read_tokens = response.cache_read_tokens,
+        } }, agent_events.default_backpressure_ms) catch {};
+
         const tool_calls = try collectToolCalls(response.content, allocator);
         defer allocator.free(tool_calls);
 
