@@ -1261,6 +1261,97 @@ test "startWorkflowScript runs a script that spawns two subagents and aggregates
     try testing.expect(child_registry.isEmpty());
 }
 
+test "a zag.detach survivor's workflow_ctx is severed when the root retires" {
+    const allocator = testing.allocator;
+
+    var engine = try LuaEngine.init(allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.initAsync(2, 16);
+    defer engine.deinitAsync();
+
+    var stub = StubTextProvider{ .response_text = "RESULT" };
+    const p = stub.provider();
+
+    var parent_registry = tools.Registry.init(allocator);
+    defer parent_registry.deinit();
+    try parent_registry.register(@import("../tools/read.zig").tool);
+
+    var parent_conv = try Conversation.init(allocator, 0, "test-parent");
+    defer parent_conv.deinit();
+
+    // Declared AFTER `engine` so its deinit defer runs after `engine.deinitAsync`.
+    // A child registry IS present so that BEFORE the fix the detached worker's
+    // `zag.task` reaches the spawn path (it does not refuse) and the live ctx is
+    // dereferenced — the bug — while AFTER the fix the severed null `workflow_ctx`
+    // makes `zag.task` refuse before touching ctx.
+    var child_registry = ChildRunnerRegistry.init(allocator);
+    defer child_registry.deinit();
+
+    const ctx: tools.TaskContext = .{
+        .allocator = allocator,
+        .provider = p,
+        .provider_name = "stub_text",
+        .model_spec = .{ .provider_name = "stub_text", .model_id = "stub-1" },
+        .registry = &parent_registry,
+        .session_handle = null,
+        .lua_engine = &engine,
+        .task_depth = 0,
+        .wake_fd = null,
+        .parent_conv = &parent_conv,
+        .child_registry = &child_registry,
+    };
+
+    // The root detaches a worker gated on `_G.go`, then returns immediately so
+    // the orchestration root retires while the worker is still parked. After the
+    // root retires, the worker's `workflow_ctx` borrow points at a frame the tool
+    // is about to abandon: a later `zag.task` must hit the soft refusal, not a
+    // stale-ctx deref. pcall keeps the coroutine from erroring (no log noise).
+    var req = LuaEngine.WorkflowRequest{
+        .script =
+        \\zag.detach(function()
+        \\  while not _G.go do zag.sleep(5) end
+        \\  local ok, err = pcall(function() return zag.task({ prompt = "x" }) end)
+        \\  _G.detach_err = tostring(err)
+        \\end)
+        \\return "root done"
+        ,
+        .ctx = &ctx,
+        .allocator = allocator,
+    };
+
+    // 1. Run the root to retire: `req.done` fires, the sever runs in the same
+    //    main-thread retire sequence.
+    engine.startWorkflowScript(&req);
+    try pumpWorkflowToDone(&engine, &child_registry, &req);
+    try testing.expect(!req.is_error);
+    const result = req.result orelse return error.NoResult;
+    defer allocator.free(result);
+    try testing.expectEqualStrings("root done", result);
+    // The detached worker is still parked (gated on `_G.go`).
+    try testing.expect(engine.tasks.count() > 0);
+
+    // 2. Release the worker; pump until it runs `zag.task` and retires.
+    try runLua(&engine, "_G.go = true");
+    const deadline = clock.milliTimestamp() + 4000;
+    while (engine.tasks.count() > 0 and clock.milliTimestamp() < deadline) {
+        child_registry.drainAll();
+        engine.pumpCompletions();
+        clock.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 0), engine.tasks.count());
+
+    // 3. The survivor's `zag.task` must have refused with the soft workflow-ctx
+    //    error — proving the borrow was severed, not dereferenced. `_G.detach_err`
+    //    is reachable as a plain global.
+    _ = try engine.lua.getGlobal("detach_err");
+    const detach_err = engine.lua.toStringEx(-1);
+    try testing.expect(std.mem.indexOf(u8, detach_err, "requires a workflow context") != null);
+    engine.lua.pop(1);
+
+    try testing.expect(child_registry.isEmpty());
+}
+
 /// Return the first `.subagent_link` node in `conv`'s root children, or null.
 fn firstLinkNode(conv: *Conversation) ?*Conversation.Node {
     for (conv.tree.root_children.items) |node| {
