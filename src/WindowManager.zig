@@ -2221,6 +2221,20 @@ pub fn paneHandleForConversation(self: *WindowManager, conv: *Conversation) ?Nod
     return null;
 }
 
+/// True when `entry`'s pane currently occupies a live layout leaf: its
+/// handle resolves and the resolved node is a `.leaf`. A retarget
+/// (`zag.layout.close` then attach) detaches the old leaf but leaves the
+/// `PaneEntry` in `extra_panes` as a dead shell whose handle no longer
+/// resolves to a leaf; this distinguishes "the user can see it" from
+/// "lingering detached entry". Mirrors the resolution `liveSubagentViews`
+/// uses; the WM owns the node registry so the check lives here rather
+/// than being duplicated in callers (the dirty scan, etc.).
+pub fn paneIsLiveLeaf(self: *const WindowManager, entry: *const PaneEntry) bool {
+    const h = entry.pane.handle orelse return false;
+    const node = self.node_registry.resolve(h) catch return false;
+    return node.* == .leaf;
+}
+
 /// True when `view_conv` is `dying` itself or a (possibly nested)
 /// subagent descendant of `dying`. Walks the child's `parent` backlinks
 /// up to the root; any step landing on `dying` is a match. Backs the

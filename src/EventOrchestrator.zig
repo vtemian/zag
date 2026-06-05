@@ -388,6 +388,12 @@ fn anyPaneDirty(self: *const EventOrchestrator) bool {
         if (root.viewport.isDirty(root.buffer.contentVersion())) return true;
     }
     for (self.window_manager.extra_panes.items) |entry| {
+        // A tile retarget (close + reattach) leaves the old borrowed-view
+        // entry detached-but-alive in extra_panes; its borrowed child keeps
+        // streaming, so its viewport never goes clean. Skip a subagent-view
+        // entry whose leaf no longer resolves live -- the user cannot see it,
+        // so its dirtiness must not force a composite (busy-repaint).
+        if (entry.is_subagent_view and !self.window_manager.paneIsLiveLeaf(entry)) continue;
         const buf = entry.pane.buffer;
         if (entry.pane.viewport.isDirty(buf.contentVersion())) return true;
     }
@@ -2278,6 +2284,56 @@ test "anyPaneDirty stays false when no pane has pending visual changes" {
     var orch: EventOrchestrator = undefined;
     orch.window_manager = f.wm.*;
     try std.testing.expect(!orch.anyPaneDirty());
+    f.wm.* = orch.window_manager;
+}
+
+test "anyPaneDirty ignores a detached subagent-view shell whose child keeps streaming" {
+    // Regression: the plugin's tile retarget (zag.layout.close then a fresh
+    // attach) leaves the OLD borrowed-view entry detached-but-alive in
+    // extra_panes. Its borrowed child conversation keeps streaming, so the
+    // entry's viewport.isDirty stayed true forever -> busy-repaint (every
+    // mouse event forces a needless composite). The dirty scan must skip a
+    // subagent-view entry whose leaf no longer resolves live.
+    const allocator = std.testing.allocator;
+    var f: FloatLifecycleFixture = undefined;
+    try f.init(allocator);
+    defer f.deinit();
+
+    // Borrow a view of a child off the root conversation, then detach its
+    // leaf (closeById) while leaving the entry in extra_panes -- exactly the
+    // shell a retarget leaves behind.
+    const child = try f.conversation.spawnSubagent("child", "");
+    const view_handle = try f.wm.attachSubagentView(&f.conversation, 0, .split, false);
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+    try f.wm.closeById(view_handle, null);
+
+    // The detached shell is still present; its leaf no longer resolves live.
+    try std.testing.expectEqual(@as(usize, 1), f.wm.extra_panes.items.len);
+    try std.testing.expect(!f.wm.paneIsLiveLeaf(f.wm.extra_panes.items[0]));
+
+    // Keep the borrowed child streaming: a new node bumps the child's
+    // content version, so the shell's viewport WOULD report dirty.
+    _ = try child.appendNode(null, .assistant_text, "still talking");
+    {
+        const shell = f.wm.extra_panes.items[0];
+        try std.testing.expect(shell.pane.viewport.isDirty(shell.pane.buffer.contentVersion()));
+    }
+
+    // Drain root dirtiness so only the (skipped) detached shell could flip
+    // the scan; the helper must report NOT dirty.
+    {
+        const root_buf = f.wm.root_pane.buffer;
+        f.wm.root_pane.viewport.clearDirty(root_buf.contentVersion());
+    }
+
+    var orch: EventOrchestrator = undefined;
+    orch.window_manager = f.wm.*;
+    try std.testing.expect(!orch.anyPaneDirty());
+
+    // A LIVE pane's dirtiness still registers: mutate the root and re-scan.
+    _ = try f.conversation.appendNode(null, .assistant_text, "root output");
+    orch.window_manager = f.wm.*;
+    try std.testing.expect(orch.anyPaneDirty());
     f.wm.* = orch.window_manager;
 }
 
