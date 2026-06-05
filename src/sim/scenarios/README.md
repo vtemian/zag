@@ -36,6 +36,7 @@ parser, tool dispatch, conversation history, slash commands).
 | `multi_turn_context.zsm`        | Turn N+1 references a fact established in turn N |
 | `mid_turn_interrupt.zsm`        | Ctrl+C mid-stream cancels, follow-up prompt recovers |
 | `slash_quit.zsm`                | `/quit` exits cleanly, zero LLM cost |
+| `workflow_view.zsm`             | workflow tool spawns a child; the workflow_panes plugin opens a live borrowed view pane (child bash output on the grid is the proof) |
 | `resume_seed.zsm`               | Plants a deterministic seed message and quits (writes a session) |
 | `resume_last.zsm`               | `zag --last` re-renders the seed message; run right after `resume_seed.zsm` |
 
