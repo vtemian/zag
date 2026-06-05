@@ -762,11 +762,42 @@ fn runWithProvider(deps: HeadlessDeps) !void {
 
     if (agent_err) |e| {
         log.err("headless agent error: {s}", .{e});
+        // The log line routes to ~/.zag/logs, which a bench harness or CI job
+        // never sees. Print one actionable line to stderr so a non-zero exit
+        // is never silent. Truncate defensively: a giant provider body must
+        // not flood stderr.
+        const truncated = e[0..@min(e.len, 512)];
+        var line_buf: [640]u8 = undefined;
+        const line = formatHeadlessFailure(&line_buf, truncated);
+        const stderr_file = std.Io.File.stderr();
+        stderr_file.writeStreamingAll(io, line) catch {};
         return error.AgentFailed;
     }
 }
 
+/// Format the one-line headless failure message written to stderr on a
+/// non-zero exit. Always returns a valid line; on a bufPrint overflow (e.g. a
+/// caller passed an over-long `err_text` despite the truncation contract) it
+/// degrades to a fixed generic line rather than panicking.
+fn formatHeadlessFailure(buf: []u8, err_text: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "zag: agent failed: {s}\n", .{err_text}) catch "zag: agent failed\n";
+}
+
 // -- Tests ------------------------------------------------------------------
+
+test "headless failure line is one actionable stderr line" {
+    var buf: [256]u8 = undefined;
+    const line = formatHeadlessFailure(&buf, "ApiError: insufficient balance");
+    try std.testing.expectEqualStrings("zag: agent failed: ApiError: insufficient balance\n", line);
+}
+
+test "headless failure formatter degrades instead of panicking on overflow" {
+    // A pathological caller that ignored the 512-byte truncation contract must
+    // not trap the process; the formatter falls back to a fixed generic line.
+    var buf: [16]u8 = undefined;
+    const line = formatHeadlessFailure(&buf, "x" ** 64);
+    try std.testing.expectEqualStrings("zag: agent failed\n", line);
+}
 
 test {
     std.testing.refAllDecls(@This());
