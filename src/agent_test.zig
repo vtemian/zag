@@ -3181,6 +3181,96 @@ test "callLlm does not retry a ReadTimeout when the turn was cancelled" {
     try std.testing.expectEqual(@as(u32, 1), stub.attempt);
 }
 
+/// Fails BOTH the streaming attempt and the non-streaming fallback with
+/// `error.ApiError`, stamping `error_detail_out` with `class` so callLlm's
+/// outer retry loop can decide. Recovers (streaming success) once the outer
+/// attempt count passes `fail_outer_attempts`. `streaming_calls` counts
+/// distinct outer attempts (the streaming call fires once per outer attempt
+/// because ApiError is not pre-stream-retryable).
+const BothPathsFailProvider = struct {
+    class: llm.error_class.ErrorClass,
+    fail_outer_attempts: u32,
+    streaming_calls: u32 = 0,
+
+    const vtable: llm.Provider.VTable = .{
+        .call = callImpl,
+        .call_streaming = callStreamingImpl,
+        .name = "both_paths_fail_stub",
+    };
+    fn callImpl(ptr: *anyopaque, req: *const llm.Request) llm.ProviderError!types.LlmResponse {
+        const self: *BothPathsFailProvider = @ptrCast(@alignCast(ptr));
+        // Fallback also fails so the outer loop is the only recovery path.
+        if (req.error_detail_out) |out| out.setClass(self.class);
+        return error.ApiError;
+    }
+    fn callStreamingImpl(ptr: *anyopaque, req: *const llm.StreamRequest) llm.ProviderError!types.LlmResponse {
+        const self: *BothPathsFailProvider = @ptrCast(@alignCast(ptr));
+        self.streaming_calls += 1;
+        if (self.streaming_calls > self.fail_outer_attempts) {
+            req.callback.on_event(req.callback.ctx, .{ .text_delta = "recovered" });
+            return .{ .content = &.{}, .stop_reason = .end_turn, .input_tokens = 1, .output_tokens = 1 };
+        }
+        if (req.error_detail_out) |out| out.setClass(self.class);
+        return error.ApiError;
+    }
+    fn provider(self: *BothPathsFailProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "callLlm outer-retries a retryable ApiError and recovers" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    // Fail the first outer attempt (transport class), recover on the second.
+    var stub = BothPathsFailProvider{ .class = .{ .transport = .{} }, .fail_outer_attempts = 1 };
+    const p = stub.provider();
+    const resp = try agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, &detail);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(types.StopReason.end_turn, resp.stop_reason);
+    // One failed outer attempt + one successful = two streaming calls.
+    try std.testing.expectEqual(@as(u32, 2), stub.streaming_calls);
+    // Recovery reset the partial then re-streamed "recovered".
+    var buf: [16]agent_events.AgentEvent = undefined;
+    const n = queue.drain(&buf);
+    var saw_reply = false;
+    for (buf[0..n]) |ev| {
+        switch (ev) {
+            .text_delta => |t| if (std.mem.eql(u8, t.bytes, "recovered")) {
+                saw_reply = true;
+            },
+            else => {},
+        }
+        ev.freeOwned();
+    }
+    try std.testing.expect(saw_reply);
+}
+
+test "callLlm does not outer-retry a billing-classified ApiError" {
+    const allocator = std.testing.allocator;
+    var queue = try agent_events.EventQueue.initBounded(allocator, 16);
+    defer {
+        drainAndFreeQueue(&queue, allocator);
+        queue.deinit();
+    }
+    var cancel = agent_events.CancelFlag.init(false);
+    var detail = llm.error_detail.ErrorDetail.init(allocator);
+    defer detail.deinit();
+    // Billing is fatal: never recovers, but the loop must give up after one
+    // attempt rather than burning the full budget on a hopeless retry.
+    var stub = BothPathsFailProvider{ .class = .{ .billing = .{ .provider_message = "recharge" } }, .fail_outer_attempts = 99 };
+    const p = stub.provider();
+    const result = agent.callLlm(p, "", "", &.{}, &.{}, .auto, allocator, &queue, &cancel, null, null, &detail);
+    try std.testing.expectError(error.ApiError, result);
+    try std.testing.expectEqual(@as(u32, 1), stub.streaming_calls);
+}
+
 // ============================================================================
 // Structured output via forced terminal tool_use (Milestone G)
 // ============================================================================
