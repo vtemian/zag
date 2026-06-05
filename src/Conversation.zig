@@ -312,6 +312,7 @@ fn appendNonToolCallNode(
     try tb.append(content);
     const node = try self.tree.appendNode(parent, node_type);
     node.buffer_id = handle;
+    self.bumpParentOnToolResult(node, parent);
     self.notifyChildChanged();
     return node;
 }
@@ -327,8 +328,24 @@ pub fn appendImageNode(self: *Conversation, parent: ?*Node, png_bytes: []const u
     try ib.setPng(png_bytes);
     const node = try self.tree.appendNode(parent, .tool_result);
     node.buffer_id = handle;
+    self.bumpParentOnToolResult(node, parent);
     self.notifyChildChanged();
     return node;
+}
+
+/// When a `tool_result` child attaches to a tool_call parent, the parent's
+/// rendered header changes (it gains the collapsed hint and, for a workflow,
+/// freezes its live elapsed into a final `in Ns` duration). The header cache
+/// is keyed by `(node.id, content_version)`, so the parent MUST be bumped on
+/// the dirty trio here or the stale "running" header is served forever — the
+/// working-line-lingers family. Invariant lives in this primitive so it holds
+/// for every caller (live stream, replay, direct API), not just the sink.
+fn bumpParentOnToolResult(self: *Conversation, node: *Node, parent: ?*Node) void {
+    if (node.node_type != .tool_result) return;
+    const p = parent orelse return;
+    p.markDirty();
+    self.tree.dirty_nodes.push(p.id);
+    self.tree.generation +%= 1;
 }
 
 /// Walk the tree and return styled display lines for the visible range.
@@ -1414,6 +1431,39 @@ fn notifyChildChanged(self: *Conversation) void {
             }
         }
         current = p;
+    }
+}
+
+/// Invalidate the cached header of every RUNNING workflow tool_call so the
+/// next composite re-renders its live elapsed second. A workflow is "running"
+/// for this purpose when it is a `workflow` tool_call that carries a live
+/// `created_at_ms` (so it has an elapsed to tick) and has not yet returned (no
+/// `tool_result` child). The renderer caches the header by
+/// `(node.id, content_version)`, so without this bump the displayed second
+/// freezes forever even though the heartbeat composites every second.
+///
+/// Called from `EventOrchestrator` exactly when the working-line's displayed
+/// second changes AND an agent is running, so it costs O(root_children) at
+/// most once per second. Finished and unstamped workflows are skipped: their
+/// headers are static, so ticking them would burn cache misses for no visual
+/// change.
+pub fn touchRunningWorkflows(self: *Conversation) void {
+    for (self.tree.root_children.items) |node| {
+        if (node.node_type != .tool_call) continue;
+        const tag = node.custom_tag orelse continue;
+        if (!std.mem.eql(u8, tag, "workflow")) continue;
+        if (node.created_at_ms == 0) continue;
+        var has_result = false;
+        for (node.children.items) |child| {
+            if (child.node_type == .tool_result) {
+                has_result = true;
+                break;
+            }
+        }
+        if (has_result) continue;
+        node.markDirty();
+        self.tree.dirty_nodes.push(node.id);
+        self.tree.generation +%= 1;
     }
 }
 
@@ -3310,6 +3360,68 @@ test "child mutation bumps the spawning workflow node's content_version" {
 
     try std.testing.expectEqual(link_before +% 1, link_node.content_version);
     try std.testing.expectEqual(wf_before +% 1, wf.content_version);
+}
+
+test "touchRunningWorkflows bumps a running workflow node but not finished ones" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    // A running workflow: a stamped workflow tool_call with linked children
+    // and no tool_result child yet.
+    const running = try conv.appendToolCallNode(null, "workflow", "wf_run", "{\"script\":\"x\"}");
+    running.created_at_ms = 1_000_000;
+    _ = try conv.spawnSubagentLinked("scout", "go", "wf_run");
+
+    // A finished workflow: same shape, but the call already returned (a
+    // tool_result child exists), so its header is frozen and must not tick.
+    const finished = try conv.appendToolCallNode(null, "workflow", "wf_done", "{\"script\":\"x\"}");
+    finished.created_at_ms = 1_000_000;
+    _ = try conv.spawnSubagentLinked("scout2", "go", "wf_done");
+    _ = try conv.appendNode(finished, .tool_result, "done");
+
+    // An unstamped workflow (replay-style): no elapsed shown, so no per-second
+    // tick is needed and it must not be bumped.
+    const unstamped = try conv.appendToolCallNode(null, "workflow", "wf_zero", "{\"script\":\"x\"}");
+    _ = try conv.spawnSubagentLinked("scout3", "go", "wf_zero");
+
+    // A non-workflow tool_call (bash) with a stamp: not a workflow, untouched.
+    const bash = try conv.appendToolCallNode(null, "bash", "bash:0", "{\"command\":\"ls\"}");
+    bash.created_at_ms = 1_000_000;
+
+    const running_before = running.content_version;
+    const finished_before = finished.content_version;
+    const unstamped_before = unstamped.content_version;
+    const bash_before = bash.content_version;
+    const gen_before = conv.tree.generation;
+
+    conv.touchRunningWorkflows();
+
+    // Only the running, stamped workflow node ticks.
+    try std.testing.expectEqual(running_before +% 1, running.content_version);
+    try std.testing.expectEqual(finished_before, finished.content_version);
+    try std.testing.expectEqual(unstamped_before, unstamped.content_version);
+    try std.testing.expectEqual(bash_before, bash.content_version);
+    // The dirty trio fired: the generation advanced and the running node id
+    // is in the dirty ring so the cache actually misses next composite.
+    try std.testing.expect(conv.tree.generation != gen_before);
+}
+
+test "touchRunningWorkflows is a no-op when no workflow is running" {
+    var conv = try Conversation.init(std.testing.allocator, 0, "parent");
+    defer conv.deinit();
+
+    // Only finished/unstamped/non-workflow calls: nothing should change.
+    const finished = try conv.appendToolCallNode(null, "workflow", "wf_done", "{\"script\":\"x\"}");
+    finished.created_at_ms = 1_000_000;
+    _ = try conv.appendNode(finished, .tool_result, "done");
+
+    const gen_before = conv.tree.generation;
+    const finished_before = finished.content_version;
+
+    conv.touchRunningWorkflows();
+
+    try std.testing.expectEqual(finished_before, finished.content_version);
+    try std.testing.expectEqual(gen_before, conv.tree.generation);
 }
 
 test "spawnSubagentLinked with a null id leaves both stamps null" {
