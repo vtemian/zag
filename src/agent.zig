@@ -521,6 +521,7 @@ pub fn runLoopStreaming(
         // force-compact and re-send ONCE before giving up. A second overflow
         // means even the trimmed history doesn't fit, so it propagates.
         var overflow_retried = false;
+        const llm_start = clock.monotonicNs();
         const response = overflow_loop: while (true) {
             break :overflow_loop callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, forced_tool_choice, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out) catch |call_err| {
                 const overflowed = call_err == error.ApiError and
@@ -553,6 +554,7 @@ pub fn runLoopStreaming(
                 return call_err;
             };
         };
+        telemetry_handle.addLlmMs(@intCast(@divTrunc(clock.monotonicNs() - llm_start, std.time.ns_per_ms)));
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
@@ -635,7 +637,9 @@ pub fn runLoopStreaming(
         }
 
         if (tool_calls.len > 0) {
+            const tool_start = clock.monotonicNs();
             const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine, tools.current_caller_pane_id);
+            telemetry_handle.addToolMs(@intCast(@divTrunc(clock.monotonicNs() - tool_start, std.time.ns_per_ms)));
             try messages.append(allocator, .{ .role = .user, .content = results });
 
             // Loop detection: compare the just-executed last tool call
