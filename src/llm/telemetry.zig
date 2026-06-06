@@ -98,6 +98,11 @@ pub const Telemetry = struct {
     /// Number of classified retries the agent fired for this call before it
     /// succeeded or gave up. Zero on the happy path; shown in the timeline.
     retry_count: u32 = 0,
+    /// Milliseconds spent inside LLM calls this turn, summed across the
+    /// overflow-retry loop (which can call the provider more than once).
+    llm_ms: u64 = 0,
+    /// Milliseconds spent executing tools this turn.
+    tool_ms: u64 = 0,
 
     /// Construct a `Telemetry` on the heap. Caller must call `deinit` to
     /// emit the timeline line and free internal state.
@@ -134,7 +139,7 @@ pub const Telemetry = struct {
         const error_kind = self.error_kind orelse "-";
         return std.fmt.allocPrint(
             self.allocator,
-            "turn={d} session={s} model={s} status={d} req_bytes={d} elapsed_ms={d} error={s} error_kind={s} retry_count={d}",
+            "turn={d} session={s} model={s} status={d} req_bytes={d} elapsed_ms={d} error={s} error_kind={s} retry_count={d} llm_ms={d} tool_ms={d}",
             .{
                 self.turn,
                 self.session_id,
@@ -145,6 +150,8 @@ pub const Telemetry = struct {
                 if (self.had_error) "true" else "false",
                 error_kind,
                 self.retry_count,
+                self.llm_ms,
+                self.tool_ms,
             },
         );
     }
@@ -154,6 +161,17 @@ pub const Telemetry = struct {
     /// turns survived transient provider failures.
     pub fn onRetry(self: *Telemetry) void {
         self.retry_count += 1;
+    }
+
+    /// Add to the turn's accumulated LLM time. Called once per provider call
+    /// so the overflow-retry loop's multiple calls sum into one turn figure.
+    pub fn addLlmMs(self: *Telemetry, ms: u64) void {
+        self.llm_ms += ms;
+    }
+
+    /// Add to the turn's accumulated tool-execution time.
+    pub fn addToolMs(self: *Telemetry, ms: u64) void {
+        self.tool_ms += ms;
     }
 
     /// Stash the status and request size for the deinit timeline line.
@@ -417,6 +435,37 @@ test "Telemetry.onRetry increments retry_count in the timeline" {
     const line = try t.formatTimeline();
     defer testing.allocator.free(line);
     try testing.expect(std.mem.indexOf(u8, line, "retry_count=2") != null);
+    t.deinit();
+}
+
+test "Telemetry accumulates llm_ms and tool_ms in the timeline" {
+    const t = try Telemetry.init(.{
+        .allocator = testing.allocator,
+        .session_id = "s",
+        .turn = 1,
+        .model = "m",
+    });
+    t.addLlmMs(1500);
+    t.addLlmMs(1500);
+    t.addToolMs(700);
+    const line = try t.formatTimeline();
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line, "llm_ms=3000") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "tool_ms=700") != null);
+    t.deinit();
+}
+
+test "Telemetry fresh handle reports zero llm_ms and tool_ms" {
+    const t = try Telemetry.init(.{
+        .allocator = testing.allocator,
+        .session_id = "s",
+        .turn = 1,
+        .model = "m",
+    });
+    const line = try t.formatTimeline();
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line, "llm_ms=0") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "tool_ms=0") != null);
     t.deinit();
 }
 

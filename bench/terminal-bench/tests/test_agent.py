@@ -113,3 +113,39 @@ def test_populate_context_null_final_metrics(tmp_path):
 
 def test_agent_name_is_zag():
     assert ZagAgent.name() == "zag"
+
+
+def test_run_command_has_detached_snapshot_loop(tmp_path):
+    # Harbor's timeout kills the host-side exec client, so no signal reaches
+    # this shell and the trap alone cannot save the log. A setsid-detached
+    # loop must snapshot the internal log through the /logs/agent bind-mount
+    # on an interval, surviving the host-side kill.
+    cmd = _make_agent(tmp_path)._build_run_command()
+    assert "setsid bash -c" in cmd
+    # Fully detached: no stdin, no stdout/stderr, backgrounded.
+    assert "</dev/null >/dev/null 2>&1 &" in cmd
+    # Snapshots overwrite (not append) on a 10s interval through the bind-mount.
+    assert 'cat "$HOME"/.zag/logs/*.log > /logs/agent/zag-internal.log' in cmd
+    assert "sleep 10" in cmd
+
+
+def test_run_command_trap_overwrites_not_appends(tmp_path):
+    # The detached loop already snapshots the full log each pass, so the
+    # trap's final flush must overwrite (>); appending (>>) would duplicate
+    # everything the loop already wrote.
+    cmd = _make_agent(tmp_path)._build_run_command()
+    assert (
+        "trap 'cat \"$HOME\"/.zag/logs/*.log > /logs/agent/zag-internal.log 2>/dev/null' EXIT TERM INT"
+        in cmd
+    )
+    assert ">> /logs/agent/zag-internal.log" not in cmd
+
+
+def test_run_command_preserves_zag_invocation(tmp_path):
+    # The detached loop and trap must wrap, not replace, the headless run that
+    # pipes through tee so pipefail carries zag's exit code.
+    cmd = _make_agent(tmp_path)._build_run_command()
+    assert "/usr/local/bin/zag --headless" in cmd
+    assert "--instruction-file=/tmp/zag-instruction.txt" in cmd
+    assert "--trajectory-out=/logs/agent/trajectory.json" in cmd
+    assert "tee /logs/agent/zag.txt" in cmd
