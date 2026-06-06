@@ -21,6 +21,7 @@ pub const Factory = *const fn (
     *const Endpoint,
     []const u8,
     []const u8,
+    u32,
 ) anyerror!Provider;
 
 /// Per-endpoint wire-protocol semantics that the rest of the runtime
@@ -597,11 +598,13 @@ fn testStubFactory(
     endpoint: *const Endpoint,
     auth_path: []const u8,
     model: []const u8,
+    max_output_tokens: u32,
 ) anyerror!Provider {
     _ = allocator;
     _ = endpoint;
     _ = auth_path;
     _ = model;
+    _ = max_output_tokens;
     return error.NotImplemented;
 }
 

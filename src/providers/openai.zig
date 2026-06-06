@@ -52,6 +52,10 @@ pub const OpenAiSerializer = struct {
     auth_path: []const u8,
     /// Model identifier (e.g., "gpt-4o", "gpt-4o-mini").
     model: []const u8,
+    /// Per-model output-token budget resolved from the endpoint rate card at
+    /// creation time. Zero means the model declared none; the transport paths
+    /// then fall back to `default_max_tokens`.
+    max_output_tokens: u32 = 0,
 
     const vtable: Provider.VTable = .{
         .call = callImpl,
@@ -63,6 +67,14 @@ pub const OpenAiSerializer = struct {
     /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *OpenAiSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// The output-token cap to send on the wire: the per-model budget when one
+    /// was declared, otherwise the protocol default. Reasoning-heavy models
+    /// (Moonshot/Kimi) burn their whole budget on hidden reasoning, so a
+    /// too-small cap truncates the answer before any tool call.
+    fn effectiveMaxTokens(self: *const OpenAiSerializer) u32 {
+        return if (self.max_output_tokens != 0) self.max_output_tokens else default_max_tokens;
     }
 
     fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
@@ -85,7 +97,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.thinking_effort, req.tool_choice, req.allocator);
+        const body = try serializeRequest(self.model, system_joined, req.messages, req.tool_definitions, false, self.effectiveMaxTokens(), self.endpoint.reasoning, req.thinking_effort, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -112,7 +124,7 @@ pub const OpenAiSerializer = struct {
 
         const system_joined = try req.joinedSystem(req.allocator);
         defer req.allocator.free(system_joined);
-        const body = try buildStreamingRequestBody(self.model, system_joined, req.messages, req.tool_definitions, self.endpoint.reasoning, req.thinking_effort, req.tool_choice, req.allocator);
+        const body = try serializeRequest(self.model, system_joined, req.messages, req.tool_definitions, true, self.effectiveMaxTokens(), self.endpoint.reasoning, req.thinking_effort, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -141,9 +153,15 @@ pub fn create(
     endpoint: *const llm.Endpoint,
     auth_path: []const u8,
     model: []const u8,
+    max_output_tokens: u32,
 ) !Provider {
     const state = try allocator.create(OpenAiSerializer);
-    state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
+    state.* = .{
+        .endpoint = endpoint,
+        .auth_path = auth_path,
+        .model = model,
+        .max_output_tokens = max_output_tokens,
+    };
     return state.provider();
 }
 
@@ -1327,6 +1345,34 @@ test "parseResponse skips reasoning when response_fields is empty" {
     // the endpoint did not opt in via response_fields.
     try std.testing.expectEqual(@as(usize, 1), resp.content.len);
     try std.testing.expect(resp.content[0] == .text);
+}
+
+test "openai effectiveMaxTokens prefers the per-model budget over the default" {
+    var serializer: OpenAiSerializer = .{
+        .endpoint = undefined,
+        .auth_path = "",
+        .model = "kimi",
+        .max_output_tokens = 32768,
+    };
+    try std.testing.expectEqual(@as(u32, 32768), serializer.effectiveMaxTokens());
+
+    const body = try serializeRequest("kimi", "sys", &.{}, &.{}, false, serializer.effectiveMaxTokens(), .{}, null, .auto, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
+}
+
+test "openai effectiveMaxTokens falls back to the default when the budget is zero" {
+    var serializer: OpenAiSerializer = .{
+        .endpoint = undefined,
+        .auth_path = "",
+        .model = "gpt-4o",
+        .max_output_tokens = 0,
+    };
+    try std.testing.expectEqual(@as(u32, default_max_tokens), serializer.effectiveMaxTokens());
+
+    const body = try serializeRequest("gpt-4o", "sys", &.{}, &.{}, false, serializer.effectiveMaxTokens(), .{}, null, .auto, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":8192") != null);
 }
 
 test "openai body places system as first message" {
