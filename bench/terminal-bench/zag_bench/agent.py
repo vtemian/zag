@@ -108,6 +108,29 @@ class ZagAgent(BaseInstalledAgent):
             env={"ZAG_AUTH_JSON": render_auth_json(provider, api_key)},
         )
 
+    def _build_run_command(self) -> str:
+        # zag is silent on stdout; its diagnostics go to $HOME/.zag/logs.
+        # Copy that log into /logs/agent so harbor collects it, preserving
+        # zag's exit code (pipefail carries it through the tee).
+        #
+        # Harbor's timeout kills the HOST-side docker exec client; no signal
+        # reaches this in-container shell, so the EXIT/TERM/INT trap alone
+        # cannot save the log on a timeout. A setsid-detached loop snapshots
+        # the internal log through the /logs/agent bind-mount (writes land on
+        # the host instantly) every 10s, surviving the host-side kill. Each
+        # pass OVERWRITES, so the trap's clean-exit flush also uses > (not >>):
+        # appending would duplicate everything the loop already wrote.
+        return (
+            "setsid bash -c 'while true; do "
+            "cat \"$HOME\"/.zag/logs/*.log > /logs/agent/zag-internal.log 2>/dev/null; "
+            "sleep 10; done' </dev/null >/dev/null 2>&1 & "
+            "trap 'cat \"$HOME\"/.zag/logs/*.log > /logs/agent/zag-internal.log 2>/dev/null' EXIT TERM INT; "
+            f"{_CONTAINER_BIN} --headless "
+            f"--instruction-file={_CONTAINER_INSTRUCTION} "
+            f"--trajectory-out={_CONTAINER_TRAJECTORY} "
+            f"--no-session 2>&1 | stdbuf -oL tee {_CONTAINER_LOG}"
+        )
+
     @with_prompt_template
     async def run(
         self,
@@ -125,20 +148,9 @@ class ZagAgent(BaseInstalledAgent):
         finally:
             os.unlink(host_instruction)
 
-        # zag is silent on stdout; its diagnostics go to $HOME/.zag/logs.
-        # Copy that log into /logs/agent so harbor collects it, preserving
-        # zag's exit code (pipefail carries it through the tee). The copy is
-        # trapped on EXIT/TERM/INT so a harbor timeout kill or container
-        # teardown still flushes the log instead of losing it.
         await self.exec_as_agent(
             environment,
-            command=(
-                "trap 'cat \"$HOME\"/.zag/logs/*.log >> /logs/agent/zag-internal.log 2>/dev/null' EXIT TERM INT; "
-                f"{_CONTAINER_BIN} --headless "
-                f"--instruction-file={_CONTAINER_INSTRUCTION} "
-                f"--trajectory-out={_CONTAINER_TRAJECTORY} "
-                f"--no-session 2>&1 | stdbuf -oL tee {_CONTAINER_LOG}"
-            ),
+            command=self._build_run_command(),
             env={"ZAG_BENCH_MODEL": self.model_name},
         )
 
