@@ -64,6 +64,11 @@ const prestream_retry_backoff_ms: u64 = 300;
 /// plus 3 classified retries. Wraps the whole streaming+fallback sequence,
 /// distinct from the inner pre-first-token retry budget above.
 pub const max_llm_call_attempts: u8 = 4;
+/// How many times a turn may continue after the model truncated its output
+/// before taking any action. Bounds the shrink-and-reissue nudge so a model
+/// that truncates forever cannot loop; the counter resets on any productive
+/// round-trip, so a turn-50 truncation gets fresh attempts.
+pub const max_truncation_continuations: u8 = 2;
 /// Backoff cap honored even when a provider's Retry-After asks for longer.
 const max_retry_backoff_ms: u64 = 60_000;
 
@@ -104,6 +109,14 @@ fn retryBackoffMs(retry_index: u8, retry_after_ms: ?u32) u64 {
 /// turn means even the compacted history doesn't fit, so the failure is real.
 fn overflowRetryAllowed(already_retried: bool) bool {
     return !already_retried;
+}
+
+/// A response truncated by the output-token limit with no tool calls is not a
+/// completed turn: the model burned its budget (typically on reasoning)
+/// before taking any action. Bounded so a model that truncates forever
+/// cannot loop; the counter resets on any productive round-trip.
+fn truncationContinueAllowed(stop_reason: types.StopReason, tool_count: usize, attempts: u8) bool {
+    return stop_reason == .max_tokens and tool_count == 0 and attempts < max_truncation_continuations;
 }
 
 /// Runs the streaming agent loop: call LLM, execute tools, repeat until
@@ -231,6 +244,11 @@ pub fn runLoopStreaming(
     defer allocator.free(last_tool_name);
     defer allocator.free(last_tool_input);
     var identical_streak: u32 = 0;
+
+    // Consecutive turns this run has truncated its output before taking any
+    // action. Bounds the shrink-and-reissue nudge; reset on any productive
+    // round-trip so an isolated late truncation gets fresh attempts.
+    var truncation_continuations: u8 = 0;
 
     // Predictive-estimator anchors: the last assistant turn's full
     // Usage and its index in `messages`. Null on the first turn (no
@@ -503,6 +521,7 @@ pub fn runLoopStreaming(
         // force-compact and re-send ONCE before giving up. A second overflow
         // means even the trimmed history doesn't fit, so it propagates.
         var overflow_retried = false;
+        const llm_start = clock.monotonicNs();
         const response = overflow_loop: while (true) {
             break :overflow_loop callLlm(provider, assembled.stable, assembled.@"volatile", messages.items, turn_tool_defs, forced_tool_choice, allocator, queue, cancel, telemetry_handle, lua_engine, error_detail_out) catch |call_err| {
                 const overflowed = call_err == error.ApiError and
@@ -535,6 +554,7 @@ pub fn runLoopStreaming(
                 return call_err;
             };
         };
+        telemetry_handle.addLlmMs(@divTrunc(clock.monotonicNs() - llm_start, std.time.ns_per_ms));
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
         // Snapshot the latest input token count so the next iteration's
         // compaction fire has a fresh estimate to compare against the
@@ -617,7 +637,9 @@ pub fn runLoopStreaming(
         }
 
         if (tool_calls.len > 0) {
+            const tool_start = clock.monotonicNs();
             const results = try executeTools(tool_calls, registry, allocator, queue, cancel, lua_engine, tools.current_caller_pane_id);
+            telemetry_handle.addToolMs(@divTrunc(clock.monotonicNs() - tool_start, std.time.ns_per_ms));
             try messages.append(allocator, .{ .role = .user, .content = results });
 
             // Loop detection: compare the just-executed last tool call
@@ -681,7 +703,29 @@ pub fn runLoopStreaming(
         fireLifecycleHook(lua_engine, &turn_end, queue, cancel);
         turn_in_progress.store(false, .release);
 
-        if (tool_calls.len == 0) break;
+        if (tool_calls.len == 0) {
+            // The model produced no tool calls. A clean stop ends the run; an
+            // output-token truncation with no action taken is not completion,
+            // so append a bounded shrink-and-reissue nudge and continue. The
+            // truncated assistant message stays in history verbatim.
+            if (truncationContinueAllowed(response.stop_reason, tool_calls.len, truncation_continuations)) {
+                truncation_continuations += 1;
+                log.warn("output truncated with no tool calls (attempt {d}/{d}); nudging continuation", .{
+                    truncation_continuations, max_truncation_continuations,
+                });
+                try messages.append(allocator, try ownedUserText(allocator,
+                    "<system-reminder>Your previous response hit the output token limit " ++
+                        "before taking any action, so nothing was executed. Do not repeat " ++
+                        "the full reasoning. Respond with brief reasoning and concrete tool " ++
+                        "calls or your final answer; if the work is large, break it into " ++
+                        "smaller steps.</system-reminder>"));
+                continue;
+            }
+            break;
+        }
+        // A productive round-trip (tool calls executed) clears the streak so a
+        // later isolated truncation gets the full continuation budget.
+        truncation_continuations = 0;
     }
 }
 
@@ -1778,6 +1822,18 @@ test "overflow retry: allowed once, refused after the first attempt" {
     try std.testing.expect(!overflowRetryAllowed(true));
 }
 
+test "truncation continue: only max_tokens with zero tools, bounded by the attempt cap" {
+    // Truncated with no action taken: continue while under the cap.
+    try std.testing.expect(truncationContinueAllowed(.max_tokens, 0, 0));
+    try std.testing.expect(truncationContinueAllowed(.max_tokens, 0, 1));
+    // Cap reached (two continuations already spent): stop.
+    try std.testing.expect(!truncationContinueAllowed(.max_tokens, 0, 2));
+    // A clean finish is a completed turn, never a continuation.
+    try std.testing.expect(!truncationContinueAllowed(.end_turn, 0, 0));
+    // Partial-tool-call truncation is self-correcting; do not nudge it.
+    try std.testing.expect(!truncationContinueAllowed(.max_tokens, 1, 0));
+}
+
 test "estimateContextTokens no anchor, no messages returns zero" {
     const est = estimateContextTokens(&.{}, null, null);
     try std.testing.expectEqual(@as(u32, 0), est.total);
@@ -2570,6 +2626,19 @@ fn serializeForSummary(
 /// summary wrapped in the COMPACTION_SUMMARY prefix/suffix. The block's
 /// text slice is heap-allocated on `allocator` and owned by the
 /// returned `Message`.
+/// Build a user message carrying a single text block. The text is duped onto
+/// `allocator` and the content slice is allocated there too, so the returned
+/// `Message` is freed by the same `Message.deinit(allocator)` path that frees
+/// every other entry in `messages`.
+fn ownedUserText(allocator: Allocator, text: []const u8) !types.Message {
+    const duped = try allocator.dupe(u8, text);
+    errdefer allocator.free(duped);
+    const blocks = try allocator.alloc(types.ContentBlock, 1);
+    errdefer allocator.free(blocks);
+    blocks[0] = .{ .text = .{ .text = duped } };
+    return .{ .role = .user, .content = blocks };
+}
+
 fn synthesizeSummaryMessage(
     summary_text: []const u8,
     allocator: Allocator,

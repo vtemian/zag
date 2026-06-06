@@ -176,11 +176,13 @@ fn testStubFactory(
     endpoint: *const Endpoint,
     auth_path: []const u8,
     model: []const u8,
+    max_output_tokens: u32,
 ) anyerror!@import("../llm.zig").Provider {
     _ = allocator;
     _ = endpoint;
     _ = auth_path;
     _ = model;
+    _ = max_output_tokens;
     return error.NotImplemented;
 }
 

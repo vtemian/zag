@@ -61,6 +61,10 @@ pub const AnthropicSerializer = struct {
     auth_path: []const u8,
     /// Model identifier (e.g., "claude-sonnet-4-20250514").
     model: []const u8,
+    /// Per-model output-token budget resolved from the endpoint rate card at
+    /// creation time. Zero means the model declared none; the transport paths
+    /// then fall back to `default_max_tokens`.
+    max_output_tokens: u32 = 0,
 
     const vtable: Provider.VTable = .{
         .call = callImpl,
@@ -72,6 +76,12 @@ pub const AnthropicSerializer = struct {
     /// Create a Provider interface backed by this serializer.
     pub fn provider(self: *AnthropicSerializer) Provider {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// The output-token cap to send on the wire: the per-model budget when one
+    /// was declared, otherwise the protocol default.
+    fn effectiveMaxTokens(self: *const AnthropicSerializer) u32 {
+        return if (self.max_output_tokens != 0) self.max_output_tokens else default_max_tokens;
     }
 
     fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
@@ -93,7 +103,7 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking, req.thinking_effort);
-        const body = try serializeRequest(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, false, default_max_tokens, thinking, req.tool_choice, req.allocator);
+        const body = try serializeRequest(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, false, self.effectiveMaxTokens(), thinking, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -119,7 +129,7 @@ pub const AnthropicSerializer = struct {
         const self: *AnthropicSerializer = @ptrCast(@alignCast(ptr));
 
         const thinking = resolveThinking(self.model, req.thinking, req.thinking_effort);
-        const body = try serializeRequest(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, true, default_max_tokens, thinking, req.tool_choice, req.allocator);
+        const body = try serializeRequest(self.model, req.system_stable, req.system_volatile, req.messages, req.tool_definitions, true, self.effectiveMaxTokens(), thinking, req.tool_choice, req.allocator);
         defer req.allocator.free(body);
 
         var headers = try llm.http.buildHeaders(self.endpoint, self.auth_path, req.allocator);
@@ -148,9 +158,15 @@ pub fn create(
     endpoint: *const llm.Endpoint,
     auth_path: []const u8,
     model: []const u8,
+    max_output_tokens: u32,
 ) !Provider {
     const state = try allocator.create(AnthropicSerializer);
-    state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
+    state.* = .{
+        .endpoint = endpoint,
+        .auth_path = auth_path,
+        .model = model,
+        .max_output_tokens = max_output_tokens,
+    };
     return state.provider();
 }
 
@@ -1291,6 +1307,58 @@ test "buildStreamingRequestBody includes stream:true" {
 
     const root = parsed.value.object;
     try std.testing.expect(root.get("stream").?.bool == true);
+}
+
+test "anthropic effectiveMaxTokens prefers the per-model budget over the default" {
+    const allocator = std.testing.allocator;
+    var serializer: AnthropicSerializer = .{
+        .endpoint = undefined,
+        .auth_path = "",
+        .model = "claude-sonnet-4-20250514",
+        .max_output_tokens = 32768,
+    };
+    try std.testing.expectEqual(@as(u32, 32768), serializer.effectiveMaxTokens());
+
+    const body = try serializeRequest(
+        "claude-sonnet-4-20250514",
+        "system",
+        "",
+        &.{},
+        &.{},
+        false,
+        serializer.effectiveMaxTokens(),
+        null,
+        .auto,
+        allocator,
+    );
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
+}
+
+test "anthropic effectiveMaxTokens falls back to the default when the budget is zero" {
+    const allocator = std.testing.allocator;
+    var serializer: AnthropicSerializer = .{
+        .endpoint = undefined,
+        .auth_path = "",
+        .model = "claude-sonnet-4-20250514",
+        .max_output_tokens = 0,
+    };
+    try std.testing.expectEqual(@as(u32, default_max_tokens), serializer.effectiveMaxTokens());
+
+    const body = try serializeRequest(
+        "claude-sonnet-4-20250514",
+        "system",
+        "",
+        &.{},
+        &.{},
+        false,
+        serializer.effectiveMaxTokens(),
+        null,
+        .auto,
+        allocator,
+    );
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":8192") != null);
 }
 
 test "anthropic serializes forced tool_choice" {

@@ -178,7 +178,12 @@ pub fn create(
     endpoint: *const llm.Endpoint,
     auth_path: []const u8,
     model: []const u8,
+    max_output_tokens: u32,
 ) !Provider {
+    // The Responses API caps output via `max_output_tokens` request fields the
+    // chatgpt wire never emits, so the per-model budget is accepted to satisfy
+    // the Factory signature and discarded.
+    _ = max_output_tokens;
     const state = try allocator.create(ChatgptSerializer);
     state.* = .{ .endpoint = endpoint, .auth_path = auth_path, .model = model };
     return state.provider();

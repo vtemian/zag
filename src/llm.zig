@@ -425,6 +425,18 @@ pub fn resolveModelSpec(
     return spec;
 }
 
+/// Look up the per-model output-token budget from an endpoint's rate card.
+/// Returns the raw declared value (0 when the model is absent from the card
+/// or declared no budget); the provider serializer applies its own
+/// `default_max_tokens` fallback so the budget can stay protocol-specific.
+/// Mirrors the `context_window` resolution in `resolveModelSpec`.
+pub fn resolveMaxOutputTokens(endpoint: *const Endpoint, model_id: []const u8) u32 {
+    for (endpoint.models) |rate| {
+        if (std.mem.eql(u8, rate.id, model_id)) return rate.max_output_tokens;
+    }
+    return 0;
+}
+
 /// Result of creating a provider. Owns all resources needed for LLM calls.
 /// A single deinit() frees everything: provider state, auth path, model
 /// string, and registry.
@@ -551,7 +563,8 @@ pub fn createProviderFromLuaConfig(
     const auth_path = try allocator.dupe(u8, auth_file_path);
     errdefer allocator.free(auth_path);
 
-    const provider = try endpoint.factory(allocator, endpoint, auth_path, spec.model_id);
+    const max_output_tokens = resolveMaxOutputTokens(endpoint, spec.model_id);
+    const provider = try endpoint.factory(allocator, endpoint, auth_path, spec.model_id, max_output_tokens);
     return .{
         .provider = provider,
         .model_id = model_id,
@@ -929,7 +942,7 @@ test "Endpoint.factory builds Provider whose vtable.deinit frees state" {
     const owned_ep = try ep.dupe(alloc);
     defer owned_ep.free(alloc);
 
-    const provider = try owned_ep.factory(alloc, &owned_ep, "/tmp/x", "m");
+    const provider = try owned_ep.factory(alloc, &owned_ep, "/tmp/x", "m", 0);
     try std.testing.expect(provider.vtable.deinit != null);
     provider.vtable.deinit.?(provider.ptr, alloc);
 }
@@ -950,6 +963,43 @@ test "parseModelString handles openai prefix" {
     const result = parseModelString("openai/gpt-4o");
     try std.testing.expectEqualStrings("openai", result.provider_name);
     try std.testing.expectEqualStrings("gpt-4o", result.model_id);
+}
+
+test "resolveMaxOutputTokens returns the declared rate-card value" {
+    const ep: Endpoint = .{
+        .name = "prov",
+        .factory = anthropic.create,
+        .url = "https://example.com",
+        .auth = .none,
+        .headers = &.{},
+        .default_model = "declared",
+        .models = &[_]Endpoint.ModelRate{
+            .{
+                .id = "declared",
+                .context_window = 200_000,
+                .max_output_tokens = 32768,
+                .input_per_mtok = 0,
+                .output_per_mtok = 0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = null,
+            },
+            .{
+                .id = "unbudgeted",
+                .context_window = 200_000,
+                .max_output_tokens = 0,
+                .input_per_mtok = 0,
+                .output_per_mtok = 0,
+                .cache_write_per_mtok = null,
+                .cache_read_per_mtok = null,
+            },
+        },
+    };
+    // Raw rate-card semantics: declared id yields its value, a model that
+    // declared 0 yields 0, and an unknown id yields 0. Providers own the
+    // 8192 fallback, not this resolve seam.
+    try std.testing.expectEqual(@as(u32, 32768), resolveMaxOutputTokens(&ep, "declared"));
+    try std.testing.expectEqual(@as(u32, 0), resolveMaxOutputTokens(&ep, "unbudgeted"));
+    try std.testing.expectEqual(@as(u32, 0), resolveMaxOutputTokens(&ep, "missing"));
 }
 
 test "parseModelString handles nested slashes for openrouter" {
