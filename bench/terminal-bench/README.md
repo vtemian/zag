@@ -47,8 +47,11 @@ Override the model or concurrency:
 
 ```sh
 MODEL=anthropic/<model> ./run.sh
-CONCURRENCY=8 ./run.sh
+CONCURRENCY=4 ./run.sh
 ```
+
+Concurrency defaults to 8 (the Docker VM is 8 CPU / 23GB and most tasks cap at
+1 CPU + 2GB); lower it if your host is smaller.
 
 ## Resume after an interrupt
 
@@ -80,3 +83,8 @@ uv run harbor view jobs
   supported by this setup.
 - Using anthropic models requires adding an anthropic key to the auth store (or
   exporting `ANTHROPIC_API_KEY`); only moonshot is configured by default.
+- `zag-config.lua` redeclares the `moonshot` provider to cap kimi-k2.6 at
+  `max_output_tokens = 16384` (bench-scoped; the product default in
+  `src/lua/zag/providers/moonshot.lua` stays 32768) and requires the
+  `bash_trim`/`rg_trim` transforms so raw tool output stops dominating request
+  bodies.

@@ -5,7 +5,9 @@ import pytest
 from harbor.models.agent.context import AgentContext
 
 from zag_bench.agent import (
+    PRACTICAL_CONSTRAINTS_SUFFIX,
     ZagAgent,
+    decorate_instruction,
     render_auth_json,
     resolve_api_key,
     split_model_name,
@@ -113,6 +115,29 @@ def test_populate_context_null_final_metrics(tmp_path):
 
 def test_agent_name_is_zag():
     assert ZagAgent.name() == "zag"
+
+
+def test_decorate_instruction_preserves_task_text():
+    task = "Recover the password from the corrupted archive."
+    decorated = decorate_instruction(task)
+    assert task in decorated
+
+
+def test_decorate_instruction_appends_practical_constraints():
+    decorated = decorate_instruction("do the thing")
+    assert PRACTICAL_CONSTRAINTS_SUFFIX in decorated
+    # The suffix is appended after the task text, not prepended.
+    assert decorated.index("do the thing") < decorated.index(
+        PRACTICAL_CONSTRAINTS_SUFFIX
+    )
+
+
+def test_practical_constraints_suffix_covers_batching_and_time():
+    # The three load-bearing directives: parallel batching, no redundant
+    # re-reads, and acting once enough is known (time is scarce).
+    assert "in parallel" in PRACTICAL_CONSTRAINTS_SUFFIX
+    assert "Never re-read" in PRACTICAL_CONSTRAINTS_SUFFIX
+    assert "Time is the scarcest resource" in PRACTICAL_CONSTRAINTS_SUFFIX
 
 
 def test_run_command_has_detached_snapshot_loop(tmp_path):
