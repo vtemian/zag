@@ -29,7 +29,9 @@ exec uv run harbor run \
   -d terminal-bench/terminal-bench-2 \
   --agent-import-path zag_bench.agent:ZagAgent \
   -m "$MODEL" \
-  -n "${CONCURRENCY:-4}" \
+  `# 8-CPU/23GB Docker VM; 84/89 tasks cap at 1 CPU + 2GB, and trials sit` \
+  `# inference-idle most of the wall clock, so 8 concurrent trials fit.` \
+  -n "${CONCURRENCY:-8}" \
   --force-build \
   --jobs-dir jobs \
   "$@"

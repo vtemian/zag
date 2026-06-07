@@ -7,6 +7,52 @@ if model then
   zag.set_default_model(model)
 end
 
+-- Trim raw tool output before it lands in history. On the bench, tool output
+-- dominated request bodies: a single password-recovery step resent 1MB+ of
+-- raw stdout every turn (87% of the body). Both transforms keep a head and
+-- elide the tail (bash 500 lines, grep 200), so the load-bearing failure
+-- lines survive while the bulk no longer rides along every subsequent turn.
+-- These are opt-in requires resolved by zag's embedded-stdlib package
+-- searcher (same mechanism the qwen3-coder prompt pack uses).
+require("zag.transforms.bash_trim")
+require("zag.transforms.rg_trim")
+
+-- Bench-scoped reasoning bound. A full-schema zag.provider redeclaration
+-- upserts by name: this wholesale-replaces the builtin "moonshot" entry, so
+-- every field below is copied verbatim from src/lua/zag/providers/moonshot.lua
+-- and exactly one value changes -- kimi-k2.6's max_output_tokens 32768 ->
+-- 16384. Reasoning fills whatever output budget it is given (mean completion
+-- length scaled 2.4x from 8192 to 32768 with no win), 16384 is moonshot's
+-- documented thinking floor, and the continue-on-truncation backstop catches
+-- the ~2% of steps that brush the lower cap. kimi-k2.5 keeps 32768.
+zag.provider {
+  name = "moonshot",
+  url  = "https://api.moonshot.ai/v1/chat/completions",
+  wire = "openai",
+  auth = { kind = "bearer" },
+  headers = {},
+  default_model = "kimi-k2.6",
+  reasoning_response_fields = { "reasoning_content", "reasoning", "reasoning_text" },
+  reasoning_echo_field = "reasoning_content",
+  reasoning_effort_field = "reasoning_effort",
+  -- Socket-level HTTP timeouts (milliseconds). 0 disables a given timer.
+  -- connect_ms is documented but unenforced today (Zig 0.15 std.http.Client
+  -- does not surface the pre-handshake socket); the OS default applies.
+  timeouts = {
+    connect_ms = 60000,
+    read_ms    = 600000,
+    write_ms   = 60000,
+  },
+  models = {
+    { id = "kimi-k2.6", recommended = true, context_window = 262144, max_output_tokens = 16384, input_per_mtok = 0.95, output_per_mtok = 4.0, cache_read_per_mtok = 0.16 },
+    { id = "kimi-k2.5",                     context_window = 262144, max_output_tokens = 32768, input_per_mtok = 0.60, output_per_mtok = 2.5, cache_read_per_mtok = 0.15 },
+  },
+}
+
+-- zag.set_thinking_effort is deliberately NOT set here: moonshot-native
+-- ignores the reasoning_effort field, so the bound above is the only lever
+-- that actually shapes reasoning length on this provider.
+
 -- Containers have no panes to lay out; keep the agent on work tools only.
 zag.tools.gate(function()
   return { "read", "write", "edit", "bash" }
