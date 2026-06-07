@@ -174,3 +174,29 @@ def test_run_command_preserves_zag_invocation(tmp_path):
     assert "--instruction-file=/tmp/zag-instruction.txt" in cmd
     assert "--trajectory-out=/logs/agent/trajectory.json" in cmd
     assert "tee /logs/agent/zag.txt" in cmd
+
+
+def test_run_uploads_decorated_instruction(tmp_path, monkeypatch):
+    """Pins the wiring: run() must upload the DECORATED instruction, not the
+    raw task text. Guards against a silent revert of the decorate_instruction
+    call at the upload site."""
+    import asyncio
+    from types import SimpleNamespace
+
+    agent = _make_agent(tmp_path)
+    captured = {}
+
+    async def fake_upload(host_path, container_path):
+        with open(host_path, encoding="utf-8") as f:
+            captured["uploaded"] = f.read()
+
+    async def fake_exec(*args, **kwargs):
+        captured["executed"] = True
+
+    env = SimpleNamespace(upload_file=fake_upload)
+    monkeypatch.setattr(agent, "exec_as_agent", fake_exec)
+    asyncio.run(agent.run("solve the task", env, AgentContext()))
+
+    assert captured["uploaded"].startswith("solve the task")
+    assert PRACTICAL_CONSTRAINTS_SUFFIX in captured["uploaded"]
+    assert captured["executed"]
