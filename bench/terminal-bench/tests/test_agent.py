@@ -133,10 +133,17 @@ def test_decorate_instruction_appends_practical_constraints():
 
 
 def test_practical_constraints_suffix_covers_batching_and_time():
-    # The three load-bearing directives: parallel batching, no redundant
-    # re-reads, and acting once enough is known (time is scarce).
-    assert "in parallel" in PRACTICAL_CONSTRAINTS_SUFFIX
+    # The load-bearing directives, each tied to an evidenced k=1 failure
+    # bucket: parallel batching + && chaining (weak tool batching in failing
+    # trials), no redundant re-reads, the no-progress-loop circuit breaker
+    # (40% of timeout cost was re-running the same failing command), the
+    # self-verification gate (wrong-but-confident shipping), and acting once
+    # enough is known (time is scarce).
+    assert "parallel" in PRACTICAL_CONSTRAINTS_SUFFIX
+    assert "&&" in PRACTICAL_CONSTRAINTS_SUFFIX
     assert "Never re-read" in PRACTICAL_CONSTRAINTS_SUFFIX
+    assert "same" in PRACTICAL_CONSTRAINTS_SUFFIX  # no-progress-loop breaker
+    assert "before you" in PRACTICAL_CONSTRAINTS_SUFFIX.lower()  # self-verify
     assert "Time is the scarcest resource" in PRACTICAL_CONSTRAINTS_SUFFIX
 
 

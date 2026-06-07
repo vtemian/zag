@@ -35,15 +35,26 @@ _BENCH_CONFIG = _BENCH_DIR / "zag-config.lua"
 # which inflates turn count and wall clock. AgentContext exposes no timeout,
 # so the time pressure is worded generically.
 PRACTICAL_CONSTRAINTS_SUFFIX = (
-    "Practical constraints: independent shell commands issued together in one\n"
-    "response run in parallel; batch them. Never re-read a file or re-run a\n"
-    "probe you have already seen. Time is the scarcest resource: once you have\n"
-    "enough information to act, act."
+    "Working rules:\n"
+    "- Issue independent shell commands together in one response; they run in\n"
+    "  parallel. Chain dependent commands with && in a single command. Do not\n"
+    "  serialize what can run together.\n"
+    "- Never re-read a file or re-run a probe whose output you already have.\n"
+    "- If two attempts produce the same failure or the same output, STOP\n"
+    "  repeating that command: change the approach or investigate why, rather\n"
+    "  than looping on it.\n"
+    "- Before you declare the task done, run your solution exactly the way the\n"
+    "  task says to invoke it (same command, same interface, same inputs) and\n"
+    "  confirm the output matches what the task asks for. A compile or syntax\n"
+    "  check is not verification; if the task names a file, accuracy target, or\n"
+    "  expected output, check against that.\n"
+    "- Time is the scarcest resource: once you have enough information to act, act."
 )
 
 
 def decorate_instruction(instruction: str) -> str:
-    """Append the batching + time-discipline guidance to a task instruction."""
+    """Append the working rules (batching, no-progress-loop breaker,
+    self-verification, time discipline) to a task instruction."""
     return f"{instruction}\n\n{PRACTICAL_CONSTRAINTS_SUFFIX}"
 
 
