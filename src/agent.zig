@@ -71,6 +71,16 @@ pub const max_llm_call_attempts: u8 = 4;
 pub const max_truncation_continuations: u8 = 2;
 /// Backoff cap honored even when a provider's Retry-After asks for longer.
 const max_retry_backoff_ms: u64 = 60_000;
+/// Total wall-clock a single `callLlm` may spend across ALL of its retry
+/// attempts before it gives up. The per-attempt 600s read budget bounds one
+/// attempt, but nothing bounded the sum: `max_llm_call_attempts` classified
+/// retries, each able to wedge for the full read budget and each re-running
+/// the inner pre-first-token retries, let one call grind for ~90 minutes
+/// against a suspended provider account. 15 minutes is generous next to any
+/// bench task budget yet tight against the observed multi-hour grinds. The
+/// budget is checked only between attempts (the read budget owns mid-attempt
+/// time), so the normal single-attempt success path never consults it.
+pub const max_llm_call_budget_ms: u64 = 900_000;
 
 /// Whether a failed LLM call should be re-attempted, given its
 /// classification and where we are in the attempt budget. Transient
@@ -109,6 +119,14 @@ fn retryBackoffMs(retry_index: u8, retry_after_ms: ?u32) u64 {
 /// turn means even the compacted history doesn't fit, so the failure is real.
 fn overflowRetryAllowed(already_retried: bool) bool {
     return !already_retried;
+}
+
+/// Whether a `callLlm` invocation has spent its total wall-clock budget and
+/// must stop retrying. Checked between attempts only: `elapsed_ms` is the time
+/// since the first attempt began. Exactly at the budget is NOT yet exceeded
+/// (one more attempt may start); strictly past it gives up.
+fn llmCallBudgetExceeded(elapsed_ms: u64) bool {
+    return elapsed_ms > max_llm_call_budget_ms;
 }
 
 /// A response truncated by the output-token limit with no tool calls is not a
@@ -1100,6 +1118,11 @@ pub fn callLlm(
     // (transport hiccup, rate limit, opaque 5xx) backs off and re-attempts;
     // a terminal one (billing, auth, malformed request) propagates at once.
     var call_attempt: u8 = 1;
+    // Total wall-clock budget across every attempt of THIS call. Captured once;
+    // each loop-back decision compares the elapsed time against it so a
+    // succession of read-wedged attempts can't grind for hours. The successful
+    // single-attempt path reads the clock once here and never consults it.
+    const call_start_ns = clock.monotonicNs();
     return retry_loop: while (true) {
         if (error_detail_out) |out| out.reset();
         // If a prior attempt streamed partial content, discard it before
@@ -1136,6 +1159,11 @@ pub fn callLlm(
                         attempt < max_prestream_retries and
                         !cancel.load(.acquire))
                     {
+                        const elapsed_ms = @divTrunc(clock.monotonicNs() - call_start_ns, std.time.ns_per_ms);
+                        if (llmCallBudgetExceeded(elapsed_ms)) {
+                            log.warn("llm call exceeded {d}ms total budget after {d} attempts; giving up", .{ max_llm_call_budget_ms, call_attempt });
+                            break :inner streaming_err;
+                        }
                         attempt += 1;
                         log.warn("pre-first-token stall; retrying streaming (attempt {d}/{d})", .{ attempt, max_prestream_retries });
                         clock.sleep(prestream_retry_backoff_ms * std.time.ns_per_ms);
@@ -1202,6 +1230,14 @@ pub fn callLlm(
         const retry_after_ms: ?u32 =
             if (error_detail_out) |out| out.retry_after_ms else null;
         if (!shouldRetryLlmCall(class, call_attempt, max_llm_call_attempts)) {
+            return attempt_err;
+        }
+        // Even when the classification and attempt budget would permit another
+        // retry, refuse once the call has burned its total wall-clock budget:
+        // surface the same error the retry would otherwise have swallowed.
+        const elapsed_ms = @divTrunc(clock.monotonicNs() - call_start_ns, std.time.ns_per_ms);
+        if (llmCallBudgetExceeded(elapsed_ms)) {
+            log.warn("llm call exceeded {d}ms total budget after {d} attempts; giving up", .{ max_llm_call_budget_ms, call_attempt });
             return attempt_err;
         }
         const backoff_ms = retryBackoffMs(call_attempt, retry_after_ms);
@@ -1820,6 +1856,14 @@ test "retry backoff schedule honors retry-after and caps" {
 test "overflow retry: allowed once, refused after the first attempt" {
     try std.testing.expect(overflowRetryAllowed(false));
     try std.testing.expect(!overflowRetryAllowed(true));
+}
+
+test "llm call budget: under is allowed, over gives up, exact boundary is allowed" {
+    try std.testing.expect(!llmCallBudgetExceeded(0));
+    try std.testing.expect(!llmCallBudgetExceeded(max_llm_call_budget_ms - 1));
+    // Exact budget is not yet exceeded: one more attempt may still start.
+    try std.testing.expect(!llmCallBudgetExceeded(max_llm_call_budget_ms));
+    try std.testing.expect(llmCallBudgetExceeded(max_llm_call_budget_ms + 1));
 }
 
 test "truncation continue: only max_tokens with zero tools, bounded by the attempt cap" {
