@@ -5,7 +5,9 @@ import pytest
 from harbor.models.agent.context import AgentContext
 
 from zag_bench.agent import (
+    PRACTICAL_CONSTRAINTS_SUFFIX,
     ZagAgent,
+    decorate_instruction,
     render_auth_json,
     resolve_api_key,
     split_model_name,
@@ -115,6 +117,29 @@ def test_agent_name_is_zag():
     assert ZagAgent.name() == "zag"
 
 
+def test_decorate_instruction_preserves_task_text():
+    task = "Recover the password from the corrupted archive."
+    decorated = decorate_instruction(task)
+    assert task in decorated
+
+
+def test_decorate_instruction_appends_practical_constraints():
+    decorated = decorate_instruction("do the thing")
+    assert PRACTICAL_CONSTRAINTS_SUFFIX in decorated
+    # The suffix is appended after the task text, not prepended.
+    assert decorated.index("do the thing") < decorated.index(
+        PRACTICAL_CONSTRAINTS_SUFFIX
+    )
+
+
+def test_practical_constraints_suffix_covers_batching_and_time():
+    # The three load-bearing directives: parallel batching, no redundant
+    # re-reads, and acting once enough is known (time is scarce).
+    assert "in parallel" in PRACTICAL_CONSTRAINTS_SUFFIX
+    assert "Never re-read" in PRACTICAL_CONSTRAINTS_SUFFIX
+    assert "Time is the scarcest resource" in PRACTICAL_CONSTRAINTS_SUFFIX
+
+
 def test_run_command_has_detached_snapshot_loop(tmp_path):
     # Harbor's timeout kills the host-side exec client, so no signal reaches
     # this shell and the trap alone cannot save the log. A setsid-detached
@@ -149,3 +174,29 @@ def test_run_command_preserves_zag_invocation(tmp_path):
     assert "--instruction-file=/tmp/zag-instruction.txt" in cmd
     assert "--trajectory-out=/logs/agent/trajectory.json" in cmd
     assert "tee /logs/agent/zag.txt" in cmd
+
+
+def test_run_uploads_decorated_instruction(tmp_path, monkeypatch):
+    """Pins the wiring: run() must upload the DECORATED instruction, not the
+    raw task text. Guards against a silent revert of the decorate_instruction
+    call at the upload site."""
+    import asyncio
+    from types import SimpleNamespace
+
+    agent = _make_agent(tmp_path)
+    captured = {}
+
+    async def fake_upload(host_path, container_path):
+        with open(host_path, encoding="utf-8") as f:
+            captured["uploaded"] = f.read()
+
+    async def fake_exec(*args, **kwargs):
+        captured["executed"] = True
+
+    env = SimpleNamespace(upload_file=fake_upload)
+    monkeypatch.setattr(agent, "exec_as_agent", fake_exec)
+    asyncio.run(agent.run("solve the task", env, AgentContext()))
+
+    assert captured["uploaded"].startswith("solve the task")
+    assert PRACTICAL_CONSTRAINTS_SUFFIX in captured["uploaded"]
+    assert captured["executed"]

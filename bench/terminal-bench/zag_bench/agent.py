@@ -30,6 +30,22 @@ _BENCH_DIR = Path(__file__).resolve().parent.parent
 _DEFAULT_BINARY = _BENCH_DIR / "bin" / "zag-linux-aarch64"
 _BENCH_CONFIG = _BENCH_DIR / "zag-config.lua"
 
+# Appended to every task instruction. kimi over-probes (re-reading files,
+# re-running settled commands) and serializes shell calls it could batch,
+# which inflates turn count and wall clock. AgentContext exposes no timeout,
+# so the time pressure is worded generically.
+PRACTICAL_CONSTRAINTS_SUFFIX = (
+    "Practical constraints: independent shell commands issued together in one\n"
+    "response run in parallel; batch them. Never re-read a file or re-run a\n"
+    "probe you have already seen. Time is the scarcest resource: once you have\n"
+    "enough information to act, act."
+)
+
+
+def decorate_instruction(instruction: str) -> str:
+    """Append the batching + time-discipline guidance to a task instruction."""
+    return f"{instruction}\n\n{PRACTICAL_CONSTRAINTS_SUFFIX}"
+
 
 def split_model_name(model_name: str) -> tuple[str, str]:
     """Split harbor's "provider/model" into (provider, model)."""
@@ -141,7 +157,7 @@ class ZagAgent(BaseInstalledAgent):
         with tempfile.NamedTemporaryFile(
             "w", suffix=".txt", delete=False, encoding="utf-8"
         ) as f:
-            f.write(instruction)
+            f.write(decorate_instruction(instruction))
             host_instruction = f.name
         try:
             await environment.upload_file(host_instruction, _CONTAINER_INSTRUCTION)
