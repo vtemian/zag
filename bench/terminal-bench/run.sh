@@ -26,7 +26,7 @@ fi
 
 MODEL="${MODEL:-moonshot/kimi-k2.6}"
 exec uv run harbor run \
-  -d terminal-bench/terminal-bench-2 \
+  -d "${DATASET:-terminal-bench/terminal-bench-2}" \
   --agent-import-path zag_bench.agent:ZagAgent \
   -m "$MODEL" \
   `# 8-CPU/23GB Docker VM; 84/89 tasks cap at 1 CPU + 2GB, and trials sit` \
