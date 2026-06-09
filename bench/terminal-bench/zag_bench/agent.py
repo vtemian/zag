@@ -99,6 +99,14 @@ class ZagAgent(BaseInstalledAgent):
     def name() -> str:
         return "zag"
 
+    def version(self) -> str:
+        # Harbor's to_agent_info() falls back to "unknown" when version() is
+        # None, which surfaces as a blank Agent / "unknown" Agent Version on
+        # the Hub. Report the same version the ATIF trajectory records
+        # (Trajectory.zig agent.version, sourced from build.zig.zon). zag has
+        # no --version flag yet; bump this in lockstep with build.zig.zon.
+        return "0.1.0"
+
     async def install(self, environment: BaseEnvironment) -> None:
         if not self._binary.is_file():
             raise FileNotFoundError(
