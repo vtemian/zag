@@ -207,3 +207,12 @@ def test_run_uploads_decorated_instruction(tmp_path, monkeypatch):
     assert captured["uploaded"].startswith("solve the task")
     assert PRACTICAL_CONSTRAINTS_SUFFIX in captured["uploaded"]
     assert captured["executed"]
+
+
+def test_agent_reports_version_matching_atif(tmp_path):
+    # The Hub "Agent Version" column reads BaseAgent.version(); without an
+    # override it falls back to "unknown". It must match the version the ATIF
+    # trajectory records (Trajectory.zig agent.version / build.zig.zon).
+    agent = _make_agent(tmp_path)
+    assert agent.version() == "0.1.0"
+    assert agent.to_agent_info().version == "0.1.0"
