@@ -2,6 +2,7 @@ bin/
 jobs/
 jobs-*/
 *.log
+*report*.json
 zig-out-linux/
 .venv/
 __pycache__/
