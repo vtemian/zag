@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Terminal-Bench runner for zag. Defaults to the full 89-task suite on kimi.
-#   ./run.sh                      full run, moonshot/kimi-k2.6
+# Terminal-Bench runner for zag. Defaults to the full 89-task suite on kimi,
+# pointed at terminal-bench-2-1 (the leaderboard dataset).
+#   ./run.sh                      full k=1 run, moonshot/kimi-k2.6
+#   ./run.sh -k 5                 k=5 run (the leaderboard ranking metric is
+#                                 mean accuracy over 5 trials)
 #   MODEL=anthropic/<model> ./run.sh
 #   ./run.sh -i 'terminal-bench/<task>'   subset (names are namespaced)
 #   ./run.sh -a oracle            oracle pass (no LLM cost, validates images)
+#
+# A leaderboard submission must pin an explicit dataset revision so the result
+# is reproducible, e.g. DATASET='terminal-bench/terminal-bench-2-1@<rev>'.
+# Fill in <rev> from the leaderboard's required revision once the board is
+# deployed; the unpinned slug below tracks latest and is fine for local runs.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -26,7 +34,7 @@ fi
 
 MODEL="${MODEL:-moonshot/kimi-k2.6}"
 exec uv run harbor run \
-  -d "${DATASET:-terminal-bench/terminal-bench-2}" \
+  -d "${DATASET:-terminal-bench/terminal-bench-2-1}" \
   --agent-import-path zag_bench.agent:ZagAgent \
   -m "$MODEL" \
   `# 8-CPU/23GB Docker VM; 84/89 tasks cap at 1 CPU + 2GB, and trials sit` \
