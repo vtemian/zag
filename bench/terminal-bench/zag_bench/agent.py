@@ -8,6 +8,7 @@ the bench config.lua feeds to zag.set_default_model().
 
 import json
 import os
+import platform
 import tempfile
 from pathlib import Path
 
@@ -27,7 +28,20 @@ _CONTAINER_TRAJECTORY = "/logs/agent/trajectory.json"
 _CONTAINER_LOG = "/logs/agent/zag.txt"
 
 _BENCH_DIR = Path(__file__).resolve().parent.parent
-_DEFAULT_BINARY = _BENCH_DIR / "bin" / "zag-linux-aarch64"
+
+# The host-arch static binary is installed into the (host-arch) task container,
+# so the default tracks the machine running the suite: Apple Silicon ->
+# aarch64, a Hetzner/Linux box -> x86_64. build-linux.sh emits the matching
+# bin/zag-linux-<arch>. Override with the `binary` kwarg for an explicit path.
+_BINARY_BY_ARCH = {
+    "x86_64": "zag-linux-x86_64",
+    "amd64": "zag-linux-x86_64",
+    "aarch64": "zag-linux-aarch64",
+    "arm64": "zag-linux-aarch64",
+}
+_DEFAULT_BINARY = (
+    _BENCH_DIR / "bin" / _BINARY_BY_ARCH.get(platform.machine(), "zag-linux-aarch64")
+)
 _BENCH_CONFIG = _BENCH_DIR / "zag-config.lua"
 
 # Appended to every task instruction. kimi over-probes (re-reading files,

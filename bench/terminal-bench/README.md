@@ -2,9 +2,10 @@
 
 A [harbor](https://github.com/laude-institute/harbor) adapter that runs zag
 headless against [Terminal-Bench 2](https://www.tbench.ai/) (89 tasks). The
-adapter (`zag_bench.agent:ZagAgent`) installs a statically linked arm64 zag
-binary into each task container and drives it as the agent under test. Task
-images are force-built locally for arm64.
+adapter (`zag_bench.agent:ZagAgent`) installs a statically linked zag binary
+into each task container and drives it as the agent under test. The binary and
+the force-built task images both track the host CPU arch, so the suite runs on
+Apple Silicon (aarch64) and on x86_64 Linux (e.g. a Hetzner box) alike.
 
 The adapter runs the full suite, emits ATIF trajectories with per-turn token
 and cost metrics, and supports k=5 runs (`./run.sh -k 5`). Leaderboard
@@ -27,10 +28,10 @@ and is pending the Harbor Hub board going live.
 
 ## Quickstart
 
-Build the arm64 linux binary once, then run the suite:
+Build the host-arch linux binary once, then run the suite:
 
 ```sh
-./build-linux.sh   # produces bin/zag-linux-aarch64
+./build-linux.sh   # produces bin/zag-linux-<arch> (aarch64 or x86_64)
 ./run.sh           # full 89-task run on moonshot/kimi-k2.6
 ```
 
@@ -109,9 +110,10 @@ meantime.
 
 ## Architecture notes
 
-- Task images are native arm64 and force-built on every run (`--force-build`),
+- Task images are force-built on every run (`--force-build`) for the host arch,
   so results reflect the locally built zag binary.
-- The suite is built and run on arm64; amd64 task images are a follow-up.
+- The suite runs on both arm64 (Apple Silicon) and x86_64 Linux; `build-linux.sh`
+  and the adapter pick the matching binary/image arch from `uname -m`.
 - Using anthropic models requires adding an anthropic key to the auth store (or
   exporting `ANTHROPIC_API_KEY`); only moonshot is configured by default.
 - `zag-config.lua` redeclares the `moonshot` provider to cap kimi-k2.6 at
