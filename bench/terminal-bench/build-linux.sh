@@ -8,8 +8,10 @@
 # the machine).
 set -euo pipefail
 
-repo="$(git -C "$(cd "$(dirname "$0")" && pwd)" rev-parse --show-toplevel)"
-bench="$repo/bench/terminal-bench"
+# Derive paths from this script's location, not git, so the build also works
+# from a plain source tree (e.g. one rsync'd to a remote build/bench host).
+bench="$(cd "$(dirname "$0")" && pwd)"
+repo="$(cd "$bench/../.." && pwd)"
 image=zag-zig-builder:0.16.0
 
 # Map the host CPU arch to the Zig toolchain arch, the zag build target, and
