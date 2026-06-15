@@ -42,4 +42,6 @@ docker run --rm \
 
 mkdir -p "$bench/bin"
 cp "$bench/zig-out-linux/bin/zag" "$bench/bin/$out"
-file "$bench/bin/$out"
+# Diagnostic only; `file` is not installed everywhere (e.g. a minimal Linux
+# build host), so never let its absence fail an otherwise-good build.
+file "$bench/bin/$out" 2>/dev/null || ls -l "$bench/bin/$out"
