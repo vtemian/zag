@@ -12,6 +12,7 @@ import platform
 import tempfile
 from pathlib import Path
 
+import certifi
 from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -43,6 +44,15 @@ _DEFAULT_BINARY = (
     _BENCH_DIR / "bin" / _BINARY_BY_ARCH.get(platform.machine(), "zag-linux-aarch64")
 )
 _BENCH_CONFIG = _BENCH_DIR / "zag-config.lua"
+
+# zag's std.http TLS reads its CA bundle from /etc/ssl/certs/ca-certificates.crt.
+# Ship certifi's bundle there at install time rather than apt-get installing
+# ca-certificates in the container: the apt path flaked (exit 100) under
+# concurrency and zeroed tasks zag otherwise solved (compile-compcert,
+# overfull-hbox). certifi is the same source on the arm64 and amd64 hosts.
+_CA_BUNDLE = Path(certifi.where())
+_TMP_CA_BUNDLE = "/tmp/zag-ca-certificates.crt"
+_CONTAINER_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 # Appended to every task instruction. kimi over-probes (re-reading files,
 # re-running settled commands) and serializes shell calls it could batch,
@@ -102,6 +112,18 @@ def render_auth_json(provider: str, api_key: str) -> str:
     return json.dumps({provider: {"type": "api_key", "key": api_key}})
 
 
+def _build_ca_setup_command() -> str:
+    """Root setup: make zag executable and place the CA bundle where its
+    std.http TLS reads it. Replaces an apt-get of ca-certificates that flaked
+    (exit 100) under concurrency at container setup and zeroed solvable tasks;
+    copying the uploaded bundle needs no network."""
+    return (
+        f"chmod 755 {_CONTAINER_BIN} && "
+        "mkdir -p /etc/ssl/certs && "
+        f"cp {_TMP_CA_BUNDLE} {_CONTAINER_CA_BUNDLE}"
+    )
+
+
 class ZagAgent(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
 
@@ -131,17 +153,9 @@ class ZagAgent(BaseInstalledAgent):
 
         await environment.upload_file(self._binary, _CONTAINER_BIN)
         await environment.upload_file(_BENCH_CONFIG, "/tmp/zag-config.lua")
+        await environment.upload_file(_CA_BUNDLE, _TMP_CA_BUNDLE)
 
-        # zag's std.http TLS needs a CA bundle; ubuntu:24.04 base lacks one.
-        await self.exec_as_root(
-            environment,
-            command=(
-                f"chmod 755 {_CONTAINER_BIN} && "
-                "(test -f /etc/ssl/certs/ca-certificates.crt || "
-                "(apt-get update && apt-get install -y --no-install-recommends ca-certificates))"
-            ),
-            env={"DEBIAN_FRONTEND": "noninteractive"},
-        )
+        await self.exec_as_root(environment, command=_build_ca_setup_command())
 
         # Config + auth store under the agent user's HOME. The key travels as
         # an env var and is expanded by the container shell, mirroring how

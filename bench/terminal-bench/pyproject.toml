@@ -3,7 +3,7 @@ name = "zag-bench"
 version = "0.1.0"
 description = "Harbor adapter running zag headless on Terminal-Bench"
 requires-python = ">=3.12"
-dependencies = ["harbor==0.13.1"]
+dependencies = ["harbor==0.13.1", "certifi"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

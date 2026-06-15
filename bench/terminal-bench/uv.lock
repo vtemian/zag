@@ -2783,6 +2783,7 @@ name = "zag-bench"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "certifi" },
     { name = "harbor" },
 ]
 
@@ -2792,7 +2793,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "harbor", specifier = "==0.13.1" }]
+requires-dist = [
+    { name = "certifi" },
+    { name = "harbor", specifier = "==0.13.1" },
+]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]

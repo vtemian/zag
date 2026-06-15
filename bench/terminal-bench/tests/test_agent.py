@@ -216,3 +216,63 @@ def test_agent_reports_version_matching_atif(tmp_path):
     agent = _make_agent(tmp_path)
     assert agent.version() == "0.1.0"
     assert agent.to_agent_info().version == "0.1.0"
+
+
+def test_ca_setup_command_ships_bundle_and_drops_apt():
+    # Root cause of zeroed-but-solvable trials (compile-compcert 4/5,
+    # overfull-hbox 3/5): apt-get installing ca-certificates at container
+    # setup flaked (exit 100) under concurrency. The fix uploads a CA bundle
+    # to the path zag's TLS reads, so no network is needed at setup.
+    from zag_bench.agent import _build_ca_setup_command
+
+    cmd = _build_ca_setup_command()
+    assert "apt-get" not in cmd
+    assert "cp /tmp/zag-ca-certificates.crt /etc/ssl/certs/ca-certificates.crt" in cmd
+    assert "chmod 755 /usr/local/bin/zag" in cmd
+
+
+def test_ca_bundle_is_a_readable_pem():
+    from zag_bench.agent import _CA_BUNDLE
+
+    assert _CA_BUNDLE.is_file()
+    assert "BEGIN CERTIFICATE" in _CA_BUNDLE.read_text()
+
+
+def test_install_ships_ca_bundle_without_apt(tmp_path, monkeypatch):
+    # Pins the fix: install() must upload a CA bundle and place it at
+    # /etc/ssl/certs/ca-certificates.crt with no apt-get, so a flaky network
+    # at container setup cannot zero tasks zag would otherwise solve.
+    import asyncio
+    from types import SimpleNamespace
+
+    from zag_bench.agent import _CA_BUNDLE
+
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test")
+    dummy_binary = tmp_path / "zag"
+    dummy_binary.write_bytes(b"\x7fELF")
+    agent = ZagAgent(
+        logs_dir=tmp_path,
+        model_name="moonshot/kimi-k2.6",
+        binary=str(dummy_binary),
+    )
+
+    uploads = []
+    root_cmds = []
+
+    async def fake_upload(host_path, container_path):
+        uploads.append((str(host_path), container_path))
+
+    async def fake_root(environment, command, **kwargs):
+        root_cmds.append(command)
+
+    async def fake_agent_exec(environment, command, **kwargs):
+        pass
+
+    env = SimpleNamespace(upload_file=fake_upload)
+    monkeypatch.setattr(agent, "exec_as_root", fake_root)
+    monkeypatch.setattr(agent, "exec_as_agent", fake_agent_exec)
+    asyncio.run(agent.install(env))
+
+    assert (str(_CA_BUNDLE), "/tmp/zag-ca-certificates.crt") in uploads
+    assert any("/etc/ssl/certs/ca-certificates.crt" in c for c in root_cmds)
+    assert not any("apt-get" in c for c in root_cmds)
