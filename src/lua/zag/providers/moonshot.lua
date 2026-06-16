@@ -35,6 +35,12 @@ zag.provider {
   },
   models = {
     { id = "kimi-k2.6", recommended = true, context_window = 262144, max_output_tokens = 32768, input_per_mtok = 0.95, output_per_mtok = 4.0, cache_read_per_mtok = 0.16 },
+    -- kimi-k2.7-code: the only K2.7 SKU on the moonshot API (code-only, GA
+    -- 2026-06-12). Same 262K window and per-token price as k2.6, ~30% fewer
+    -- thinking tokens. Thinking is forced always-on and reasoning_content must
+    -- round-trip on tool-call turns; the reasoning_* fields above already do
+    -- that. A faster `kimi-k2.7-code-highspeed` variant is also served.
+    { id = "kimi-k2.7-code",                context_window = 262144, max_output_tokens = 32768, input_per_mtok = 0.95, output_per_mtok = 4.0, cache_read_per_mtok = 0.19 },
     { id = "kimi-k2.5",                     context_window = 262144, max_output_tokens = 32768, input_per_mtok = 0.60, output_per_mtok = 2.5, cache_read_per_mtok = 0.15 },
   },
 }

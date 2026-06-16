@@ -27,8 +27,14 @@ for pair in "MOONSHOT_API_KEY:moonshot" "ANTHROPIC_API_KEY:anthropic" "OPENAI_AP
   fi
 done
 
-if [[ ! -f bin/zag-linux-aarch64 ]]; then
-  echo "bin/zag-linux-aarch64 missing; run ./build-linux.sh" >&2
+# The adapter installs the host-arch binary into the (host-arch) task
+# containers, so the required binary tracks the machine running the suite.
+case "$(uname -m)" in
+  x86_64|amd64)  zag_bin=bin/zag-linux-x86_64 ;;
+  *)             zag_bin=bin/zag-linux-aarch64 ;;
+esac
+if [[ ! -f "$zag_bin" ]]; then
+  echo "$zag_bin missing; run ./build-linux.sh" >&2
   exit 1
 fi
 
