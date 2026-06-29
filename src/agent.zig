@@ -731,12 +731,11 @@ pub fn runLoopStreaming(
                 log.warn("output truncated with no tool calls (attempt {d}/{d}); nudging continuation", .{
                     truncation_continuations, max_truncation_continuations,
                 });
-                try messages.append(allocator, try ownedUserText(allocator,
-                    "<system-reminder>Your previous response hit the output token limit " ++
-                        "before taking any action, so nothing was executed. Do not repeat " ++
-                        "the full reasoning. Respond with brief reasoning and concrete tool " ++
-                        "calls or your final answer; if the work is large, break it into " ++
-                        "smaller steps.</system-reminder>"));
+                try messages.append(allocator, try ownedUserText(allocator, "<system-reminder>Your previous response hit the output token limit " ++
+                    "before taking any action, so nothing was executed. Do not repeat " ++
+                    "the full reasoning. Respond with brief reasoning and concrete tool " ++
+                    "calls or your final answer; if the work is large, break it into " ++
+                    "smaller steps.</system-reminder>"));
                 continue;
             }
             break;
