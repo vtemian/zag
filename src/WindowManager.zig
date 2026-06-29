@@ -9689,11 +9689,13 @@ test "zag.popup.list 100 keystrokes through PaneDraftChange stay under the per-k
         \\require("zag.popup.list").close(_G.handle)
     );
 
-    // 500 ms ceiling for 100 keystrokes. Debug builds with Lua hooks
-    // are nowhere near this in practice (single-digit ms total);
-    // emitting the actual elapsed in the failure message makes a
-    // future regression easy to spot.
-    const budget_ns: u64 = 500 * std.time.ns_per_ms;
+    // 2 s ceiling for 100 keystrokes. Debug builds with Lua hooks are
+    // nowhere near this in practice (single-digit ms total), but contended
+    // shared CI runners have been observed at ~600 ms, so the budget carries
+    // wide headroom while still catching an order-of-magnitude regression;
+    // emitting the actual elapsed in the failure message makes one easy to
+    // spot.
+    const budget_ns: u64 = 2000 * std.time.ns_per_ms;
     if (elapsed_ns >= budget_ns) {
         // Test diagnostic: bypass std.log so the elapsed time prints even
         // when the test runner has the log level pinned to .err.

@@ -6907,14 +6907,17 @@ test "zag.spawn returns handle and :done() flips after sleep completes" {
 
     // Parent spawns a short-sleeping child, checks :done() immediately
     // (must be false while child sleeps), then sleeps long enough for the
-    // child to retire and re-checks :done() (must be true).
+    // child to retire and re-checks :done() (must be true). The 5 ms child /
+    // 200 ms parent gap is deliberately wide so a contended CI runner that
+    // delays timer delivery still processes the child's retirement before the
+    // parent wakes.
     try eng.lua.doString(
         \\function outer()
         \\  local t = zag.spawn(function()
         \\    zag.sleep(5)
         \\  end)
         \\  _outer_initial_done = t:done()
-        \\  zag.sleep(50)
+        \\  zag.sleep(200)
         \\  _outer_final_done = t:done()
         \\end
     );
