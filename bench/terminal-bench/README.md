@@ -54,6 +54,7 @@ Override the model or concurrency:
 ```sh
 MODEL=anthropic/<model> ./run.sh
 CONCURRENCY=4 ./run.sh
+MODEL=zai/glm-5.2 ZAI_API_KEY=sk-... ./run.sh   # GLM-5.2 at max reasoning effort
 ```
 
 Concurrency defaults to 8 (the Docker VM is 8 CPU / 23GB and most tasks cap at
@@ -114,10 +115,17 @@ meantime.
   so results reflect the locally built zag binary.
 - The suite runs on both arm64 (Apple Silicon) and x86_64 Linux; `build-linux.sh`
   and the adapter pick the matching binary/image arch from `uname -m`.
-- Using anthropic models requires adding an anthropic key to the auth store (or
-  exporting `ANTHROPIC_API_KEY`); only moonshot is configured by default.
+- Using anthropic or zai models requires the matching key in the auth store
+  (or `ANTHROPIC_API_KEY` / `ZAI_API_KEY` exported); only moonshot is
+  configured by default.
 - `zag-config.lua` redeclares the `moonshot` provider to cap kimi-k2.6 at
   `max_output_tokens = 16384` (bench-scoped; the product default in
   `src/lua/zag/providers/moonshot.lua` stays 32768) and requires the
   `bash_trim`/`rg_trim` transforms so raw tool output stops dominating request
   bodies.
+- For `zai/glm-5.2`, `zag-config.lua` sends `reasoning_effort = max` (scoped to
+  `zai/` runs) and raises the bench cap to `max_output_tokens = 65536`. GLM-5.2
+  always reasons and shares that budget between thinking and answer; the higher
+  cap leaves room to act, and Z.ai bills actual tokens (not the cap), so a high
+  ceiling does not inflate cost until used. The general pay-per-token endpoint
+  (`api.z.ai/api/paas/v4`) is used, not the quota-limited Coding Plan endpoint.
