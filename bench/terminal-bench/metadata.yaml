@@ -1,11 +1,13 @@
-# Harbor Hub leaderboard submission metadata (terminal-bench/terminal-bench-2-1).
-# Used by: uv run harbor leaderboard submit -l terminal-bench/terminal-bench-2-1 \
+# Harbor Hub leaderboard submission metadata.
+# Used by: uv run harbor leaderboard submit -l terminal-bench-2-1 \
 #            -j <uploaded job uuid> -m metadata.yaml
+# The leaderboard slug is terminal-bench-2-1 (no org prefix); the dataset is
+# referenced separately as terminal-bench/terminal-bench-2-1@sha256:<rev>.
 agent_url: https://zag.engineer/
 agent_display_name: zag
 agent_org_display_name: Vlad Temian
 models:
-  - model_name: kimi-k2.6
+  - model_name: kimi-k2.7-code
     model_provider: moonshot
-    model_display_name: Kimi K2.6
+    model_display_name: Kimi K2.7 Code
     model_org_display_name: Moonshot AI
