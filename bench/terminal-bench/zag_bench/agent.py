@@ -21,6 +21,7 @@ _KEY_ENV_BY_PROVIDER = {
     "moonshot": "MOONSHOT_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "zai": "ZAI_API_KEY",
 }
 
 _CONTAINER_BIN = "/usr/local/bin/zag"

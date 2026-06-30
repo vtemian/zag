@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 auth_store="$HOME/.config/zag/auth.json"
-for pair in "MOONSHOT_API_KEY:moonshot" "ANTHROPIC_API_KEY:anthropic" "OPENAI_API_KEY:openai"; do
+for pair in "MOONSHOT_API_KEY:moonshot" "ANTHROPIC_API_KEY:anthropic" "OPENAI_API_KEY:openai" "ZAI_API_KEY:zai"; do
   var="${pair%%:*}" prov="${pair##*:}"
   if [[ -z "${!var:-}" && -f "$auth_store" ]]; then
     # A malformed auth store must not abort the run for env-var users.

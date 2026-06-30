@@ -7,6 +7,12 @@ if model then
   zag.set_default_model(model)
 end
 
+-- GLM-5.2 honors reasoning_effort ("high"|"max"); send max for zai runs only.
+-- Moonshot ignores the field, so scoping this to zai/ keeps it off other runs.
+if model and model:match("^zai/") then
+  zag.set_thinking_effort("max")
+end
+
 -- Trim raw tool output before it lands in history. On the bench, tool output
 -- dominated request bodies: a single password-recovery step resent 1MB+ of
 -- raw stdout every turn (87% of the body). Both transforms keep a head and
@@ -61,6 +67,31 @@ zag.provider {
 -- zag.set_thinking_effort is deliberately NOT set here: moonshot-native
 -- ignores the reasoning_effort field, so the bound above is the only lever
 -- that actually shapes reasoning length on this provider.
+
+-- Bench-scoped GLM provider. Mirrors src/lua/zag/providers/zai.lua but raises
+-- glm-5.2's max_output_tokens 32768 -> 65536: at reasoning_effort=max the
+-- shared reasoning+answer budget is large, and unlike moonshot (billed TPM on
+-- the cap) Z.ai bills actual tokens, so a high ceiling costs nothing until
+-- used. The continue-on-truncation backstop still catches finish_reason=length.
+zag.provider {
+  name = "zai",
+  url  = "https://api.z.ai/api/paas/v4/chat/completions",
+  wire = "openai",
+  auth = { kind = "bearer" },
+  headers = {},
+  default_model = "glm-5.2",
+  reasoning_response_fields = { "reasoning_content" },
+  reasoning_echo_field = "reasoning_content",
+  reasoning_effort_field = "reasoning_effort",
+  timeouts = {
+    connect_ms = 60000,
+    read_ms    = 600000,
+    write_ms   = 60000,
+  },
+  models = {
+    { id = "glm-5.2", recommended = true, context_window = 1000000, max_output_tokens = 65536, input_per_mtok = 1.40, output_per_mtok = 4.40, cache_read_per_mtok = 0.26 },
+  },
+}
 
 -- Containers have no panes to lay out; keep the agent on work tools only.
 zag.tools.gate(function()
