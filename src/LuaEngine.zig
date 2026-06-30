@@ -9648,6 +9648,32 @@ test "stdlib: require(zag.providers.ollama) registers ollama" {
     try std.testing.expect(std.meta.activeTag(ep.auth) == .none);
 }
 
+test "zag.providers.zai registers GLM-5.2 on the openai wire" {
+    if (sandbox_enabled) return error.SkipZigTest;
+
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString("require(\"zag.providers.zai\")");
+    const ep = engine.providers_registry.find("zai") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://api.z.ai/api/paas/v4/chat/completions", ep.url);
+    try std.testing.expectEqual(@as(llm.Factory, llm.openai.create), ep.factory);
+    try std.testing.expectEqual(true, ep.wire_semantics.cached_overlaps_input);
+    try std.testing.expectEqual(llm.Endpoint.Auth.bearer, ep.auth);
+    try std.testing.expectEqualStrings("glm-5.2", ep.default_model);
+    try std.testing.expectEqual(@as(usize, 1), ep.models.len);
+    try std.testing.expectEqualStrings("glm-5.2", ep.models[0].id);
+    try std.testing.expectEqual(@as(u32, 1000000), ep.models[0].context_window);
+    try std.testing.expectEqual(@as(u32, 32768), ep.models[0].max_output_tokens);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.40), ep.models[0].input_per_mtok, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.40), ep.models[0].output_per_mtok, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.26), ep.models[0].cache_read_per_mtok.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), ep.reasoning.response_fields.len);
+    try std.testing.expectEqualStrings("reasoning_content", ep.reasoning.response_fields[0]);
+    try std.testing.expectEqualStrings("reasoning_content", ep.reasoning.echo_field.?);
+    try std.testing.expectEqualStrings("reasoning_effort", ep.reasoning.effort_request_field.?);
+}
+
 test "stdlib: require(zag.providers.openai-oauth) registers openai-oauth with Codex spec" {
     if (sandbox_enabled) return error.SkipZigTest;
 
