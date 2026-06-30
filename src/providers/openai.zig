@@ -991,6 +991,13 @@ test "buildRequestBody omits reasoning_effort when runtime level is null" {
     try std.testing.expect(root.get("reasoning_effort") == null);
 }
 
+test "openai serializer injects reasoning_effort=max when set" {
+    const reasoning: llm.Endpoint.ReasoningConfig = .{ .effort_request_field = "reasoning_effort" };
+    const body = try serializeRequest("glm-5.2", "sys", &.{}, &.{}, false, 65536, reasoning, "max", .auto, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"max\"") != null);
+}
+
 test "buildRequestBody omits reasoning_effort when endpoint did not opt in" {
     const allocator = std.testing.allocator;
     const messages = [_]types.Message{};

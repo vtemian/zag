@@ -145,8 +145,8 @@ fn zagSetBashSandboxLevelFn(lua: *Lua) !i32 {
 }
 
 /// Zig function backing `zag.set_thinking_effort(level)`.
-/// Accepts one of `"minimal"`, `"low"`, `"medium"`, `"high"`, or
-/// `nil` to clear the runtime setting. Stored module-level on the
+/// Accepts one of `"minimal"`, `"low"`, `"medium"`, `"high"`, `"max"`,
+/// or `nil` to clear the runtime setting. Stored module-level on the
 /// engine so it survives across turns within a session. Providers
 /// that didn't opt in via `effort_request_field` see the value but
 /// drop it silently; this matches pi-mono's "providers carry their
@@ -176,7 +176,7 @@ fn zagSetThinkingEffortFn(lua: *Lua) !i32 {
         log.warn("zag.set_thinking_effort(): arg 1 must be a string or nil", .{});
         return error.LuaError;
     };
-    _ = try LuaEngine.requireOneOf(level, &[_][]const u8{ "minimal", "low", "medium", "high" }, "set_thinking_effort");
+    _ = try LuaEngine.requireOneOf(level, &[_][]const u8{ "minimal", "low", "medium", "high", "max" }, "set_thinking_effort");
 
     const owned = try engine.allocator.dupe(u8, level);
     if (engine.thinking_effort) |old| engine.allocator.free(old);

@@ -6199,6 +6199,14 @@ test "zag.set_thinking_effort replaces prior value without leaking" {
     try std.testing.expectEqualStrings("high", engine.currentThinkingEffort().?);
 }
 
+test "zag.set_thinking_effort accepts max (GLM-5.2 effort tier)" {
+    var engine = try LuaEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.storeSelfPointer();
+    try engine.lua.doString("zag.set_thinking_effort(\"max\")");
+    try std.testing.expectEqualStrings("max", engine.thinking_effort.?);
+}
+
 test "zag.provider{}: full x_api_key declaration registers the endpoint" {
     var engine = try LuaEngine.init(std.testing.allocator);
     defer engine.deinit();
