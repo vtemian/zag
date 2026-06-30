@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -48,7 +48,7 @@ jobs:
           version: 0.16.0
 
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .zig-cache
@@ -84,7 +84,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -92,7 +92,7 @@ jobs:
           version: 0.16.0
 
       - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .zig-cache
