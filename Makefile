@@ -33,11 +33,11 @@ test:
 
 .PHONY: fmt-check
 fmt-check:
-	$(ZIG) fmt --check .
+	$(ZIG) fmt --check build.zig build.zig.zon src
 
 .PHONY: fmt
 fmt:
-	$(ZIG) fmt .
+	$(ZIG) fmt build.zig build.zig.zon src
 
 # ---------------------------------------------------------------------------
 # Release builds (cross-compilation)
