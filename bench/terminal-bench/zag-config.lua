@@ -64,9 +64,10 @@ zag.provider {
   },
 }
 
--- zag.set_thinking_effort is deliberately NOT set here: moonshot-native
--- ignores the reasoning_effort field, so the bound above is the only lever
--- that actually shapes reasoning length on this provider.
+-- For moonshot, zag.set_thinking_effort is deliberately NOT set: moonshot-native
+-- ignores the reasoning_effort field, so the bound above is the only lever that
+-- shapes reasoning length on it. (GLM/zai DOES honor reasoning_effort; that value
+-- is set near the top of this file, scoped to zai/ runs.)
 
 -- Bench-scoped GLM provider. Mirrors src/lua/zag/providers/zai.lua but raises
 -- glm-5.2's max_output_tokens 32768 -> 65536: at reasoning_effort=max the

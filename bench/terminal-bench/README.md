@@ -52,7 +52,7 @@ Oracle pass (runs the reference solution, no LLM cost, validates the images):
 Override the model or concurrency:
 
 ```sh
-MODEL=anthropic/<model> ./run.sh
+MODEL=anthropic/<model> ./run.sh   # declare this provider in zag-config.lua first
 CONCURRENCY=4 ./run.sh
 MODEL=zai/glm-5.2 ZAI_API_KEY=sk-... ./run.sh   # GLM-5.2 at max reasoning effort
 ```
@@ -115,9 +115,12 @@ meantime.
   so results reflect the locally built zag binary.
 - The suite runs on both arm64 (Apple Silicon) and x86_64 Linux; `build-linux.sh`
   and the adapter pick the matching binary/image arch from `uname -m`.
-- Using anthropic or zai models requires the matching key in the auth store
-  (or `ANTHROPIC_API_KEY` / `ZAI_API_KEY` exported); only moonshot is
-  configured by default.
+- The bench registers only the providers `zag-config.lua` declares (`moonshot`
+  and `zai`); declaring any provider suppresses the stdlib bootstrap that would
+  otherwise load them all. `moonshot` (kimi) and `zai` (GLM-5.2) work out of the
+  box with their key in the auth store or `MOONSHOT_API_KEY` / `ZAI_API_KEY`
+  exported. To run anthropic/openai models, declare that provider in
+  `zag-config.lua` too and supply its key.
 - `zag-config.lua` redeclares the `moonshot` provider to cap kimi-k2.6 at
   `max_output_tokens = 16384` (bench-scoped; the product default in
   `src/lua/zag/providers/moonshot.lua` stays 32768) and requires the
